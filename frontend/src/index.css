@@ -1,0 +1,267 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 98%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 240 5.9% 10%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 3.9%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 240 4.9% 83.9%;
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Clearfix for floated elements */
+.clearfix::after {
+  content: "";
+  display: table;
+  clear: both;
+}
+
+/* Glassmorphism utilities */
+.glass {
+  @apply bg-white/10 backdrop-blur-lg border border-white/20;
+}
+
+.dark .glass {
+  @apply bg-black/10 backdrop-blur-lg border border-white/10;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-muted-foreground/20 rounded-full hover:bg-muted-foreground/40 transition-colors;
+}
+
+/* Animations */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slide-in-from-top {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.5s ease-out;
+}
+
+.animate-slide-in-from-top {
+  animation: slide-in-from-top 0.3s ease-out;
+}
+
+.animate-bounce {
+  animation: bounce 2s ease-in-out infinite;
+}
+
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted)) 0%,
+    hsl(var(--muted-foreground) / 0.1) 50%,
+    hsl(var(--muted)) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+/* MDEditor light theme overrides */
+[data-color-mode="light"] .w-md-editor,
+.w-md-editor:not([data-color-mode="dark"]) {
+  --color-canvas-default: #fff !important;
+  --color-border-default: hsl(240 5.9% 90%) !important;
+  background-color: #fff !important;
+}
+
+[data-color-mode="light"] .w-md-editor-text-pre,
+[data-color-mode="light"] .w-md-editor-text-input,
+[data-color-mode="light"] .w-md-editor-text {
+  background-color: #fff !important;
+  color: #1a1a1a !important;
+}
+
+[data-color-mode="light"] .w-md-editor-toolbar {
+  background-color: #fff !important;
+  border-bottom: 1px solid hsl(240 5.9% 90%) !important;
+}
+
+[data-color-mode="light"] .w-md-editor-toolbar svg {
+  color: #1a1a1a !important;
+}
+
+[data-color-mode="light"] .w-md-editor-content {
+  background-color: #fff !important;
+}
+
+/* Force dark text in light mode editor */
+[data-color-mode="light"] .wmde-markdown-color,
+[data-color-mode="light"] .w-md-editor,
+[data-color-mode="light"] .w-md-editor *,
+[data-color-mode="light"] .w-md-editor textarea {
+  color: #1a1a1a !important;
+  caret-color: #1a1a1a !important;
+  -webkit-text-fill-color: #1a1a1a !important;
+}
+
+/* Underline links in markdown content */
+.wmde-markdown a,
+.prose a,
+.w-md-editor-preview a {
+  text-decoration: underline !important;
+}
+
+/* Code block styling for prose/markdown content */
+.prose code {
+  @apply bg-muted text-foreground px-1.5 py-0.5 rounded text-sm font-mono;
+}
+
+.prose code::before,
+.prose code::after {
+  content: none;
+}
+
+.prose pre {
+  @apply bg-muted border border-border rounded-lg p-6 overflow-x-auto;
+}
+
+.prose pre code {
+  @apply bg-transparent p-0 text-sm;
+}
+
+.dark .prose pre {
+  @apply bg-black/50;
+}
+
+/* MDEditor dark theme overrides */
+[data-color-mode="dark"] .w-md-editor {
+  --color-canvas-default: #000 !important;
+  --color-border-default: hsl(240 3.7% 15.9%) !important;
+  background-color: #000 !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-text-pre,
+[data-color-mode="dark"] .w-md-editor-text-input,
+[data-color-mode="dark"] .w-md-editor-text {
+  background-color: #000 !important;
+  color: #fafafa !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-toolbar {
+  background-color: #000 !important;
+  border-bottom: 1px solid hsl(240 3.7% 15.9%) !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-toolbar svg {
+  color: #fafafa !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-content {
+  background-color: #000 !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-text-pre > code,
+[data-color-mode="dark"] .w-md-editor-text-input,
+[data-color-mode="dark"] .w-md-editor-area .w-md-editor-text {
+  color: #fafafa !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-text-pre > code .token {
+  color: #fafafa !important;
+}
+
+/* Force white text in dark mode editor */
+[data-color-mode="dark"] .wmde-markdown-color,
+[data-color-mode="dark"] .w-md-editor,
+[data-color-mode="dark"] .w-md-editor *,
+[data-color-mode="dark"] .w-md-editor textarea {
+  color: #fafafa !important;
+  caret-color: #fafafa !important;
+  -webkit-text-fill-color: #fafafa !important;
+}
+

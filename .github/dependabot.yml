@@ -1,63 +1,30 @@
-# Dependabot configuration for automated dependency updates
+# Weekly grouped dependency PRs. Minor+patch are batched into a single PR
+# so you mostly merge once a week. Majors get individual PRs.
+#
+# Single npm entry at root — workspaces (frontend/, backend/, circuits/,
+# tests/e2e/) share the root lockfile so one scan covers them all.
 version: 2
 updates:
-  - package-ecosystem: "npm"
-    directory: "/backend"
+  - package-ecosystem: npm
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "backend"
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
 
-  - package-ecosystem: "npm"
-    directory: "/frontend"
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "frontend"
-
-  - package-ecosystem: "npm"
-    directory: "/mobile"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "mobile"
-
-  - package-ecosystem: "npm"
-    directory: "/extension"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "extension"
-
-  - package-ecosystem: "cargo"
-    directory: "/contracts"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "contracts"
-
-  - package-ecosystem: "docker"
-    directory: "/backend"
-    schedule:
-      interval: "weekly"
-    labels:
-      - "dependencies"
-      - "docker"
-
-  - package-ecosystem: "docker"
-    directory: "/frontend"
-    schedule:
-      interval: "weekly"
-    labels:
-      - "dependencies"
-      - "docker"
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London

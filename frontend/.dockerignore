@@ -1,8 +1,11 @@
 node_modules
-.next
-out
-build
-.git
-.github
+dist
+.env
+.env.*
 *.log
-.env*.local
+.git
+.gitignore
+*.md
+*.test.ts
+*.test.tsx
+src/contracts/*/node_modules

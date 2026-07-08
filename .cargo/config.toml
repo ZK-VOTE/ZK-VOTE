@@ -1,0 +1,14 @@
+# Cargo configuration for ZKVote Soroban contracts
+#
+# Protocol 25 requires wasm32v1-none target for BN254 pairing and Poseidon hash support.
+#
+# Build contracts:   cargo build --target wasm32v1-none --release
+# Run tests:         cargo test --workspace
+#
+# Note: Do NOT set a default target here as it breaks cargo test.
+
+[target.wasm32v1-none]
+rustflags = [
+    "-C", "target-feature=+multivalue",
+    "-C", "target-feature=+sign-ext",
+]

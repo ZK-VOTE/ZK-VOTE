@@ -1,0 +1,28 @@
+{
+  "name": "zkvote-circuits",
+  "version": "1.0.0",
+  "description": "Circom circuits for ZKVote anonymous voting",
+  "main": "index.js",
+  "scripts": {
+    "compile": "circom vote.circom --r1cs --wasm --sym -o build",
+    "setup": "snarkjs groth16 setup build/vote.r1cs pot14_final.ptau build/vote_0000.zkey",
+    "contribute": "snarkjs zkey contribute build/vote_0000.zkey build/vote_final.zkey --name='ZKVote Phase 1' -v",
+    "export-vkey": "snarkjs zkey export verificationkey build/vote_final.zkey build/verification_key.json",
+    "export-solidity": "snarkjs zkey export solidityverifier build/vote_final.zkey build/verifier.sol",
+    "witness": "node build/vote_js/generate_witness.js build/vote_js/vote.wasm input.json witness.wtns",
+    "prove": "snarkjs groth16 prove build/vote_final.zkey witness.wtns proof.json public.json",
+    "verify": "snarkjs groth16 verify build/verification_key.json public.json proof.json",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
+    "snarkjs": "^0.7.4"
+  },
+  "devDependencies": {
+    "circom_tester": "^0.0.19",
+    "jest": "^29.7.0"
+  }
+}

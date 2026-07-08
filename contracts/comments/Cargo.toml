@@ -1,0 +1,18 @@
+[package]
+name = "comments"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+zkvote-groth16 = { path = "../zkvote-groth16" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+zkvote-groth16 = { path = "../zkvote-groth16", features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils", "zkvote-groth16/testutils"]

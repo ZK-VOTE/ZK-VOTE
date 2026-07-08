@@ -1,0 +1,23 @@
+# Build outputs
+build/
+*.wtns
+*.r1cs
+*.sym
+*.zkey
+
+# Generated files
+proof.json
+public.json
+proof_soroban.json
+input.json
+test_members.json
+witness.wtns
+
+# Powers of Tau (large files)
+*.ptau
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store

@@ -1,0 +1,20 @@
+[package]
+name = "zkvote-integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+hex = "0.4"
+
+# Import all contract crates with testutils enabled
+dao_registry = { path = "../../contracts/dao-registry", package = "dao-registry", features = ["testutils"] }
+membership_sbt = { path = "../../contracts/membership-sbt", package = "membership-sbt", features = ["testutils"] }
+membership_tree = { path = "../../contracts/membership-tree", package = "membership-tree", features = ["testutils"] }
+voting = { path = "../../contracts/voting", package = "voting", features = ["testutils"] }

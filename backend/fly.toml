@@ -1,0 +1,39 @@
+# Fly.io configuration for ZKVote Relayer
+# https://fly.io/docs/reference/configuration/
+
+app = "zkvote-relayer"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+  # Non-sensitive config - secrets set via `fly secrets set`
+  SOROBAN_RPC_URL = "https://rpc-futurenet.stellar.org"
+  NETWORK_PASSPHRASE = "Test SDF Future Network ; October 2022"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+
+[mounts]
+  source = "zkvote_data"
+  destination = "/app/data"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

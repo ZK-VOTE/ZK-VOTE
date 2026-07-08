@@ -1,0 +1,43 @@
+#!/bin/sh
+
+echo "Running pre-commit checks..."
+
+# Format Rust code
+echo "→ Checking Rust formatting..."
+if ! cargo fmt --check 2>/dev/null; then
+    echo "ERROR: Rust code not formatted. Run 'cargo fmt' first."
+    exit 1
+fi
+echo "✓ Rust formatting OK"
+
+# Run Rust clippy (warnings only, don't block)
+echo "→ Running Rust clippy..."
+cargo clippy --workspace --quiet 2>/dev/null || true
+
+# Lint frontend if changes in frontend/
+if git diff --cached --name-only | grep -q "^frontend/"; then
+    echo "→ Linting frontend..."
+    cd frontend && npm run lint --silent 2>/dev/null || {
+        echo "ERROR: Frontend lint failed. Run 'cd frontend && npm run lint' to see errors."
+        exit 1
+    }
+    cd ..
+    echo "✓ Frontend lint OK"
+fi
+
+# Lint backend if changes in backend/ and lint script exists
+if git diff --cached --name-only | grep -q "^backend/"; then
+    if grep -q '"lint"' backend/package.json 2>/dev/null; then
+        echo "→ Linting backend..."
+        cd backend && npm run lint --silent 2>/dev/null || {
+            echo "ERROR: Backend lint failed. Run 'cd backend && npm run lint' to see errors."
+            exit 1
+        }
+        cd ..
+        echo "✓ Backend lint OK"
+    else
+        echo "→ Skipping backend lint (no lint script)"
+    fi
+fi
+
+echo "✓ Pre-commit checks passed"

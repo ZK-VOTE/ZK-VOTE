@@ -1,0 +1,32 @@
+name: deploy-pages
+on:
+  push:
+    branches: [main]
+    paths: ['frontend/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: frontend
+      - name: build (PUBLIC values only)
+        working-directory: frontend
+        env:
+          # Only public config. VITE_RELAYER_AUTH_TOKEN is intentionally NOT
+          # set — it would be baked into public JS (secret leak). The relayer
+          # must not require a client-held token.
+          VITE_RELAYER_URL: ${{ vars.VITE_RELAYER_URL }}
+        run: npm run build
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: frontend
+          command: pages deploy dist --project-name=zkvote

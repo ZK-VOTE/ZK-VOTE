@@ -1,3 +1,0 @@
-[workspace]
-members = ["greenpay-contract", "escrow-contract"]
-resolver = "2"

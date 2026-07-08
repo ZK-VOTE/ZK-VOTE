@@ -1,0 +1,17 @@
+{
+  "name": "zkvote-e2e-tests",
+  "version": "1.0.0",
+  "description": "End-to-end tests for ZKVote with real Groth16 proofs",
+  "type": "module",
+  "scripts": {
+    "test": "node run-all.js",
+    "test:zkproof": "node run-all.js --filter=zkproof",
+    "test:revocation": "node run-all.js --filter=revocation",
+    "test:comments": "node run-all.js --filter=comment"
+  },
+  "dependencies": {
+    "circomlibjs": "^0.1.7",
+    "snarkjs": "^0.7.5",
+    "@stellar/stellar-sdk": "^14.0.0"
+  }
+}

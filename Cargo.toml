@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "contracts/zkvote-groth16",
+    "contracts/dao-registry",
+    "contracts/membership-sbt",
+    "contracts/membership-tree",
+    "contracts/voting",
+    "contracts/comments",
+    "tests/integration",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Soroban SDK with BN254 + Poseidon support (Protocol 25+)
+soroban-sdk = "25.3.0"
+num-bigint = "0.4"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
