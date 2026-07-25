@@ -123,6 +123,8 @@ pub enum DataKey {
     VerifyOverride,
     DaoCurrentCircuit(u64), // dao_id -> current circuit_id string
     DaoMigration(u64),      // dao_id -> MigrationInfo
+    EventSequence(u64),     // dao_id -> incrementing event sequence counter
+    EventHash(u64),         // dao_id -> running SHA256 hash of all events
 }
 
 #[contracttype]
@@ -188,6 +190,7 @@ pub struct ProposalInfo {
 pub struct VKSetEvent {
     #[topic]
     pub dao_id: u64,
+    pub sequence: u32,
 }
 
 #[soroban_sdk::contractevent]
@@ -197,6 +200,7 @@ pub struct ProposalEvent {
     pub dao_id: u64,
     #[topic]
     pub proposal_id: u64,
+    pub sequence: u32,
     pub title: String,
     pub content_cid: String,
     pub creator: Address,
@@ -209,6 +213,7 @@ pub struct ProposalClosedEvent {
     pub dao_id: u64,
     #[topic]
     pub proposal_id: u64,
+    pub sequence: u32,
     pub closed_by: Address,
 }
 
@@ -219,6 +224,7 @@ pub struct ProposalArchivedEvent {
     pub dao_id: u64,
     #[topic]
     pub proposal_id: u64,
+    pub sequence: u32,
     pub archived_by: Address,
 }
 
@@ -229,6 +235,7 @@ pub struct VoteEvent {
     pub dao_id: u64,
     #[topic]
     pub proposal_id: u64,
+    pub sequence: u32,
     pub choice: bool,
     pub nullifier: U256,
 }
@@ -236,6 +243,7 @@ pub struct VoteEvent {
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractUpgraded {
+    pub sequence: u32,
     pub from: u32,
     pub to: u32,
 }
@@ -257,6 +265,40 @@ impl Voting {
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     }
 
+    fn next_event_seq(env: &Env, dao_id: u64) -> u32 {
+        let seq_key = DataKey::EventSequence(dao_id);
+        let seq: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
+        let new_seq = seq + 1;
+        env.storage().persistent().set(&seq_key, &new_seq);
+        Self::bump_persistent(env, &seq_key);
+        new_seq
+    }
+
+    fn update_event_hash(env: &Env, dao_id: u64, seq: u32, event_label: &str) {
+        let hash_key = DataKey::EventHash(dao_id);
+        let prev_hash: Option<BytesN<32>> = env.storage().persistent().get(&hash_key);
+        let mut data = Bytes::new(env);
+        if let Some(h) = prev_hash {
+            data.append(&Bytes::from_array(env, &h.to_array()));
+        }
+        let seq_bytes: [u8; 4] = seq.to_be_bytes();
+        data.append(&Bytes::from_array(env, &seq_bytes));
+        let label = event_label.as_bytes();
+        let mut label_arr = [0u8; 32];
+        let copy_len = core::cmp::min(label.len(), 32);
+        let mut i = 0;
+        while i < copy_len {
+            label_arr[i] = label[i];
+            i += 1;
+        }
+        data.append(&Bytes::from_array(env, &label_arr));
+        let dao_bytes: [u8; 8] = dao_id.to_be_bytes();
+        data.append(&Bytes::from_array(env, &dao_bytes));
+        let new_hash: BytesN<32> = env.crypto().sha256(&data).into();
+        env.storage().persistent().set(&hash_key, &new_hash);
+        Self::bump_persistent(env, &hash_key);
+    }
+
     /// Constructor: Initialize contract with MembershipTree address
     pub fn __constructor(env: Env, tree_contract: Address, registry: Address) {
         // Prevent accidental re-initialization
@@ -266,7 +308,10 @@ impl Voting {
 
         // Record contract version and emit upgrade event for observability
         env.storage().instance().set(&VERSION_KEY, &VERSION);
+        let seq = Self::next_event_seq(&env, 0);
+        Self::update_event_hash(&env, 0, seq, "ContractUpgraded");
         ContractUpgraded {
+            sequence: seq,
             from: 0,
             to: VERSION,
         }
@@ -379,7 +424,9 @@ impl Voting {
         env.storage().persistent().set(&vk_ver_key, &vk);
         Self::bump_persistent(&env, &vk_ver_key);
 
-        VKSetEvent { dao_id }.publish(&env);
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VKSetEvent");
+        VKSetEvent { dao_id, sequence: seq }.publish(&env);
     }
 
     /// Set BLS12-381 verification key for a DAO (admin only)
@@ -410,7 +457,9 @@ impl Voting {
         env.storage().persistent().set(&vk_ver_key, &vk);
         Self::bump_persistent(&env, &vk_ver_key);
 
-        VKSetEvent { dao_id }.publish(&env);
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VKSetEvent");
+        VKSetEvent { dao_id, sequence: seq }.publish(&env);
     }
 
     /// Internal helper to fetch a BN254 VK by version or fail with a clear error
@@ -495,7 +544,9 @@ impl Voting {
         env.storage().persistent().set(&vk_ver_key, &vk);
         Self::bump_persistent(&env, &vk_ver_key);
 
-        VKSetEvent { dao_id }.publish(&env);
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VKSetEvent");
+        VKSetEvent { dao_id, sequence: seq }.publish(&env);
     }
 
     /// Set BLS12-381 verification key from registry during DAO initialization
@@ -526,7 +577,9 @@ impl Voting {
         env.storage().persistent().set(&vk_ver_key, &vk);
         Self::bump_persistent(&env, &vk_ver_key);
 
-        VKSetEvent { dao_id }.publish(&env);
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VKSetEvent");
+        VKSetEvent { dao_id, sequence: seq }.publish(&env);
     }
 
     /// Create a new proposal for a DAO
@@ -734,9 +787,12 @@ impl Voting {
         env.storage().persistent().set(&curve_key, &curve_id);
         Self::bump_persistent(&env, &curve_key);
 
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "ProposalEvent");
         ProposalEvent {
             dao_id,
             proposal_id,
+            sequence: seq,
             title,
             content_cid,
             creator,
@@ -947,9 +1003,12 @@ impl Voting {
         env.storage().persistent().set(&prop_key, &proposal);
         Self::bump_persistent(&env, &prop_key);
 
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VoteEvent");
         VoteEvent {
             dao_id,
             proposal_id,
+            sequence: seq,
             choice: vote_choice,
             nullifier,
         }
@@ -1084,9 +1143,12 @@ impl Voting {
         env.storage().persistent().set(&prop_key, &proposal);
         Self::bump_persistent(&env, &prop_key);
 
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VoteEvent");
         VoteEvent {
             dao_id,
             proposal_id,
+            sequence: seq,
             choice: vote_choice,
             nullifier,
         }
@@ -1187,9 +1249,12 @@ impl Voting {
             proposal.state = ProposalState::Closed;
             env.storage().persistent().set(&key, &proposal);
             Self::bump_persistent(&env, &key);
+            let seq = Self::next_event_seq(&env, dao_id);
+            Self::update_event_hash(&env, dao_id, seq, "ProposalClosedEvent");
             ProposalClosedEvent {
                 dao_id,
                 proposal_id,
+                sequence: seq,
                 closed_by: admin,
             }
             .publish(&env);
@@ -1216,9 +1281,12 @@ impl Voting {
             proposal.state = ProposalState::Archived;
             env.storage().persistent().set(&key, &proposal);
             Self::bump_persistent(&env, &key);
+            let seq = Self::next_event_seq(&env, dao_id);
+            Self::update_event_hash(&env, dao_id, seq, "ProposalArchivedEvent");
             ProposalArchivedEvent {
                 dao_id,
                 proposal_id,
+                sequence: seq,
                 archived_by: admin,
             }
             .publish(&env);
@@ -1573,13 +1641,43 @@ impl Voting {
         env.storage().persistent().set(&prop_key, &proposal);
         Self::bump_persistent(&env, &prop_key);
 
+        let seq = Self::next_event_seq(&env, dao_id);
+        Self::update_event_hash(&env, dao_id, seq, "VoteEvent");
         VoteEvent {
             dao_id,
             proposal_id,
+            sequence: seq,
             choice: vote_choice,
             nullifier,
         }
         .publish(&env);
+    }
+
+    /// Verify that the event sequence for a DAO matches the expected count.
+    /// Returns true if the sequence count equals expected_count, indicating no gaps.
+    pub fn verify_event_sequence(env: Env, dao_id: u64, expected_count: u32) -> bool {
+        Self::bump_instance(&env);
+        let seq_key = DataKey::EventSequence(dao_id);
+        let seq: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
+        seq == expected_count
+    }
+
+    /// Get the running event hash for a DAO.
+    /// Returns BytesN<32> hash or zeros if no events have been emitted.
+    pub fn event_hash(env: Env, dao_id: u64) -> BytesN<32> {
+        Self::bump_instance(&env);
+        let hash_key = DataKey::EventHash(dao_id);
+        env.storage()
+            .persistent()
+            .get(&hash_key)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Get the current event sequence number for a DAO.
+    pub fn event_sequence(env: Env, dao_id: u64) -> u32 {
+        Self::bump_instance(&env);
+        let seq_key = DataKey::EventSequence(dao_id);
+        env.storage().persistent().get(&seq_key).unwrap_or(0)
     }
 }
 

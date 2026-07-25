@@ -29,6 +29,7 @@ export interface Event {
   tx_hash: string | null;
   timestamp: string;
   verified: boolean;
+  event_sequence?: number | null;
   created_at?: string;
 }
 
@@ -40,6 +41,7 @@ export interface EventInput {
   txHash?: string | null;
   timestamp?: string;
   verified?: boolean;
+  eventSequence?: number | null;
 }
 
 export interface EventQueryOptions {
@@ -134,6 +136,7 @@ export function initDb(): DatabaseType {
       tx_hash TEXT,
       timestamp TEXT NOT NULL,
       verified INTEGER DEFAULT 0,
+      event_sequence INTEGER,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(dao_id, ledger, tx_hash, type)
     );
@@ -161,6 +164,16 @@ export function initDb(): DatabaseType {
       metadata_cid TEXT,
       member_count INTEGER DEFAULT 0,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Event sequences table for integrity tracking
+    CREATE TABLE IF NOT EXISTS event_sequences (
+      dao_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      last_sequence INTEGER DEFAULT 0,
+      expected_sequence INTEGER DEFAULT 0,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (dao_id, event_type)
     );
   `);
 
@@ -209,6 +222,84 @@ export function setMetadata<T>(key: string, value: T): void {
 }
 
 // ============================================
+// EVENT SEQUENCE TRACKING
+// ============================================
+
+export interface EventSequenceRow {
+  dao_id: number;
+  event_type: string;
+  last_sequence: number;
+  expected_sequence: number;
+  updated_at: string;
+}
+
+export function getExpectedSequence(daoId: number, eventType: string): number {
+  const database = initDb();
+  const row = database
+    .prepare(
+      "SELECT expected_sequence FROM event_sequences WHERE dao_id = ? AND event_type = ?",
+    )
+    .get(daoId, eventType) as { expected_sequence: number } | undefined;
+  return row?.expected_sequence ?? 0;
+}
+
+export function updateExpectedSequence(
+  daoId: number,
+  eventType: string,
+  lastSequence: number,
+): void {
+  const database = initDb();
+  const expected = lastSequence + 1;
+  database
+    .prepare(
+      `INSERT INTO event_sequences (dao_id, event_type, last_sequence, expected_sequence, updated_at)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(dao_id, event_type) DO UPDATE SET
+         last_sequence = excluded.last_sequence,
+         expected_sequence = excluded.expected_sequence,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+    .run(daoId, eventType, lastSequence, expected);
+}
+
+export function checkSequenceGap(
+  daoId: number,
+  eventType: string,
+  actualSequence: number,
+): boolean {
+  const database = initDb();
+  const row = database
+    .prepare(
+      "SELECT expected_sequence FROM event_sequences WHERE dao_id = ? AND event_type = ?",
+    )
+    .get(daoId, eventType) as { expected_sequence: number } | undefined;
+  const expected = row?.expected_sequence ?? 1;
+  return actualSequence !== expected;
+}
+
+export function getSequenceGaps(
+  limit = 50,
+): Array<{ dao_id: number; event_type: string; expected: number; actual: number }> {
+  const database = initDb();
+  const rows = database
+    .prepare(
+      `SELECT e.dao_id, e.type, COALESCE(s.expected_sequence, 1) as expected
+       FROM events e
+       LEFT JOIN event_sequences s ON e.dao_id = s.dao_id
+       WHERE e.verified = 1
+       GROUP BY e.dao_id, e.type
+       HAVING COUNT(*) < COALESCE(s.expected_sequence, 1) - 1`,
+    )
+    .all() as Array<{ dao_id: number; type: string; expected: number }>;
+  return rows.map((r) => ({
+    dao_id: r.dao_id,
+    event_type: r.type,
+    expected: r.expected,
+    actual: 0, // simplified
+  }));
+}
+
+// ============================================
 // EVENT FUNCTIONS
 // ============================================
 
@@ -221,6 +312,7 @@ interface EventRow {
   tx_hash: string | null;
   timestamp: string;
   verified: number;
+  event_sequence: number | null;
   created_at: string;
 }
 
@@ -238,8 +330,8 @@ export function addEvent(event: EventInput): boolean {
     database
       .prepare(
         `
-      INSERT INTO events (dao_id, type, data, ledger, tx_hash, timestamp, verified)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO events (dao_id, type, data, ledger, tx_hash, timestamp, verified, event_sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `,
       )
       .run(
@@ -250,6 +342,7 @@ export function addEvent(event: EventInput): boolean {
         event.txHash ?? null,
         event.timestamp ?? new Date().toISOString(),
         event.verified ? 1 : 0,
+        event.eventSequence ?? null,
       );
     return true;
   } catch (err) {
@@ -270,6 +363,7 @@ export function addPendingEvent(
   type: string,
   data: Record<string, unknown> | null,
   txHash: string,
+  sequence?: number | null,
 ): boolean {
   return addEvent({
     daoId,
@@ -279,6 +373,7 @@ export function addPendingEvent(
     txHash,
     timestamp: new Date().toISOString(),
     verified: false,
+    eventSequence: sequence ?? null,
   });
 }
 
@@ -348,6 +443,7 @@ export function getEventsForDao(
       tx_hash: e.tx_hash,
       timestamp: e.timestamp,
       verified: !!e.verified,
+      event_sequence: e.event_sequence,
       created_at: e.created_at,
     })),
     total: countResult.total,
@@ -422,6 +518,7 @@ export function getUnverifiedEvents(limit = 10): Event[] {
     tx_hash: e.tx_hash,
     timestamp: e.timestamp,
     verified: !!e.verified,
+    event_sequence: e.event_sequence,
     created_at: e.created_at,
   }));
 }

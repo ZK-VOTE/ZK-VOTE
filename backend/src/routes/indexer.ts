@@ -120,6 +120,20 @@ router.post("/events/notify", authGuard, queryLimiter, (async (
   }
 
   try {
+    // Integrity validation: verify sequence continuity
+    if (data?.sequence != null) {
+      const isGap = (
+        await import("../services/db.js")
+      ).checkSequenceGap(Number(daoId), type, Number(data.sequence));
+      if (isGap) {
+        log("warn", "notify_sequence_gap", {
+          daoId,
+          type,
+          sequence: data.sequence,
+        });
+      }
+    }
+
     notifyEvent(Number(daoId), type, data || {}, txHash);
 
     // Trigger membership cache refresh for membership events

@@ -155,6 +155,36 @@ function parseEventData(event: {
 }
 
 // ============================================
+// SEQUENCE VALIDATION
+// ============================================
+
+/**
+ * Validate event sequence continuity and alert on gaps
+ */
+function validateEventSequence(
+  daoId: number,
+  eventType: string,
+  sequence: number | null,
+): void {
+  if (sequence == null) return; // Event doesn't carry sequence info
+
+  const isGap = db.checkSequenceGap(daoId, eventType, sequence);
+
+  if (isGap) {
+    const expected = db.getExpectedSequence(daoId, eventType);
+    log("warn", "event_sequence_gap", {
+      daoId,
+      eventType,
+      expected,
+      actual: sequence,
+      gap: sequence - expected,
+    });
+  }
+
+  db.updateExpectedSequence(daoId, eventType, sequence);
+}
+
+// ============================================
 // POLLING
 // ============================================
 
@@ -194,6 +224,8 @@ async function pollEvents(
           for (const event of events.events) {
             const parsed = parseEventData(event);
             if (parsed && parsed.daoId !== null) {
+              const sequence =
+                (parsed.data?.sequence as number) ?? null;
               const eventInput: EventInput = {
                 daoId: parsed.daoId,
                 type: parsed.type,
@@ -202,9 +234,13 @@ async function pollEvents(
                 txHash: parsed.txHash,
                 timestamp: parsed.timestamp,
                 verified: true, // Events from RPC are verified
+                eventSequence: sequence != null ? Number(sequence) : null,
               };
               const added = db.addEvent(eventInput);
-              if (added) addedCount++;
+              if (added) {
+                addedCount++;
+                validateEventSequence(parsed.daoId, parsed.type, sequence);
+              }
             }
           }
           if (addedCount > 0) {
@@ -340,6 +376,9 @@ export async function startIndexer(
 
       // Also verify any pending events
       await verifyPendingEvents();
+
+      // Periodic event sequence integrity check
+      checkEventSequenceIntegrity();
     } catch (err) {
       log("error", "poll_failed", { error: (err as Error).message });
     }
@@ -348,6 +387,25 @@ export async function startIndexer(
   };
 
   setTimeout(poll, pollIntervalMs);
+}
+
+/**
+ * Periodic check for event sequence gaps across all indexed DAOs
+ */
+function checkEventSequenceIntegrity(): void {
+  try {
+    const gaps = db.getSequenceGaps();
+    if (gaps.length > 0) {
+      log("warn", "sequence_integrity_gaps_detected", {
+        gapCount: gaps.length,
+        gaps: gaps.slice(0, 10),
+      });
+    }
+  } catch (err) {
+    log("error", "sequence_integrity_check_failed", {
+      error: (err as Error).message,
+    });
+  }
 }
 
 /**
@@ -405,6 +463,7 @@ export function addManualEvent(
   ledger = 0,
 ): void {
   db.initDb();
+  const sequence = (data?.sequence as number) ?? null;
   db.addEvent({
     daoId: Number(daoId),
     type,
@@ -413,7 +472,11 @@ export function addManualEvent(
     txHash: "manual-" + Date.now(),
     timestamp: new Date().toISOString(),
     verified: true,
+    eventSequence: sequence,
   });
+  if (sequence != null) {
+    validateEventSequence(Number(daoId), type, Number(sequence));
+  }
 }
 
 /**
@@ -427,8 +490,10 @@ export function notifyEvent(
   txHash: string,
 ): void {
   db.initDb();
-  db.addPendingEvent(daoId, type, data, txHash);
-  log("info", "event_notified", { daoId, type, txHash });
+  const sequence = (data?.sequence as number) ?? null;
+  db.addPendingEvent(daoId, type, data, txHash, sequence);
+  validateEventSequence(daoId, type, sequence);
+  log("info", "event_notified", { daoId, type, txHash, sequence });
 }
 
 /**
