@@ -108,6 +108,10 @@ pub enum VotingError {
     ProposalCooldownActive = 41,
     InvalidProposalDeposit = 42,
     ProposalHasVotes = 43,
+    /// Vote rate limit: caller voted too recently on this proposal
+    VoteCooldownActive = 44,
+    /// Circuit breaker: too many votes in a short window
+    CircuitBreakerActive = 45,
 }
 
 // Maximum allowed IC vector length (num_public_inputs + 1)
@@ -131,6 +135,12 @@ const MIN_RANDOMNESS_PARTICIPANTS: u32 = 2;
 const MAX_RANDOMNESS_PARTICIPANTS: u32 = 32;
 pub const MAX_CONCURRENT_ELECTIONS: u64 = 20;
 pub const ELECTION_CREATION_COOLDOWN: u64 = 600;
+/// Minimum seconds between votes from the same address on the same proposal
+pub const VOTE_COOLDOWN: u64 = 5;
+/// Maximum votes per proposal before the circuit breaker trips
+pub const CIRCUIT_BREAKER_THRESHOLD: u64 = 500;
+/// How long the circuit breaker pauses voting after threshold is reached
+pub const CIRCUIT_BREAKER_COOLDOWN: u64 = 300;
 
 #[contracttype]
 #[derive(Clone)]
@@ -168,6 +178,10 @@ pub enum DataKey {
     ProposalCooldown(u64, Address),
     DepositConfig(u64),
     ProposalDeposit(u64, u64),
+    /// Per-address vote cooldown: (dao_id, proposal_id, address) -> cooldown end timestamp
+    VoteCooldown(u64, u64, Address),
+    /// Circuit breaker state: (dao_id, proposal_id) -> (vote_count, breaker_until_timestamp)
+    CircuitBreakerState(u64, u64),
 }
 
 #[contracttype]
@@ -700,6 +714,52 @@ impl Voting {
         }
     }
 
+    /// Enforce per-address vote cooldown: prevents rapid successive votes from the same address
+    /// on the same proposal. This limits the rate at which an attacker can flood the contract.
+    fn enforce_vote_rate_limit(env: &Env, dao_id: u64, proposal_id: u64, voter: &Address, now: u64) {
+        let cooldown_key = DataKey::VoteCooldown(dao_id, proposal_id, voter.clone());
+        let cooldown_end: u64 = env.storage().persistent().get(&cooldown_key).unwrap_or(0);
+        if now < cooldown_end {
+            panic_with_error!(env, VotingError::VoteCooldownActive);
+        }
+        // Set next allowed vote time
+        env.storage().persistent().set(&cooldown_key, &(now + VOTE_COOLDOWN));
+        Self::bump_persistent(env, &cooldown_key);
+    }
+
+    /// Contract-level circuit breaker: pauses voting on a proposal if too many votes
+    /// arrive within a short window. Protects against resource exhaustion attacks.
+    fn check_circuit_breaker(env: &Env, dao_id: u64, proposal_id: u64, now: u64) {
+        let state_key = DataKey::CircuitBreakerState(dao_id, proposal_id);
+        let (count, breaker_until): (u64, u64) = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or((0u64, 0u64));
+
+        if now < breaker_until {
+            panic_with_error!(env, VotingError::CircuitBreakerActive);
+        }
+
+        // If the breaker tripped and expired, reset the counter
+        if breaker_until > 0 && now >= breaker_until {
+            env.storage().persistent().set(&state_key, &(1u64, 0u64));
+            Self::bump_persistent(env, &state_key);
+            return;
+        }
+
+        let new_count = count + 1;
+        if new_count >= CIRCUIT_BREAKER_THRESHOLD {
+            // Trip the breaker
+            env.storage()
+                .persistent()
+                .set(&state_key, &(new_count, now + CIRCUIT_BREAKER_COOLDOWN));
+        } else {
+            env.storage().persistent().set(&state_key, &(new_count, 0u64));
+        }
+        Self::bump_persistent(env, &state_key);
+    }
+
     fn decrement_active_count(env: &Env, dao_id: u64) {
         let key = DataKey::ActiveProposalCount(dao_id);
         let active: u64 = env.storage().instance().get(&key).unwrap_or(0);
@@ -1109,6 +1169,11 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+
+        // Circuit breaker: pauses voting on this proposal under extreme load
+        let now = env.ledger().timestamp();
+        Self::check_circuit_breaker(&env, dao_id, proposal_id, now);
+
         // SECURITY: Validate public signals are within BN254 scalar field FIRST
         // This prevents modular reduction attacks where values >= r verify identically
         // to their reduced equivalents but are stored as different keys.
@@ -1136,7 +1201,6 @@ impl Voting {
 
         // Check voting period and state (voting starts at creation, ends at end_time)
         // If end_time is 0, there's no deadline (voting never closes)
-        let now = env.ledger().timestamp();
         if proposal.state != ProposalState::Active {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
@@ -1278,6 +1342,11 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+
+        // Circuit breaker
+        let now = env.ledger().timestamp();
+        Self::check_circuit_breaker(&env, dao_id, proposal_id, now);
+
         Self::assert_in_field_bls381(&env, &nullifier);
         Self::assert_in_field_bls381(&env, &root);
 
@@ -1297,7 +1366,6 @@ impl Voting {
             .get(&prop_key)
             .expect("proposal not found");
 
-        let now = env.ledger().timestamp();
         if proposal.state != ProposalState::Active {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
@@ -1805,6 +1873,11 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+
+        // Circuit breaker
+        let now = env.ledger().timestamp();
+        Self::check_circuit_breaker(&env, dao_id, proposal_id, now);
+
         Self::assert_in_field(&env, &nullifier);
         Self::assert_in_field(&env, &root);
 
@@ -1824,7 +1897,6 @@ impl Voting {
             .get(&prop_key)
             .expect("proposal not found");
 
-        let now = env.ledger().timestamp();
         if proposal.state != ProposalState::Active {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
