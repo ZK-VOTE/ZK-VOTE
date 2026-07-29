@@ -10,6 +10,8 @@ import slowDown from "express-slow-down";
 import crypto from "crypto";
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { log } from "../services/logger.js";
+import { extractAuthToken } from "./auth.js";
+import { RedisStore } from "./redisStore.js";
 
 const isTestMode = process.env.RELAYER_TEST_MODE === "true";
 
@@ -46,6 +48,20 @@ function hashIp(ip: string | undefined): string {
 const keyGenerator = (req: Express.Request): string =>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   hashIp((req as any).ip || "");
+
+/**
+ * Key generator that buckets by auth token when present, falling back to
+ * hashed IP. Prevents an authenticated client from resetting its limit by
+ * rotating IPs, while still rate limiting unauthenticated traffic by IP.
+ */
+const authOrIpKeyGenerator = (req: Express.Request): string => {
+  const token = extractAuthToken(req as unknown as Request);
+  if (token) {
+    return crypto.createHash("sha256").update(token).digest("hex");
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return hashIp((req as any).ip || "");
+};
 
 // ============================================
 // PER-ENDPOINT METRICS (#193)
@@ -171,7 +187,8 @@ export const voteLimiter = isTestMode
         windowMs: 60 * 1000, // 1 minute
         max: 10,
         ...headerOptions,
-        keyGenerator,
+        keyGenerator: authOrIpKeyGenerator,
+        store: new RedisStore("vote"),
         handler: makeHandler(
           "vote",
           "Too many vote requests, please try again later",
@@ -191,7 +208,8 @@ export const queryLimiter = isTestMode
         windowMs: 60 * 1000, // 1 minute
         max: 60,
         ...headerOptions,
-        keyGenerator,
+        keyGenerator: authOrIpKeyGenerator,
+        store: new RedisStore("query"),
         handler: makeHandler(
           "query",
           "Too many requests, please try again later",
@@ -211,7 +229,8 @@ export const ipfsUploadLimiter = isTestMode
         windowMs: 60 * 1000, // 1 minute
         max: 10,
         ...headerOptions,
-        keyGenerator,
+        keyGenerator: authOrIpKeyGenerator,
+        store: new RedisStore("ipfsUpload"),
         handler: makeHandler(
           "ipfsUpload",
           "Too many upload requests, please try again later",
@@ -231,7 +250,8 @@ export const ipfsReadLimiter = isTestMode
         windowMs: 60 * 1000, // 1 minute
         max: 200,
         ...headerOptions,
-        keyGenerator,
+        keyGenerator: authOrIpKeyGenerator,
+        store: new RedisStore("ipfsRead"),
         handler: makeHandler(
           "ipfsRead",
           "Too many requests, please try again later",
@@ -251,7 +271,8 @@ export const commentLimiter = isTestMode
         windowMs: 60 * 1000, // 1 minute
         max: 20,
         ...headerOptions,
-        keyGenerator,
+        keyGenerator: authOrIpKeyGenerator,
+        store: new RedisStore("comment"),
         handler: makeHandler(
           "comment",
           "Too many comment requests, please try again later",

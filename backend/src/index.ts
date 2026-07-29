@@ -89,6 +89,7 @@ validateEnv();
 // ============================================
 
 const app: Express = express();
+app.set("trust proxy", 1);
 
 // Security: HTTP headers with CSP
 app.use(
