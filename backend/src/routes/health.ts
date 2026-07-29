@@ -18,6 +18,12 @@ import { getWalHealth } from "../services/walResilience.js";
 import { rpcPoolManager } from "../services/stellar.js";
 import { getAllCircuitBreakerMetrics } from "../services/circuit-breaker.js";
 import { getMemorySnapshot } from "../services/memory-monitor.js";
+import {
+  getOverallHealth,
+  markDegraded,
+  markHealthy,
+  markUnavailable,
+} from "../services/service-health.js";
 import v8 from "node:v8";
 import fs from "node:fs";
 import os from "node:os";
@@ -70,14 +76,25 @@ async function rpcHealth(): Promise<{
  */
 router.get("/health", async (req: Request, res: Response) => {
   const rpc = config.healthcheckPing ? await rpcHealth() : { ok: true };
+  if (rpc.ok) {
+    markHealthy("soroban_rpc");
+  } else {
+    markUnavailable("soroban_rpc", rpc.error ?? "RPC unhealthy");
+  }
+
   const memory = getMemorySnapshot();
+  const services = getOverallHealth();
+
+  // Overall status is degraded when any tracked service is degraded/unavailable,
+  // even if the process itself is up (graceful degradation #204).
   const base: Record<string, unknown> = {
-    status: "ok",
+    status: services.status,
     rpc: {
       ...rpc,
       pool: rpcPoolManager.getMetrics(),
     },
     circuitBreakers: getAllCircuitBreakerMetrics(),
+    services,
     memory: {
       rssMb: Math.round(memory.rss / 1024 / 1024),
       heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
@@ -104,8 +121,10 @@ router.get("/health", async (req: Request, res: Response) => {
   try {
     base.db = getDbStatus();
     base.backup = getBackupStatus();
+    markHealthy("sqlite");
   } catch (err) {
     base.db = { error: (err as Error).message };
+    markDegraded("sqlite", (err as Error).message);
   }
 
   res.json(base);

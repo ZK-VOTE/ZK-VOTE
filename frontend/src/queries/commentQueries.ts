@@ -3,7 +3,9 @@ import {
   type CommentWithContent,
   type CommentInfo,
   type CommentMetadata,
+  type PaginatedResult,
   fetchComments,
+  fetchAllComments,
   fetchCommentContent,
   buildCommentTree,
 } from "../lib/comments";
@@ -12,21 +14,32 @@ import { queryKeys } from "../lib/queryClient";
 interface UseCommentsQueryOptions {
   daoId: number;
   proposalId: number;
+  pageSize?: number;
   enabled?: boolean;
 }
 
 /**
- * Fetch all comments with their content and build the tree
+ * Fetch paginated comments for a proposal (first page only).
  */
-async function fetchCommentsWithContent(
+async function fetchPaginatedComments(
+  daoId: number,
+  proposalId: number,
+  cursor?: string,
+): Promise<PaginatedResult<CommentInfo>> {
+  return fetchComments(daoId, proposalId, cursor);
+}
+
+/**
+ * Fetch all comments with their content and build the tree (auto-paginates).
+ */
+async function fetchAllCommentsWithContent(
   daoId: number,
   proposalId: number,
 ): Promise<CommentWithContent[]> {
-  // Fetch comments from relayer
-  const rawComments: CommentInfo[] = await fetchComments(daoId, proposalId);
+  // Fetch all comments (auto-paginates)
+  const rawComments: CommentInfo[] = await fetchAllComments(daoId, proposalId);
 
   // Fetch content for each comment in parallel
-  // TODO: Consider adding a batch /ipfs/batch endpoint on the relayer to reduce N+1 fetches
   const contentMap = new Map<string, CommentMetadata | null>();
   await Promise.all(
     rawComments.map(async (c) => {
@@ -40,21 +53,21 @@ async function fetchCommentsWithContent(
 }
 
 /**
- * React Query hook for fetching comments on a proposal.
- * Replaces useState/useEffect pattern with caching and automatic refetching.
+ * React Query hook for fetching paginated comments on a proposal.
+ * Returns the first page with cursor for infinite scroll.
  */
 export function useCommentsQuery({
   daoId,
   proposalId,
+  pageSize,
   enabled = true,
 }: UseCommentsQueryOptions) {
   return useQuery({
     queryKey: queryKeys.comments.list(daoId, proposalId),
-    queryFn: () => fetchCommentsWithContent(daoId, proposalId),
+    queryFn: () => fetchAllCommentsWithContent(daoId, proposalId),
     enabled: enabled && daoId > 0 && proposalId > 0,
-    staleTime: 30 * 1000, // 30 seconds - comments change infrequently
+    staleTime: 30 * 1000,
     retry: (failureCount, error) => {
-      // Don't retry on 404 (endpoint doesn't exist)
       if (error instanceof Error && error.message.includes("404")) {
         return false;
       }
@@ -90,11 +103,9 @@ export function useOptimisticComment() {
 
     queryClient.setQueryData<CommentWithContent[]>(queryKey, (old) => {
       if (!old) return [comment];
-      // If it's a root comment
       if (!comment.parentId) {
         return [comment, ...old];
       }
-      // If it's a reply, we need to find the parent and append to its replies
       return old.map((c) => {
         if (c.id === comment.parentId) {
           return { ...c, replies: [...c.replies, comment] };
@@ -111,7 +122,6 @@ export function useOptimisticComment() {
   };
 
   const clearPendingComment = (daoId: number, proposalId: number) => {
-    // Invalidate instead of manually clearing, since backend now has it
     const queryKey = queryKeys.comments.list(daoId, proposalId);
     queryClient.invalidateQueries({ queryKey });
   };

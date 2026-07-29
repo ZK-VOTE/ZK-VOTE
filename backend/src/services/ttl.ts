@@ -16,6 +16,7 @@ import {
   isInGracePeriod,
   formatRemaining,
 } from "./ttl-checker.js";
+import { markDegraded, markHealthy } from "./service-health.js";
 
 const CONTRACT_META: Array<{
   envKey: keyof typeof config;
@@ -126,6 +127,25 @@ async function submitCall(
   } catch (err) {
     return { success: false, error: (err as Error).message };
   }
+}
+
+type TTLSubmitter = typeof submitCall;
+
+let ttlSubmitter: TTLSubmitter = submitCall;
+
+/**
+ * Replace only the transaction-submission boundary in test mode.
+ */
+export function setTTLSubmitterForTests(
+  submitter: TTLSubmitter | null,
+): void {
+  if (!config.testMode) {
+    throw new Error(
+      "TTL submitter overrides are only available in test mode",
+    );
+  }
+
+  ttlSubmitter = submitter ?? submitCall;
 }
 
 function buildEntryId(
@@ -313,7 +333,11 @@ async function executeBatch(batch: RenewalEntry[]): Promise<{
   let txCount = 0;
 
   for (const entry of batch) {
-    const result = await submitCall(entry.contractId, entry.method, entry.args);
+    const result = await ttlSubmitter(
+      entry.contractId,
+      entry.method,
+      entry.args,
+    );
     if (result.success) {
       successCount++;
       totalFee += result.feeXlm ?? 0;
@@ -435,18 +459,24 @@ export function startTTLRenewal(intervalMs?: number): void {
 
   const interval = intervalMs ?? config.ttlRenewalIntervalMs;
 
-  renewAllTTLs().catch((err) => {
-    log("error", "ttl_renewal_initial_failed", {
-      error: (err as Error).message,
-    });
-  });
-
-  renewalTimerId = setInterval(() => {
-    renewAllTTLs().catch((err) => {
-      log("error", "ttl_renewal_periodic_failed", {
+  renewAllTTLs()
+    .then(() => markHealthy("ttl_renewal"))
+    .catch((err) => {
+      markDegraded("ttl_renewal", (err as Error).message);
+      log("error", "ttl_renewal_initial_failed", {
         error: (err as Error).message,
       });
     });
+
+  renewalTimerId = setInterval(() => {
+    renewAllTTLs()
+      .then(() => markHealthy("ttl_renewal"))
+      .catch((err) => {
+        markDegraded("ttl_renewal", (err as Error).message);
+        log("error", "ttl_renewal_periodic_failed", {
+          error: (err as Error).message,
+        });
+      });
   }, interval);
 
   const intervalDays = (interval / (24 * 60 * 60 * 1000)).toFixed(1);

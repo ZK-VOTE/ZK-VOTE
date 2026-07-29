@@ -3,9 +3,15 @@ import { buildPoseidon } from "circomlibjs";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
 import { CONTRACTS, NETWORK_CONFIG } from "../config/contracts";
 
+// Domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Must match DOMAIN_TAG in circuits
+const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
+
 export interface ZKCredentials {
   secret: string;
   salt: string;
+  blindingFactor: string;
   commitment: string;
 }
 
@@ -81,12 +87,27 @@ By signing, you acknowledge that anyone who obtains this signature can vote on y
         .join(""),
   );
 
-  // Compute commitment: Poseidon(secret, salt)
-  const commitment = poseidon.F.toString(poseidon([secret, salt]));
+  // Derive blinding factor with a third domain separator
+  const blindingInput = new TextEncoder().encode(`blinding:${signedMessage}`);
+  const blindingHashBuffer = await crypto.subtle.digest("SHA-256", blindingInput);
+  const blindingHashArray = new Uint8Array(blindingHashBuffer);
+
+  const blindingFactor = BigInt(
+    "0x" +
+      Array.from(blindingHashArray)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+  );
+
+  // Compute commitment: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+  // Domain-separated commitment prevents cross-protocol attacks.
+  // Blinding factor ensures uniform distribution even if secret/salt are correlated.
+  const commitment = poseidon.F.toString(poseidon([DOMAIN_TAG, secret, salt, blindingFactor]));
 
   return {
     secret: secret.toString(),
     salt: salt.toString(),
+    blindingFactor: blindingFactor.toString(),
     commitment,
   };
 }
@@ -110,12 +131,21 @@ export async function generateRandomZKCredentials(): Promise<ZKCredentials> {
         .join(""),
   );
 
-  // Compute commitment: Poseidon(secret, salt)
-  const commitment = poseidon.F.toString(poseidon([secret, salt]));
+  // Generate random blinding factor
+  const blindingFactor = BigInt(
+    "0x" +
+      Array.from(crypto.getRandomValues(new Uint8Array(32)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+  );
+
+  // Compute commitment: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+  const commitment = poseidon.F.toString(poseidon([DOMAIN_TAG, secret, salt, blindingFactor]));
 
   return {
     secret: secret.toString(),
     salt: salt.toString(),
+    blindingFactor: blindingFactor.toString(),
     commitment,
   };
 }
@@ -134,6 +164,7 @@ export function storeZKCredentials(
     JSON.stringify({
       secret: credentials.secret,
       salt: credentials.salt,
+      blindingFactor: credentials.blindingFactor,
       commitment: credentials.commitment,
       leafIndex,
       registeredAt: Date.now(),
@@ -152,6 +183,7 @@ export function getZKCredentials(
 ): {
   secret: string;
   salt: string;
+  blindingFactor: string;
   commitment: string;
   leafIndex: number;
 } | null {
@@ -187,6 +219,7 @@ export async function getOrRegenerateZKCredentials(
 ): Promise<{
   secret: string;
   salt: string;
+  blindingFactor: string;
   commitment: string;
   leafIndex: number;
 } | null> {
@@ -266,23 +299,33 @@ export async function generateFakeZKCredentials(): Promise<ZKCredentials> {
         .join(""),
   );
 
-  const commitment = poseidon.F.toString(poseidon([secret, salt]));
+  const blindingFactor = BigInt(
+    "0x" +
+      Array.from(crypto.getRandomValues(new Uint8Array(32)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+  );
+
+  const commitment = poseidon.F.toString(poseidon([DOMAIN_TAG, secret, salt, blindingFactor]));
 
   return {
     secret: secret.toString(),
     salt: salt.toString(),
+    blindingFactor: blindingFactor.toString(),
     commitment,
   };
 }
 
-// Compute commitment from secret and salt
+// Compute commitment from secret, salt, and blinding factor
+// Matches circuit computation: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
 export async function computeCommitment(
   secret: string,
   salt: string,
+  blindingFactor: string,
 ): Promise<string> {
   const poseidon = await buildPoseidon();
   const commitment = poseidon.F.toString(
-    poseidon([BigInt(secret), BigInt(salt)]),
+    poseidon([DOMAIN_TAG, BigInt(secret), BigInt(salt), BigInt(blindingFactor)]),
   );
   return commitment;
 }

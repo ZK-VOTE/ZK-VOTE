@@ -10,6 +10,7 @@ const setupApp = async () => {
   process.env.RELAYER_SECRET_KEY = TEST_SECRET;
   process.env.VOTING_CONTRACT_ID = 'C'.padEnd(56, 'A');
   process.env.TREE_CONTRACT_ID = 'C'.padEnd(56, 'B');
+  process.env.COMMENTS_CONTRACT_ID = 'C'.padEnd(56, 'D');
   process.env.SOROBAN_RPC_URL = 'http://localhost';
   process.env.CORS_ORIGIN = 'http://localhost'; // CSRF middleware fails-closed on wildcard CORS
   process.env.NETWORK_PASSPHRASE = 'Test';

@@ -4,6 +4,12 @@ include "node_modules/circomlib/circuits/poseidon.circom";
 include "node_modules/circomlib/circuits/comparators.circom";
 include "merkle_tree.circom";
 
+// DAO domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Prevents cross-protocol attacks where commitments from other systems
+// could be valid in ZK-VOTE
+var DOMAIN_TAG = 19666041591797403834655481403982443037438503980743793537655983658411276515161;
+
 // BridgeVote Circuit
 //
 // Proves cross-chain SBT membership for voting from Ethereum.
@@ -20,7 +26,7 @@ include "merkle_tree.circom";
 //
 // Public signals: [sbtContractAddr, memberAddr, daoId, proposalId,
 //                  nullifier, voteChoice, voteRoot, sbtRoot]
-// Private signals: secret, salt, votingPathElements, votingPathIndices,
+// Private signals: secret, salt, blindingFactor, votingPathElements, votingPathIndices,
 //                  sbtPathElements, sbtPathIndices, sbtLeaf
 //
 // Security:
@@ -42,7 +48,8 @@ template BridgeVote(levels) {
 
     // === Private inputs ===
     signal input secret;                    // Voter's secret
-    signal input salt;                      // Random salt
+    signal input salt;                      // Salt for commitment
+    signal input blindingFactor;            // Random blinding factor for uniform distribution
     signal input votingPathElements[levels]; // Voting Merkle proof siblings
     signal input votingPathIndices[levels];  // Voting Merkle proof path (0=left, 1=right)
     signal input sbtPathElements[levels];    // SBT state Merkle proof siblings
@@ -50,12 +57,16 @@ template BridgeVote(levels) {
     signal input sbtLeaf;                   // SBT state leaf data
 
     // ============================================
-    // 1. Compute identity commitment: Poseidon(secret, salt)
+    // 1. Compute identity commitment: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+    //    Domain-separated commitment prevents cross-protocol attacks.
+    //    Blinding factor ensures uniform distribution across the field.
     //    This is the leaf in the voting Merkle tree
     // ============================================
-    component commitmentHasher = Poseidon(2);
-    commitmentHasher.inputs[0] <== secret;
-    commitmentHasher.inputs[1] <== salt;
+    component commitmentHasher = Poseidon(4);
+    commitmentHasher.inputs[0] <== DOMAIN_TAG;
+    commitmentHasher.inputs[1] <== secret;
+    commitmentHasher.inputs[2] <== salt;
+    commitmentHasher.inputs[3] <== blindingFactor;
 
     signal commitment;
     commitment <== commitmentHasher.out;

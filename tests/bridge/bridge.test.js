@@ -67,8 +67,10 @@ describe("Bridge Circuit", () => {
 
   test("generates valid proof with mocked SBT state", async () => {
     // Setup parameters
+    const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
     const secret = 12345n;
     const salt = 67890n;
+    const blindingFactor = 54321n;
     const daoId = 1n;
     const proposalId = 1n;
     const voteChoice = 1n;
@@ -76,11 +78,12 @@ describe("Bridge Circuit", () => {
     const memberAddr = 88888n;
     const levels = 4; // Small tree for testing
 
-    // Compute commitment
-    const commitment = poseidon([secret, salt]);
+    // Compute commitment with domain separation
+    const commitment = poseidon([DOMAIN_TAG, secret, salt, blindingFactor]);
 
     // Build voting Merkle tree
-    const votingLeaves = [commitment, poseidon([111n, 222n]), poseidon([333n, 444n])];
+    const makeLeaf = (s, sa, bf) => poseidon([DOMAIN_TAG, s, sa, bf]);
+    const votingLeaves = [commitment, makeLeaf(111n, 222n, 333n), makeLeaf(444n, 555n, 666n)];
     const votingTree = await buildMerkleTree(poseidon, votingLeaves, levels);
     const voteRoot = votingTree.root;
     const votingProof = votingTree.getProof(0);
@@ -109,6 +112,7 @@ describe("Bridge Circuit", () => {
       // Private inputs
       secret: secret.toString(),
       salt: salt.toString(),
+      blindingFactor: blindingFactor.toString(),
       votingPathElements: votingProof.pathElements.map(String),
       votingPathIndices: votingProof.pathIndices.map(String),
       sbtPathElements: sbtProof.pathElements.map(String),
@@ -138,11 +142,13 @@ describe("Bridge Circuit", () => {
 
   test("rejects invalid vote choice", async () => {
     const poseidon = await buildPoseidon();
+    const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
     const levels = 4;
 
     const secret = 111n;
     const salt = 222n;
-    const commitment = poseidon([secret, salt]);
+    const blindingFactor = 333n;
+    const commitment = poseidon([DOMAIN_TAG, secret, salt, blindingFactor]);
 
     const votingLeaves = [commitment];
     const votingTree = await buildMerkleTree(poseidon, votingLeaves, levels);
@@ -164,6 +170,7 @@ describe("Bridge Circuit", () => {
       sbtRoot: sbtTree.root.toString(),
       secret: secret.toString(),
       salt: salt.toString(),
+      blindingFactor: blindingFactor.toString(),
       votingPathElements: votingProof.pathElements.map(String),
       votingPathIndices: votingProof.pathIndices.map(String),
       sbtPathElements: sbtProof.pathElements.map(String),
@@ -182,11 +189,13 @@ describe("Bridge Circuit", () => {
 
   test("rejects wrong SBT leaf (inactive member)", async () => {
     const poseidon = await buildPoseidon();
+    const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
     const levels = 4;
 
     const secret = 111n;
     const salt = 222n;
-    const commitment = poseidon([secret, salt]);
+    const blindingFactor = 333n;
+    const commitment = poseidon([DOMAIN_TAG, secret, salt, blindingFactor]);
 
     const votingLeaves = [commitment];
     const votingTree = await buildMerkleTree(poseidon, votingLeaves, levels);
@@ -210,6 +219,7 @@ describe("Bridge Circuit", () => {
       sbtRoot: sbtTree.root.toString(),
       secret: secret.toString(),
       salt: salt.toString(),
+      blindingFactor: blindingFactor.toString(),
       votingPathElements: votingProof.pathElements.map(String),
       votingPathIndices: votingProof.pathIndices.map(String),
       sbtPathElements: sbtProof.pathElements.map(String),
@@ -219,7 +229,7 @@ describe("Bridge Circuit", () => {
     };
 
     await expect(
-      snarkjs.groth16.fullProve(
+      snarkjs.groth16.fullProbe(
         input,
         "build/bridge_js/bridge.wasm",
         "build/bridge_final.zkey"

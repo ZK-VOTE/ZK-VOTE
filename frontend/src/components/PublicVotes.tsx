@@ -382,7 +382,7 @@ export default function PublicVotes({
       setRegistering(true);
       setError(null);
 
-      let secret, salt, commitment;
+      let secret, salt, blindingFactor, commitment;
 
       if (import.meta.env.DEV)
         console.log(
@@ -395,6 +395,7 @@ export default function PublicVotes({
         );
         secret = credentials.secret;
         salt = credentials.salt;
+        blindingFactor = credentials.blindingFactor;
         commitment = credentials.commitment;
       } catch (err) {
         console.error("[Registration] Step 1 failed:", err);
@@ -588,7 +589,7 @@ export default function PublicVotes({
       storeZKCredentials(
         dao.id,
         publicKey,
-        { secret, salt, commitment },
+        { secret, salt, blindingFactor, commitment },
         leafIndex,
       );
 

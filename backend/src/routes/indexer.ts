@@ -21,9 +21,28 @@ import {
   auditLog,
   queryLimiter,
   validateParams,
+  validateQuery,
 } from "../middleware/index.js";
-import { daoParamsSchema, archiveParamsSchema } from "../validation/schemas.js";
+import { daoParamsSchema, eventsQuerySchema, archiveParamsSchema } from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
+import type { EventQueryOptions } from "../services/db.js";
+
+function encodeCursor(event: { id?: number; ledger?: number; timestamp?: string }, cursorField: string): string {
+  const payload = cursorField === "ledger"
+    ? { l: event.ledger }
+    : cursorField === "timestamp"
+    ? { t: event.timestamp }
+    : { i: event.id };
+  return Buffer.from(JSON.stringify(payload)).toString("base64");
+}
+
+function decodeCursor(cursor: string): Record<string, unknown> {
+  try {
+    return JSON.parse(Buffer.from(cursor, "base64").toString("utf-8"));
+  } catch {
+    return {};
+  }
+}
 
 const router = Router();
 
@@ -71,26 +90,44 @@ router.get("/events/archived/:archiveId", queryLimiter, validateParams(archivePa
 });
 
 /**
- * GET /events/:daoId - Get events for a DAO
+ * GET /events/:daoId - Get events for a DAO (cursor-based pagination)
  */
-router.get("/events/:daoId", queryLimiter, validateParams(daoParamsSchema), (req: Request, res: Response) => {
+router.get("/events/:daoId", queryLimiter, validateParams(daoParamsSchema), validateQuery(eventsQuerySchema), (async (
+  req: Request,
+  res: Response,
+) => {
   const { daoId } = (req as any).validatedParams;
-  const { limit = "50", offset = "0", types } = req.query;
+  const { limit, cursor, types, orderBy, orderDirection, cursorField } = (req as any).validatedQuery;
 
   try {
-    const options = {
-      limit: Math.min(parseInt(limit as string) || 50, 100),
-      offset: parseInt(offset as string) || 0,
-      types: types ? (types as string).split(",") : null,
+    const options: EventQueryOptions = {
+      limit,
+      types,
+      orderBy,
+      orderDirection,
+      cursor,
+      cursorField,
     };
 
     const result = getEventsForDao(daoId, options);
-    res.json(result);
+    const hasMore = result.events.length === limit && result.total > result.events.length;
+    const nextCursor = hasMore && result.events.length > 0
+      ? encodeCursor(result.events[result.events.length - 1], cursorField)
+      : undefined;
+
+    res.json({
+      data: result.events,
+      pagination: {
+        cursor: nextCursor,
+        hasMore,
+        total: result.total,
+      },
+    });
   } catch (err) {
     log("error", "get_events_failed", { daoId, error: (err as Error).message });
     res.status(500).json({ error: "Failed to get events" });
   }
-});
+}) as AsyncHandler);
 
 /**
  * GET /indexer/status - Get indexer status

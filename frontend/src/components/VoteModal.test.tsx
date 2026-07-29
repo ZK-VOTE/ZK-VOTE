@@ -49,11 +49,13 @@ vi.mock("../lib/zk", () => ({
   generateDeterministicZKCredentials: vi.fn().mockResolvedValue({
     secret: "123",
     salt: "456",
+    blindingFactor: "999",
     commitment: "789",
   }),
   getZKCredentials: vi.fn().mockReturnValue({
     secret: "123",
     salt: "456",
+    blindingFactor: "999",
     commitment: "789",
     leafIndex: 0,
   }),

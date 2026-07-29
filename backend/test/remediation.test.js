@@ -1,7 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
-import {
+const token = 'testtoken';
+
+process.env.RELAYER_TEST_MODE = 'true';
+process.env.RELAYER_SECRET_KEY = 'SCVZXEUXJLRZKPCUXGXN53BJTD3RAZPRSSXHXDGSZQH5EOGEUTWINUXF';
+process.env.VOTING_CONTRACT_ID = 'C'.padEnd(56, 'A');
+process.env.TREE_CONTRACT_ID = 'C'.padEnd(56, 'B');
+process.env.COMMENTS_CONTRACT_ID = 'C'.padEnd(56, 'D');
+process.env.SOROBAN_RPC_URL = 'http://localhost';
+process.env.CORS_ORIGIN = 'http://localhost';
+process.env.NETWORK_PASSPHRASE = 'Test';
+process.env.RELAYER_AUTH_TOKEN = token;
+
+const {
   classifyError,
   remediateError,
   getRemediationHistory,
@@ -10,19 +22,9 @@ import {
   setBackupRpcUrls,
   getCurrentRpcUrl,
   getCurrentPollingInterval,
-} from '../src/services/remediation.ts';
-
-const token = 'testtoken';
+} = await import('../src/services/remediation.ts');
 
 const setupApp = async () => {
-  process.env.RELAYER_SECRET_KEY = 'SCVZXEUXJLRZKPCUXGXN53BJTD3RAZPRSSXHXDGSZQH5EOGEUTWINUXF';
-  process.env.VOTING_CONTRACT_ID = 'C'.padEnd(56, 'A');
-  process.env.TREE_CONTRACT_ID = 'C'.padEnd(56, 'B');
-  process.env.SOROBAN_RPC_URL = 'http://localhost';
-  process.env.CORS_ORIGIN = 'http://localhost';
-  process.env.NETWORK_PASSPHRASE = 'Test';
-  process.env.RELAYER_AUTH_TOKEN = token;
-
   const relayer = await import('../src/index.ts');
   return relayer.app || relayer.default || relayer;
 };

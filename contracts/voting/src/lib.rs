@@ -28,6 +28,8 @@
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+
+mod storage;
 use soroban_sdk::xdr::ToXdr;
 #[allow(unused_imports)]
 use soroban_sdk::{
@@ -42,6 +44,9 @@ pub use zkvote_groth16::{
     Bls12381Curve, CurveId, Groth16Error, Proof, ProofBls381, VerificationKey,
     VerificationKeyBls381,
 };
+
+// ZK quadratic voting with range proofs (issue #50)
+mod quadratic;
 
 const TREE_CONTRACT: Symbol = symbol_short!("tree");
 const REGISTRY: Symbol = symbol_short!("registry");
@@ -104,6 +109,27 @@ pub enum VotingError {
     InsufficientRandomness = 37,
     RandomnessAlreadyRevealed = 38,
     RandomnessParticipantLimit = 39,
+    TooManyActiveProposals = 40,
+    ProposalCooldownActive = 41,
+    InvalidProposalDeposit = 42,
+    ProposalHasVotes = 43,
+    VotingNotStarted = 44,
+    ElectionDurationTooShort = 45,
+    ElectionDurationTooLong = 46,
+    InvalidNoticePeriod = 47,
+    InvalidRegistrationPeriod = 48,
+    InvalidRegistrationGap = 49,
+    /// Regular `vote` called on a Quadratic proposal (use `cast_qv_vote`), or
+    /// `cast_qv_vote` called on a non-Quadratic proposal
+    NotQuadraticProposal = 50,
+    /// Quadratic-voting verification key not set for this DAO
+    QvVkNotSet = 51,
+    /// Quadratic ballot exceeds the fixed credit budget (sum of squares > MAX_QV_BUDGET)
+    QvBudgetExceeded = 52,
+    /// Quadratic tally verification key not set for this DAO
+    QvTallyVkNotSet = 53,
+    /// Tally proposal_ids / tallies vectors have mismatched or empty length
+    QvTallyLengthMismatch = 54,
     /// Candidate index >= numCandidates configured for this election
     InvalidCandidateIndex = 40,
     /// Reentrant call detected (defense-in-depth against cross-contract reentrancy)
@@ -148,9 +174,27 @@ const MIN_VDF_CHECKPOINTS: u32 = 3;
 /// Maximum VDF checkpoints to bound on-chain computation
 const MAX_VDF_CHECKPOINTS: u32 = 100;
 
+// Quadratic-voting circuit constants (issue #50)
+/// QV circuit public signals: [root, daoId, proposalId, nullifier, totalCreditsSpent, allocationsHash]
+const QV_NUM_PUBLIC_SIGNALS: u32 = 6;
+/// IC vector length for the QV Groth16 VK = QV_NUM_PUBLIC_SIGNALS + 1
+const QV_CIRCUIT_IC_LEN: u32 = QV_NUM_PUBLIC_SIGNALS + 1;
+/// Fixed quadratic credit budget per member per snapshot. MUST match the
+/// MAX_BUDGET baked into the deployed quadratic_vote circuit (see
+/// circuits/quadratic_vote_main.circom). Enforced on-chain as defense in depth;
+/// the circuit already proves sum(voiceCredits_i^2) <= MAX_BUDGET.
+const MAX_QV_BUDGET: u64 = 100;
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    Proposal(u64, u64), // (dao_id, proposal_id) -> ProposalInfo
+    ProposalCount(u64), // dao_id -> count
+    /// Election-scoped nullifier usage flag (`NullifierUsed(election, n)`).
+    /// Election identity is `(dao_id, proposal_id)`. Must not be a flat global map
+    /// — see issue #64 / `storage.rs`.
+    Nullifier(u64, u64, U256), // (dao_id, proposal_id, nullifier) -> bool
+    VotingKey(u64),            // dao_id -> latest VerificationKey (BN254)
     Proposal(u64, u64),          // (dao_id, proposal_id) -> ProposalInfo
     ProposalCount(u64),          // dao_id -> count
     Nullifier(u64, u64, U256),   // (dao_id, proposal_id, nullifier) -> bool
@@ -181,6 +225,39 @@ pub enum DataKey {
     RandomnessCommit(u64, u64, Address),
     RandomnessReveal(u64, u64, Address),
     RandomnessCommitters(u64, u64),
+    ActiveProposalCount(u64),
+    ProposalCooldown(u64, Address),
+    DepositConfig(u64),
+    ProposalDeposit(u64, u64),
+    /// Legacy global nullifier flag (pre domain-separation). Appended at end so
+    /// existing storage discriminants stay stable. Migrate via
+    /// [`VotingContract::migrate_nullifier`].
+    LegacyNullifierUsed(U256),
+
+    // --- Quadratic voting with range proofs (issue #50) ---
+    QvVotingKey(u64),           // dao_id -> latest QV VerificationKey (BN254)
+    QvVkVersion(u64),           // dao_id -> current QV VK version
+    QvVkByVersion(u64, u32),    // (dao_id, qv_vk_version) -> QV VerificationKey
+    QvTallyKey(u64),            // dao_id -> QV tally VerificationKey
+    QvBallot(u64, u64, U256),   // (dao_id, round_id, nullifier) -> QvBallot
+    QvBallotCount(u64, u64),    // (dao_id, round_id) -> u64
+    QvCreditsTotal(u64, u64),   // (dao_id, round_id) -> u128 (sum of credits spent)
+    QvTally(u64, u64, u64),     // (dao_id, round_id, proposal_id) -> u64 credits
+    QvTallyFinalized(u64, u64), // (dao_id, round_id) -> bool
+}
+
+/// A single quadratic-voting ballot as stored on-chain.
+///
+/// The individual allocations stay private: only the Poseidon commitment to them
+/// (`allocations_hash`) and the revealed quadratic cost (`total_credits_spent`)
+/// are recorded. The ZK proof verified at `cast_qv_vote` guarantees that
+/// `total_credits_spent == sum(voiceCredits_i^2)` and that every allocation is in
+/// range, so overspending is impossible.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QvBallot {
+    pub allocations_hash: U256,
+    pub total_credits_spent: u64,
     /// Reentrancy guard: contract-level lock to prevent reentrant calls
     /// into vote/vote_bls381 during proof verification or cross-contract calls.
     ReentrancyLock,
@@ -264,8 +341,9 @@ pub struct ElectionConfig {
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoteMode {
-    Fixed,    // Only members at snapshot can vote
-    Trailing, // Members added after proposal creation can also vote
+    Fixed,     // Only members at snapshot can vote
+    Trailing,  // Members added after proposal creation can also vote
+    Quadratic, // ZK quadratic voting (issue #50). Use `cast_qv_vote`, not `vote`.
 }
 
 #[contracttype]
@@ -414,18 +492,27 @@ pub struct CandidateSeedFinalizedEvent {
 
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
+pub struct QvVoteEvent {
 pub struct VdfSubmittedEvent {
 pub struct RecursiveTallySubmittedEvent {
     #[topic]
     pub dao_id: u64,
     #[topic]
     pub proposal_id: u64,
+    pub nullifier: U256,
+    pub total_credits_spent: u64,
     pub output: BytesN<32>,
     pub delay: u64,
 }
 
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
+pub struct QvTallyEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub round_id: u64,
+    pub ballots: u64,
 pub struct VdfVerifiedEvent {
     #[topic]
     pub dao_id: u64,
@@ -1286,8 +1373,9 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidNullifier);
         }
 
-        // Check nullifier hasn't been used (prevents double voting)
-        let null_key = DataKey::Nullifier(dao_id, proposal_id, nullifier.clone());
+        // Check nullifier hasn't been used for THIS election (dao_id, proposal_id).
+        // Election-scoped storage prevents cross-election DoS from a flat namespace (#64).
+        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
         if env.storage().persistent().has(&null_key) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
@@ -1370,6 +1458,10 @@ impl Voting {
                     panic_with_error!(&env, VotingError::RootPredatesRemoval);
                 }
             }
+            VoteMode::Quadratic => {
+                // Quadratic proposals must be voted on via `cast_qv_vote`.
+                panic_with_error!(&env, VotingError::NotQuadraticProposal);
+            }
         }
 
         // Verify proposal was created for BN254 curve (not BLS12-381)
@@ -1394,6 +1486,15 @@ impl Voting {
         }
 
         // Verify Groth16 proof
+        // Public signals: [root, nullifier, daoId, proposalId, voteChoice]
+        // daoId + proposalId ARE the election binding verified on-chain (#64):
+        // the circuit enforces nullifier = Poseidon(secret, daoId, proposalId), so a
+        // proof for election A cannot authorize a vote in election B.
+        let vote_signal = if vote_choice {
+            U256::from_u32(&env, 1)
+        } else {
+            U256::from_u32(&env, 0)
+        };
         // Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates]
         // Note: daoId is included for domain separation (prevents cross-DAO nullifier linkability)
         // numCandidates is bound into the proof to prevent circuit/contract candidate bound desync
@@ -1484,7 +1585,7 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidNullifier);
         }
 
-        let null_key = DataKey::Nullifier(dao_id, proposal_id, nullifier.clone());
+        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
         if env.storage().persistent().has(&null_key) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
@@ -1544,6 +1645,10 @@ impl Voting {
                 if root_index < min_valid_root {
                     panic_with_error!(&env, VotingError::RootPredatesRemoval);
                 }
+            }
+            VoteMode::Quadratic => {
+                // Quadratic proposals must be voted on via `cast_qv_vote`.
+                panic_with_error!(&env, VotingError::NotQuadraticProposal);
             }
         }
 
@@ -1671,11 +1776,57 @@ impl Voting {
             .unwrap_or(0)
     }
 
-    /// Check if nullifier has been used
+    /// Check if a nullifier has been used for a specific election.
+    ///
+    /// Requires election identity `(dao_id, proposal_id)` — never queries a
+    /// global nullifier namespace (issue #64).
     pub fn is_nullifier_used(env: Env, dao_id: u64, proposal_id: u64, nullifier: U256) -> bool {
         Self::bump_instance(&env);
-        let key = DataKey::Nullifier(dao_id, proposal_id, nullifier);
+        let key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
         env.storage().persistent().has(&key)
+    }
+
+    /// Alias for [`Self::is_nullifier_used`] matching the issue #64 naming.
+    pub fn has_nullifier_been_used(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        nullifier: U256,
+    ) -> bool {
+        Self::is_nullifier_used(env, dao_id, proposal_id, nullifier)
+    }
+
+    /// Migrate a legacy globally-scoped nullifier into election-scoped storage.
+    ///
+    /// Moves `LegacyNullifierUsed(nullifier)` → `Nullifier(dao_id, proposal_id, nullifier)`
+    /// and deletes the legacy entry. Returns `true` if a legacy entry was migrated.
+    pub fn migrate_nullifier(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        nullifier: U256,
+        admin: Address,
+    ) -> bool {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+        Self::assert_in_field(&env, &nullifier);
+
+        if nullifier == U256::from_u32(&env, 0) {
+            panic_with_error!(&env, VotingError::InvalidNullifier);
+        }
+
+        let legacy_key = storage::legacy_nullifier_used_key(nullifier.clone());
+        if !env.storage().persistent().has(&legacy_key) {
+            return false;
+        }
+
+        let scoped_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
+        env.storage().persistent().set(&scoped_key, &true);
+        Self::bump_persistent(&env, &scoped_key);
+        env.storage().persistent().remove(&legacy_key);
+        true
     }
 
     /// Get tree contract address
@@ -1998,7 +2149,7 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidNullifier);
         }
 
-        let null_key = DataKey::Nullifier(dao_id, proposal_id, nullifier.clone());
+        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
         if env.storage().persistent().has(&null_key) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
@@ -2050,6 +2201,10 @@ impl Voting {
                 if root_index < min_valid_root {
                     panic_with_error!(&env, VotingError::RootPredatesRemoval);
                 }
+            }
+            VoteMode::Quadratic => {
+                // Quadratic proposals must be voted on via `cast_qv_vote`.
+                panic_with_error!(&env, VotingError::NotQuadraticProposal);
             }
         }
 

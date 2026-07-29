@@ -21,6 +21,7 @@ import { useDaoInfoQuery, useRelayerStatusQuery } from "./queries";
 import { truncateText, toIdSlug, parseIdFromSlug } from "./lib/utils";
 import { validateStaticConfig } from "./config/guardrails";
 import { RelayerStatusBanner } from "./components/RelayerStatusBanner";
+import { ServiceDegradationBanner } from "./components/ServiceDegradationBanner";
 import { Button } from "./components/ui/Button";
 import { I18nProvider } from "./i18n/I18nContext";
 
@@ -196,6 +197,7 @@ function App() {
 
       {/* Relayer Status Banner */}
       <RelayerStatusBanner />
+      <ServiceDegradationBanner />
 
       {/* Main Content */}
       <main className="container mx-auto py-8 md:py-24 px-4 sm:px-6 lg:px-8">

@@ -28,7 +28,6 @@ async function fetchDaoInfo(
         dao_id: BigInt(daoId),
       });
     } catch (err) {
-      // If account not found, fall back to read-only client
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (
         errorMessage.includes("Account not found") ||
@@ -43,7 +42,6 @@ async function fetchDaoInfo(
       }
     }
   } else {
-    // No wallet connected, use read-only
     const registry = getReadOnlyDaoRegistry();
     result = await registry.get_dao({
       dao_id: BigInt(daoId),
@@ -64,10 +62,6 @@ interface UseDaoInfoQueryOptions {
   enabled?: boolean;
 }
 
-/**
- * React Query hook for fetching DAO info.
- * Replaces the manual useDaoInfo hook with React Query's caching and refetching.
- */
 export function useDaoInfoQuery({
   daoId,
   publicKey,
@@ -77,7 +71,6 @@ export function useDaoInfoQuery({
     queryKey: queryKeys.dao.info(daoId ?? 0),
     queryFn: () => fetchDaoInfo(daoId!, publicKey),
     enabled: enabled && daoId !== null,
-    // Re-compute isAdmin when publicKey changes
     select: (data) => ({
       ...data,
       isAdmin: data.admin === publicKey,
@@ -85,10 +78,6 @@ export function useDaoInfoQuery({
   });
 }
 
-/**
- * Hook to invalidate DAO info cache.
- * Useful after profile updates or admin transfers.
- */
 export function useInvalidateDaoInfo() {
   const queryClient = useQueryClient();
 
@@ -109,50 +98,77 @@ export interface DAO {
   role?: "admin" | "member" | null;
 }
 
-interface DAOListResponse {
-  daos: DAO[];
+interface DAOsListResponse {
+  data: DAO[];
+  pagination: {
+    cursor: string | undefined;
+    hasMore: boolean;
+    total: number;
+  };
+  lastSync: string | null;
+  cached: boolean;
 }
 
 /**
- * Fetch DAO list from relayer API
+ * Fetch DAO list from relayer API with pagination support.
  */
-async function fetchDaoList(userAddress?: string | null): Promise<DAO[]> {
-  const endpoint = userAddress ? `/daos?user=${userAddress}` : "/daos";
+async function fetchDaosPage(
+  userAddress?: string | null,
+  cursor?: string,
+): Promise<DAOsListResponse> {
+  const params = new URLSearchParams();
+  if (userAddress) params.set("user", userAddress);
+  if (cursor) params.set("cursor", cursor);
+  if (params.toString()) {
+    params.set("limit", "100");
+  }
+
+  const endpoint = `/daos${params.toString() ? `?${params.toString()}` : ""}`;
   const response = await relayerFetch(endpoint);
 
   if (!response.ok) {
     throw new Error(`Failed to fetch DAOs: ${response.status}`);
   }
 
-  const data: DAOListResponse = await response.json();
-  return data.daos;
+  return response.json();
+}
+
+/**
+ * Fetch all DAOs (auto-paginates through all pages).
+ */
+async function fetchAllDaos(userAddress?: string | null): Promise<DAO[]> {
+  const allDaos: DAO[] = [];
+  let cursor: string | undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    const result = await fetchDaosPage(userAddress, cursor);
+    allDaos.push(...result.data);
+    hasMore = result.pagination.hasMore;
+    cursor = result.pagination.cursor;
+  }
+
+  return allDaos;
 }
 
 interface UseDaoListQueryOptions {
   userAddress?: string | null;
   enabled?: boolean;
+  pageSize?: number;
 }
 
-/**
- * React Query hook for fetching DAO list.
- * Supports optional user address for membership filtering.
- */
 export function useDaoListQuery({
   userAddress,
   enabled = true,
 }: UseDaoListQueryOptions = {}) {
   return useQuery({
     queryKey: queryKeys.dao.list(userAddress),
-    queryFn: () => fetchDaoList(userAddress),
+    queryFn: () => fetchAllDaos(userAddress),
     enabled,
-    staleTime: 30 * 1000, // 30 seconds - DAO list changes infrequently
+    staleTime: 30 * 1000,
   });
 }
 
-/**
- * Hook to invalidate DAO list cache.
- * Useful after creating a new DAO or joining/leaving.
- */
 export function useInvalidateDaoList() {
   const queryClient = useQueryClient();
 

@@ -73,6 +73,7 @@ export const relayerKeypair = _relayerKeypair;
  * Promise-based mutex to serialize transaction submissions.
  * Prevents nonce race conditions when multiple requests try to
  * build+submit transactions concurrently using the same relayer account.
+ * Uses IPC distributed sequence lock when running in cluster mode.
  */
 let sequenceLock: Promise<void> = Promise.resolve();
 
@@ -103,6 +104,15 @@ export async function waitForSequenceLockIdle(
 }
 
 export async function withSequenceLock<T>(fn: () => Promise<T>): Promise<T> {
+  if (config.clusterEnabled && cluster.isWorker) {
+    await acquireClusterSequenceLock();
+    try {
+      return await fn();
+    } finally {
+      await releaseClusterSequenceLock();
+    }
+  }
+
   const previous = sequenceLock;
   let resolve: () => void;
   sequenceLock = new Promise<void>((r) => {
@@ -300,13 +310,22 @@ export async function callWithTimeout<T>(
   fn: () => Promise<T>,
   label: string,
 ): Promise<T> {
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
       () => reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)),
       config.rpcTimeoutMs,
-    ),
-  );
-  return Promise.race([fn(), timeout]);
+    );
+  });
+
+  try {
+    return await Promise.race([fn(), timeout]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
 }
 
 /**

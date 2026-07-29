@@ -92,7 +92,7 @@ test("Historical event archival flow, eligibility rules, compressed export, regi
   assert.equal(result.archivesCreatedCount, 1);
 
   // 4. Verify remaining events in DB (active proposal 20 events must still exist)
-  const remaining = db.prepare("SELECT * FROM events_1").all() as any[];
+  const remaining = db.prepare("SELECT * FROM events_1").all();
   assert.equal(remaining.length, 2);
   const remainingPropIds = remaining.map((r) => JSON.parse(r.data).proposalId);
   assert.ok(remainingPropIds.every((id) => id === 20));

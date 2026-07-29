@@ -4,6 +4,12 @@ include "node_modules/circomlib/circuits/poseidon.circom";
 include "node_modules/circomlib/circuits/comparators.circom";
 include "merkle_tree.circom";
 
+// DAO domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Prevents cross-protocol attacks where commitments from other systems
+// could be valid in ZK-VOTE
+var DOMAIN_TAG = 19666041591797403834655481403982443037438503980743793537655983658411276515161;
+
 // DaoVote Anonymous Vote Circuit
 //
 // Proves:
@@ -12,7 +18,7 @@ include "merkle_tree.circom";
 // 3. Vote choice (candidate index) is within [0, numCandidates)
 //
 // Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates]
-// Private signals: secret, salt, pathElements, pathIndices
+// Private signals: secret, salt, blindingFactor, pathElements, pathIndices
 //
 // PRIVACY: Commitment is NOT exposed publicly. Votes are fully unlinkable across proposals.
 // Revocation is enforced via Merkle tree updates (zeroing leaves) rather than on-chain checks.
@@ -32,15 +38,21 @@ template Vote(levels) {
 
     // Private inputs
     signal input secret;            // Voter's secret (like password)
-    signal input salt;              // Random salt for commitment
+    signal input salt;              // Salt for commitment
+    signal input blindingFactor;    // Random blinding factor for uniform distribution
     signal input pathElements[levels];  // Merkle proof siblings
     signal input pathIndices[levels];   // Merkle proof path (0=left, 1=right)
 
-    // 1. Compute identity commitment: Poseidon(secret, salt)
+    // 1. Compute identity commitment: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+    // Domain-separated commitment prevents cross-protocol attacks.
+    // Blinding factor ensures uniform distribution across the field even
+    // if secret and salt are correlated (e.g., derived from same wallet signature).
     // This is used as the leaf in the Merkle tree
-    component commitmentHasher = Poseidon(2);
-    commitmentHasher.inputs[0] <== secret;
-    commitmentHasher.inputs[1] <== salt;
+    component commitmentHasher = Poseidon(4);
+    commitmentHasher.inputs[0] <== DOMAIN_TAG;
+    commitmentHasher.inputs[1] <== secret;
+    commitmentHasher.inputs[2] <== salt;
+    commitmentHasher.inputs[3] <== blindingFactor;
 
     // Commitment is computed internally (private) - not exposed as public signal
     signal commitment;
@@ -81,3 +93,5 @@ template Vote(levels) {
 // Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
 // Commitment is computed internally from secret+salt (private)
 component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates]} = Vote(18);
+
+

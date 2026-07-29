@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   isFreighterInstalled,
-  isFreighterLocked,
   connectFreighter,
   persistConnectionIntent,
   hasConnectionIntent,
@@ -76,10 +75,27 @@ describe("freighter service", () => {
   });
 
   it("persists connection intent in localStorage", () => {
+    let storage: Record<string, string> = {};
+    const originalLocalStorage = window.localStorage;
+    Object.defineProperty(window, 'localStorage', {
+      value: {
+        getItem: (key: string) => storage[key] || null,
+        setItem: (key: string, value: string) => { storage[key] = value; },
+        removeItem: (key: string) => { delete storage[key]; },
+        clear: () => { storage = {}; }
+      },
+      writable: true
+    });
+
     expect(hasConnectionIntent()).toBe(false);
     persistConnectionIntent(true);
     expect(hasConnectionIntent()).toBe(true);
     persistConnectionIntent(false);
     expect(hasConnectionIntent()).toBe(false);
+
+    Object.defineProperty(window, 'localStorage', {
+      value: originalLocalStorage,
+      writable: true
+    });
   });
 });

@@ -269,6 +269,7 @@ test('ZK Proof Voting E2E', { concurrency: false, timeout: 120000 }, async (t) =
     const { proof, publicSignals } = await generateVoteProof({
       secret: credentials.secret,
       salt: credentials.salt,
+      blindingFactor: credentials.blindingFactor,
       commitment: credentials.commitment,
       root: merkleRoot,
       nullifier,

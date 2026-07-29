@@ -107,7 +107,7 @@ export function useRegistration({
         throw new Error("Wallet kit not available");
       }
 
-      let secret: string, salt: string, commitment: string;
+      let secret: string, salt: string, blindingFactor: string, commitment: string;
 
       const cached = publicKey ? getZKCredentials(daoId, publicKey) : null;
 
@@ -118,6 +118,7 @@ export function useRegistration({
           );
         secret = cached.secret;
         salt = cached.salt;
+        blindingFactor = cached.blindingFactor;
         commitment = cached.commitment;
         setRegistrationStatus("Using existing credentials...");
       } else {
@@ -136,6 +137,7 @@ export function useRegistration({
 
         secret = credentials.secret;
         salt = credentials.salt;
+        blindingFactor = credentials.blindingFactor;
         commitment = credentials.commitment;
 
         if (import.meta.env.DEV)
@@ -212,7 +214,7 @@ export function useRegistration({
       storeZKCredentials(
         daoId,
         publicKey || "",
-        { secret, salt, commitment },
+        { secret, salt, blindingFactor, commitment },
         leafIndex,
       );
 

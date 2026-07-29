@@ -17,6 +17,7 @@ import {
   indexerEventsProcessed,
   indexerLag as indexerLagGauge,
 } from "./metrics.js";
+import { markDegraded, markHealthy } from "./service-health.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -380,8 +381,10 @@ export async function startIndexer(
 
       // Also verify any pending events
       await verifyPendingEvents();
+      markHealthy("indexer");
     } catch (err) {
       serviceErrors.inc({ service: "indexer" });
+      markDegraded("indexer", (err as Error).message);
       log("error", "poll_failed", { error: (err as Error).message });
     }
 

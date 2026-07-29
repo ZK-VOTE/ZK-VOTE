@@ -58,7 +58,7 @@ test("DAO cache OCC, copy-on-write snapshot, version counter, invalidation event
 
   // 6. Test concurrent read consistency during fast writes
   const snapBeforeBurst = getCacheSnapshot();
-  const readResults: Array<Set<string> | undefined> = [];
+  const readResults = [];
 
   // Simulate concurrent readers reading snapshot while writes occur
   for (let i = 1; i <= 5; i++) {

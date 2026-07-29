@@ -4,6 +4,12 @@ include "node_modules/circomlib/circuits/poseidon.circom";
 include "node_modules/circomlib/circuits/comparators.circom";
 include "merkle_tree.circom";
 
+// DAO domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Prevents cross-protocol attacks where commitments from other systems
+// could be valid in ZK-VOTE
+var DOMAIN_TAG = 19666041591797403834655481403982443037438503980743793537655983658411276515161;
+
 // DaoVote Anonymous Vote Circuit v2
 //
 // Adds chainId as a public signal to prevent cross-chain replay attacks.
@@ -11,7 +17,7 @@ include "merkle_tree.circom";
 // into the ZK proof, preventing circuit/contract candidate bound desync.
 //
 // Public signals: [root, nullifier, familyNullifier, daoId, proposalId, voteChoice, numCandidates, chainId, nonce]
-// Private signals: secret, salt, pathElements, pathIndices
+// Private signals: secret, salt, blindingFactor, pathElements, pathIndices
 //
 // chainId prevents replay attacks: a proof generated for one chain
 // (e.g., testnet) cannot be replayed on another chain (e.g., mainnet).
@@ -29,14 +35,20 @@ template VoteV2(levels) {
 
     // Private inputs
     signal input secret;            // Voter's secret (like password)
-    signal input salt;              // Random salt for commitment
+    signal input salt;              // Salt for commitment
+    signal input blindingFactor;    // Random blinding factor for uniform distribution
     signal input pathElements[levels];  // Merkle proof siblings
     signal input pathIndices[levels];   // Merkle proof path (0=left, 1=right)
 
-    // 1. Compute identity commitment: Poseidon(secret, salt)
-    component commitmentHasher = Poseidon(2);
-    commitmentHasher.inputs[0] <== secret;
-    commitmentHasher.inputs[1] <== salt;
+    // 1. Compute identity commitment: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+    // Domain-separated commitment prevents cross-protocol attacks.
+    // Blinding factor ensures uniform distribution across the field even
+    // if secret and salt are correlated (e.g., derived from same wallet signature).
+    component commitmentHasher = Poseidon(4);
+    commitmentHasher.inputs[0] <== DOMAIN_TAG;
+    commitmentHasher.inputs[1] <== secret;
+    commitmentHasher.inputs[2] <== salt;
+    commitmentHasher.inputs[3] <== blindingFactor;
 
     signal commitment;
     commitment <== commitmentHasher.out;

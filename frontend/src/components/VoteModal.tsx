@@ -1,13 +1,6 @@
 import { useState } from "react";
 import { Button } from "./ui/Button";
 import Alert from "./ui/Alert";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-  CardDescription,
-} from "./ui/Card";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
 import { initializeContractClients } from "../lib/contracts";
 import { relayerFetch, parseApiError, getApiErrorCode, ErrorCode } from "../lib/api";
@@ -67,7 +60,7 @@ export default function VoteModal({
 
       // Step 1: Load registration data (or regenerate from wallet)
       setProgress("Loading voting credentials...");
-      let secret: string, salt: string, commitment: string, leafIndex: number;
+      let secret: string, salt: string, blindingFactor: string, commitment: string, leafIndex: number;
 
       const cached = getZKCredentials(daoId, publicKey);
 
@@ -97,6 +90,7 @@ export default function VoteModal({
         leafIndex = Number(leafIndexResult.result);
         secret = credentials.secret;
         salt = credentials.salt;
+        blindingFactor = credentials.blindingFactor;
         commitment = credentials.commitment;
 
         // Cache for next time
@@ -106,6 +100,7 @@ export default function VoteModal({
       } else {
         secret = cached.secret;
         salt = cached.salt;
+        blindingFactor = cached.blindingFactor;
         commitment = cached.commitment;
         leafIndex = cached.leafIndex;
       }
@@ -179,6 +174,7 @@ export default function VoteModal({
         // Private signals
         secret: secret.toString(),
         salt: salt.toString(),
+        blindingFactor: blindingFactor.toString(),
         pathElements,
         pathIndices,
       };
@@ -225,7 +221,7 @@ export default function VoteModal({
         return bigInt.toString(16).padStart(64, "0");
       };
 
-      const requestBody = JSON.stringify({
+      const votePayload = {
         daoId: Number(daoId),
         proposalId: Number(proposalId),
         choice: choice,
@@ -236,6 +232,33 @@ export default function VoteModal({
           b: proof_b,
           c: proof_c,
         },
+        timestamp: Date.now(),
+      };
+
+      // Sign the vote payload with the voter's Stellar keypair
+      let voterSignature: string | undefined;
+      try {
+        setProgress("Signing vote with your wallet...");
+        const { signVotePayload } = await import("../services/freighter");
+        const { getFreighterNetworkDetails } = await import("../services/freighter");
+        const networkDetails = await getFreighterNetworkDetails();
+        const networkPassphrase = networkDetails?.networkPassphrase || "Public Global Stellar Network ; September 2015";
+        
+        const payloadToSign = JSON.stringify(votePayload);
+        voterSignature = await signVotePayload(payloadToSign, publicKey, networkPassphrase);
+        
+        if (import.meta.env.DEV) {
+          console.log("Vote payload signed:", { signature: voterSignature.slice(0, 16) + "..." });
+        }
+      } catch (err) {
+        console.warn("Failed to sign vote payload:", err);
+        // Continue without signature - backend will still accept it with relayer auth token
+      }
+
+      const requestBody = JSON.stringify({
+        ...votePayload,
+        voterPublicKey: publicKey,
+        voterSignature,
       });
 
       // Optimistic update
@@ -256,11 +279,12 @@ export default function VoteModal({
       .then(async (response) => {
         if (!response.ok) {
           const errorData = await response.json();
-          const errorMsg =
-            errorData.error || "Failed to submit vote through relay";
+          const errorMsg = parseApiError(errorData);
+          const errorCode = getApiErrorCode(errorData);
 
           // Detect double-vote error
           if (
+            errorCode === ErrorCode.VOTE_ALREADY_CAST ||
             errorMsg.includes("already voted") ||
             errorMsg.includes("UnreachableCodeReached")
           ) {
@@ -270,20 +294,6 @@ export default function VoteModal({
           }
           revertOptimisticUpdate();
           return;
-      if (!response.ok) {
-        const errorData = await response.json();
-        const errorMsg = parseApiError(errorData);
-        const errorCode = getApiErrorCode(errorData);
-
-        // Detect double-vote error
-        if (
-          errorCode === ErrorCode.VOTE_ALREADY_CAST ||
-          errorMsg.includes("already voted") ||
-          errorMsg.includes("UnreachableCodeReached")
-        ) {
-          throw new Error(
-            "You have already voted on this proposal. Each member can only vote once per proposal.",
-          );
         }
 
         const result = await response.json();
@@ -384,28 +394,6 @@ export default function VoteModal({
                   Vote No
                 </Button>
               </div>
-                  </Alert>
-                )}
-
-                <div className="grid grid-cols-2 gap-4 pt-2">
-                  <Button
-                    onClick={() => handleVote(true)}
-                    disabled={step !== "select"}
-                    variant="outline"
-                    className="h-12 text-lg"
-                  >
-                    Vote Yes
-                  </Button>
-                  <Button
-                    onClick={() => handleVote(false)}
-                    disabled={step !== "select"}
-                    variant="outline"
-                    className="h-12 text-lg"
-                  >
-                    Vote No
-                  </Button>
-                </div>
-              </CardContent>
             </>
           )}
 

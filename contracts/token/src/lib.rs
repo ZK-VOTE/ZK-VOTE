@@ -24,6 +24,14 @@ const PERSISTENT_TTL_EXTEND: u32 = 535_680;
 const CLAWBACK_DELAY_LEDGERS: u32 = 34_560;
 const CLAWBACK_PERIOD_LEDGERS: u32 = 5_184_000;
 
+// Issue #110: batch operations. Soroban enforces per-transaction CPU
+// instruction and read/write-entry limits; a single batch call must not
+// exceed those. 50 is a conservative starting point — see the
+// `bench_batch_transfer_cost_scaling` test below, which prints actual CPU
+// instructions consumed per batch size so this can be tuned against real
+// mainnet resource limits rather than guessed.
+const MAX_BATCH_SIZE: u32 = 50;
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum TokenError {
@@ -48,6 +56,8 @@ pub enum TokenError {
     PermitReplay = 19,
     SupplyCapExceeded = 20,
     SelfDelegation = 21,
+    BatchTooLarge = 22,
+    EmptyBatch = 23,
 }
 
 #[contracttype]
@@ -1342,6 +1352,161 @@ impl Token {
     pub fn get_delegate(env: Env, holder: Address) -> Option<Address> {
         Self::bump_instance(&env);
         env.storage().persistent().get(&DataKey::Delegate(holder))
+    }
+
+
+    // ── Batch Operations (Issue #110) ───────────────────────────────────────
+    //
+    // Soroban already guarantees whole-invocation atomicity at the host
+    // level (a panic anywhere reverts every storage write made during that
+    // call) — these functions don't need to invent atomicity themselves.
+    // What they add on top of that guarantee: an explicit up-front
+    // validation pass (so a batch fails fast with one clear error instead
+    // of failing partway through on whichever item happens to run out of
+    // balance/allowance first), a hard batch-size cap (DoS/resource-limit
+    // guard), and one event per item so indexers see the same event shape
+    // they'd see from `MAX_BATCH_SIZE` individual calls.
+
+    /// Batch transfer: `from` sends multiple (recipient, amount) pairs in
+    /// one call. Validates every pair and the total against `from`'s
+    /// current balance before moving any funds.
+    pub fn batch_transfer(env: Env, from: Address, transfers: Vec<(Address, i128)>) {
+        from.require_auth();
+        Self::bump_instance(&env);
+
+        let len = transfers.len();
+        if len == 0 {
+            panic_with_error!(&env, TokenError::EmptyBatch);
+        }
+        if len > MAX_BATCH_SIZE {
+            panic_with_error!(&env, TokenError::BatchTooLarge);
+        }
+
+        // ── Validate all parameters before executing any ───────────────────
+        let mut total: i128 = 0;
+        for (_, amount) in transfers.iter() {
+            if amount < 0 {
+                panic_with_error!(&env, TokenError::InvalidAmount);
+            }
+            total = total.checked_add(amount).unwrap_or_else(|| {
+                panic_with_error!(&env, TokenError::Overflow);
+            });
+        }
+
+        let balance_key = DataKey::Balance(from.clone());
+        let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        if current_balance < total {
+            panic_with_error!(&env, TokenError::InsufficientBalance);
+        }
+
+        // ── Execute, emitting one event per item ────────────────────────────
+        for (to, amount) in transfers.iter() {
+            Self::xfer(&env, &from, &to, amount);
+            TransferEvent {
+                from: from.clone(),
+                to: to.clone(),
+                amount,
+            }
+            .publish(&env);
+        }
+    }
+
+    /// Batch mint (airdrops): admin mints multiple (recipient, amount)
+    /// pairs in one call. Validates the total against the supply cap (if
+    /// set) before minting any.
+    pub fn batch_mint(env: Env, mints: Vec<(Address, i128)>) {
+        let admin: Address = Self::admin(env.clone());
+        admin.require_auth();
+        Self::bump_instance(&env);
+
+        let len = mints.len();
+        if len == 0 {
+            panic_with_error!(&env, TokenError::EmptyBatch);
+        }
+        if len > MAX_BATCH_SIZE {
+            panic_with_error!(&env, TokenError::BatchTooLarge);
+        }
+
+        // ── Validate all parameters before executing any ───────────────────
+        let mut total: i128 = 0;
+        for (_, amount) in mints.iter() {
+            if amount < 0 {
+                panic_with_error!(&env, TokenError::InvalidAmount);
+            }
+            total = total.checked_add(amount).unwrap_or_else(|| {
+                panic_with_error!(&env, TokenError::Overflow);
+            });
+        }
+
+        if let Some(cap) = Self::get_max_supply_storage(&env) {
+            let current = Self::get_supply(&env);
+            let new_supply = current.checked_add(total).unwrap_or_else(|| {
+                panic_with_error!(&env, TokenError::Overflow);
+            });
+            if new_supply > cap {
+                panic_with_error!(&env, TokenError::SupplyCapExceeded);
+            }
+        }
+
+        // ── Execute, emitting one event per item ────────────────────────────
+        for (to, amount) in mints.iter() {
+            Self::receive_balance(&env, &to, amount);
+            Self::increment_supply(&env, amount);
+            MintEvent {
+                admin: admin.clone(),
+                to: to.clone(),
+                amount,
+            }
+            .publish(&env);
+        }
+    }
+
+    /// Batch approve: `from` sets multiple (spender, amount,
+    /// expiration_ledger) allowances in one call. Each entry is validated
+    /// independently (approvals don't move funds, so there's no shared
+    /// "total" to check against a balance) — but the same race-rejection
+    /// rule as `approve` applies per spender.
+    pub fn batch_approve(env: Env, from: Address, approvals: Vec<(Address, i128, u32)>) {
+        from.require_auth();
+        Self::bump_instance(&env);
+
+        let len = approvals.len();
+        if len == 0 {
+            panic_with_error!(&env, TokenError::EmptyBatch);
+        }
+        if len > MAX_BATCH_SIZE {
+            panic_with_error!(&env, TokenError::BatchTooLarge);
+        }
+
+        // ── Validate all parameters before executing any ───────────────────
+        for (spender, amount, _expiration_ledger) in approvals.iter() {
+            if amount < 0 {
+                panic_with_error!(&env, TokenError::NegativeAllowance);
+            }
+            let current = read_allowance_amount(&env, from.clone(), spender.clone());
+            let is_race_rejected = current != 0 && amount != 0 && current != amount;
+            if is_race_rejected {
+                panic_with_error!(&env, TokenError::AllowanceRaceRejected);
+            }
+        }
+
+        // ── Execute, emitting one event per item ────────────────────────────
+        for (spender, amount, expiration_ledger) in approvals.iter() {
+            write_allowance(
+                &env,
+                from.clone(),
+                spender.clone(),
+                amount,
+                expiration_ledger,
+            );
+            ApproveEvent {
+                from: from.clone(),
+                spender: spender.clone(),
+                amount,
+                expiration_ledger,
+            }
+            .publish(&env);
+        }
     }
 }
 

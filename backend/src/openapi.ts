@@ -24,6 +24,9 @@ import {
   flagCommentSchema,
   manualEventSchema,
   notifyEventSchema,
+  eventsQuerySchema,
+  daosQuerySchema,
+  commentCountQuerySchema,
 } from "./validation/schemas.js";
 import { bridgeVoteSchema } from "./routes/bridge.js";
 import { circuitParamsSchema } from "./routes/circuits.js";
@@ -73,10 +76,25 @@ export const configResponseSchema = z
   .passthrough()
   .openapi("ConfigResponse");
 
+export const paginatedResponseSchema = z
+  .object({
+    data: z.array(z.record(z.unknown())),
+    pagination: z.object({
+      cursor: z.string().nullable().optional(),
+      hasMore: z.boolean(),
+      total: z.number(),
+    }),
+  })
+  .openapi("PaginatedResponse");
+
 export const daosListResponseSchema = z
   .object({
-    daos: z.array(z.record(z.unknown())),
-    total: z.number(),
+    data: z.array(z.record(z.unknown())),
+    pagination: z.object({
+      cursor: z.string().nullable().optional(),
+      hasMore: z.boolean(),
+      total: z.number(),
+    }),
     lastSync: z.string().nullable(),
     cached: z.boolean(),
   })
@@ -245,14 +263,22 @@ export const ENDPOINTS: EndpointDef[] = [
     method: "get",
     path: "/comments/:daoId/:proposalId",
     tag: "Comments",
-    summary: "List comments for a proposal",
+    summary: "List comments for a proposal (paginated)",
     auth: false,
     rateLimit: "queryLimiter",
     params: {
       daoId: idParam("0", "DAO identifier"),
       proposalId: idParam("1", "Proposal identifier"),
     },
-    responseExample: { comments: [], total: 0 },
+    query: {
+      limit: z.number().int().min(1).max(500).optional().openapi({ example: 100 }),
+      cursor: z.string().optional().openapi({ example: "eyJpIjoxMjN9" }),
+    },
+    responseExample: {
+      data: [],
+      pagination: { cursor: undefined, hasMore: false, total: 0 },
+    },
+    responseSchema: paginatedResponseSchema,
   },
   {
     method: "get",
@@ -320,16 +346,20 @@ export const ENDPOINTS: EndpointDef[] = [
     method: "get",
     path: "/daos",
     tag: "DAOs",
-    summary: "List all cached DAOs, optionally with a user's membership role",
+    summary: "List cached DAOs with pagination, optionally including user membership role",
     auth: false,
     rateLimit: "queryLimiter",
     query: {
-      user: z
-        .string()
-        .optional()
-        .openapi({ example: "GABCDEF...", description: "Stellar address" }),
+      user: z.string().optional().openapi({ example: "GABCDEF...", description: "Stellar address" }),
+      limit: z.number().int().min(1).max(500).optional().openapi({ example: 100 }),
+      cursor: z.string().optional().openapi({ example: "100" }),
     },
-    responseExample: { daos: [], total: 0, lastSync: null, cached: true },
+    responseExample: {
+      data: [],
+      pagination: { cursor: undefined, hasMore: false, total: 0 },
+      lastSync: null,
+      cached: true,
+    },
     responseSchema: daosListResponseSchema,
   },
   {
@@ -444,19 +474,23 @@ export const ENDPOINTS: EndpointDef[] = [
     method: "get",
     path: "/events/:daoId",
     tag: "Events",
-    summary: "Get events for a DAO",
+    summary: "Get events for a DAO with cursor-based pagination",
     auth: false,
     rateLimit: "queryLimiter",
     params: { daoId: idParam("0", "DAO identifier") },
     query: {
-      limit: z.string().optional().openapi({ example: "50" }),
-      offset: z.string().optional().openapi({ example: "0" }),
-      types: z
-        .string()
-        .optional()
-        .openapi({ example: "vote_cast,proposal_created" }),
+      limit: z.number().int().min(1).max(500).optional().openapi({ example: 100 }),
+      cursor: z.string().optional().openapi({ example: "eyJpIjoxMjN9" }),
+      types: z.string().optional().openapi({ example: "vote_cast,proposal_created" }),
+      orderBy: z.enum(['id', 'timestamp', 'ledger', 'type', 'verified', 'created_at']).optional().openapi({ example: "timestamp" }),
+      orderDirection: z.enum(['ASC', 'DESC']).optional().openapi({ example: "DESC" }),
+      cursorField: z.enum(['id', 'ledger', 'timestamp']).optional().openapi({ example: "id" }),
     },
-    responseExample: { events: [], total: 0, daoId: 0 },
+    responseExample: {
+      data: [],
+      pagination: { cursor: undefined, hasMore: false, total: 0 },
+    },
+    responseSchema: paginatedResponseSchema,
   },
   {
     method: "get",

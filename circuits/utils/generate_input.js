@@ -26,12 +26,18 @@ function poseidonHash(inputs) {
   return poseidon.F.toObject(hash);
 }
 
-// Generate identity commitment
+// Domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
+
+// Generate identity commitment with domain separation and blinding factor
+// commitment = Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
 function generateIdentity() {
   const secret = randomFieldElement();
   const salt = randomFieldElement();
-  const commitment = poseidonHash([secret, salt]);
-  return { secret, salt, commitment };
+  const blindingFactor = randomFieldElement();
+  const commitment = poseidonHash([DOMAIN_TAG, secret, salt, blindingFactor]);
+  return { secret, salt, blindingFactor, commitment };
 }
 
 // Compute nullifier for a proposal (domain-separated with daoId)
@@ -124,6 +130,7 @@ function generateVoteInput(memberSecrets, voterIndex, daoId, proposalId, voteCho
     // Private inputs
     secret: voter.secret.toString(),
     salt: voter.salt.toString(),
+    blindingFactor: voter.blindingFactor.toString(),
     pathElements: proof.pathElements.map(e => e.toString()),
     pathIndices: proof.pathIndices.map(i => i.toString())
   };
@@ -185,6 +192,7 @@ if (require.main === module) {
     const secretsData = members.map(m => ({
       secret: m.secret.toString(),
       salt: m.salt.toString(),
+      blindingFactor: m.blindingFactor.toString(),
       commitment: m.commitment.toString()
     }));
     fs.writeFileSync(secretsFile, JSON.stringify(secretsData, null, 2));

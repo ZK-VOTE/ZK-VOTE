@@ -58,9 +58,9 @@ function loadCommitments() {
   const commitments = new Map();
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
-    const [key, secret, salt, commitment] = line.split(',');
+    const [key, secret, salt, commitment, blindingFactor] = line.split(',');
     const idx = parseInt(key.replace('stresstest-', ''));
-    commitments.set(idx, { secret, salt, commitment });
+    commitments.set(idx, { secret, salt, blindingFactor, commitment });
   }
   return commitments;
 }
@@ -274,6 +274,7 @@ async function main() {
         commitment: account.commitment,  // Already decimal from CSV
         secret: account.secret,
         salt: account.salt,
+        blindingFactor: account.blindingFactor,
         pathElements: paddedPathElements,
         pathIndices: paddedPathIndices,
       };

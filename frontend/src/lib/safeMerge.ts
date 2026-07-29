@@ -58,16 +58,16 @@ export function safeMerge<T extends Record<string, unknown>>(
         value &&
         typeof value === "object" &&
         !Array.isArray(value) &&
-        result[key] &&
-        typeof result[key] === "object" &&
-        !Array.isArray(result[key])
+        (result as Record<string, unknown>)[key] &&
+        typeof (result as Record<string, unknown>)[key] === "object" &&
+        !Array.isArray((result as Record<string, unknown>)[key])
       ) {
-        result[key] = safeMerge(
-          result[key] as Record<string, unknown>,
+        (result as Record<string, unknown>)[key] = safeMerge(
+          (result as Record<string, unknown>)[key] as Record<string, unknown>,
           value as Record<string, unknown>,
         );
       } else {
-        result[key] = safeClone(value);
+        (result as Record<string, unknown>)[key] = safeClone(value);
       }
     }
   }

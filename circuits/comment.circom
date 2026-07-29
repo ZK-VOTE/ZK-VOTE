@@ -4,15 +4,21 @@ include "node_modules/circomlib/circuits/poseidon.circom";
 include "node_modules/circomlib/circuits/comparators.circom";
 include "merkle_tree.circom";
 
+// DAO domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Prevents cross-protocol attacks where commitments from other systems
+// could be valid in ZK-VOTE
+var DOMAIN_TAG = 19666041591797403834655481403982443037438503980743793537655983658411276515161;
+
 // DaoVote Anonymous Comment Circuit
 //
 // Proves:
 // 1. Commenter knows secret & salt that hash to a leaf in the Merkle tree
 // 2. Nullifier is correctly derived from secret, daoId, proposalId, and commentNonce
-// 3. Commitment matches Poseidon(secret, salt)
+// 3. Commitment matches Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
 //
 // Public signals: [root, nullifier, daoId, proposalId, commentNonce, commitment]
-// Private signals: secret, salt, pathElements, pathIndices
+// Private signals: secret, salt, blindingFactor, pathElements, pathIndices
 //
 // NOTE: Unlike votes, comments don't have a "choice" field.
 // The commentNonce allows multiple comments per user per proposal (increment nonce for each).
@@ -28,15 +34,20 @@ template Comment(levels) {
 
     // Private inputs
     signal input secret;            // Commenter's secret (like password)
-    signal input salt;              // Random salt for commitment
+    signal input salt;              // Salt for commitment
+    signal input blindingFactor;    // Random blinding factor for uniform distribution
     signal input pathElements[levels];  // Merkle proof siblings
     signal input pathIndices[levels];   // Merkle proof path (0=left, 1=right)
 
-    // 1. Compute identity commitment: Poseidon(secret, salt)
+    // 1. Compute identity commitment: Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
     // and verify it matches the public commitment input
-    component commitmentHasher = Poseidon(2);
-    commitmentHasher.inputs[0] <== secret;
-    commitmentHasher.inputs[1] <== salt;
+    // Domain-separated commitment prevents cross-protocol attacks.
+    // Blinding factor ensures uniform distribution across the field.
+    component commitmentHasher = Poseidon(4);
+    commitmentHasher.inputs[0] <== DOMAIN_TAG;
+    commitmentHasher.inputs[1] <== secret;
+    commitmentHasher.inputs[2] <== salt;
+    commitmentHasher.inputs[3] <== blindingFactor;
 
     // Constrain computed commitment to match public commitment
     commitment === commitmentHasher.out;

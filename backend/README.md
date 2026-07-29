@@ -459,7 +459,12 @@ Returns binary image with appropriate `Content-Type` header.
 - **Authentication**: Required auth token for write endpoints (`X-Relayer-Auth` header)
 - **Token Strength**: Minimum 32 characters required for auth token
 - **CORS**: Configurable origins via `CORS_ORIGIN` env var
-- **CSRF Protection**: Origin validation for non-GET requests when CORS is configured
+- **CSRF Protection**: Multi-layered CSRF protection following OWASP recommendations:
+  - **Origin/Referer Validation**: Exact origin matching (no wildcard subdomains)
+  - **Null Origin Rejection**: Explicitly blocks `Origin: null` from sandboxed iframes/data URIs
+  - **Missing Header Rejection**: Requires either Origin or Referer header on write endpoints
+  - **CSRF Token Validation**: Token-based protection as defense-in-depth (`X-CSRF-Token` header)
+  - **Fail-Closed**: Rejects requests when CORS_ORIGIN is wildcard on write endpoints
 - **Helmet**: HTTP security headers
 - **Input Validation**: All inputs validated for type, length, and format
 - **BN254 Field Validation**: Values validated to be within BN254 scalar field
@@ -469,12 +474,14 @@ Returns binary image with appropriate `Content-Type` header.
 
 ### Production Recommendations
 
-1. Set `CORS_ORIGIN` to specific frontend origins
+1. Set `CORS_ORIGIN` to specific frontend origins (exact origins, no wildcards)
 2. Use strong `RELAYER_AUTH_TOKEN` (32+ chars)
 3. Set `LOG_CLIENT_IP=hash` to anonymize IPs
 4. Set `HEALTH_EXPOSE_DETAILS=false` to hide contract IDs
 5. Deploy behind reverse proxy with DDoS protection
 6. Use HTTPS/TLS termination
+7. Ensure frontend includes `X-CSRF-Token` header in all write requests
+8. Retrieve CSRF token from `X-CSRF-Token` response header or `csrf_token` cookie
 
 ## Architecture
 

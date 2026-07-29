@@ -3297,3 +3297,494 @@ fn test_recursive_tally_submission() {
     assert_eq!(prop_info.no_votes, 350);
     assert_eq!(prop_info.state, ProposalState::Closed);
 }
+
+// ============================================================================
+// Quadratic voting with range proofs (issue #50)
+// ============================================================================
+
+// QV circuit has 6 public signals -> IC length must be 7.
+fn create_dummy_qv_vk(env: &Env) -> VerificationKey {
+    let g1 = bn254_g1_generator(env);
+    let g2 = bn254_g2_generator(env);
+    VerificationKey {
+        alpha: g1.clone(),
+        beta: g2.clone(),
+        gamma: g2.clone(),
+        delta: g2.clone(),
+        ic: soroban_sdk::vec![
+            env,
+            g1.clone(),
+            g1.clone(),
+            g1.clone(),
+            g1.clone(),
+            g1.clone(),
+            g1.clone(),
+            g1.clone()
+        ],
+    }
+}
+
+// Tally VK with `num_public + 1` IC points.
+fn create_dummy_tally_vk(env: &Env, num_public: u32) -> VerificationKey {
+    let g1 = bn254_g1_generator(env);
+    let g2 = bn254_g2_generator(env);
+    let mut ic = soroban_sdk::vec![env];
+    for _ in 0..(num_public + 1) {
+        ic.push_back(g1.clone());
+    }
+    VerificationKey {
+        alpha: g1.clone(),
+        beta: g2.clone(),
+        gamma: g2.clone(),
+        delta: g2,
+        ic,
+    }
+}
+
+// Register mocks, give `member` an SBT, set the root + admin + QV VK, and create
+// a quadratic proposal. Returns (env, voting_client, proposal_id, eligible_root).
+fn setup_qv_round() -> (Env, VotingClient<'static>, Address, u64, U256) {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let voting_client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+
+    sbt_client.set_member(&1u64, &member, &true);
+    let root = U256::from_u32(&env, 12345);
+    tree_client.set_root(&1u64, &root);
+    registry_client.set_admin(&1u64, &admin);
+    voting_client.set_qv_vk(&1u64, &create_dummy_qv_vk(&env), &admin);
+
+    let now = env.ledger().timestamp();
+    let proposal_id = voting_client.create_qv_proposal(
+        &1u64,
+        &String::from_str(&env, "QV Round"),
+        &String::from_str(&env, ""),
+        &(now + 3600),
+        &member,
+    );
+    let proposal = voting_client.get_proposal(&1u64, &proposal_id);
+    (
+        env,
+        voting_client,
+        admin,
+        proposal_id,
+        proposal.eligible_root,
+    )
+}
+
+#[test]
+fn test_quadratic_set_qv_vk_and_version() {
+    let (env, voting_id, _tree_id, _sbt_id, registry_id, _member) = setup_env_with_registry();
+    let voting_client = VotingClient::new(&env, &voting_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+
+    assert_eq!(voting_client.qv_vk_version(&1u64), 0);
+    voting_client.set_qv_vk(&1u64, &create_dummy_qv_vk(&env), &admin);
+    assert_eq!(voting_client.qv_vk_version(&1u64), 1);
+    voting_client.set_qv_vk(&1u64, &create_dummy_qv_vk(&env), &admin);
+    assert_eq!(voting_client.qv_vk_version(&1u64), 2);
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_set_qv_vk_wrong_ic_length_fails() {
+    let (env, voting_id, _tree_id, _sbt_id, registry_id, _member) = setup_env_with_registry();
+    let voting_client = VotingClient::new(&env, &voting_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    // Regular vote VK has IC length 6, not the 7 the QV circuit requires.
+    voting_client.set_qv_vk(&1u64, &create_dummy_vk(&env), &admin);
+}
+
+#[test]
+fn test_quadratic_create_proposal() {
+    let (_env, voting_client, _admin, proposal_id, _root) = setup_qv_round();
+    let proposal = voting_client.get_proposal(&1u64, &proposal_id);
+    assert_eq!(proposal.vote_mode, VoteMode::Quadratic);
+    assert_eq!(
+        voting_client.get_vote_mode(&1u64, &proposal_id),
+        VoteMode::Quadratic
+    );
+    assert_eq!(voting_client.qv_ballot_count(&1u64, &proposal_id), 0);
+}
+
+#[test]
+fn test_quadratic_cast_vote_success() {
+    let (env, voting_client, _admin, proposal_id, root) = setup_qv_round();
+
+    let nullifier = U256::from_u32(&env, 77777);
+    let alloc_hash = U256::from_u32(&env, 424242);
+    let proof = create_dummy_proof(&env);
+
+    // 3^2 + 1^2 + 0 = 10 credits, within the budget of 100.
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &nullifier,
+        &root,
+        &10u64,
+        &alloc_hash,
+        &proof,
+    );
+
+    assert_eq!(voting_client.qv_ballot_count(&1u64, &proposal_id), 1);
+    assert_eq!(voting_client.qv_credits_total(&1u64, &proposal_id), 10u128);
+    assert!(voting_client.is_qv_nullifier_used(&1u64, &proposal_id, &nullifier));
+    let ballot = voting_client.get_qv_ballot(&1u64, &proposal_id, &nullifier);
+    assert_eq!(ballot.total_credits_spent, 10u64);
+    assert_eq!(ballot.allocations_hash, alloc_hash);
+}
+
+#[test]
+fn test_quadratic_credits_total_accumulates() {
+    let (env, voting_client, _admin, proposal_id, root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 11),
+        &root,
+        &10u64,
+        &U256::from_u32(&env, 111),
+        &proof,
+    );
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 22),
+        &root,
+        &25u64,
+        &U256::from_u32(&env, 222),
+        &proof,
+    );
+
+    assert_eq!(voting_client.qv_ballot_count(&1u64, &proposal_id), 2);
+    assert_eq!(voting_client.qv_credits_total(&1u64, &proposal_id), 35u128);
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_double_vote_fails() {
+    let (env, voting_client, _admin, proposal_id, root) = setup_qv_round();
+    let nullifier = U256::from_u32(&env, 77777);
+    let proof = create_dummy_proof(&env);
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &nullifier,
+        &root,
+        &10u64,
+        &U256::from_u32(&env, 1),
+        &proof,
+    );
+    // Same nullifier again -> NullifierUsed.
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &nullifier,
+        &root,
+        &4u64,
+        &U256::from_u32(&env, 2),
+        &proof,
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_budget_exceeded_fails() {
+    let (env, voting_client, _admin, proposal_id, root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+    // 101 > MAX_QV_BUDGET (100).
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 5),
+        &root,
+        &101u64,
+        &U256::from_u32(&env, 9),
+        &proof,
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_wrong_root_fails() {
+    let (env, voting_client, _admin, proposal_id, _root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+    // Root does not match the snapshot -> RootMismatch.
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 5),
+        &U256::from_u32(&env, 999999),
+        &10u64,
+        &U256::from_u32(&env, 9),
+        &proof,
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_zero_nullifier_fails() {
+    let (env, voting_client, _admin, proposal_id, root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 0),
+        &root,
+        &10u64,
+        &U256::from_u32(&env, 9),
+        &proof,
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_regular_vote_on_qv_proposal_fails() {
+    let (env, voting_client, _admin, proposal_id, root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+    // The plain `vote` entrypoint must reject a Quadratic proposal.
+    voting_client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 5),
+        &root,
+        &proof,
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_cast_on_non_qv_proposal_fails() {
+    // Build a regular Fixed proposal, then try to cast a QV ballot on it.
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let voting_client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+
+    sbt_client.set_member(&1u64, &member, &true);
+    let root = U256::from_u32(&env, 12345);
+    tree_client.set_root(&1u64, &root);
+    registry_client.set_admin(&1u64, &admin);
+    voting_client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let now = env.ledger().timestamp();
+    let proposal_id = voting_client.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Fixed"),
+        &String::from_str(&env, ""),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+    let proof = create_dummy_proof(&env);
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 5),
+        &root,
+        &10u64,
+        &U256::from_u32(&env, 9),
+        &proof,
+    );
+}
+
+#[test]
+fn test_quadratic_tally_record_and_get() {
+    let (env, voting_client, admin, proposal_id, root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+
+    // Two ballots cast on-chain (allocations stay private).
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 11),
+        &root,
+        &10u64,
+        &U256::from_u32(&env, 111),
+        &proof,
+    );
+    voting_client.cast_qv_vote(
+        &1u64,
+        &proposal_id,
+        &U256::from_u32(&env, 22),
+        &root,
+        &9u64,
+        &U256::from_u32(&env, 222),
+        &proof,
+    );
+
+    // Off-chain aggregation produced these per-proposal totals; commit them
+    // on-chain with a tally proof. Public signals = [round_id, 3 ids, 3 tallies]
+    // = 7 -> tally VK IC length 8.
+    voting_client.set_qv_tally_vk(&1u64, &create_dummy_tally_vk(&env, 7), &admin);
+
+    let proposal_ids = soroban_sdk::vec![&env, 100u64, 200u64, 300u64];
+    let tallies = soroban_sdk::vec![&env, 5u64, 3u64, 0u64];
+    voting_client.record_qv_tally(&1u64, &proposal_id, &proposal_ids, &tallies, &proof);
+
+    assert!(voting_client.is_qv_tally_finalized(&1u64, &proposal_id));
+    assert_eq!(
+        voting_client.get_qv_tally(&1u64, &proposal_id, &100u64),
+        5u64
+    );
+    assert_eq!(
+        voting_client.get_qv_tally(&1u64, &proposal_id, &200u64),
+        3u64
+    );
+    assert_eq!(
+        voting_client.get_qv_tally(&1u64, &proposal_id, &300u64),
+        0u64
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_quadratic_tally_length_mismatch_fails() {
+    let (env, voting_client, admin, proposal_id, _root) = setup_qv_round();
+    let proof = create_dummy_proof(&env);
+    voting_client.set_qv_tally_vk(&1u64, &create_dummy_tally_vk(&env, 7), &admin);
+    let proposal_ids = soroban_sdk::vec![&env, 100u64, 200u64, 300u64];
+    let tallies = soroban_sdk::vec![&env, 5u64, 3u64]; // one short
+    voting_client.record_qv_tally(&1u64, &proposal_id, &proposal_ids, &tallies, &proof);
+}
+
+/// Issue #64: nullifiers are election-scoped by (dao_id, proposal_id).
+/// Using the same nullifier hash in election A must not mark it used in election B.
+#[test]
+fn test_nullifier_domain_separation_across_elections() {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let voting_client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+
+    sbt_client.set_member(&1u64, &member, &true);
+    sbt_client.set_member(&2u64, &member, &true);
+    let root = U256::from_u32(&env, 4242);
+    tree_client.set_root(&1u64, &root);
+    tree_client.set_root(&2u64, &root);
+    registry_client.set_admin(&1u64, &admin);
+    registry_client.set_admin(&2u64, &admin);
+    voting_client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+    voting_client.set_vk(&2u64, &create_dummy_vk(&env), &admin);
+
+    let now = env.ledger().timestamp();
+    let election_a = voting_client.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Election A"),
+        &String::from_str(&env, ""),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+    env.ledger().set_timestamp(now + ELECTION_CREATION_COOLDOWN);
+    let now2 = env.ledger().timestamp();
+    let election_b = voting_client.create_proposal(
+        &2u64,
+        &String::from_str(&env, "Election B"),
+        &String::from_str(&env, ""),
+        &(now2 + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    let shared_nullifier = U256::from_u32(&env, 0xDEAD);
+    let proof = create_dummy_proof(&env);
+    let prop_a = voting_client.get_proposal(&1u64, &election_a);
+    let prop_b = voting_client.get_proposal(&2u64, &election_b);
+
+    // Vote in election A
+    voting_client.vote(
+        &1u64,
+        &election_a,
+        &true,
+        &shared_nullifier,
+        &prop_a.eligible_root,
+        &proof,
+    );
+
+    // Scoped queries: used in A, unused in B
+    assert!(voting_client.is_nullifier_used(&1u64, &election_a, &shared_nullifier));
+    assert!(voting_client.has_nullifier_been_used(&1u64, &election_a, &shared_nullifier));
+    assert!(!voting_client.is_nullifier_used(&2u64, &election_b, &shared_nullifier));
+    assert!(!voting_client.has_nullifier_been_used(&2u64, &election_b, &shared_nullifier));
+
+    // Same nullifier value must still be votable in election B (no global DoS)
+    voting_client.vote(
+        &2u64,
+        &election_b,
+        &false,
+        &shared_nullifier,
+        &prop_b.eligible_root,
+        &proof,
+    );
+    assert!(voting_client.is_nullifier_used(&2u64, &election_b, &shared_nullifier));
+}
+
+/// Issue #64: migrate LegacyNullifierUsed(n) → Nullifier(dao, proposal, n).
+#[test]
+fn test_migrate_nullifier_to_election_scope() {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let voting_client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+
+    sbt_client.set_member(&1u64, &member, &true);
+    let root = U256::from_u32(&env, 111);
+    tree_client.set_root(&1u64, &root);
+    registry_client.set_admin(&1u64, &admin);
+    voting_client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let now = env.ledger().timestamp();
+    let proposal_id = voting_client.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Migrate election"),
+        &String::from_str(&env, ""),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    let nullifier = U256::from_u32(&env, 777);
+    // Seed a legacy flat nullifier entry directly in storage
+    env.as_contract(&voting_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::LegacyNullifierUsed(nullifier.clone()), &true);
+    });
+
+    assert!(!voting_client.is_nullifier_used(&1u64, &proposal_id, &nullifier));
+
+    let migrated = voting_client.migrate_nullifier(
+        &1u64,
+        &proposal_id,
+        &nullifier,
+        &admin,
+    );
+    assert!(migrated);
+    assert!(voting_client.is_nullifier_used(&1u64, &proposal_id, &nullifier));
+
+    // Second migrate is a no-op (legacy already removed)
+    let migrated_again = voting_client.migrate_nullifier(
+        &1u64,
+        &proposal_id,
+        &nullifier,
+        &admin,
+    );
+    assert!(!migrated_again);
+}

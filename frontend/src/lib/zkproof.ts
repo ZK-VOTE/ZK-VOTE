@@ -6,6 +6,7 @@ import type { CircuitSignals, Groth16Proof } from "snarkjs";
 export interface VoteProofInput {
   secret: string;
   salt: string;
+  blindingFactor: string;
   root: string;
   nullifier: string;
   daoId: string;
@@ -21,6 +22,7 @@ export interface VoteProofInput {
 export interface CommentProofInput {
   secret: string;
   salt: string;
+  blindingFactor: string;
   root: string;
   nullifier: string;
   daoId: string;
@@ -74,7 +76,7 @@ export async function generateVoteProof(
     let circuitInput: CircuitSignals;
 
     if (circuitVersion === "v2") {
-      // vote_v2.circom - adds chainId as 6th public signal
+      // vote_v2.circom
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
@@ -84,11 +86,12 @@ export async function generateVoteProof(
         chainId: input.chainId || "0",
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
     } else {
-      // vote_v1.circom - original 5 public signals
+      // vote_v1.circom
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
@@ -97,6 +100,7 @@ export async function generateVoteProof(
         voteChoice: input.voteChoice,
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
@@ -170,6 +174,7 @@ export async function generateCommentProof(
         parentCommentId: input.parentCommentId || "0",
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
@@ -184,6 +189,7 @@ export async function generateCommentProof(
         commitment: input.commitment,
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
@@ -346,18 +352,25 @@ export async function calculateCommentNullifier(
   return hash;
 }
 
+// Domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Must match DOMAIN_TAG in circuits for consistency
+const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
+
 /**
- * Calculate commitment from secret and salt using Poseidon hash
- * commitment = Poseidon(secret, salt)
+ * Calculate commitment from secret, salt, and blinding factor using Poseidon hash
+ * commitment = Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+ * Domain-separated commitment prevents cross-protocol attacks.
  */
 export async function calculateCommitment(
   secret: string,
   salt: string,
+  blindingFactor: string,
 ): Promise<string> {
   const { buildPoseidon } = await import("circomlibjs");
   const poseidon = await buildPoseidon();
 
-  const hash = poseidon.F.toString(poseidon([BigInt(secret), BigInt(salt)]));
+  const hash = poseidon.F.toString(poseidon([DOMAIN_TAG, BigInt(secret), BigInt(salt), BigInt(blindingFactor)]));
 
   return hash;
 }

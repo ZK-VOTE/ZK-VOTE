@@ -1,9 +1,12 @@
 import { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
+import rehypeExternalLinks from "rehype-external-links";
 import { ExternalLink } from "lucide-react";
 import { relayerFetch, RELAYER_URL } from "../lib/api";
 import { LoadingSpinner, MediaSlider } from "./ui";
+import { markdownSanitizeSchema } from "../lib/markdownSanitizeSchema";
 
 export interface ProposalMetadata {
   version: number;
@@ -38,6 +41,7 @@ export default function ProposalContent({ contentCid }: ProposalContentProps) {
     if (hasRichContent && !metadata && !loadingMetadata && !metadataFailed) {
       loadMetadata();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contentCid, hasRichContent, metadata, loadingMetadata, metadataFailed]);
 
   const loadMetadata = async () => {
@@ -85,7 +89,13 @@ export default function ProposalContent({ contentCid }: ProposalContentProps) {
 
         {metadata?.body && (
           <div className="prose prose-sm dark:prose-invert max-w-none">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown 
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[
+                [rehypeSanitize, markdownSanitizeSchema],
+                [rehypeExternalLinks, { target: "_blank", rel: ["noopener", "noreferrer"] }]
+              ]}
+            >
               {metadata.body}
             </ReactMarkdown>
           </div>

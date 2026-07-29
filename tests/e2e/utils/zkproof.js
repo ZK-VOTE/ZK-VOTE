@@ -51,11 +51,18 @@ export async function poseidonHash(inputs) {
   return p.F.toString(hash);
 }
 
+// Domain separation tag for commitment scheme
+// SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
+// Must match DOMAIN_TAG in circuits for consistency
+const DOMAIN_TAG = BigInt("19666041591797403834655481403982443037438503980743793537655983658411276515161");
+
 /**
- * Compute commitment = Poseidon(secret, salt)
+ * Compute commitment = Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)
+ * Domain-separated commitment prevents cross-protocol attacks.
+ * Blinding factor ensures uniform distribution across the field.
  */
-export async function computeCommitment(secret, salt) {
-  return poseidonHash([secret, salt]);
+export async function computeCommitment(secret, salt, blindingFactor) {
+  return poseidonHash([DOMAIN_TAG, secret, salt, blindingFactor]);
 }
 
 /**
@@ -71,9 +78,10 @@ export async function computeNullifier(secret, daoId, proposalId) {
 export async function generateCredentials() {
   const secret = randomFieldElement();
   const salt = randomFieldElement();
-  const commitment = await computeCommitment(secret, salt);
+  const blindingFactor = randomFieldElement();
+  const commitment = await computeCommitment(secret, salt, blindingFactor);
 
-  return { secret, salt, commitment };
+  return { secret, salt, blindingFactor, commitment };
 }
 
 // Circuit expects exactly 18 levels
@@ -231,6 +239,7 @@ export async function buildMerkleProof(leafIndex, contractOutput) {
 export async function generateVoteProof({
   secret,
   salt,
+  blindingFactor,
   commitment,
   root,
   nullifier,
@@ -263,6 +272,7 @@ export async function generateVoteProof({
     // Private inputs
     secret: secret.toString(),
     salt: salt.toString(),
+    blindingFactor: blindingFactor.toString(),
     pathElements: pathElements.map(x => x.toString()),
     pathIndices: pathIndices.map(x => x.toString()),
   };

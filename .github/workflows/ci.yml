@@ -134,6 +134,15 @@ jobs:
         run: npm ci
       - name: Run tests
         run: npm test
+      - name: Compile circuits with Docker
+        run: ../scripts/compile-circuits.sh --docker
+      - name: Verify circuit artifact checksums (if artifacts exist)
+        run: |
+          if [ -f "build/vote.r1cs" ] || [ -f "build/verification_key.json" ]; then
+            ../scripts/verify-circuits.sh
+          else
+            echo "Skipping verification - no compiled artifacts found"
+          fi
       - name: Compile v2 circuits (if available)
         run: |
           if command -v circom &> /dev/null; then

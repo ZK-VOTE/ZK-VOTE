@@ -5,14 +5,73 @@
  * Covers parameterized queries, input validation, and edge cases.
  */
 
-const { describe, beforeEach, afterEach, test, expect } = require('@jest/globals');
-const Database = require('better-sqlite3');
-const fs = require('fs');
-const path = require('path');
-const { fileURLToPath } = require('url');
+import { describe, beforeEach, afterEach, test } from "node:test";
+import assert from "node:assert/strict";
+import Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import * as db from "../src/services/db.ts";
 
-// Import the database service
-const db = require('../src/services/db.js');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function removeMigrationFixture(filePath) {
+  for (const candidate of [filePath, `${filePath}.migrated`]) {
+    if (fs.existsSync(candidate)) {
+      fs.unlinkSync(candidate);
+    }
+  }
+}
+
+function expect(actual) {
+  return {
+    toThrow(expected) {
+      assert.equal(typeof actual, "function");
+
+      let thrown;
+      try {
+        actual();
+      } catch (error) {
+        thrown = error;
+      }
+
+      assert.ok(thrown, "Expected function to throw");
+
+      if (expected !== undefined) {
+        const message =
+          thrown instanceof Error ? thrown.message : String(thrown);
+
+        if (expected instanceof RegExp) {
+          assert.match(message, expected);
+        } else {
+          assert.ok(
+            message.includes(String(expected)),
+            `Expected error message to include "${expected}", received "${message}"`,
+          );
+        }
+      }
+    },
+
+    toBe(expected) {
+      assert.equal(actual, expected);
+    },
+
+    toBeGreaterThanOrEqual(expected) {
+      assert.ok(
+        actual >= expected,
+        `Expected ${actual} to be greater than or equal to ${expected}`,
+      );
+    },
+
+    not: {
+      toThrow() {
+        assert.equal(typeof actual, "function");
+        assert.doesNotThrow(actual);
+      },
+    },
+  };
+}
 
 describe('SQL Injection Security Tests', () => {
   let testDb;
@@ -263,9 +322,7 @@ describe('SQL Injection Security Tests', () => {
       }).not.toThrow();
 
       // Clean up
-      if (fs.existsSync(maliciousJsonPath)) {
-        fs.unlinkSync(maliciousJsonPath);
-      }
+      removeMigrationFixture(maliciousJsonPath);
     });
 
     test('should reject invalid timestamps in JSON', () => {
@@ -297,9 +354,7 @@ describe('SQL Injection Security Tests', () => {
       expect(result).toBe(0);
 
       // Clean up
-      if (fs.existsSync(jsonPath)) {
-        fs.unlinkSync(jsonPath);
-      }
+      removeMigrationFixture(jsonPath);
     });
   });
 

@@ -64,6 +64,8 @@ export interface EventQueryOptions {
   verifiedOnly?: boolean;
   orderBy?: string;
   orderDirection?: string;
+  cursor?: string;
+  cursorField?: string;
 }
 
 export interface EventQueryResult {
@@ -294,6 +296,47 @@ const EXPECTED_SCHEMA: Record<string, ExpectedTable> = {
     ],
     indexes: [{ name: "idx_ttl_cost_cycle", columns: ["cycle_id"] }],
   },
+  auth_tokens: {
+    columns: [
+      { name: "id", type: "TEXT", notNull: true, primaryKey: true },
+      { name: "token_hash", type: "TEXT", notNull: true, primaryKey: false },
+      { name: "client_id", type: "TEXT", notNull: true, primaryKey: false },
+      { name: "description", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "status", type: "TEXT", notNull: true, primaryKey: false },
+      { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+      { name: "expires_at", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "revoked_at", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "last_used_at", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "use_count", type: "INTEGER", notNull: true, primaryKey: false },
+      { name: "rotation_group_id", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "is_legacy", type: "INTEGER", notNull: true, primaryKey: false },
+    ],
+    indexes: [
+      { name: "idx_auth_tokens_token_hash", columns: ["token_hash"] },
+      { name: "idx_auth_tokens_client_id", columns: ["client_id"] },
+      { name: "idx_auth_tokens_status", columns: ["status"] },
+      { name: "idx_auth_tokens_expires_at", columns: ["expires_at"] },
+      { name: "idx_auth_tokens_rotation_group", columns: ["rotation_group_id"] },
+    ],
+  },
+  auth_token_audit: {
+    columns: [
+      { name: "id", type: "INTEGER", notNull: true, primaryKey: true },
+      { name: "token_id", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "client_id", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "action", type: "TEXT", notNull: true, primaryKey: false },
+      { name: "path", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "method", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "ip_hash", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "success", type: "INTEGER", notNull: true, primaryKey: false },
+      { name: "error_message", type: "TEXT", notNull: false, primaryKey: false },
+      { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+    ],
+    indexes: [
+      { name: "idx_auth_audit_token_id", columns: ["token_id"] },
+      { name: "idx_auth_audit_client_id", columns: ["client_id"] },
+      { name: "idx_auth_audit_action", columns: ["action"] },
+      { name: "idx_auth_audit_created_at", columns: ["created_at"] },
   proof_commitments: {
     columns: [
       { name: "commitment_hash", type: "TEXT", notNull: true, primaryKey: true },
@@ -378,6 +421,18 @@ function validateEventTypes(types: string[]): string[] {
     throw new Error(`Invalid event types: ${invalid.join(', ')}`);
   }
   return types;
+}
+
+/**
+ * Decode a base64-encoded cursor back into its components.
+ */
+function decodeCursor(cursor: string, cursorField: string): { i?: number; l?: number; t?: string } {
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64").toString("utf-8"));
+    return decoded;
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -651,6 +706,45 @@ export function initDb(dbPath?: string): DatabaseType {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- Auth tokens table: stores hashed authentication tokens with expiration and metadata
+    CREATE TABLE IF NOT EXISTS auth_tokens (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TEXT,
+      revoked_at TEXT,
+      last_used_at TEXT,
+      use_count INTEGER NOT NULL DEFAULT 0,
+      rotation_group_id TEXT,
+      is_legacy INTEGER NOT NULL DEFAULT 0,
+      CHECK(status IN ('active', 'expired', 'revoked', 'rotating'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_token_hash ON auth_tokens(token_hash);
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_client_id ON auth_tokens(client_id);
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_status ON auth_tokens(status);
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_expires_at ON auth_tokens(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_rotation_group ON auth_tokens(rotation_group_id);
+
+    -- Auth token audit log: records all token operations and usage
+    CREATE TABLE IF NOT EXISTS auth_token_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_id TEXT,
+      client_id TEXT,
+      action TEXT NOT NULL,
+      path TEXT,
+      method TEXT,
+      ip_hash TEXT,
+      success INTEGER NOT NULL DEFAULT 1,
+      error_message TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_audit_token_id ON auth_token_audit(token_id);
+    CREATE INDEX IF NOT EXISTS idx_auth_audit_client_id ON auth_token_audit(client_id);
+    CREATE INDEX IF NOT EXISTS idx_auth_audit_action ON auth_token_audit(action);
+    CREATE INDEX IF NOT EXISTS idx_auth_audit_created_at ON auth_token_audit(created_at);
     CREATE TABLE IF NOT EXISTS proof_commitments (
       commitment_hash TEXT PRIMARY KEY,
       nullifier TEXT NOT NULL,
@@ -772,7 +866,8 @@ export function initDb(dbPath?: string): DatabaseType {
     });
   }
 
-  // Populate knownPartitions from the registry
+  // Populate knownPartitions from the active database registry.
+  knownPartitions.clear();
   const rows = database
     .prepare("SELECT dao_id FROM partition_registry")
     .all() as Array<{ dao_id: number }>;
@@ -811,9 +906,7 @@ export function initDb(dbPath?: string): DatabaseType {
     }
   }
 
-  if (!dbPath) {
-    db = database;
-  }
+  db = database;
 
   log("info", "db_initialized", {
     path: dbFile,
@@ -824,6 +917,7 @@ export function initDb(dbPath?: string): DatabaseType {
 }
 
 /**
+ * Return the initialized database instance, initializing it if needed.
  * Get active database instance or initialize default.
  * Return the initialized database instance (initializing it if needed).
  * archival.ts and backup.ts import this; it was missing from this module's
@@ -1162,6 +1256,15 @@ export function addPendingEvent(
  * SECURITY: Uses parameterized queries and validates inputs.
  */
 export function verifyEvent(txHash: string, ledger: number): void {
+  if (
+    typeof txHash !== "string" ||
+    txHash.length === 0 ||
+    txHash.length > 128 ||
+    !/^[A-Za-z0-9_-]+$/.test(txHash)
+  ) {
+    throw new Error("Invalid transaction hash");
+  }
+
   // SECURITY: Basic input validation
   if (typeof txHash !== 'string' || txHash.length === 0 || txHash.length > 128) {
     throw new Error(`Invalid txHash: ${txHash}`);
@@ -1186,6 +1289,7 @@ export function verifyEvent(txHash: string, ledger: number): void {
 
 /**
  * Get events for a DAO (from its partition).
+ * Supports both cursor-based and offset-based pagination.
  * SECURITY: Uses parameterized queries and validates all inputs.
  */
 export function getEventsForDao(
@@ -1197,12 +1301,14 @@ export function getEventsForDao(
   ensurePartitionTable(daoId);
 
   const {
-    limit = 50,
+    limit = 100,
     offset = 0,
     types = null,
     verifiedOnly = false,
     orderBy = 'timestamp',
-    orderDirection = 'DESC'
+    orderDirection = 'DESC',
+    cursor,
+    cursorField = 'id',
   } = options;
 
   // SECURITY: Validate limit and offset
@@ -1225,11 +1331,24 @@ export function getEventsForDao(
     query = query.where("verified", "=", 1);
   }
 
+  // Cursor-based pagination: filter for records after the cursor position
+  if (cursor) {
+    const decoded = decodeCursor(cursor, cursorField);
+    if (cursorField === "id") {
+      query = query.where("id", ">", decoded.i as number);
+    } else if (cursorField === "ledger") {
+      query = query.where("ledger", ">", decoded.l as number);
+    } else if (cursorField === "timestamp") {
+      query = query.where("timestamp", ">", decoded.t as string);
+    }
+  } else {
+    query = query.offset(validOffset);
+  }
+
   query = query
     .orderBy(orderColumn as any, direction.toLowerCase() as any)
     .orderBy("ledger", "desc")
-    .limit(validLimit)
-    .offset(validOffset);
+    .limit(validLimit);
 
   const compiled = query.compile();
 
@@ -1242,7 +1361,7 @@ export function getEventsForDao(
   let countQuery = kysely
     .selectFrom(sql<any>`${sql.raw(tableName)}`.as("events"))
     .select(sql<number>`COUNT(*)`.as("total"));
-    
+
   if (types && types.length > 0) {
     countQuery = countQuery.where("type", "in", validateEventTypes(types));
   }
@@ -1856,10 +1975,16 @@ export function migrateFromJson(jsonPath: string): number {
 
             // SECURITY: Validate timestamp format if provided
             const timestamp = event.timestamp ?? new Date().toISOString();
-            if (event.timestamp && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(event.timestamp)) {
-              log("warn", "json_migration_invalid_timestamp", { 
-                timestamp: event.timestamp, 
-                daoId 
+            if (
+              event.timestamp &&
+              (
+                !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(event.timestamp) ||
+                Number.isNaN(Date.parse(event.timestamp))
+              )
+            ) {
+              log("warn", "json_migration_invalid_timestamp", {
+                timestamp: event.timestamp,
+                daoId,
               });
               continue;
             }
@@ -2301,6 +2426,251 @@ export function getTotalTTLCostXLM(): number {
 }
 
 // ============================================
+// AUTH TOKEN FUNCTIONS
+// ============================================
+
+export interface AuthToken {
+  id: string;
+  tokenHash: string;
+  clientId: string;
+  description: string | null;
+  status: "active" | "expired" | "revoked" | "rotating";
+  createdAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+  useCount: number;
+  rotationGroupId: string | null;
+  isLegacy: boolean;
+}
+
+export interface AuthTokenAuditEntry {
+  id: number;
+  tokenId: string | null;
+  clientId: string | null;
+  action: string;
+  path: string | null;
+  method: string | null;
+  ipHash: string | null;
+  success: boolean;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
+function rowToAuthToken(row: Record<string, unknown>): AuthToken {
+  return {
+    id: row.id as string,
+    tokenHash: row.token_hash as string,
+    clientId: row.client_id as string,
+    description: (row.description as string) ?? null,
+    status: row.status as AuthToken["status"],
+    createdAt: row.created_at as string,
+    expiresAt: (row.expires_at as string) ?? null,
+    revokedAt: (row.revoked_at as string) ?? null,
+    lastUsedAt: (row.last_used_at as string) ?? null,
+    useCount: Number(row.use_count) || 0,
+    rotationGroupId: (row.rotation_group_id as string) ?? null,
+    isLegacy: !!row.is_legacy,
+  };
+}
+
+export function createAuthToken(token: {
+  id: string;
+  tokenHash: string;
+  clientId: string;
+  description?: string | null;
+  expiresAt?: string | null;
+  rotationGroupId?: string | null;
+  isLegacy?: boolean;
+}): void {
+  const database = initDb();
+  const query = `
+    INSERT INTO auth_tokens (id, token_hash, client_id, description, expires_at, rotation_group_id, is_legacy)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `;
+  const params = [
+    token.id,
+    token.tokenHash,
+    token.clientId,
+    token.description ?? null,
+    token.expiresAt ?? null,
+    token.rotationGroupId ?? null,
+    token.isLegacy ? 1 : 0,
+  ];
+  logQuery(query, params, "create_auth_token");
+  database.prepare(query).run(...params);
+}
+
+export function getAuthTokenByHash(tokenHash: string): AuthToken | null {
+  const database = initDb();
+  const row = database
+    .prepare("SELECT * FROM auth_tokens WHERE token_hash = ?")
+    .get(tokenHash) as Record<string, unknown> | undefined;
+  return row ? rowToAuthToken(row) : null;
+}
+
+export function getAuthTokenById(id: string): AuthToken | null {
+  const database = initDb();
+  const row = database
+    .prepare("SELECT * FROM auth_tokens WHERE id = ?")
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? rowToAuthToken(row) : null;
+}
+
+export function getAllAuthTokens(): AuthToken[] {
+  const database = initDb();
+  const rows = database
+    .prepare("SELECT * FROM auth_tokens ORDER BY created_at DESC")
+    .all() as Record<string, unknown>[];
+  return rows.map(rowToAuthToken);
+}
+
+export function getActiveAuthTokens(): AuthToken[] {
+  const now = new Date().toISOString();
+  const database = initDb();
+  const rows = database
+    .prepare(
+      `SELECT * FROM auth_tokens 
+       WHERE status = 'active' 
+       AND (expires_at IS NULL OR expires_at > ?)
+       ORDER BY created_at DESC`,
+    )
+    .all(now) as Record<string, unknown>[];
+  return rows.map(rowToAuthToken);
+}
+
+export function getValidAuthTokens(transitionMs: number): AuthToken[] {
+  const now = new Date().toISOString();
+  const transitionCutoff = new Date(Date.now() - transitionMs).toISOString();
+  const database = initDb();
+  const rows = database
+    .prepare(
+      `SELECT * FROM auth_tokens 
+       WHERE (
+         status = 'active' 
+         AND (expires_at IS NULL OR expires_at > ?)
+       ) OR (
+         status = 'rotating'
+         AND revoked_at IS NOT NULL
+         AND revoked_at > ?
+       )
+       ORDER BY created_at DESC`,
+    )
+    .all(now, transitionCutoff) as Record<string, unknown>[];
+  return rows.map(rowToAuthToken);
+}
+
+export function updateAuthTokenStatus(
+  id: string,
+  status: AuthToken["status"],
+): void {
+  const database = initDb();
+  const query = "UPDATE auth_tokens SET status = ? WHERE id = ?";
+  logQuery(query, [status, id], "update_auth_token_status");
+  database.prepare(query).run(status, id);
+}
+
+export function revokeAuthToken(id: string): void {
+  const database = initDb();
+  const query =
+    "UPDATE auth_tokens SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP WHERE id = ?";
+  logQuery(query, [id], "revoke_auth_token");
+  database.prepare(query).run(id);
+}
+
+export function markTokenRotated(oldId: string, newId: string): void {
+  const database = initDb();
+  database.transaction(() => {
+    // Mark old token as rotating
+    database
+      .prepare(
+        "UPDATE auth_tokens SET status = 'rotating', revoked_at = CURRENT_TIMESTAMP WHERE id = ?",
+      )
+      .run(oldId);
+    // New token is already inserted by caller with same rotation_group_id
+  })();
+}
+
+export function recordTokenUsage(
+  id: string,
+  ipHash: string | null,
+): void {
+  const database = initDb();
+  const query =
+    "UPDATE auth_tokens SET last_used_at = CURRENT_TIMESTAMP, use_count = use_count + 1 WHERE id = ?";
+  logQuery(query, [id], "record_token_usage");
+  database.prepare(query).run(id);
+}
+
+export function expireAuthTokens(): number {
+  const now = new Date().toISOString();
+  const database = initDb();
+  const query = `
+    UPDATE auth_tokens SET status = 'expired' 
+    WHERE status = 'active' 
+    AND expires_at IS NOT NULL 
+    AND expires_at <= ?
+  `;
+  logQuery(query, [now], "expire_auth_tokens");
+  const result = database.prepare(query).run(now);
+  return result.changes;
+}
+
+export function cleanupRevokedTokens(maxAgeMs = 7_776_000_000): number {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const database = initDb();
+  const query = `
+    DELETE FROM auth_tokens 
+    WHERE status IN ('revoked', 'expired', 'rotating') 
+    AND revoked_at IS NOT NULL 
+    AND revoked_at < ?
+  `;
+  logQuery(query, [cutoff], "cleanup_revoked_tokens");
+  const result = database.prepare(query).run(cutoff);
+  return result.changes;
+}
+
+export function getAuthTokensByClient(clientId: string): AuthToken[] {
+  const database = initDb();
+  const rows = database
+    .prepare("SELECT * FROM auth_tokens WHERE client_id = ? ORDER BY created_at DESC")
+    .all(clientId) as Record<string, unknown>[];
+  return rows.map(rowToAuthToken);
+}
+
+export function getTokensNeedingRotation(maxAgeMs: number): AuthToken[] {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const database = initDb();
+  const rows = database
+    .prepare(
+      `SELECT * FROM auth_tokens 
+       WHERE status = 'active' 
+       AND is_legacy = 0
+       AND created_at < ?
+       AND (rotation_group_id IS NULL OR id IN (
+         SELECT MIN(id) FROM auth_tokens WHERE rotation_group_id IS NOT NULL GROUP BY rotation_group_id
+       ))
+       ORDER BY created_at ASC`,
+    )
+    .all(cutoff) as Record<string, unknown>[];
+  return rows.map(rowToAuthToken);
+}
+
+// ============================================
+// AUTH TOKEN AUDIT LOG FUNCTIONS
+// ============================================
+
+function rowToAuditEntry(row: Record<string, unknown>): AuthTokenAuditEntry {
+  return {
+    id: Number(row.id),
+    tokenId: (row.token_id as string) ?? null,
+    clientId: (row.client_id as string) ?? null,
+    action: row.action as string,
+    path: (row.path as string) ?? null,
+    method: (row.method as string) ?? null,
+    ipHash: (row.ip_hash as string) ?? null,
+    success: !!row.success,
+    errorMessage: (row.error_message as string) ?? null,
 // PROOF COMMITMENT STORAGE
 // ============================================
 
@@ -2354,6 +2724,77 @@ export function getProofCommitment(commitmentHash: string): ProofCommitmentRecor
   };
 }
 
+export function recordAuthAudit(entry: {
+  tokenId?: string | null;
+  clientId?: string | null;
+  action: string;
+  path?: string | null;
+  method?: string | null;
+  ipHash?: string | null;
+  success?: boolean;
+  errorMessage?: string | null;
+}): void {
+  const database = initDb();
+  const query = `
+    INSERT INTO auth_token_audit (token_id, client_id, action, path, method, ip_hash, success, error_message)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+  const params = [
+    entry.tokenId ?? null,
+    entry.clientId ?? null,
+    entry.action,
+    entry.path ?? null,
+    entry.method ?? null,
+    entry.ipHash ?? null,
+    entry.success !== false ? 1 : 0,
+    entry.errorMessage ?? null,
+  ];
+  database.prepare(query).run(...params);
+}
+
+export function getAuditLog(
+  options: {
+    tokenId?: string;
+    clientId?: string;
+    action?: string;
+    limit?: number;
+    offset?: number;
+  } = {},
+): AuthTokenAuditEntry[] {
+  const { tokenId, clientId, action, limit = 100, offset = 0 } = options;
+  const database = initDb();
+
+  let query = "SELECT * FROM auth_token_audit WHERE 1=1";
+  const params: (string | number)[] = [];
+
+  if (tokenId) {
+    query += " AND token_id = ?";
+    params.push(tokenId);
+  }
+  if (clientId) {
+    query += " AND client_id = ?";
+    params.push(clientId);
+  }
+  if (action) {
+    query += " AND action = ?";
+    params.push(action);
+  }
+
+  query += " ORDER BY id DESC LIMIT ? OFFSET ?";
+  params.push(limit, offset);
+
+  const rows = database.prepare(query).all(...params) as Record<string, unknown>[];
+  return rows.map(rowToAuditEntry);
+}
+
+export function cleanupAuditLog(maxAgeMs = 15_552_000_000): number {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const database = initDb();
+  const result = database
+    .prepare("DELETE FROM auth_token_audit WHERE created_at < ?")
+    .run(cutoff);
+  return result.changes;
+}
 export function updateProofCommitmentStatus(
   commitmentHash: string,
   status: "COMMITTED" | "REVEALED" | "EXPIRED",

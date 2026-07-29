@@ -19,7 +19,7 @@ Scope: current multi-tenant Soroban contracts (registry, membership-sbt, members
 - **Can learn**: proposal metadata, tallies, events (nullifier values are public on-chain), membership state they already manage. No access to secrets.
 - **Can do**: set/rotate VK for their DAO; create proposals; mint/revoke/reinstate SBTs via membership contracts; initialize tree params per DAO; emit events; pause new proposals by withholding VK; choose vote mode (Fixed/Trailing) when creating proposals.
 - **Cannot do**: see voter identities; override votes or edit tallies (no admin entrypoint); accept proofs without proper VK/root/nullifier checks; change VK for an existing proposal (vk_hash is snapshotted and enforced); bypass nullifier replay protection.
-- Nullifier domain separation: circuit expects `nullifier = H(secret, dao_id, proposal_id)`; on-chain storage keyed by `(dao_id, proposal_id, nullifier)` to prevent reuse across proposals/DAOs.
+- Nullifier domain separation: circuit expects `nullifier = H(secret, dao_id, proposal_id)`; on-chain storage keyed by `(dao_id, proposal_id, nullifier)` to prevent reuse across proposals/DAOs. Election identity is `(dao_id, proposal_id)` — never a flat global `NullifierUsed(hash)` map (issue #64). Legacy global entries, if any, migrate via `migrate_nullifier`. Backend nullifier queries must include both election IDs (`GET /nullifier/:daoId/:proposalId/:nullifier`).
 
 ## Code Alignment Checks (current repo)
 - `contracts/voting/src/lib.rs`: no admin override path; nullifier checked first; VK hash snapshotted per proposal; root checks enforce snapshot/trailing rules; proof verification bound to public signals (dao/proposal/root/nullifier/choice/commitment); set_vk gated by registry admin.
@@ -137,5 +137,39 @@ The client exposes `generateFakeZKCredentials()` (`frontend/src/lib/zk.ts`). Thi
 - Relay: structured logging with redaction; configurable log retention; coarser error responses; optional cover traffic/backoff to reduce correlation; explicit anti-censorship monitoring (missing votes vs submissions).
 - Contracts: coarse error codes to avoid fine-grained leakage; optional per-contract versioning + upgrade events; ensure membership/admin checks stay isolated.
 - Ops: monitor relayer availability; document user guidance (do not mix identifiable transactions around anonymous voting).
+
+## Post-Quantum Risk Assessment & Hybrid Defense Model (Issue #115)
+
+### Quantum Threat Vectors to ZKVote Primitives
+Quantum computing presents two distinct threat paradigms for cryptographic systems:
+
+1. **Shor's Algorithm ($O(n^3)$ Polynomial Time Breakdown)**:
+   - **Target**: Discrete Logarithm Problem (DLP) over elliptic curves (BN254 curve, pairing-based Groth16 zk-SNARKs).
+   - **Impact**: Shor's algorithm completely breaks BN254 curve discrete logarithm and pairing security.
+   - **System Property at Risk**: **Long-Term Vote Privacy & Voter Anonymity**. An adversary with a quantum computer can solve the discrete log of published Groth16 proofs or commitment signatures, recovering the underlying voter secrets and opening historical vote choices recorded on-chain.
+   - **Soundness Impact**: An attacker could forge Groth16 proofs without possessing valid Merkle membership branches, violating soundness.
+
+2. **Grover's Algorithm ($O(\sqrt{N})$ Quadratic Speedup)**:
+   - **Target**: Cryptographic hash functions (Poseidon, SHA-256, SHA3-256).
+   - **Impact**: Grover's algorithm reduces preimage and collision resistance strength by half (e.g. 256-bit hash has ~128-bit quantum security).
+   - **System Property at Risk**: Minimal risk if output size is $\ge 256$ bits. Poseidon-256 and SHA3-256 maintain 128-bit post-quantum security against Grover's algorithm, which remains practically infeasible to attack.
+
+### System Property Risk Matrix
+
+| System Property | Primitive Used | Quantum Vulnerability | Shor/Grover Risk Level | Hybrid / PQ Defense |
+| :--- | :--- | :--- | :--- | :--- |
+| **Vote Choice Confidentiality** | BN254 Groth16 Proof | Broken by Shor's algorithm | **CRITICAL (Long-term)** | Hybrid Hash Commitment + STARKs |
+| **Voter Anonymity / Leaf Privacy** | Poseidon Merkle Tree + BN254 | BN254 broken by Shor's; Poseidon ~128-bit PQ | **HIGH** | Post-Quantum SHA3 Merkle Layer |
+| **Double-Voting Prevention** | Nullifier Hash ($H(secret, dao, prop)$) | Dependent on Poseidon hash collision resistance | **LOW** | 256-bit PQ Nullifier ($H_{SHA3}$) |
+| **On-chain Tally Soundness** | Soroban Smart Contract Verification | Groth16 verifier broken by Shor's | **HIGH (Future)** | STARK / FRI Proof Verifier |
+
+### Hybrid Post-Quantum Commitment Scheme
+To protect votes cast today against quantum decryption decades in the future, ZKVote employs a **Hybrid PQ Commitment Layer**:
+- Alongside classical BN254 Poseidon commitments, each vote produces a **Quantum-Resistant Hash Commitment** $C_{PQ} = \text{SHA3-256}(secret \parallel salt \parallel dao\_id \parallel proposal\_id)$.
+- Information-theoretic hiding / preimage resistance of SHA3-256 is unaffected by Shor's algorithm, ensuring that recorded on-chain vote transcripts cannot be retroactively opened even if BN254 curve discrete log is solved.
+
+### Post-Quantum Migration Strategy
+See [`docs/post-quantum-evaluation.md`](file:///home/uche/ZK-VOTE/docs/post-quantum-evaluation.md) and [`docs/post-quantum-roadmap.md`](file:///home/uche/ZK-VOTE/docs/post-quantum-roadmap.md) for the STARK circuit evaluation (Cairo/Miden vs Groth16) and multi-phase transition roadmap.
+
 - Coercion resistance: implement re-voting window and registrar tally filter (see #96).
 - Tally proofs: add `verify_tally_proof` contract entrypoint and circuit for universal verifiability (see #94).

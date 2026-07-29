@@ -1,10 +1,18 @@
 {
   "name": "zkvote-circuits",
   "version": "1.0.0",
+  "circomVersion": "2.1.8",
   "description": "Circom circuits for ZKVote anonymous voting",
   "main": "index.js",
   "scripts": {
+    "compile": "../scripts/compile-circuits.sh",
+    "compile:docker": "../scripts/compile-circuits.sh --docker",
+    "compile:direct": "circom vote.circom --r1cs --wasm --sym -o build",
     "compile": "circom vote.circom --r1cs --wasm --sym -o build",
+    "compile:qv": "circom quadratic_vote_main.circom --r1cs --wasm --sym -o build/quadratic_vote",
+    "setup:qv": "snarkjs groth16 setup build/quadratic_vote/quadratic_vote_main.r1cs pot14_final.ptau build/quadratic_vote/quadratic_vote_0000.zkey",
+    "export-vkey:qv": "snarkjs zkey export verificationkey build/quadratic_vote/quadratic_vote_final.zkey build/quadratic_vote/verification_key.json",
+    "test:qv": "jest --testPathPattern=quadratic",
     "setup": "snarkjs groth16 setup build/vote.r1cs pot14_final.ptau build/vote_0000.zkey",
     "contribute": "snarkjs zkey contribute build/vote_0000.zkey build/vote_final.zkey --name='ZKVote Phase 1' -v",
     "export-vkey": "snarkjs zkey export verificationkey build/vote_final.zkey build/verification_key.json",
@@ -12,6 +20,8 @@
     "witness": "node build/vote_js/generate_witness.js build/vote_js/vote.wasm input.json witness.wtns",
     "prove": "snarkjs groth16 prove build/vote_final.zkey witness.wtns proof.json public.json",
     "verify": "snarkjs groth16 verify build/verification_key.json public.json proof.json",
+    "verify:artifacts": "../scripts/verify-circuits.sh",
+    "checksums": "sha256sum build/vote.r1cs build/vote_js/vote.wasm build/verification_key.json build/verification_key_soroban.json > checksums.sha256",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"

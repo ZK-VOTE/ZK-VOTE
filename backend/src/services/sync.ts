@@ -28,6 +28,7 @@ import {
   daosSynced,
   membershipSyncsTotal,
 } from "./metrics.js";
+import { markDegraded, markHealthy } from "./service-health.js";
 import { sharedSingleFlight } from "../utils/singleflight.js";
 
 // ============================================
@@ -390,19 +391,24 @@ export function startDaoSync(): void {
   syncDaosFromContract()
     .then((count) => {
       log("info", "initial_dao_sync", { count });
+      markHealthy("dao_sync");
     })
     .catch((err) => {
+      markDegraded("dao_sync", (err as Error).message);
       log("error", "initial_dao_sync_failed", {
         error: (err as Error).message,
       });
     });
 
   daoSyncInterval = setInterval(() => {
-    syncDaosFromContract().catch((err) => {
-      log("error", "periodic_dao_sync_failed", {
-        error: (err as Error).message,
+    syncDaosFromContract()
+      .then(() => markHealthy("dao_sync"))
+      .catch((err) => {
+        markDegraded("dao_sync", (err as Error).message);
+        log("error", "periodic_dao_sync_failed", {
+          error: (err as Error).message,
+        });
       });
-    });
   }, config.daoSyncIntervalMs);
 
   log("info", "dao_sync_started", { intervalMs: config.daoSyncIntervalMs });

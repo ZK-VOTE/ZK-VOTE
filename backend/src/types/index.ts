@@ -82,6 +82,8 @@ export interface VoteRequest {
   nullifier: U256Hex;
   root: U256Hex;
   proof: Groth16Proof;
+  voterPublicKey?: string;
+  voterSignature?: string;
 }
 
 // ============================================

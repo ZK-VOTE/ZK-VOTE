@@ -118,19 +118,64 @@ export async function fetchCommentContent(
   }
 }
 
-// Fetch all comments for a proposal
-export async function fetchComments(
+export interface PaginatedResult<T> {
+  data: T[];
+  pagination: {
+    cursor: string | undefined;
+    hasMore: boolean;
+    total: number;
+  };
+}
+
+// Fetch all comments for a proposal (paginated, auto-loads all pages)
+async function fetchAllComments(
   daoId: number,
   proposalId: number,
 ): Promise<CommentInfo[]> {
-  const response = await relayerFetch(`/comments/${daoId}/${proposalId}`);
+  const allComments: CommentInfo[] = [];
+  let cursor: string | undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    const url = cursor
+      ? `/comments/${daoId}/${proposalId}?cursor=${encodeURIComponent(cursor)}`
+      : `/comments/${daoId}/${proposalId}`;
+
+    const response = await relayerFetch(url);
+    if (!response.ok) {
+      if (response.status === 404) return allComments;
+      throw new Error("Failed to fetch comments");
+    }
+
+    const data: PaginatedResult<CommentInfo> = await response.json();
+    allComments.push(...data.data);
+    hasMore = data.pagination.hasMore;
+    cursor = data.pagination.cursor;
+  }
+
+  return allComments;
+}
+
+// Fetch comments with pagination support (returns first page only)
+export async function fetchComments(
+  daoId: number,
+  proposalId: number,
+  cursor?: string,
+): Promise<PaginatedResult<CommentInfo>> {
+  const url = cursor
+    ? `/comments/${daoId}/${proposalId}?cursor=${encodeURIComponent(cursor)}`
+    : `/comments/${daoId}/${proposalId}`;
+
+  const response = await relayerFetch(url);
   if (!response.ok) {
-    // If endpoint doesn't exist yet, return empty array
-    if (response.status === 404) return [];
+    if (response.status === 404) {
+      return { data: [], pagination: { cursor: undefined, hasMore: false, total: 0 } };
+    }
     throw new Error("Failed to fetch comments");
   }
-  const data = await response.json();
-  return data.comments || [];
+
+  const data: PaginatedResult<CommentInfo> = await response.json();
+  return data;
 }
 
 /**

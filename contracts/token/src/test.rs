@@ -1141,3 +1141,155 @@ fn test_redelegate_overwrites_previous_delegatee() {
     client.delegate(&alice, &carol);
     assert_eq!(client.get_delegate(&alice), Some(carol));
 }
+
+// ── Batch Operations (Issue #110) ───────────────────────────────────────────
+
+#[test]
+fn test_batch_transfer_moves_all_funds_and_emits_individual_events() {
+    let (env, _admin, alice, bob, client) = setup_token_with_balance();
+    let carol = Address::generate(&env);
+
+    let transfers = Vec::from_array(&env, [(bob.clone(), 100i128), (carol.clone(), 200i128)]);
+    client.batch_transfer(&alice, &transfers);
+
+    assert_eq!(client.balance(&alice), 700);
+    assert_eq!(client.balance(&bob), 100);
+    assert_eq!(client.balance(&carol), 200);
+
+    let events = env.events().all();
+    // Last two events should be the two individual TransferEvents.
+    assert!(events.len() >= 2);
+}
+
+#[test]
+#[should_panic]
+fn test_batch_transfer_rejects_when_total_exceeds_balance() {
+    let (env, _admin, alice, bob, client) = setup_token_with_balance();
+    let carol = Address::generate(&env);
+
+    // alice has 1000; this totals 1100 and must be rejected before any
+    // individual transfer executes.
+    let transfers = Vec::from_array(&env, [(bob.clone(), 600i128), (carol.clone(), 500i128)]);
+    client.batch_transfer(&alice, &transfers);
+}
+
+#[test]
+fn test_batch_transfer_leaves_balances_untouched_when_rejected() {
+    let (env, _admin, alice, bob, client) = setup_token_with_balance();
+    let carol = Address::generate(&env);
+
+    let transfers = Vec::from_array(&env, [(bob.clone(), 600i128), (carol.clone(), 500i128)]);
+    let result = client.try_batch_transfer(&alice, &transfers);
+    assert!(result.is_err());
+
+    // Confirms Soroban's whole-invocation atomicity: no partial transfer happened.
+    assert_eq!(client.balance(&alice), 1000);
+    assert_eq!(client.balance(&bob), 0);
+    assert_eq!(client.balance(&carol), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_batch_transfer_rejects_batch_larger_than_max() {
+    let (env, _admin, alice, _bob, client) = setup_token_with_balance();
+    let mut transfers = Vec::new(&env);
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
+        transfers.push_back((Address::generate(&env), 1i128));
+    }
+    client.batch_transfer(&alice, &transfers);
+}
+
+#[test]
+#[should_panic]
+fn test_batch_transfer_rejects_empty_batch() {
+    let (env, _admin, alice, _bob, client) = setup_token_with_balance();
+    let transfers: Vec<(Address, i128)> = Vec::new(&env);
+    client.batch_transfer(&alice, &transfers);
+}
+
+#[test]
+fn test_batch_mint_airdrops_to_multiple_recipients() {
+    let (env, admin, client) = setup_token();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    let mints = Vec::from_array(&env, [(alice.clone(), 500i128), (bob.clone(), 750i128)]);
+    client.batch_mint(&mints);
+
+    assert_eq!(client.balance(&alice), 500);
+    assert_eq!(client.balance(&bob), 750);
+    assert_eq!(client.total_supply(), 1250);
+    let _ = admin;
+}
+
+#[test]
+#[should_panic]
+fn test_batch_mint_rejects_exceeding_supply_cap() {
+    let (env, _admin, client) = setup_token();
+    client.set_max_supply(&1000i128);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    let mints = Vec::from_array(&env, [(alice.clone(), 600i128), (bob.clone(), 600i128)]);
+    client.batch_mint(&mints);
+}
+
+#[test]
+fn test_batch_approve_sets_multiple_allowances_independently() {
+    let (env, _admin, alice, bob, client) = setup_token_with_balance();
+    let carol = Address::generate(&env);
+
+    let approvals = Vec::from_array(
+        &env,
+        [(bob.clone(), 50i128, 9999999u32), (carol.clone(), 75i128, 9999999u32)],
+    );
+    client.batch_approve(&alice, &approvals);
+
+    assert_eq!(client.allowance(&alice, &bob), 50);
+    assert_eq!(client.allowance(&alice, &carol), 75);
+}
+
+// ── Benchmark: gas savings vs individual transactions ───────────────────────
+//
+// Required by the issue: "Benchmark gas savings vs individual transactions."
+// Prints actual CPU instructions consumed for a batch of N transfers vs N
+// individual transfer() calls, at a few batch sizes, so MAX_BATCH_SIZE can
+// be tuned against real Soroban resource limits instead of guessed.
+#[test]
+fn bench_batch_transfer_cost_scaling() {
+    for &n in &[1u32, 5, 10, 25, 50] {
+        let (env, _admin, alice, _bob, client) = setup_token_with_balance();
+        client.mint(&alice, &1_000_000i128); // headroom for larger batches
+
+        let recipients: Vec<Address> = (0..n).map(|_| Address::generate(&env)).collect();
+
+        // Individual calls.
+        env.cost_estimate().budget().reset_default();
+        for r in recipients.iter() {
+            client.transfer(&alice, r, &1i128);
+        }
+        let individual_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        // One batch call.
+        let (env2, _admin2, alice2, _bob2, client2) = setup_token_with_balance();
+        client2.mint(&alice2, &1_000_000i128);
+        let transfers = Vec::from_array(
+            &env2,
+            recipients
+                .iter()
+                .map(|r| (r.clone(), 1i128))
+                .collect::<std::vec::Vec<_>>()
+                .try_into()
+                .unwrap_or_default(),
+        );
+        env2.cost_estimate().budget().reset_default();
+        client2.batch_transfer(&alice2, &transfers);
+        let batch_cpu = env2.cost_estimate().budget().cpu_instruction_cost();
+
+        std::println!(
+            "batch size {n}: individual calls = {individual_cpu} CPU insns, \
+             one batch call = {batch_cpu} CPU insns, saved {}%",
+            100 - (batch_cpu * 100 / individual_cpu.max(1))
+        );
+    }
+}

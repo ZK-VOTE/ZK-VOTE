@@ -17,6 +17,7 @@ export function useMounted(): boolean {
 
   // eslint-disable-next-line react-hooks/set-state-in-effect -- hydration guard: must signal client mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMounted(true);
   }, []);
 

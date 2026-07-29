@@ -18,60 +18,74 @@ import {
   auditLog,
   queryLimiter,
   validateParams,
+  noteDegraded,
 } from "../middleware/index.js";
+import { getServiceHealth } from "../services/service-health.js";
 import { daoParamsSchema } from "../validation/schemas.js";
+  validateQuery,
+} from "../middleware/index.js";
+import { daoParamsSchema, daosQuerySchema } from "../validation/schemas.js";
 import type { AsyncHandler, DaoWithRole } from "../types/index.js";
 
 const router = Router();
 
 /**
- * GET /daos - Get all DAOs (with optional user membership info)
+ * GET /daos - Get all DAOs with limit/offset pagination
  */
-router.get("/daos", queryLimiter, (async (req: Request, res: Response) => {
+router.get("/daos", queryLimiter, validateQuery(daosQuerySchema), (async (req: Request, res: Response) => {
+  const { limit, offset, user } = (req as any).validatedQuery;
+
   try {
-    const daos = dbService.getAllCachedDaos();
-    const lastSync = dbService.getDaosSyncTime();
-    const userAddress = req.query.user as string | undefined;
+    const allDaos = dbService.getAllCachedDaos();
+    let filteredDaos = allDaos;
 
     if (!userAddress) {
+      const syncHealth = getServiceHealth("dao_sync") as { state: string };
+      if (syncHealth.state !== "healthy") {
+        noteDegraded("dao_sync");
+      }
       return res.json({
         daos,
         total: daos.length,
         lastSync,
         cached: true,
+      if (user) {
+      if (!/^[GC][A-Z2-7]{55}$/.test(user)) {
+        return res.status(400).json({ error: "Invalid Stellar address format" });
+      }
+      filteredDaos = allDaos.map((dao) => {
+        const adminAddr = daoAdminsCache.get(dao.id) || dao.creator;
+        if (adminAddr === user) {
+          return { ...dao, role: "admin" as const };
+        }
+        const members = daoMembersCache.get(dao.id);
+        if (members && members.has(user)) {
+          return { ...dao, role: "member" as const };
+        }
+        return { ...dao, role: null };
       });
     }
 
-    // Validate address
-    if (!/^[GC][A-Z2-7]{55}$/.test(userAddress)) {
-      return res.status(400).json({ error: "Invalid Stellar address format" });
-    }
+    const total = filteredDaos.length;
+    const paginatedDaos = filteredDaos.slice(offset, offset + limit);
+    const hasMore = offset + limit < total;
 
-    // Use global membership cache
-    const daosWithRoles: DaoWithRole[] = daos.map((dao) => {
-      const adminAddr = daoAdminsCache.get(dao.id) || dao.creator;
-      if (adminAddr === userAddress) {
-        return { ...dao, role: "admin" as const };
-      }
-
-      const members = daoMembersCache.get(dao.id);
-      if (members && members.has(userAddress)) {
-        return { ...dao, role: "member" as const };
-      }
-
-      return { ...dao, role: null };
-    });
-
-    log("info", "get_daos_with_membership", {
-      user: userAddress.slice(0, 8) + "...",
-      count: daos.length,
-      cachedDaos: daoMembersCache.size,
+    log("info", "get_daos_paginated", {
+      user: user?.slice(0, 8) + "...",
+      count: paginatedDaos.length,
+      total,
+      offset,
+      limit,
     });
 
     res.json({
-      daos: daosWithRoles,
-      total: daosWithRoles.length,
-      lastSync,
+      data: paginatedDaos,
+      pagination: {
+        cursor: hasMore ? String(offset + limit) : undefined,
+        hasMore,
+        total,
+      },
+      lastSync: dbService.getDaosSyncTime(),
       cached: true,
     });
   } catch (err) {

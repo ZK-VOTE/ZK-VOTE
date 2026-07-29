@@ -213,6 +213,7 @@ describe("ProposalCard", () => {
       mockGetZKCredentials.mockReturnValue({
         secret: "123",
         salt: "456",
+        blindingFactor: "999",
         commitment: "789",
         leafIndex: 0,
       });
@@ -256,6 +257,7 @@ describe("ProposalCard", () => {
       mockGetZKCredentials.mockReturnValue({
         secret: "123",
         salt: "456",
+        blindingFactor: "999",
         commitment: "789",
         leafIndex: 0,
       });
@@ -279,6 +281,7 @@ describe("ProposalCard", () => {
       mockGetZKCredentials.mockReturnValue({
         secret: "123",
         salt: "456",
+        blindingFactor: "999",
         commitment: "789",
         leafIndex: 0,
       });
@@ -414,6 +417,7 @@ describe("ProposalCard with VoteModal", () => {
     mockGetZKCredentials.mockReturnValue({
       secret: "123",
       salt: "456",
+      blindingFactor: "999",
       commitment: "789",
       leafIndex: 0,
     });

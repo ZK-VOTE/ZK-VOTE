@@ -27,6 +27,9 @@ import {
   queryLimiter,
   validateBody,
   validateParams,
+  noteDegraded,
+  sendPartial,
+  validateQuery,
 } from "../middleware/index.js";
 import {
   anonymousCommentSchema,
@@ -34,6 +37,7 @@ import {
   commentParamsSchema,
   proposalParamsSchema,
   commitmentParamsSchema,
+  commentCountQuerySchema,
 } from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
 import { generateChallenge, verifyChallenge } from "../services/pow.js";
@@ -44,6 +48,14 @@ import {
   getHiddenCommentIds,
 } from "../services/anti-spam.js";
 import { commentsSubmitted } from "../services/metrics.js";
+import {
+  markDegraded,
+  markHealthy,
+  markUnavailable,
+  setLkg,
+  getLkg,
+  commentsLkgKey,
+} from "../services/service-health.js";
 
 const router = Router();
 
@@ -432,14 +444,14 @@ router.get("/comments/:daoId/:proposalId/nonce", queryLimiter, validateParams(pr
 // ============================================
 
 /**
- * GET /comments/:daoId/:proposalId - Get comments for a proposal
+ * GET /comments/:daoId/:proposalId - Get comments for a proposal with pagination
  */
-router.get("/comments/:daoId/:proposalId", queryLimiter, validateParams(proposalParamsSchema), (async (
+router.get("/comments/:daoId/:proposalId", queryLimiter, validateParams(proposalParamsSchema), validateQuery(commentCountQuerySchema), (async (
   req: Request,
   res: Response,
 ) => {
   const { daoId, proposalId } = (req as any).validatedParams;
-  const { limit = "50", offset = "0" } = req.query;
+  const { limit, offset } = (req as any).validatedQuery;
 
   try {
     const contract = new StellarSdk.Contract(config.commentsContractId!);
@@ -448,7 +460,7 @@ router.get("/comments/:daoId/:proposalId", queryLimiter, validateParams(proposal
       StellarSdk.nativeToScVal(daoId, { type: "u64" }),
       StellarSdk.nativeToScVal(proposalId, { type: "u64" }),
       StellarSdk.nativeToScVal(parseInt(offset as string), { type: "u64" }),
-      StellarSdk.nativeToScVal(Math.min(parseInt(limit as string), 100), {
+      StellarSdk.nativeToScVal(Math.min(parseInt(limit as string), 500), {
         type: "u64",
       }),
     ];
@@ -500,20 +512,76 @@ router.get("/comments/:daoId/:proposalId", queryLimiter, validateParams(proposal
           hidden: hiddenIds.has(c.id),
         }));
 
-        res.json({ comments: filtered, total: filtered.length });
+        const payload = { comments: filtered, total: filtered.length };
+        setLkg(commentsLkgKey(daoId, proposalId), payload);
+        markHealthy("comments");
+        res.json(payload);
+        const total = filtered.length;
+        const hasMore = total === limit;
+
+        res.json({
+          data: filtered,
+          pagination: {
+            cursor: hasMore ? String(offset + limit) : undefined,
+            hasMore,
+            total,
+          },
+        });
       } else {
-        res.json({ comments: [], total: 0 });
+        res.json({
+          data: [],
+          pagination: {
+            cursor: undefined,
+            hasMore: false,
+            total: 0,
+          },
+        });
       }
     } else {
       res.status(400).json({ error: "Failed to get comments" });
     }
   } catch (err) {
+    const message = (err as Error).message;
     log("error", "get_comments_failed", {
       daoId,
       proposalId,
-      error: (err as Error).message,
+      error: message,
     });
-    res.status(500).json({ error: "Failed to fetch comments" });
+
+    // Disable comments UX when contract/RPC unavailable — serve LKG if present
+    if (!config.commentsContractId) {
+      markUnavailable("comments", "comments contract not configured");
+      noteDegraded("comments");
+      return res.status(503).json({
+        error: "Comments system unavailable",
+        disabled: true,
+      });
+    }
+
+    markDegraded("comments", message);
+    noteDegraded("comments");
+    const cached = getLkg<{ comments: unknown[]; total: number }>(
+      commentsLkgKey(daoId, proposalId),
+    );
+    if (cached) {
+      return sendPartial(
+        res,
+        {
+          comments: cached.comments,
+          total: cached.total,
+          stale: true,
+          source: "last_known_good",
+        },
+        ["comments"],
+      );
+    }
+
+    res.status(503).json({
+      error: "Comments temporarily unavailable",
+      disabled: true,
+      comments: [],
+      total: 0,
+    });
   }
 }) as AsyncHandler);
 
