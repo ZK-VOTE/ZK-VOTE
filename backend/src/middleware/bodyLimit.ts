@@ -8,6 +8,7 @@
  */
 
 import express, { type RequestHandler } from "express";
+import multer from "multer";
 
 import { log } from "../services/logger.js";
 
@@ -32,3 +33,31 @@ export function bodyLimit(limit: string): RequestHandler {
     });
   };
 }
+
+/**
+ * Per-Upload Memory Limit
+ * 
+ * Wraps Multer with memory storage and a fixed per-route file size limit (in
+ * bytes) to prevent memory exhaustion. The in-memory buffer also enables
+ * downstream magic-byte, dimension, EXIF, and malware validation.
+ */
+export function uploadLimit(limit: number): RequestHandler {
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: limit, files: 1 },
+  });
+
+  return (req, res, next) => {
+    upload.single("file")(req, res, (err: unknown) => {
+      if (err) {
+        log("warn", "upload_rejected", {
+          path: req.path,
+          limit,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      next(err);
+    });
+  };
+}
+
