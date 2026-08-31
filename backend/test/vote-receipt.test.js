@@ -4,7 +4,20 @@ import {
   storeVoteReceipt,
   getVoteReceipt,
   getVoteReceiptsByDao,
+  upsertDao,
 } from "../src/services/db.js";
+
+// vote_receipts.dao_id references daos(id); seed the DAOs these tests insert
+// against so the FK constraint holds regardless of shared database state.
+for (const id of [1, 2, 42, 43]) {
+  upsertDao({
+    id,
+    name: `test-dao-${id}`,
+    creator: "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN",
+    membership_open: true,
+    members_can_propose: true,
+  });
+}
 
 test("vote-receipt: stores and retrieves vote receipt", () => {
   const testNullifier = `test-nullifier-${Date.now()}`;

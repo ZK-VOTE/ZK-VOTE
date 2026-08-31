@@ -429,33 +429,35 @@ export async function callWithTimeout<T>(
 }
 
 /**
- * Wait for transaction confirmation.
+ * Wait for transaction confirmation (#172).
  *
- * Polls getTransaction up to maxAttempts times (1 second apart).
- * Note: callers may also wrap this in callWithTimeout for an outer
- * deadline -- the two timeouts are intentionally independent: this
- * loop controls polling cadence while callWithTimeout enforces a
- * hard wall-clock limit.
+ * Delegates to the shared confirmation queue: a single background worker polls
+ * `getTransaction` with exponential backoff + jitter (starting at ~2s), with a
+ * configurable wall-clock deadline. Concurrent waiters for the same hash are
+ * coalesced, resolutions are broadcast to connected frontends over WebSocket,
+ * and confirmation times are tracked in Prometheus metrics.
+ *
+ * Backward compatible: `waitForTransaction(hash, maxAttempts)` treats the
+ * numeric argument as a cap on the number of polls; callers may also pass a
+ * `WaitForTransactionOptions` object (see services/confirmation-queue.ts).
+ *
+ * Note: callers may still wrap this in callWithTimeout for an outer deadline
+ * -- the queue enforces its own wall-clock budget while callWithTimeout
+ * provides a hard per-request limit.
  */
-export async function waitForTransaction(
-  hash: string,
-  maxAttempts = 30,
-): Promise<StellarSdk.rpc.Api.GetTransactionResponse> {
-  let attempts = 0;
-
-  while (attempts < maxAttempts) {
-    const result = await (server as StellarSdk.rpc.Server).getTransaction(hash);
-
-    if (result.status !== "NOT_FOUND") {
-      return result;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    attempts++;
-  }
-
-  throw new Error("Transaction not found after timeout");
-}
+export {
+  waitForTransaction,
+  getConfirmationStatus,
+  getConfirmationQueueStats,
+  startConfirmationWorker,
+  stopConfirmationWorker,
+  TransactionConfirmationTimeoutError,
+} from "./confirmation-queue.js";
+export type {
+  ConfirmationState,
+  ConfirmationStatus,
+  WaitForTransactionOptions,
+} from "./confirmation-queue.js";
 
 /**
  * Simulate with backoff/retry

@@ -88,6 +88,51 @@
           "ipfsEnabled"
         ]
       },
+      "TxStatusResponse": {
+        "type": "object",
+        "properties": {
+          "hash": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "CONFIRMED",
+              "FAILED",
+              "EXPIRED",
+              "UNKNOWN"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "attempts": {
+            "type": "number"
+          },
+          "elapsedMs": {
+            "type": "number"
+          },
+          "error": {
+            "type": "string"
+          },
+          "enqueuedAt": {
+            "type": "string"
+          },
+          "confirmedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hash",
+          "state",
+          "attempts",
+          "elapsedMs"
+        ]
+      },
       "SuccessResponse": {
         "type": "object",
         "properties": {
@@ -311,6 +356,90 @@
                   "queries": {},
                   "tables": [],
                   "cache": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tx/{hash}": {
+      "get": {
+        "tags": [
+          "Transactions"
+        ],
+        "summary": "Confirmation status for a transaction hash (polling fallback)",
+        "description": "Rate limit: queryLimiter.",
+        "security": [],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "description": "Transaction hash",
+              "example": "a1b2c3...64hex"
+            },
+            "required": true,
+            "name": "hash",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TxStatusResponse"
+                },
+                "example": {
+                  "hash": "a1b2c3...64hex",
+                  "state": "PENDING",
+                  "status": "NOT_FOUND",
+                  "attempts": 1,
+                  "elapsedMs": 2500
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tx/stats": {
+      "get": {
+        "tags": [
+          "Transactions"
+        ],
+        "summary": "Confirmation queue and WebSocket hub diagnostics",
+        "description": "Rate limit: queryLimiter.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "queue": {
+                    "running": true,
+                    "pending": 3,
+                    "cached": 5
+                  },
+                  "websocket": {
+                    "attached": true,
+                    "connectedClients": 2,
+                    "path": "/ws/confirmations",
+                    "enabled": true
+                  }
                 }
               }
             }
@@ -1316,7 +1445,6 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 500,
-              "description": "Page size (default 100)",
               "example": 100
             },
             "required": false,
@@ -1325,19 +1453,7 @@
           },
           {
             "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Rows to skip (default 0)",
-              "example": 0
-            },
-            "required": false,
-            "name": "offset",
-            "in": "query"
-          },
-          {
-            "schema": {
               "type": "string",
-              "description": "Opaque cursor from a previous pagination.cursor; alias for offset",
               "example": "100"
             },
             "required": false,
@@ -1361,26 +1477,6 @@
                   },
                   "lastSync": null,
                   "cached": true
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error (HTTP 400)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error (HTTP 500)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2423,7 +2519,9 @@
         "parameters": [
           {
             "schema": {
-              "type": "string"
+              "type": "string",
+              "description": "DAO identifier",
+              "example": "0"
             },
             "required": true,
             "name": "dao",
@@ -2433,9 +2531,11 @@
             "schema": {
               "type": "string",
               "enum": [
-                "comment",
-                "vote"
-              ]
+                "vote",
+                "comment"
+              ],
+              "description": "Circuit type",
+              "example": "vote"
             },
             "required": true,
             "name": "type",
@@ -2536,96 +2636,6 @@
                   "total": 0,
                   "limit": 50,
                   "offset": 0
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Error (HTTP 401)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error (HTTP 500)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/admin/sbt-transfer-attempts": {
-      "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Review flagged membership-SBT transfer/approval attempts for a DAO (admin only)",
-        "description": "Rate limit: queryLimiter.",
-        "security": [
-          {
-            "RelayerAuth": []
-          }
-        ],
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "example": "1"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "example": "50"
-            },
-            "required": false,
-            "name": "limit",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "example": "0"
-            },
-            "required": false,
-            "name": "offset",
-            "in": "query"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "daoId": 1,
-                  "attempts": [],
-                  "total": 0,
-                  "limit": 50,
-                  "offset": 0
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error (HTTP 400)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }

@@ -50,6 +50,14 @@ import {
   waitForSequenceLockIdle,
 } from "./services/stellar.js";
 import {
+  startConfirmationWorker,
+  stopConfirmationWorker,
+} from "./services/confirmation-queue.js";
+import {
+  attachConfirmationHub,
+  closeConfirmationHub,
+} from "./services/confirmation-hub.js";
+import {
   startDaoSync,
   stopDaoSync,
   startMembershipSync,
@@ -74,7 +82,16 @@ import {
 import { closeDb } from "./services/db.js";
 
 // Middleware
-import { csrfGuard, requestLogger, errorHandler, auditMiddleware } from "./middleware/index.js";
+import {
+  csrfGuard,
+  csrfTokenMiddleware,
+  requestLogger,
+  errorHandler,
+  auditMiddleware,
+  graduatedSlowDown,
+  degradationContext,
+  metricsMiddleware,
+} from "./middleware/index.js";
 
 // Routes
 import {
@@ -89,7 +106,17 @@ import {
   initIndexerRoutes,
   bridgeRoutes,
   circuitRoutes,
+  transactionRoutes,
+  authRoutes,
+  quadraticRoutes,
+  metricsRoutes,
+  remediationRoutes,
+  novaRoutes,
+  adminRoutes,
+  thresholdRoutes,
+  auditRoutes,
 } from "./routes/index.js";
+import { registerShutdownHandler } from "./routes/admin.js";
 import openApiSpec from "./openapi.js";
 
 // ============================================
@@ -203,11 +230,17 @@ app.use(cors(corsOptions));
 // Logging middleware
 app.use(requestLogger);
 
+// Graduated throttling (delays before a client is hard rate-limited)
+app.use(graduatedSlowDown);
+
 // Audit middleware - must be after body parsing and requestLogger, before routes
 // Audits every mutating route (POST/PUT/PATCH/DELETE) with PII redaction, append-only
 app.use(auditMiddleware);
 
-// CSRF protection (applied globally)
+// CSRF token generation for safe methods (GET, HEAD, OPTIONS)
+app.use(csrfTokenMiddleware);
+
+// CSRF protection (applied globally for write methods)
 app.use(csrfGuard);
 
 // ============================================
@@ -230,6 +263,69 @@ app.use(claimRoutes);
 app.use(indexerRoutes);
 app.use(bridgeRoutes);
 app.use(circuitRoutes);
+app.use(transactionRoutes);
+app.use(authRoutes);
+app.use(quadraticRoutes);
+app.use("/api/v1/nova", novaRoutes);
+app.use(noStore, adminRoutes);
+app.use(noStore, thresholdRoutes);
+app.use(auditRoutes);
+
+// ============================================
+// API VERSIONING (#139)
+// ============================================
+// URL-based versioning: mount the same routers under /api/v1 in addition to
+// the existing unversioned paths, so existing clients keep working while new
+// clients can opt into the explicit, cache-friendly versioned path. A
+// response header also advertises which version served the request.
+app.use((_req, res, next) => {
+  res.setHeader("API-Version", "v1");
+  next();
+});
+
+const v1Router = express.Router();
+
+function mountV1(): void {
+  v1Router.use(metricsRoutes);
+  v1Router.use(healthRoutes);
+  v1Router.use(remediationRoutes);
+  v1Router.use(noStore, votingRoutes);
+  v1Router.use(daoRoutes);
+  v1Router.use(ipfsRoutes);
+  v1Router.use(commentsRoutes);
+  v1Router.use(claimRoutes);
+  v1Router.use(indexerRoutes);
+  v1Router.use(bridgeRoutes);
+  v1Router.use(circuitRoutes);
+  v1Router.use(transactionRoutes);
+  v1Router.use(quadraticRoutes);
+  v1Router.use(noStore, adminRoutes);
+  v1Router.use(noStore, thresholdRoutes);
+  v1Router.use(auditRoutes);
+}
+
+mountV1();
+app.use("/api/v1", v1Router);
+
+// OpenAPI spec + interactive docs
+const openApiDocument = buildOpenApiDocument();
+app.get("/openapi.json", (_req, res) => res.json(openApiSpec));
+app.get("/api-docs/openapi.json", (_req, res) => res.json(openApiDocument));
+app.use(
+  "/api-docs",
+  // helmet's default CSP blocks the inline scripts/styles Swagger UI's
+  // bundled assets need; relax it for this documentation-only route.
+  (
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) => {
+    res.removeHeader("Content-Security-Policy");
+    next();
+  },
+  swaggerUi.serve,
+  swaggerUi.setup(openApiDocument),
+);
 
 // Global error handler (must be last)
 app.use(errorHandler);
@@ -292,49 +388,38 @@ async function gracefulShutdown(reason: string): Promise<void> {
   stopBackgroundServices();
   stopAuthScheduler();
   stopWalResilience();
+  closeConfirmationHub();
   log("info", "shutdown_component_stopped", {
     component: "background_services",
   });
 
   await httpClosed;
 
-    // Keep the startup banner on stdout for human-readable output
-    console.log(`\nZKVote Relayer running on http://localhost:${PORT}`);
+  // Drain in-flight sequence-locked chain submissions before closing the DB,
+  // so a proof is never accepted but left unsubmitted.
+  const pendingSequenceOps = getPendingSequenceLockOps();
+  if (pendingSequenceOps > 0) {
+    log("info", "shutdown_draining_sequence_lock", {
+      pending: pendingSequenceOps,
+      pid: process.pid,
+    });
+  }
+  const drained = await waitForSequenceLockIdle(DRAIN_TIMEOUT_MS);
+  log(drained ? "info" : "warn", "shutdown_sequence_lock_drained", {
+    drained,
+    remaining: getPendingSequenceLockOps(),
+    pid: process.pid,
+  });
 
-    logger.info("endpoints_registered", {
-      core: [
-        "/health",
-        "/ready",
-        "/config",
-        "/vote",
-        "/proposal/:dao/:prop",
-        "/root/:dao",
-        "/events/:daoId",
-        "/events/notify",
-        "/indexer/status",
-      ],
-      comments: [
-        "/comment/anonymous",
-        "/comments/:dao/:prop",
-        "/comments/:dao/:prop/nonce",
-        "/comment/:dao/:prop/:id",
-        "/comment/edit",
-        "/comment/delete",
-      ],
-      bridge: [
-        "/bridge/vote",
-        "/bridge/nullifier/:daoId/:proposalId/:nullifier",
-        "/bridge/relay",
-      ],
-      ipfs: config.ipfsEnabled
-        ? [
-            "/ipfs/image",
-            "/ipfs/metadata",
-            "/ipfs/:cid",
-            "/ipfs/image/:cid",
-            "/ipfs/health",
-          ]
-        : [],
+  // Close the SQLite connection cleanly (checkpoints WAL, avoids corruption
+  // on restart).
+  try {
+    closeDb();
+    log("info", "shutdown_component_stopped", { component: "database" });
+  } catch (err) {
+    log("error", "shutdown_db_close_error", {
+      error: (err as Error).message,
+      pid: process.pid,
     });
   }
 
@@ -466,6 +551,10 @@ async function startBackgroundServices(): Promise<void> {
     });
     void gracefulShutdown("memory_threshold");
   });
+
+  // Dedicated confirmation worker (#172): single poller for all outstanding
+  // transaction-confirmation waits, with exponential backoff + jitter.
+  startConfirmationWorker();
 }
 
 function stopBackgroundServices(): void {
@@ -481,6 +570,9 @@ function stopBackgroundServices(): void {
   stopSbtTransferWatch();
   stopPinMonitor();
   stopMemoryMonitor();
+
+  // Drain any outstanding confirmation waits so callers never hang on exit.
+  void stopConfirmationWorker();
 }
 
 // ============================================
@@ -574,6 +666,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       } else {
         await startBackgroundServices();
       }
+
+      // Attach the confirmation WebSocket hub (#172) so frontends receive
+      // push notifications the moment a transaction confirms. `httpServer` is
+      // assigned synchronously by app.listen() before this callback fires.
+      attachConfirmationHub(httpServer!);
     });
 
     registerWorkerShutdownHandler((reason) => {

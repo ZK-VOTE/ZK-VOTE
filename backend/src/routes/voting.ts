@@ -181,12 +181,6 @@ router.post(
       commitmentHash,
       timestamp,
       walletAddress,
-      choice,
-      root,
-      proof,
-      scNullifier,
-      scRoot,
-      scProof,
     } = req.body;
 
     const now = Date.now();
@@ -204,37 +198,10 @@ router.post(
         .json({ error: "Invalid timestamp: timestamp is in the future" });
     }
 
-    if (config.testMode) {
-      if (!voteExecutorOverride) {
-        return res.status(400).json({
-          error: "Simulation failed (test mode)",
-        });
-      }
-
-      const execution = await voteExecutorOverride({
-        daoId,
-        proposalId,
-        choice,
-        nullifier,
-        root,
-        proof,
-        scNullifier,
-        scRoot,
-        scProof,
-      });
-
-      if (nullifier && execution.sendResult.hash) {
-        recordTransactionLog(nullifier, execution.sendResult.hash, "PENDING");
-      }
-
-      return respondToVoteExecution(
-        res,
-        execution,
-        nullifier,
-        daoId,
-        proposalId,
-      );
-    }
+    // Commit is a pure DB write (records the commitment for later reveal) —
+    // it never submits a transaction, so it must not route through the
+    // vote executor even in test mode. Recording the commitment is what the
+    // reveal step (POST /vote) checks against for replay protection.
     const existingCommitment = getProofCommitment(commitmentHash);
     if (existingCommitment && existingCommitment.status === "REVEALED") {
       return res
@@ -486,7 +453,32 @@ router.post(
       }
 
       if (config.testMode) {
-        return res.status(400).json({ error: "Simulation failed (test mode)" });
+        // The external Stellar boundary is replaceable in test mode; without
+        // an override, the submission is reported as unavailable.
+        if (!voteExecutorOverride) {
+          return res.status(400).json({ error: "Simulation failed (test mode)" });
+        }
+        const execution = await voteExecutorOverride({
+          daoId,
+          proposalId,
+          choice,
+          nullifier,
+          root,
+          proof,
+          scNullifier,
+          scRoot,
+          scProof,
+        });
+        if (nullifier && execution.sendResult.hash) {
+          recordTransactionLog(nullifier, execution.sendResult.hash, "PENDING");
+        }
+        return respondToVoteExecution(
+          res,
+          execution,
+          nullifier,
+          daoId,
+          proposalId,
+        );
       }
 
       // Build contract call

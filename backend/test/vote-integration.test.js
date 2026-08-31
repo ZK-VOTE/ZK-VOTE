@@ -29,10 +29,21 @@ const {
   initDb,
   closeDb,
   getTransactionLog,
+  upsertDao,
 } = await import("../src/services/db.js");
 
 test("POST /vote completes a successful vote flow", async (t) => {
   initDb(dbPath);
+
+  // vote_receipts.dao_id references daos(id); seed the DAO so the receipt
+  // insert on confirmation doesn't trip the FK constraint.
+  upsertDao({
+    id: 7,
+    name: "DAO 7",
+    creator: "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN",
+    membership_open: true,
+    members_can_propose: true,
+  });
 
   t.after(() => {
     setVoteExecutorForTests(null);
@@ -71,7 +82,7 @@ test("POST /vote completes a successful vote flow", async (t) => {
       proof: {
         a: "11".repeat(64),
         b: "22".repeat(128),
-        c: "33".repeat(64),
+        c: "0f".repeat(64),
       },
     });
 

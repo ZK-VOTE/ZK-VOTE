@@ -215,6 +215,97 @@ Database diagnostics (query metrics, table stats, cache stats). Full detail requ
 
 ---
 
+## Transactions
+
+### GET /tx/:hash
+
+Confirmation status for a transaction hash. Serves as the polling fallback for frontends that do not (or cannot) use the WebSocket confirmation feed. The backend answers from its confirmation queue state (pending / cached outcome) and falls back to a single `getTransaction` lookup for hashes it has never seen.
+
+**Authentication:** No
+**Rate Limit:** 60/min (queryLimiter)
+
+#### Path Parameters
+
+| Field  | Type     | Required | Description                         |
+|--------|----------|----------|-------------------------------------|
+| `hash` | `string` | Yes      | 64-character lowercase hex Stellar transaction hash |
+
+#### Example Request
+
+```bash
+curl http://localhost:3001/tx/a1b2c3d4e5f6...64hex
+```
+
+#### Response (200)
+
+`state` is one of `PENDING`, `CONFIRMED`, `FAILED`, `EXPIRED`, or `UNKNOWN`:
+
+```json
+{
+  "hash": "a1b2c3d4e5f6...64hex",
+  "state": "PENDING",
+  "status": "NOT_FOUND",
+  "attempts": 1,
+  "elapsedMs": 2500,
+  "enqueuedAt": "2026-08-31T00:00:00.000Z"
+}
+```
+
+Once resolved, `state` is `CONFIRMED`/`FAILED` (with the raw `getTransaction` result) or `EXPIRED` (never confirmed within the wait budget):
+
+```json
+{
+  "hash": "a1b2c3d4e5f6...64hex",
+  "state": "CONFIRMED",
+  "status": "SUCCESS",
+  "attempts": 2,
+  "elapsedMs": 4200,
+  "confirmedAt": "2026-08-31T00:00:05.000Z"
+}
+```
+
+#### Error Responses
+
+| Status | Error                                        | Cause                      |
+|--------|----------------------------------------------|----------------------------|
+| 400    | `"Invalid transaction hash (expected 64 hex characters)"` | Malformed hash  |
+| 500    | `"Failed to resolve transaction status"`    | Internal error             |
+
+---
+
+### GET /tx/stats
+
+Diagnostics for the confirmation queue and WebSocket hub: aggregate counters only (no per-hash data), matching the `/health` pattern.
+
+**Authentication:** No
+**Rate Limit:** 60/min (queryLimiter)
+
+#### Example Request
+
+```bash
+curl http://localhost:3001/tx/stats
+```
+
+#### Response (200)
+
+```json
+{
+  "queue": {
+    "running": true,
+    "pending": 3,
+    "cached": 5
+  },
+  "websocket": {
+    "attached": true,
+    "connectedClients": 2,
+    "path": "/ws/confirmations",
+    "enabled": true
+  }
+}
+```
+
+---
+
 ## Voting
 
 ### POST /vote
@@ -1356,9 +1447,9 @@ When `hasMore` is `false`, there are no additional pages. Pass the `cursor` valu
 
 ---
 
-### GET /events/archived
+### GET /indexer/status
 
-Get the current status of the event indexer.
+Get the current status of the event indexer (polling state, checkpoint, lag).
 
 **Authentication:** No
 **Rate Limit:** 60/min (queryLimiter)
@@ -1373,10 +1464,12 @@ curl http://localhost:3001/indexer/status
 
 ```json
 {
-  "running": true,
-  "lastPoll": "2025-01-01T00:00:00Z",
-  "eventsProcessed": 150,
-  "errors": 0
+  "isRunning": true,
+  "indexerLag": 0,
+  "hasGap": false,
+  "catchUpMode": false,
+  "checkpoint": "2026-08-31T00:00:00.000Z",
+  "db": { "totalEvents": 0, "daoCount": 0, "lastLedger": 0 }
 }
 ```
 

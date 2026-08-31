@@ -290,6 +290,29 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  // Transaction confirmation queue (#172): confirmation polling is delegated
+  // to a single background worker that polls with exponential backoff + jitter.
+  CONFIRMATION_QUEUE_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  CONFIRMATION_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(2000),
+  CONFIRMATION_MAX_DELAY_MS: z.coerce.number().int().positive().default(30000),
+  CONFIRMATION_MAX_WAIT_MS: z.coerce.number().int().positive().default(60000),
+  CONFIRMATION_BACKOFF_FACTOR: z.coerce.number().min(1).default(2),
+  CONFIRMATION_JITTER_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  CONFIRMATION_RESULT_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
+
+  // WebSocket confirmation notifications (#172)
+  CONFIRMATION_WS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  CONFIRMATION_WS_PATH: z.string().default("/ws/confirmations"),
 });
 
 type EnvConfig = z.infer<typeof envSchema>;
@@ -402,6 +425,7 @@ export const config = {
   membershipSbtContractId: process.env.MEMBERSHIP_SBT_CONTRACT_ID,
   bridgeContractId: process.env.BRIDGE_CONTRACT_ID,
   circuitRegistryContractId: process.env.CIRCUIT_REGISTRY_CONTRACT_ID,
+  rewardsContractId: process.env.REWARDS_CONTRACT_ID,
 
   // VK Version
   staticVkVersion: validatedEnv.VOTING_VK_VERSION,
@@ -526,6 +550,19 @@ export const config = {
 
   // Test mode
   testMode: validatedEnv.RELAYER_TEST_MODE,
+
+  // Transaction confirmation queue (#172)
+  confirmationQueueEnabled: validatedEnv.CONFIRMATION_QUEUE_ENABLED,
+  confirmationInitialDelayMs: validatedEnv.CONFIRMATION_INITIAL_DELAY_MS,
+  confirmationMaxDelayMs: validatedEnv.CONFIRMATION_MAX_DELAY_MS,
+  confirmationMaxWaitMs: validatedEnv.CONFIRMATION_MAX_WAIT_MS,
+  confirmationBackoffFactor: validatedEnv.CONFIRMATION_BACKOFF_FACTOR,
+  confirmationJitterEnabled: validatedEnv.CONFIRMATION_JITTER_ENABLED,
+  confirmationResultCacheTtlMs: validatedEnv.CONFIRMATION_RESULT_CACHE_TTL_MS,
+
+  // WebSocket confirmation notifications (#172)
+  confirmationWsEnabled: validatedEnv.CONFIRMATION_WS_ENABLED,
+  confirmationWsPath: validatedEnv.CONFIRMATION_WS_PATH,
 } as const;
 
 // ============================================
@@ -564,7 +601,7 @@ export const ALLOWED_IMAGE_MIMES = [
 
 // BN254 field modulus (p)
 export const BN254_MODULUS = BigInt(
-  "218882428718392752222464057452572750885483644004160343698204186575808495617",
+  "21888242871839275222246405745257275088548364400416034343698204186575808495617",
 );
 
 // BN254 scalar field modulus (r)
@@ -587,10 +624,15 @@ export function validateEnv(): void {
 
   if (!config.votingContractId) errors.push("VOTING_CONTRACT_ID is required");
   if (!config.treeContractId) errors.push("TREE_CONTRACT_ID is required");
-  if (!config.commentsContractId)
+  // The comments contract is optional in test mode (many service tests boot
+  // without it); outside tests it gates the comment relay endpoints.
+  if (!config.commentsContractId && !config.testMode)
     errors.push("COMMENTS_CONTRACT_ID is required");
   if (!config.relayerSecretKey) errors.push("RELAYER_SECRET_KEY is required");
-  if (!config.authMasterKey) errors.push("AUTH_MASTER_KEY is required");
+  // AUTH_MASTER_KEY gates the token-management endpoints; it is optional in
+  // test mode so service tests can boot without a master key.
+  if (!config.authMasterKey && !config.testMode)
+    errors.push("AUTH_MASTER_KEY is required");
 
   if (config.votingContractId && !isValidContractId(config.votingContractId)) {
     errors.push(
@@ -604,6 +646,16 @@ export function validateEnv(): void {
     );
   }
 
+  // Report missing optional env vars so operators notice gaps. Critical keys
+  // abort startup; non-critical ones only warn in test mode.
+  const requiredKeys = [
+    "VOTING_CONTRACT_ID",
+    "TREE_CONTRACT_ID",
+    "COMMENTS_CONTRACT_ID",
+    "RELAYER_SECRET_KEY",
+    "RELAYER_AUTH_TOKEN",
+  ];
+  const missing = requiredKeys.filter((k) => !process.env[k]);
   const criticalKeys = ["VOTING_CONTRACT_ID", "TREE_CONTRACT_ID", "RELAYER_SECRET_KEY", "RELAYER_AUTH_TOKEN"];
   const criticalMissing = missing.filter((k) => criticalKeys.includes(k));
   const nonCriticalMissing = missing.filter((k) => !criticalKeys.includes(k));
@@ -677,16 +729,21 @@ export function validateEnv(): void {
     );
   }
 
-  if (config.commentsContractId && !isValidContractId(config.commentsContractId)) {
+  // In test mode, a missing OR placeholder comments contract is allowed
+  // (warned above, not fatal) so service tests can boot without one.
+  if (
+    config.commentsContractId &&
+    !isValidContractId(config.commentsContractId) &&
+    !config.testMode
+  ) {
     console.error(
       JSON.stringify({
         level: "error",
         event: "invalid_contract_id",
-        var: "REWARDS_CONTRACT_ID",
-        value: config.rewardsContractId,
+        var: "COMMENTS_CONTRACT_ID",
+        value: config.commentsContractId,
       }),
     );
     process.exit(1);
   }
-  // In test mode, missing comments contract is allowed (warned above, not fatal)
 }

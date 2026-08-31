@@ -1,4 +1,4 @@
-import { initDb } from "./db.js";
+import { getReadDb, getWriteDb } from "./db.js";
 import { log } from "./logger.js";
 import { kysely } from "./kysely.js";
 import { sql } from "kysely";
@@ -23,7 +23,7 @@ export function checkCommitmentRateLimit(
   maxPerWindow: number,
   windowMs: number,
 ): boolean {
-  const database = initDb();
+  const database = getReadDb();
   const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
 
   const query = kysely
@@ -59,7 +59,7 @@ export function recordCommentSubmission(
   proposalId: number,
   windowMs: number,
 ): void {
-  const database = initDb();
+  const database = getWriteDb();
   const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
 
   const query = kysely
@@ -89,7 +89,7 @@ export function flagComment(
   flaggerNullifier: string,
   threshold: number,
 ): FlagResult {
-  const database = initDb();
+  const database = getWriteDb();
 
   const existingQuery = kysely
     .selectFrom("comment_flags")
@@ -201,7 +201,7 @@ export function getFlagStatus(
   daoId: number,
   proposalId: number,
 ): FlagStatus {
-  const database = initDb();
+  const database = getReadDb();
 
   const flagCountQuery = kysely
     .selectFrom("comment_flags")
@@ -238,7 +238,7 @@ export function getHiddenCommentIds(
   daoId: number,
   proposalId: number,
 ): number[] {
-  const database = initDb();
+  const database = getReadDb();
   const query = kysely
     .selectFrom("hidden_comments")
     .select("comment_id")

@@ -64,6 +64,9 @@ const bn254Field = z.string().refine(
  * Soroban host's job at proof-verification time (see module comment above).
  */
 function coordinatesInFieldRange(paddedHex: string, count: number): boolean {
+  // Non-hex input (e.g. a malformed proof from a client) must fail validation
+  // cleanly instead of throwing a SyntaxError out of BigInt() (#172).
+  if (!/^[0-9a-fA-F]+$/.test(paddedHex)) return false;
   const coordHexLen = paddedHex.length / count;
   for (let i = 0; i < count; i++) {
     const coordHex = paddedHex.slice(i * coordHexLen, (i + 1) * coordHexLen);

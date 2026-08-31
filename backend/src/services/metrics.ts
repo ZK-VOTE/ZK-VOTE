@@ -369,6 +369,67 @@ export const memoryThresholdBreachesTotal = new Counter({
 });
 
 // ============================================
+// TRANSACTION CONFIRMATION METRICS (#172)
+// ============================================
+
+export const txConfirmationsTotal = new Counter({
+  name: "zkvote_tx_confirmations_total",
+  help: "Total transaction confirmations resolved by the confirmation queue",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const txConfirmationDuration = new Histogram({
+  name: "zkvote_tx_confirmation_duration_seconds",
+  help: "Time from enqueue to confirmation resolution in seconds",
+  labelNames: ["status"] as const,
+  buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120],
+  registers: [register],
+});
+
+export const txConfirmationAttempts = new Histogram({
+  name: "zkvote_tx_confirmation_attempts",
+  help: "Number of getTransaction polls performed per confirmation",
+  labelNames: ["status"] as const,
+  buckets: [1, 2, 3, 4, 5, 8, 12, 16, 24, 32],
+  registers: [register],
+});
+
+export const txConfirmationQueueDepth = new Gauge({
+  name: "zkvote_tx_confirmation_queue_depth",
+  help: "Number of transactions currently pending confirmation",
+  registers: [register],
+});
+
+export const txConfirmationCacheSize = new Gauge({
+  name: "zkvote_tx_confirmation_cache_size",
+  help: "Number of transaction confirmation results currently cached",
+  registers: [register],
+});
+
+export const txConfirmationPollTotal = new Counter({
+  name: "zkvote_tx_confirmation_polls_total",
+  help: "Total getTransaction polls performed by the confirmation worker",
+  registers: [register],
+});
+
+// ============================================
+// WEBSOCKET METRICS (#172)
+// ============================================
+
+export const wsConnections = new Gauge({
+  name: "zkvote_ws_connections",
+  help: "Number of currently connected WebSocket clients",
+  registers: [register],
+});
+
+export const wsMessagesSent = new Counter({
+  name: "zkvote_ws_messages_sent_total",
+  help: "Total WebSocket messages sent to connected clients",
+  registers: [register],
+});
+
+// ============================================
 // HELPER: Normalise route labels
 // ============================================
 

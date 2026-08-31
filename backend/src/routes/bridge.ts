@@ -33,7 +33,7 @@ const router = Router();
 // VALIDATION SCHEMAS
 // ============================================
 
-const bridgeVoteSchema = z.object({
+export const bridgeVoteSchema = z.object({
   daoId: z.number().int().positive(),
   proposalId: z.number().int().positive(),
   voteChoice: z.number().int().min(0).max(1),

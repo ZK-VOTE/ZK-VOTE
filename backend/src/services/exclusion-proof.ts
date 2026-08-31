@@ -6,9 +6,39 @@
  * to check revocation status.
  */
 
-import { Proof } from "./proof-system.js";
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
+import type { Database as DatabaseType } from "better-sqlite3";
+
+/**
+ * The `member_revocations` table is created lazily so the revocation-tracking
+ * feature works on fresh databases (including test databases) without
+ * requiring a migration to have run first. Idempotent and cheap after the
+ * first call.
+ */
+const REVOCATIONS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS member_revocations (
+  commitment TEXT NOT NULL,
+  dao_id INTEGER NOT NULL,
+  revoked_at INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  reinstated_at INTEGER,
+  PRIMARY KEY (commitment, dao_id)
+)`;
+
+function ensureRevocationsTable(db: DatabaseType): void {
+  db.exec(REVOCATIONS_TABLE_SQL);
+}
+
+/** Base shape of a Groth16 proof with arbitrary public inputs. */
+export interface Proof {
+  proof: {
+    a: string;
+    b: string;
+    c: string;
+  };
+  publicInputs: Record<string, unknown>;
+}
 
 export interface ExclusionProof extends Proof {
   publicInputs: {
@@ -130,15 +160,19 @@ async function checkRevocationStatus(
   _treeContractId: string,
 ): Promise<RevocationStatus> {
   const db = getDb();
+  ensureRevocationsTable(db);
 
-  const revocationRecord = db
-    .selectFrom("member_revocations")
-    .where("commitment", "==", commitment)
-    .where("dao_id", "==", daoId)
-    .selectAll()
-    .executeTakeFirst();
+  const row = db
+    .prepare(
+      `SELECT revoked_at, reinstated_at
+       FROM member_revocations
+       WHERE commitment = ? AND dao_id = ?`,
+    )
+    .get(commitment, daoId) as
+    | { revoked_at: number; reinstated_at: number | null }
+    | undefined;
 
-  if (!revocationRecord) {
+  if (!row) {
     return {
       isRevoked: false,
       commitment,
@@ -147,8 +181,8 @@ async function checkRevocationStatus(
 
   return {
     isRevoked: true,
-    revokedAt: revocationRecord.revoked_at,
-    reinstatedAt: revocationRecord.reinstated_at || undefined,
+    revokedAt: row.revoked_at,
+    reinstatedAt: row.reinstated_at ?? undefined,
     commitment,
   };
 }
@@ -177,21 +211,20 @@ export async function recordRevocation(
   timestamp: number,
 ): Promise<void> {
   const db = getDb();
+  ensureRevocationsTable(db);
 
-  db.insertInto("member_revocations")
-    .values({
-      commitment,
-      dao_id: daoId,
-      revoked_at: timestamp,
-      created_at: new Date().toISOString(),
-    })
-    .executeTakeFirst()
-    .catch((err) => {
-      log("error", "revocation_record_failed", {
-        commitment: commitment.slice(0, 10),
-        error: (err as Error).message,
-      });
+  try {
+    db.prepare(
+      `INSERT OR IGNORE INTO member_revocations
+         (commitment, dao_id, revoked_at, created_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(commitment, daoId, timestamp, new Date().toISOString());
+  } catch (err) {
+    log("error", "revocation_record_failed", {
+      commitment: commitment.slice(0, 10),
+      error: (err as Error).message,
     });
+  }
 }
 
 /**
@@ -203,16 +236,18 @@ export async function recordReinstatement(
   timestamp: number,
 ): Promise<void> {
   const db = getDb();
+  ensureRevocationsTable(db);
 
-  db.updateTable("member_revocations")
-    .set({ reinstated_at: timestamp })
-    .where("commitment", "==", commitment)
-    .where("dao_id", "==", daoId)
-    .executeTakeFirst()
-    .catch((err) => {
-      log("error", "reinstatement_record_failed", {
-        commitment: commitment.slice(0, 10),
-        error: (err as Error).message,
-      });
+  try {
+    db.prepare(
+      `UPDATE member_revocations
+       SET reinstated_at = ?
+       WHERE commitment = ? AND dao_id = ?`,
+    ).run(timestamp, commitment, daoId);
+  } catch (err) {
+    log("error", "reinstatement_record_failed", {
+      commitment: commitment.slice(0, 10),
+      error: (err as Error).message,
     });
+  }
 }

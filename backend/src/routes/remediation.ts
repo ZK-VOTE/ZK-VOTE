@@ -14,7 +14,7 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { authGuard, queryLimiter } from "../middleware/index.js";
+import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import {
   appendAudit,
   isIdempotencyKeyUsed,
@@ -119,7 +119,7 @@ function validateRemediationBody(body: any): { valid: boolean; error?: string } 
  * POST /remediation/action - Submit structured remediation action
  * Requires auth (authz), append-only, replay-safe
  */
-router.post("/remediation/action", authGuard, (async (req: Request, res: Response) => {
+router.post("/remediation/action", bodyLimit("100kb"), authGuard, (async (req: Request, res: Response) => {
   const validation = validateRemediationBody(req.body);
   if (!validation.valid) {
     return res.status(400).json({ error: validation.error });
@@ -269,7 +269,7 @@ router.get("/remediation/:id", authGuard, queryLimiter, (req: Request, res: Resp
  * POST /remediation/verify - Verify remediation log integrity (immutable check)
  * Returns hash chain to prove append-only
  */
-router.post("/remediation/verify", authGuard, (req: Request, res: Response) => {
+router.post("/remediation/verify", bodyLimit("100kb"), authGuard, (req: Request, res: Response) => {
   // Compute simple hash chain of remediation log to prove no tampering
   let prevHash = "0".repeat(64);
   const chain: Array<{ id: string; hash: string; prevHash: string }> = [];

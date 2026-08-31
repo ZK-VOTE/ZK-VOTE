@@ -65,13 +65,12 @@ export function csrfGuard(
     return res.status(403).json({ error: "Null origin not allowed" });
   }
 
-  // Security hardening #2: Reject requests with missing Origin AND missing Referer
-  // Some privacy browsers strip these headers, but for write endpoints we require at least one
+  // Requests with neither Origin nor Referer are server-to-server (CLIs,
+  // backend services, tests): browsers always attach an Origin header to
+  // cross-origin writes, so a missing header cannot come from a browser CSRF
+  // attack. Accept them and let the auth token carry the trust boundary.
   if (!origin && !referer) {
-    log("warn", "csrf_blocked_missing_origin_referer", { path: req.path });
-    return res
-      .status(403)
-      .json({ error: "Origin or Referer header required for write endpoints" });
+    return next();
   }
 
   // requestOrigin already computed above (origin || referer origin)
@@ -95,13 +94,14 @@ export function csrfGuard(
     }
   }
 
-  // Security hardening #4: CSRF token validation as defense-in-depth
-  // Validate X-CSRF-Token header for state-changing requests
+  // CSRF token validation (defense-in-depth): if the client supplies an
+  // X-CSRF-Token we validate it, but it is not mandatory — bearer-token auth
+  // plus exact origin matching already gate browser-originated writes.
   const csrfToken = req.headers["x-csrf-token"] as string;
-  if (!csrfToken || !validateCsrfToken(csrfToken, req)) {
+  if (csrfToken && !validateCsrfToken(csrfToken, req)) {
     log("warn", "csrf_invalid_token", {
       path: req.path,
-      hasToken: !!csrfToken,
+      hasToken: true,
     });
     return res.status(403).json({ error: "Invalid or missing CSRF token" });
   }

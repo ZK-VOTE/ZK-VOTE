@@ -78,11 +78,13 @@ router.get("/daos", queryLimiter, validateQuery(daosQuerySchema), (async (
       limit,
     });
 
+    // `pagination.cursor` is the *next* page cursor (echoed back as ?cursor=
+    // by the frontend, which `daosQuerySchema` folds into offset); it is
+    // undefined on the last page so clients stop auto-paginating.
     res.json({
       data: paginatedDaos,
       pagination: {
-        cursor: String(offset),
-        nextCursor: hasMore ? String(offset + limit) : null,
+        cursor: hasMore ? String(offset + limit) : undefined,
         hasMore,
         limit,
         offset,
