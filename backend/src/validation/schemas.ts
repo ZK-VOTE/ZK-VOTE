@@ -6,8 +6,99 @@
  */
 
 import { z } from "zod";
-import { BN254_SCALAR_FIELD } from "../config.js";
+import { createHash } from "node:crypto";
+import { fileTypeFromBuffer } from "file-type";
+import sharp from "sharp";
+import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+
+const ALLOWED_IMAGE_MIME_SET = new Set<string>(ALLOWED_IMAGE_MIMES);
+
+// ============================================
+// IPFS IMAGE UPLOAD SECURITY SCHEMA
+// ============================================
+
+export const MAX_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MiB
+export const MAX_IMAGE_DIMENSION = 4096;
+
+export const imageUploadMulterLimits = {
+  fileSize: MAX_IMAGE_UPLOAD_BYTES,
+  files: 1,
+} as const;
+
+const IMAGE_DANGEROUS_PATTERNS = [
+  /<\s*(script|iframe|object|embed|svg|math)[\s>]/i,
+  /<\?php/i,
+  /<!DOCTYPE\s+html/i,
+  /%PDF/i,
+  /onerror\s*=/i,
+] as const;
+
+async function hasMalwareIndicators(buffer: Buffer): Promise<boolean> {
+  const text = buffer.toString("latin1");
+  return IMAGE_DANGEROUS_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+export const imageUploadSchema = z
+  .object({
+    fieldname: z.string().optional(),
+    originalname: z.string().max(255).optional(),
+    encoding: z.string().optional(),
+    mimetype: z.string().min(1),
+    size: z.number().int().min(1).max(MAX_IMAGE_UPLOAD_BYTES),
+    buffer: z.instanceof(Buffer),
+  })
+  .superRefine(async (file, ctx) => {
+    try {
+      const claimedMime = file.mimetype.toLowerCase();
+      const detected = await fileTypeFromBuffer(file.buffer);
+      if (!detected) {
+        ctx.addIssue({ code: "custom", message: "Upload is not a valid JPEG, PNG, GIF, or WebP image" });
+        return;
+      }
+      if (detected.mime === "image/svg+xml" || claimedMime === "image/svg+xml") {
+        ctx.addIssue({ code: "custom", message: "SVG uploads are not allowed" });
+        return;
+      }
+      if (!ALLOWED_IMAGE_MIME_SET.has(detected.mime)) {
+        ctx.addIssue({ code: "custom", message: "Upload is not a valid JPEG, PNG, GIF, or WebP image" });
+        return;
+      }
+      if (detected.mime !== claimedMime) {
+        ctx.addIssue({ code: "custom", message: "Declared file type does not match actual file content" });
+        return;
+      }
+      if (await hasMalwareIndicators(file.buffer)) {
+        ctx.addIssue({ code: "custom", message: "Image contains embedded script or polyglot markers" });
+        return;
+      }
+      const metadata = await sharp(file.buffer, { failOn: "error", animated: true }).metadata();
+      if (!metadata.width || !metadata.height) {
+        ctx.addIssue({ code: "custom", message: "Could not read image dimensions" });
+        return;
+      }
+      if (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) {
+        ctx.addIssue({ code: "custom", message: `Image dimensions must not exceed ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}px` });
+      }
+    } catch {
+      ctx.addIssue({ code: "custom", message: "Invalid or corrupted image file" });
+    }
+  })
+  .transform(async (file) => {
+    const detected = await fileTypeFromBuffer(file.buffer);
+    const metadata = await sharp(file.buffer, { failOn: "error", animated: true }).metadata();
+    const sanitizedBuffer = await sharp(file.buffer, { failOn: "error", animated: true })
+      .rotate()
+      .toBuffer();
+    return {
+      ...file,
+      detectedMime: detected?.mime ?? file.mimetype,
+      width: metadata.width,
+      height: metadata.height,
+      sha256: createHash("sha256").update(file.buffer).digest("hex"),
+      sanitizedBuffer,
+    };
+  });
 
 // ============================================
 // PRIMITIVE VALIDATORS

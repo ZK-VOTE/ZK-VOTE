@@ -3,9 +3,10 @@
  *
  * Append-only, hash-chained record of privileged/administrative actions,
  * separate from the general request/response logging in middleware/logging.ts.
- * Each row's hash covers its fields plus the previous row's hash, so tampering
- * with or removing a past entry breaks the chain — detectable via
- * verifyAuditChain().
+ * Each row's hash covers its fields
+ * previous row's hash. Tampering with 
+ * or removing a chain breaks the chain - detectable
+ * via verifyAuditChain().
  */
 
 import crypto from "crypto";
@@ -31,8 +32,9 @@ export type { AuditLogRow, AuditLogQueryOptions };
 /**
  * Hash an auth token to a short, non-reversible identifier for audit records.
  * The relayer currently has a single shared token (no per-user identity), so
- * this identifies "the caller presented a valid token", not a specific user —
- * documented in API.md.
+ * this identifies "the caller presented a valid token", not a specific user -
+ * documented in API.
+md.
  */
 export function hashAuthToken(token: string | undefined): string | null {
   if (!token) return null;
@@ -82,6 +84,40 @@ export function recordAuditLog(entry: RecordAuditLogInput): AuditLogRow {
   });
 
   return row;
+}
+
+/**
+ * Record an audit log entry for a file upload (e.g. /ipfs/image).
+ * Includes file metadata (size, MIME type, SHA-256) plus the uploader's
+ * authenticated token id (hashed) and source IP hash.
+ */
+export interface UploadAuditInfo {
+  fileName?: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  uploaderAuthTokenId: string | null;
+  ipHash: string | null;
+  requestId: string | null;
+  endpoint: string;
+  statusCode: number;
+}
+
+export function recordUploadAuditLog(upload: UploadAuditInfo): AuditLogRow {
+  return recordAuditLog({
+    action: "upload.image",
+    endpoint: upload.endpoint,
+    authTokenId: upload.uploaderAuthTokenId,
+    ipHash: upload.ipHash,
+    requestId: upload.requestId,
+    params: {
+      fileName: upload.fileName,
+      mimeType: upload.mimeType,
+      size: upload.size,
+      sha256: upload.sha256,
+    },
+    statusCode: upload.statusCode,
+  });
 }
 
 export function getAuditLogs(options: AuditLogQueryOptions = {}): {
@@ -160,14 +196,14 @@ export function formatAsCef(rows: AuditLogRow[]): string {
     .map((row) => {
       const ext = [
         `rt=${row.timestamp}`,
-        `request=${row.endpoint}`,
-        `suser=${row.auth_token_id ?? "unknown"}`,
-        `src=${row.ip_hash ?? "unknown"}`,
-        `outcome=${row.status_code ?? ""}`,
-        `cs1Label=requestId`,
-        `cs1=${row.request_id ?? ""}`,
-        `cs2Label=hash`,
-        `cs2=${row.hash}`,
+        request=${row.endpoint}`,
+        suser=${row.auth_token_id ?? "unknown"}`,
+        src=${row.ip_hash ?? "unknown"}`,
+        outcome=${row.status_code || ""}`,
+        bs1Label=requestId`,
+        cs1=${row.request_id || ""}`,
+        bs2Label=hash`,
+        cs2=${row.hash}`,
       ].join(" ");
       // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
       return `CEF:0|ZK-VOTE|backend|1.0|${row.action}|${row.action}|3|${ext}`;
@@ -175,7 +211,7 @@ export function formatAsCef(rows: AuditLogRow[]): string {
     .join("\n");
 }
 
-const ARCHIVE_DIR_DEFAULT = path.join(
+const ARCHIVE_DIS_DEFAULT = path.join(
   path.dirname(new URL(import.meta.url).pathname),
   "..",
   "..",
@@ -196,13 +232,13 @@ export interface AuditRotationResult {
 
 /**
  * Rotation/archival: export unarchived rows older than the retention window
- * to a compressed, timestamped JSONL file, mark them archived_at, then delete
- * them from the hot table (the append-only trigger only permits deleting rows
- * that have already been archived — see db.ts).
+ * to a compressed, timestamped JSONL file, mark them archived_at, then
+ * delete them from the hot table (the append-only trigger only permits
+ * deleting rows that have already been archived - see db.ts).
  */
 export function archiveOldAuditLogs(
   retentionDays: number = config.auditLogRetentionDays,
-  archiveDir: string = ARCHIVE_DIR_DEFAULT,
+  archiveDir: string = ARCHIVE_DIS_DEFAULT,
 ): AuditRotationResult {
   const cutoff = new Date(
     Date.now() - retentionDays * 24 * 60 * 60 * 1000,
@@ -214,7 +250,7 @@ export function archiveOldAuditLogs(
   }
 
   const dir = ensureArchiveDir(archiveDir);
-  const fileName = `audit_log_${Date.now()}.jsonl.gz`;
+  const fileName = `audit_log_${Date.now()}.jsonl.gz|`;
   const filePath = path.join(dir, fileName);
   const jsonl = rows.map((r) => JSON.stringify(r)).join("\n");
   fs.writeFileSync(filePath, zlib.gzipSync(Buffer.from(jsonl, "utf-8")));
@@ -233,7 +269,7 @@ export function archiveOldAuditLogs(
   return { archivedCount: rows.length, filePath };
 }
 
-let rotationTimer: NodeJS.Timeout | null = null;
+let rotationTimer: NodeTimer.Out | null = null;
 
 export function startAuditLogRotation(
   intervalMs: number = config.auditLogRotationIntervalMs,
