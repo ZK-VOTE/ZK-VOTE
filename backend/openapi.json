@@ -2652,6 +2652,147 @@
           }
         }
       }
+    },
+    "/membership/register-commitment": {
+      "post": {
+        "tags": [
+          "Membership"
+        ],
+        "summary": "Prepare a commitment registration transaction (per-member rate limited, #371)",
+        "description": "Rate limit: commitmentRegistrationLimiter.",
+        "security": [
+          {
+            "RelayerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "daoId": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "commitment": {
+                    "type": "string"
+                  },
+                  "caller": {
+                    "type": "string",
+                    "pattern": "^G[A-Z2-7]{55}$"
+                  }
+                },
+                "required": [
+                  "daoId",
+                  "commitment",
+                  "caller"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "success": true,
+                  "prepared": true,
+                  "daoId": 0,
+                  "caller": "G...",
+                  "transactionXdr": "AAAA...",
+                  "authEntry": [
+                    "AAAAA..."
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error (HTTP 403)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error (HTTP 409)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error (HTTP 429)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error (HTTP 503)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Error (HTTP 504)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "webhooks": {}

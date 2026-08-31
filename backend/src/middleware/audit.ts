@@ -317,6 +317,38 @@ export function clearIdempotencyKeys(): void {
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
+ * Build audit-logging middleware for a named action.
+ *
+ * Compatibility layer for the pre-rewrite `auditLog(action)` API used by
+ * route handlers that want a per-action audit entry on a specific route
+ * (e.g. `/daos/sync`) in addition to the global mutating-route audit.
+ */
+export function auditLog(action: string) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    res.on("finish", () => {
+      try {
+        appendAudit({
+          requestId: (req as any).ctx || crypto.randomBytes(6).toString("hex"),
+          method: req.method,
+          path: req.path,
+          action,
+          actor: deriveActor(req),
+          actorIpHash: hashIp(req.ip),
+          requestBody: req.body ? (redactBody(req.body) as unknown) : undefined,
+          query: req.query ? (redactPii({ ...req.query }) as unknown) : undefined,
+          params: req.params ? (redactPii({ ...req.params }) as unknown) : undefined,
+          statusCode: res.statusCode,
+          userAgent: (req.headers["user-agent"] as string) || undefined,
+        });
+      } catch {
+        // Never block the request on audit failure.
+      }
+    });
+    next();
+  };
+}
+
+/**
  * Audit middleware - should be mounted early but after body parsing.
  * Audits every mutating request (POST/PUT/PATCH/DELETE).
  * - Captures redacted body, actor, timing
@@ -370,6 +402,13 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
  * Synchronous helper to manually audit an action inside route handlers.
  * Use when you need to record audit with custom action name or extra context.
  */
+export function auditLog(action: string): (req: Request, res: Response, next: NextFunction) => void {
+  return (req, _res, next) => {
+    auditAction(req, action);
+    next();
+  };
+}
+
 export function auditAction(
   req: Request,
   action: string,

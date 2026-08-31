@@ -19,6 +19,7 @@ The relayer provides anonymity by submitting vote transactions on behalf of user
 - **IPFS integration** via Pinata for proposal content
 - **Rate limiting** per endpoint type
 - **Security hardening** (CORS, Helmet, CSRF protection)
+- **Prometheus RED metrics** at `/metrics` and optional OTLP/HTTP tracing
 
 ## Setup
 
@@ -84,10 +85,23 @@ npm run dev:relayer
 | `INDEXER_POLL_INTERVAL_MS` | No | `5000` | Indexer polling interval |
 | `DAO_SYNC_INTERVAL_MS` | No | `30000` | DAO sync interval |
 | `MEMBERSHIP_SYNC_INTERVAL_MS` | No | `600000` | Membership cache refresh interval |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | - | OTLP/HTTP collector base URL; tracing is disabled when unset |
+| `OTEL_SERVICE_NAME` | No | `zkvote-relayer` | OpenTelemetry service name |
+| `OTEL_SDK_DISABLED` | No | `false` | Disable optional trace export |
+| `OTEL_EXPORT_TIMEOUT_MS` | No | `2000` | Maximum time spent exporting one span |
 
 ## API Reference
 
 ### Health & Status
+
+#### `GET /metrics`
+Prometheus text exposition endpoint. It exports request rate, status, latency, RPC, database, indexer, IPFS, and business metrics. Protect this endpoint at the ingress/network layer if it is not intended to be public.
+
+```bash
+curl http://localhost:3001/metrics
+```
+
+Tracing uses W3C `traceparent` propagation and exports completed indexer spans to `${OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces` when configured. Collector failures are isolated and do not affect requests or background work. Import `monitoring/grafana/zkvote-relayer.json` into Grafana and load `monitoring/prometheus/zkvote-alerts.yml` as Prometheus rule configuration.
 
 #### `GET /health`
 Basic health check (no auth required).

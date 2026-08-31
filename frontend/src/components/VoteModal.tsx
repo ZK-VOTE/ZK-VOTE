@@ -15,11 +15,15 @@ import { getMerklePath } from "../lib/merkletree";
 import { useOptimisticVote } from "../queries/proposalQueries";
 import {
   generateDeterministicZKCredentials,
+  generateFakeZKCredentials,
   getZKCredentials,
   storeZKCredentials,
 } from "../lib/zk";
-import { CheckCircle, XCircle, AlertTriangle, Loader2, X } from "lucide-react";
+import { submissionQueue } from "../store/submissionQueue";
+import { processEntry } from "../lib/queueProcessor";
+import { CheckCircle, XCircle, AlertTriangle, Loader2, X, WifiOff } from "lucide-react";
 import { useReceipts } from "../hooks/useReceipts";
+import VoteModeExplainer from "./ui/VoteModeExplainer";
 
 interface VoteModalProps {
   proposalId: number;
@@ -33,7 +37,7 @@ interface VoteModalProps {
   onComplete: () => void;
 }
 
-type VoteStep = "select" | "generating" | "submitting" | "success" | "error";
+type VoteStep = "select" | "generating" | "submitting" | "success" | "queued" | "error";
 
 export default function VoteModal({
   proposalId,
@@ -49,6 +53,7 @@ export default function VoteModal({
   const [step, setStep] = useState<VoteStep>("select");
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
+  const [isOfflineQueued, setIsOfflineQueued] = useState(false);
   const { addReceipt } = useReceipts();
   const { setOptimisticVote, clearPendingVote } = useOptimisticVote();
 
@@ -61,6 +66,15 @@ export default function VoteModal({
       const clients = getZkVoteClient(publicKey);
 
       // Step 1: Load registration data (or regenerate from wallet)
+      //
+      // COERCION-RESISTANCE (§panic-mode / THREAT_MODEL §coercion):
+      // When panicMode is active, we intentionally use randomly-generated
+      // "fake" credentials instead of the voter's real credentials.
+      // The resulting ZK proof is structurally valid (passes the circuit)
+      // but the fake commitment is NOT in the on-chain membership Merkle
+      // tree, so the vote will be rejected on-chain. The coercer sees a
+      // valid-looking proof being submitted — they cannot distinguish it
+      // from a real vote. The real credentials remain usable afterwards.
       setProgress("Loading voting credentials...");
       let secret: string,
         salt: string,
@@ -68,47 +82,63 @@ export default function VoteModal({
         commitment: string,
         leafIndex: number;
 
-      const cached = getZKCredentials(daoId, publicKey);
-
-      if (!cached) {
-        // Try to regenerate from wallet signature
+      if (panicMode) {
+        // PANIC MODE: generate fresh random credentials each time.
+        // Never touch or reveal the real credentials.
+        setProgress("Loading decoy credentials (coercion-resistant mode)...");
+        const fakeCredentials = await generateFakeZKCredentials();
+        secret = fakeCredentials.secret;
+        salt = fakeCredentials.salt;
+        blindingFactor = fakeCredentials.blindingFactor;
+        commitment = fakeCredentials.commitment;
+        // Use a fake leaf index (0) — the Merkle path won't match anyway
+        leafIndex = 0;
         if (import.meta.env.DEV)
-          console.log("[Vote] No cached credentials, regenerating...");
-
-        if (!kit) {
-          throw new Error(
-            "You must register for voting first. Please click 'Register for Voting' button.",
-          );
-        }
-
-        setProgress("Regenerating credentials from wallet signature...");
-        const credentials = await generateDeterministicZKCredentials(
-          kit,
-          daoId,
-        );
-
-        // Get leaf index from contract
-        const leafIndexResult = await clients.membershipTree.get_leaf_index({
-          dao_id: BigInt(daoId),
-          commitment: BigInt(credentials.commitment),
-        });
-
-        leafIndex = Number(leafIndexResult.result);
-        secret = credentials.secret;
-        salt = credentials.salt;
-        blindingFactor = credentials.blindingFactor;
-        commitment = credentials.commitment;
-
-        // Cache for next time
-        storeZKCredentials(daoId, publicKey, credentials, leafIndex);
-
-        if (import.meta.env.DEV) console.log("[Vote] Credentials regenerated");
+          console.log("[Vote] PANIC MODE — using fake credentials");
       } else {
-        secret = cached.secret;
-        salt = cached.salt;
-        blindingFactor = cached.blindingFactor;
-        commitment = cached.commitment;
-        leafIndex = cached.leafIndex;
+        const cached = getZKCredentials(daoId, publicKey);
+
+        if (!cached) {
+          // Try to regenerate from wallet signature
+          if (import.meta.env.DEV)
+            console.log("[Vote] No cached credentials, regenerating...");
+
+          if (!kit) {
+            throw new Error(
+              "You must register for voting first. Please click 'Register for Voting' button.",
+            );
+          }
+
+          setProgress("Regenerating credentials from wallet signature...");
+          const credentials = await generateDeterministicZKCredentials(
+            kit,
+            daoId,
+          );
+
+          // Get leaf index from contract
+          const leafIndexResult = await clients.membershipTree.get_leaf_index({
+            dao_id: BigInt(daoId),
+            commitment: BigInt(credentials.commitment),
+          });
+
+          leafIndex = Number(leafIndexResult.result);
+          secret = credentials.secret;
+          salt = credentials.salt;
+          blindingFactor = credentials.blindingFactor;
+          commitment = credentials.commitment;
+
+          // Cache for next time
+          storeZKCredentials(daoId, publicKey, credentials, leafIndex);
+
+          if (import.meta.env.DEV)
+            console.log("[Vote] Credentials regenerated");
+        } else {
+          secret = cached.secret;
+          salt = cached.salt;
+          blindingFactor = cached.blindingFactor;
+          commitment = cached.commitment;
+          leafIndex = cached.leafIndex;
+        }
       }
 
       if (import.meta.env.DEV)
@@ -151,6 +181,12 @@ export default function VoteModal({
         daoId.toString(),
         proposalId.toString(),
       );
+
+      // Validate proof inputs using shared field/nullifier helpers (#370)
+      // These guards catch malformed values before they reach the circuit,
+      // preventing hard-to-diagnose WASM errors at the circuit level.
+      assertValidNullifier(nullifier);
+      assertValidFieldElement(root.toString(), "root");
 
       // Step 4: Download circuit artifacts with progress (the proving key
       // is several MB and is the main bottleneck for perceived performance)
@@ -217,28 +253,14 @@ export default function VoteModal({
       setProgress("Formatting proof...");
       const { proof_a, proof_b, proof_c } = formatProofForSoroban(proof);
 
-      // Step 6: Submit vote through anonymous relay
+      // Step 6: Build the vote payload
       setStep("submitting");
-      setProgress("Submitting anonymous vote through relay...");
+      setProgress("Preparing vote submission...");
 
       // Convert U256 to big-endian hex (U256 values use big-endian, unlike BN254 curve points which use little-endian)
       const toHexBE = (value: string | bigint): string => {
         const bigInt = typeof value === "string" ? BigInt(value) : value;
         return bigInt.toString(16).padStart(64, "0");
-      };
-
-      const votePayload = {
-        daoId: Number(daoId),
-        proposalId: Number(proposalId),
-        choice: choice,
-        nullifier: toHexBE(nullifier),
-        root: toHexBE(root),
-        proof: {
-          a: proof_a,
-          b: proof_b,
-          c: proof_c,
-        },
-        timestamp: Date.now(),
       };
 
       // Sign the vote payload with the voter's Stellar keypair
@@ -253,7 +275,14 @@ export default function VoteModal({
           networkDetails?.networkPassphrase ||
           "Public Global Stellar Network ; September 2015";
 
-        const payloadToSign = JSON.stringify(votePayload);
+        const payloadToSign = JSON.stringify({
+          daoId: Number(daoId),
+          proposalId: Number(proposalId),
+          choice,
+          nullifier: toHexBE(nullifier),
+          root: toHexBE(root),
+          timestamp: Date.now(),
+        });
         voterSignature = await signVotePayload(
           payloadToSign,
           publicKey,
@@ -270,77 +299,99 @@ export default function VoteModal({
         // Continue without signature - backend will still accept it with relayer auth token
       }
 
-      const requestBody = JSON.stringify({
-        ...votePayload,
+      const votePayload = {
+        daoId: Number(daoId),
+        proposalId: Number(proposalId),
+        choice: choice,
+        nullifier: toHexBE(nullifier),
+        root: toHexBE(root),
+        proof: {
+          a: proof_a,
+          b: proof_b,
+          c: proof_c,
+        },
+        timestamp: Date.now(),
         voterPublicKey: publicKey,
         voterSignature,
-      });
+      };
 
-      // Optimistic update
+      // Step 7: Deduplication check — if this nullifier is already in the
+      // queue as submitted or conflict, surface that to the user.
+      const existingEntry = submissionQueue.getState().entries[votePayload.nullifier];
+      if (existingEntry) {
+        if (existingEntry.status === "submitted") {
+          // Already successfully submitted — idempotent success
+          setStep("success");
+          onComplete();
+          return;
+        }
+        if (existingEntry.status === "conflict") {
+          // Already recorded as a conflict
+          setStep("error");
+          setError(
+            existingEntry.conflictDetail ||
+              "You have already voted on this proposal.",
+          );
+          return;
+        }
+      }
+
+      // Optimistic update — show success UI before the network round-trip
       const revertOptimisticUpdate = setOptimisticVote(
         daoId,
         proposalId,
         choice,
       );
 
-      // Close the modal immediately to show optimistic UI state
+      // Step 8: Enqueue the vote (persists to localStorage for offline resilience)
+      setProgress("Queuing vote submission...");
+      const entry = submissionQueue.enqueue(votePayload);
+
+      // If we're offline, show the queued state and return
+      const isCurrentlyOffline = !navigator.onLine;
+      if (isCurrentlyOffline) {
+        setIsOfflineQueued(true);
+        setStep("queued");
+        onComplete();
+        return;
+      }
+
+      // Step 9: Attempt immediate submission via queue processor
+      setProgress("Submitting anonymous vote through relay...");
       setStep("success");
       onComplete();
 
-      // Submit to relay server asynchronously in background
-      relayerFetch("/vote", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: requestBody,
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            const errorData = await response.json();
-            const errorMsg = parseApiError(errorData);
-            const errorCode = getApiErrorCode(errorData);
+      // Submit in background via the queue processor
+      processEntry(entry)
+        .then(() => {
+          // Read final state from the queue
+          const finalEntry = submissionQueue.getState().entries[votePayload.nullifier];
+          if (!finalEntry) return;
 
-            // Detect double-vote error
-            if (
-              errorCode === ErrorCode.VOTE_ALREADY_CAST ||
-              errorMsg.includes("already voted") ||
-              errorMsg.includes("UnreachableCodeReached")
-            ) {
-              alert(
-                "You have already voted on this proposal. Each member can only vote once per proposal.",
-              );
-            } else {
-              alert(errorMsg);
+          if (finalEntry.status === "submitted") {
+            if (finalEntry.txHash) {
+              addReceipt({
+                txHash: finalEntry.txHash,
+                nullifier: votePayload.nullifier,
+                timestamp: Date.now(),
+                daoId: Number(daoId),
+                proposalId: Number(proposalId),
+              });
             }
+            clearPendingVote(daoId, proposalId);
+          } else if (finalEntry.status === "conflict") {
+            // Conflict: this nullifier was already used.
+            // The SubmissionQueueBanner will surface the conflict notification.
             revertOptimisticUpdate();
-            return;
+          } else if (finalEntry.status === "failed") {
+            // Permanent failure
+            revertOptimisticUpdate();
           }
-
-          const result = await response.json();
-          if (import.meta.env.DEV)
-            console.log("Vote submitted successfully:", result);
-
-          // Save receipt
-          if (result.txHash) {
-            addReceipt({
-              txHash: result.txHash,
-              nullifier: toHexBE(nullifier),
-              timestamp: Date.now(),
-              daoId: Number(daoId),
-              proposalId: Number(proposalId),
-            });
-          }
-
-          clearPendingVote(daoId, proposalId);
+          // For "pending" (retryable): leave optimistic update in place,
+          // the queue processor will retry automatically.
         })
-        .catch((err) => {
-          console.error("Vote submission background failure:", err);
-          alert(
-            "Background vote submission failed: " +
-              (err instanceof Error ? err.message : "Network error"),
-          );
-          revertOptimisticUpdate();
+        .catch(() => {
+          // processEntry never throws — errors are recorded in the queue entry
         });
     } catch (err) {
       setStep("error");
@@ -407,15 +458,67 @@ export default function VoteModal({
         <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
           {step === "select" && (
             <>
-              {voteMode === "Fixed" && (
-                <Alert variant="warning" className="text-xs">
-                  <AlertTriangle className="h-4 w-4 shrink-0" />
-                  <span>
-                    Only members present when this proposal was created can vote
-                    (snapshot voting).
-                  </span>
-                </Alert>
-              )}
+              <VoteModeExplainer mode={voteMode} />
+
+              {/* ── PANIC MODE TOGGLE (coercion resistance) ─────────────────────
+                  THREAT_MODEL §coercion: if a voter is being coerced, they can
+                  activate panic mode to submit a structurally-valid ZK proof
+                  backed by fake (random) credentials. The proof will be rejected
+                  on-chain because the commitment is not in the membership tree,
+                  but the coercer cannot distinguish it from a real submission.
+                  The real credentials remain usable after the coercive situation
+                  ends. ──────────────────────────────────────────────────────── */}
+              <div className="border border-yellow-500/40 rounded-lg p-3 bg-yellow-500/5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle
+                      className="h-4 w-4 text-yellow-500 shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span className="text-xs font-semibold text-yellow-700 dark:text-yellow-400">
+                      Coercion-resistant mode
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={panicMode}
+                    aria-label={
+                      panicMode ? "Disable panic mode" : "Enable panic mode"
+                    }
+                    onClick={() => setPanicMode((prev) => !prev)}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-500 ${
+                      panicMode ? "bg-yellow-500" : "bg-muted"
+                    }`}
+                    data-testid="panic-mode-toggle"
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                        panicMode ? "translate-x-4" : "translate-x-1"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {panicMode && (
+                  <div
+                    className="mt-2 space-y-1"
+                    role="alert"
+                    aria-live="assertive"
+                    data-testid="panic-mode-warning"
+                  >
+                    <p className="text-xs font-bold text-yellow-700 dark:text-yellow-400">
+                      ⚠ Panic mode is ON — decoy credentials will be used
+                    </p>
+                    <p className="text-xs text-yellow-600 dark:text-yellow-300">
+                      Your vote will appear valid but will NOT be recorded
+                      on-chain. Your real credentials are never touched. You can
+                      cast your real vote after the coercive situation ends by
+                      disabling this mode.
+                    </p>
+                  </div>
+                )}
+              </div>
 
               <div
                 className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2"
@@ -491,6 +594,40 @@ export default function VoteModal({
                   Your anonymous vote has been recorded on the blockchain.
                 </p>
               </div>
+              <Button onClick={onClose} className="w-full min-h-[48px] mt-4">
+                Done
+              </Button>
+            </div>
+          )}
+
+          {step === "queued" && (
+            <div
+              className="py-8 flex flex-col items-center text-center space-y-4"
+              aria-live="assertive"
+              aria-atomic="true"
+            >
+              <div className="h-16 w-16 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center mb-2">
+                <WifiOff
+                  className="h-8 w-8 text-blue-600 dark:text-blue-400"
+                  aria-hidden="true"
+                />
+              </div>
+              <div className="space-y-1">
+                <h3 className="font-bold text-xl">Vote Queued</h3>
+                <p className="text-sm text-muted-foreground">
+                  {isOfflineQueued
+                    ? "You appear to be offline. Your vote has been saved and will be submitted automatically when you reconnect."
+                    : "Your vote has been queued and will be submitted shortly."}
+                </p>
+              </div>
+              <Alert className="text-xs text-left">
+                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  Do not cast this vote again — it will be submitted
+                  automatically. A status notification will appear if any issue
+                  occurs.
+                </span>
+              </Alert>
               <Button onClick={onClose} className="w-full min-h-[48px] mt-4">
                 Done
               </Button>

@@ -8,11 +8,22 @@
  * submission.
  */
 
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import crypto from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
 
 import { canonicalizeProof } from "../src/services/stellar.js";
 import { BN254_FQ_MODULUS } from "../src/types/index.js";
+import {
+  initDb,
+  closeDb,
+  recordProofCommitment,
+  getProofCommitment,
+  getProofCommitmentByCanonicalHash,
+} from "../src/services/db.js";
 
 function bigIntToBytes(n, length) {
   return Buffer.from(n.toString(16).padStart(length * 2, "0"), "hex");
@@ -37,6 +48,40 @@ function buildB(yc1, yc0) {
     bigIntToBytes(yc1, 32),
     bigIntToBytes(yc0, 32),
   ]);
+}
+
+/** Build a Groth16Proof-shaped object from raw Buffer/bigint values. */
+function buildProofObject(aY, bYc1, bYc0, cY = 3n) {
+  const a = buildA(aY);
+  const b = buildB(bYc1, bYc0);
+  const c = Buffer.concat([bigIntToBytes(0xcccn, 32), bigIntToBytes(cY, 32)]);
+  return {
+    a: a.toString("hex"),
+    b: b.toString("hex"),
+    c: c.toString("hex"),
+  };
+}
+
+/**
+ * Replicate the computeCanonicalProofHash logic from voting.ts so we can
+ * test it in isolation without spinning up a full Express app.
+ */
+function computeCanonicalProofHash(proof) {
+  if (!proof || typeof proof !== "object") return null;
+  const { a, b, c } = proof;
+  if (typeof a !== "string" || typeof b !== "string" || typeof c !== "string") {
+    return null;
+  }
+  const aBytes = Buffer.from(a.replace(/^0x/, ""), "hex");
+  const bBytes = Buffer.from(b.replace(/^0x/, ""), "hex");
+  if (aBytes.length !== 64 || bBytes.length !== 128) return null;
+
+  const { a: canonA, b: canonB } = canonicalizeProof(aBytes, bBytes);
+  const cHex = c.replace(/^0x/, "").toLowerCase();
+  return crypto
+    .createHash("sha256")
+    .update(canonA.toString("hex") + canonB.toString("hex") + cHex)
+    .digest("hex");
 }
 
 describe("canonicalizeProof", () => {
@@ -89,5 +134,188 @@ describe("canonicalizeProof", () => {
 
     assert.strictEqual(canon1.a.toString("hex"), canon2.a.toString("hex"));
     assert.strictEqual(canon1.b.toString("hex"), canon2.b.toString("hex"));
+  });
+});
+
+// ============================================================
+// computeCanonicalProofHash tests (#341)
+// ============================================================
+
+describe("computeCanonicalProofHash", () => {
+  it("returns the same hash for both malleable forms of a proof", () => {
+    // Form 1: A.Y in upper half (non-canonical)
+    const proof1 = buildProofObject(HIGH_Y, 7n, 9n);
+    // Form 2: A.Y in lower half after negation (canonical)
+    const negY = BN254_FQ_MODULUS - HIGH_Y;
+    const proof2 = buildProofObject(negY, BN254_FQ_MODULUS - 7n, BN254_FQ_MODULUS - 9n);
+
+    const hash1 = computeCanonicalProofHash(proof1);
+    const hash2 = computeCanonicalProofHash(proof2);
+
+    assert.ok(hash1 !== null, "hash1 must not be null");
+    assert.ok(hash2 !== null, "hash2 must not be null");
+    assert.strictEqual(hash1, hash2, "both malleable forms must hash identically");
+  });
+
+  it("returns a different hash when proof C differs", () => {
+    const proof1 = buildProofObject(LOW_Y, 7n, 9n, 11n);
+    const proof2 = buildProofObject(LOW_Y, 7n, 9n, 99n); // different C
+
+    const hash1 = computeCanonicalProofHash(proof1);
+    const hash2 = computeCanonicalProofHash(proof2);
+
+    assert.ok(hash1 !== null && hash2 !== null);
+    assert.notStrictEqual(hash1, hash2, "different C must produce different canonical hash");
+  });
+
+  it("returns null for a malformed proof object", () => {
+    assert.strictEqual(computeCanonicalProofHash(null), null);
+    assert.strictEqual(computeCanonicalProofHash({}), null);
+    assert.strictEqual(computeCanonicalProofHash({ a: "deadbeef", b: "x", c: "y" }), null);
+  });
+
+  it("returns null when a/b have wrong byte lengths", () => {
+    // a too short (not 64 bytes), b too short (not 128 bytes)
+    const bad = {
+      a: "aabb",          // 2 bytes, not 64
+      b: "ccdd".repeat(4), // 16 bytes, not 128
+      c: "0".repeat(128),
+    };
+    assert.strictEqual(computeCanonicalProofHash(bad), null);
+  });
+
+  it("produces a 64-character hex SHA-256 digest", () => {
+    const proof = buildProofObject(LOW_Y, 7n, 9n);
+    const hash = computeCanonicalProofHash(proof);
+    assert.ok(hash !== null);
+    assert.match(hash, /^[0-9a-f]{64}$/, "hash must be a 64-char hex string");
+  });
+});
+
+// ============================================================
+// DB dedup tests using canonical_proof_hash (#341)
+// ============================================================
+
+describe("canonical proof hash DB dedup", () => {
+  let dbPath;
+
+  beforeEach(() => {
+    // Use a fresh in-memory-style temp DB for each test
+    dbPath = path.join(os.tmpdir(), `zkvote-test-${crypto.randomUUID()}.db`);
+    initDb(dbPath);
+  });
+
+  afterEach(() => {
+    closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-wal"); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-shm"); } catch { /* ignore */ }
+  });
+
+  it("stores and retrieves a proof commitment by canonical hash", () => {
+    const proof = buildProofObject(LOW_Y, 7n, 9n);
+    const canonicalHash = computeCanonicalProofHash(proof);
+    const commitmentHash = "commitment-" + crypto.randomUUID();
+
+    recordProofCommitment(
+      commitmentHash,
+      "nullifier-abc",
+      1, // daoId
+      42, // proposalId
+      Date.now(),
+      null,
+      canonicalHash,
+    );
+
+    const record = getProofCommitmentByCanonicalHash(canonicalHash);
+    assert.ok(record !== null, "should find record by canonical hash");
+    assert.strictEqual(record.commitmentHash, commitmentHash);
+    assert.strictEqual(record.canonicalProofHash, canonicalHash);
+    assert.strictEqual(record.status, "COMMITTED");
+  });
+
+  it("both malleable forms of a proof map to the same DB record via canonical hash", () => {
+    // Form 1 (non-canonical A.Y in upper half)
+    const proof1 = buildProofObject(HIGH_Y, 7n, 9n);
+    const canonHash1 = computeCanonicalProofHash(proof1);
+
+    // Form 2 (malleable counterpart: negated A.Y, negated B.Y)
+    const negY = BN254_FQ_MODULUS - HIGH_Y;
+    const proof2 = buildProofObject(negY, BN254_FQ_MODULUS - 7n, BN254_FQ_MODULUS - 9n);
+    const canonHash2 = computeCanonicalProofHash(proof2);
+
+    assert.ok(canonHash1 !== null && canonHash2 !== null);
+    assert.strictEqual(
+      canonHash1,
+      canonHash2,
+      "both malleable forms must produce the same canonical hash",
+    );
+
+    // Record with form 1's canonical hash
+    const commitmentHash = "commitment-" + crypto.randomUUID();
+    recordProofCommitment(
+      commitmentHash,
+      "nullifier-xyz",
+      2,
+      7,
+      Date.now(),
+      null,
+      canonHash1,
+    );
+
+    // Looking up by form 2's canonical hash should find the same record
+    const record = getProofCommitmentByCanonicalHash(canonHash2);
+    assert.ok(record !== null, "canonical lookup must find the committed record");
+    assert.strictEqual(record.commitmentHash, commitmentHash);
+  });
+
+  it("returns null for an unknown canonical hash", () => {
+    const result = getProofCommitmentByCanonicalHash("nonexistent-hash-value");
+    assert.strictEqual(result, null);
+  });
+
+  it("legacy records without canonical_proof_hash are not found by canonical lookup", () => {
+    // Write a record WITHOUT a canonical hash (legacy row)
+    const commitmentHash = "legacy-" + crypto.randomUUID();
+    recordProofCommitment(
+      commitmentHash,
+      "nullifier-legacy",
+      3,
+      10,
+      Date.now(),
+      null,
+      null, // no canonical hash
+    );
+
+    // The legacy row is still found by its commitment_hash
+    const byCommitment = getProofCommitment(commitmentHash);
+    assert.ok(byCommitment !== null);
+    assert.strictEqual(byCommitment.canonicalProofHash, null);
+
+    // But canonical lookup returns null (NULL IS NOT equal to any string)
+    const byCanonical = getProofCommitmentByCanonicalHash("anything");
+    assert.strictEqual(byCanonical, null);
+  });
+
+  it("two different proofs with the same C but different A/B produce different canonical hashes", () => {
+    const proof1 = buildProofObject(LOW_Y, 7n, 9n, 3n);
+    const proof2 = buildProofObject(LOW_Y, 11n, 13n, 3n); // different B.Y values
+
+    const hash1 = computeCanonicalProofHash(proof1);
+    const hash2 = computeCanonicalProofHash(proof2);
+
+    assert.ok(hash1 !== null && hash2 !== null);
+    assert.notStrictEqual(hash1, hash2, "different proofs must produce different canonical hashes");
+
+    const ch1 = "commitment-a-" + crypto.randomUUID();
+    const ch2 = "commitment-b-" + crypto.randomUUID();
+    recordProofCommitment(ch1, "n1", 4, 1, Date.now(), null, hash1);
+    recordProofCommitment(ch2, "n2", 4, 1, Date.now(), null, hash2);
+
+    const r1 = getProofCommitmentByCanonicalHash(hash1);
+    const r2 = getProofCommitmentByCanonicalHash(hash2);
+    assert.ok(r1 !== null && r2 !== null);
+    assert.strictEqual(r1.commitmentHash, ch1);
+    assert.strictEqual(r2.commitmentHash, ch2);
   });
 });

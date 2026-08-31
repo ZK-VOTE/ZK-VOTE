@@ -58,6 +58,8 @@ In **Fixed mode**, a proposal's eligible root is snapshotted at proposal creatio
 
 **Contrast with Trailing Mode**: In Trailing mode, the contract also checks `min_root` (the root at which the member was added). This ensures revoked members cannot vote even on older proposals, because their `min_root` will be invalidated when they're removed. Trailing mode provides stronger revocation guarantees at the cost of some privacy (admin can influence eligibility mid-proposal by revoking members).
 
+**Frontend disclosure (issue #347)**: The frontend surfaces these revocation semantics to users — the vote-mode picker when creating a proposal, a revocation-semantics explainer in the vote dialog, and an eligibility preview on the proposal page — so the "documented per proposal" guidance above is reflected in the product UI.
+
 ## BN254 Public Signal Constraints
 
 All public signals passed to Groth16 verification **must** be less than the BN254 scalar field modulus (Fr):
@@ -228,6 +230,69 @@ Admin guidance per DAO (documented for frontend tooltip):
 - `frontend/src/lib/zkproof.ts`: `generateClaimProof`, `calculateClaimNullifier`, `calculateVoteNullifier`.
 - `frontend/src/components/ClaimRewards.tsx` + `frontend/src/queries/claimQueries.ts` use `relayerFetch("/api/v1/claim", ...)`.
 
+## Privacy-Preserving Analytics (#306)
+
+Scope addition: on-chain homomorphic accumulation in `contracts/threshold-crypto`
+(`submit_analytic_contribution`, `analytics_aggregate`, `analytics_min_cohort`,
+`init_analytics`), backend service `backend/src/services/privacy-analytics.ts`
++ `backend/src/routes/analytics.ts`, migration `004_add_privacy_analytics`, and
+frontend `AnalyticsPanel` (`frontend/src/components/AnalyticsPanel.tsx`,
+`analyticsCrypto.ts`, `frontend/src/queries/analyticsQueries.ts`).
+
+**Goal**: compute turnout / participation aggregates (e.g. how many members
+contributed to a round) **without leaking which member contributed** to indexers or
+observers, and without revealing any single contribution.
+
+### Cryptographic design
+
+Analytics use an **ElGamal ciphertext over BN254 G1**. Each contributor submits
+`(c1, c2) = (r·G, m·G + r·Y)` where `m ∈ {0,1}` is their contributed value
+(1 = participated), `Y` is the DAO's joint public key, and `r` is fresh
+per submission.
+
+- **Homomorphic accumulation (off-chain, tested)**: contributions are summed via
+  point addition so the stored value is always the *sum*
+  `(Σ c1, Σ c2) = (R·G, (Σm)·G + R·Y)`. Any single intermediate sum is a valid
+  encryption of the running total, never a contributor's own ciphertext, so an
+  indexer reading the aggregate at any time learns nothing about any individual
+  `m_i`. See `homomorphicAdd` / `thresholdDecryptAggregate` in
+  `backend/src/services/privacy-analytics.ts`.
+- **On-chain register (tested, real host crypto)**: the threshold-crypto contract
+  holds the *aggregate only* and accumulates with the Soroban `bn254_g1_add` host
+  function. It never stores per-contributor plaintext. A contributor may submit at
+  most once per `(dao_id, round_id)`.
+- **Threshold decrypt of aggregate only**: there is no key enabling plaintext
+  recovery of any single contribution. Decryption recovers only `Σm` after enough
+  key shares combine, and only once the **privacy budget** is met.
+
+### Privacy budget (`min_cohort`)
+
+Before any aggregate may be decrypted, at least `minimum_cohort` contributions
+must be present (configured via `init_analytics`, checked in the contract's
+`analytics_aggregate` gate). This prevents an observer from decrypting an
+aggregate of one or two contributions and thereby singling out a voter. Counts
+(`analytics_count`) are public — they do not reveal identities.
+
+### Threat note
+
+- **Indexer/observer learns**: only `Σm` after cohort is met (and only via
+  threshold-decryption). Aggregate counts are public. No per-voter `m_i`.
+- **Cannot learn**: which contributor submitted what; the value of any single
+  contribution; the timely aggregate while below `min_cohort`.
+- **Contract admin**: can set/rotate the joint key and the cohort, but gains no
+  plaintext linkage to a member unless a full threshold of shares colludes.
+- **Threshold collusion**: the standard risk applies — if `t` of `n` share-holders
+  collude, they can decrypt the *aggregate*. This leaks only `Σm`, not per-voter
+  values, so the exposure is bounded to overall turnout.
+- **Double-counting**: prevented per contributor per round on-chain; off-chain the
+  service replaces a prior round's row on re-submission for the same DAO.
+- **Residual**: the ElGamal discrete-log lookup for `Σm` (solving `x` where
+  `x·G = Σm·G`) assumes `Σm` is small (bounded by cohort / DAO size), which holds
+  because contributions are single-bit; the scheme deliberately does not try to
+  hide the *total count* from a threshold decryptor, only from indexers without a
+  threshold. On-chain and off-chain homomorphic surfaces are independently tested
+  against the same BN254 primitives.
+
 ## Next Hardening Steps
 - Relay: structured logging with redaction; configurable log retention; coarser error responses; optional cover traffic/backoff to reduce correlation; explicit anti-censorship monitoring (missing votes vs submissions).
 - Contracts: coarse error codes to avoid fine-grained leakage; optional per-contract versioning + upgrade events; ensure membership/admin checks stay isolated.
@@ -313,6 +378,77 @@ See [`docs/post-quantum-evaluation.md`](docs/post-quantum-evaluation.md) and [`d
 - **Circuit constraint-count optimization** (tracked separately, #123): a
   multi-week circuit-engineering task independent of the security fixes
   above.
+
+## Relayer Address Binding (Issue #361)
+
+**Threat (from #167 deferred list)**: A malicious relayer could intercept
+a ZK proof and resubmit it through a different channel (different relayer or
+delayed resubmission) for strategic advantage. While the tally remains
+unaffected (votes are additive), voters may have preferences about:
+- Which relayer processes their vote (trust/latency)
+- Voting order (time-sensitive elections)
+- Proof reuse prevention (cross-relayer replay)
+
+**Mitigation (implemented in #361)**: Add `relayer_address` as the 7th public
+signal in the vote circuit (`vote.circom`) and 10th in the re-voting circuit
+(`vote_v2.circom`). The contract:
+
+1. **Extracts relayer address** from the transaction signer (`env.invoker()`)
+2. **Converts to field element** via SHA-256 hash: `relayer_signal = SHA256(address_xdr)`
+3. **Validates field membership** (must be < BN254 scalar field modulus r, non-zero)
+4. **Includes in public signals** passed to Groth16 verifier
+5. **Proof verification fails** if `relayer_address` in circuit ≠ `actual_relayer_submitting`
+
+**Security properties**:
+- **Proof binding**: A proof generated with `relayer_address=A` cannot be
+  resubmitted through relayer B; the pairing check will fail
+- **No nullifier pollution**: Nullifier remains deterministic per (voter, election),
+  unaffected by relayer change
+- **Election-scoped**: Each proof is bound to a specific relayer for a specific
+  election; not a global signature
+- **Frontend responsibility**: Frontend must pass correct relayer address when
+  generating proofs; incorrect address causes vote rejection
+
+**What this prevents**:
+- ✅ Cross-relayer proof reuse
+- ✅ Selective front-running via relayer switching
+- ✅ Proof harvesting and replay by malicious observer
+
+**What this does NOT prevent**:
+- ❌ Front-running within a single relayer (still possible)
+- ❌ Censorship (relayer can still drop votes)
+- ❌ Ordering attacks if coordinated with proposer
+- ❌ Nullifier censorship (relayer knows nullifier from proof)
+
+**Privacy impact**: Relayer address is now a public signal (visible on-chain in
+proof verification). Voters with different relayers will have different proofs.
+No new privacy leakage: relayer addresses are already known from transaction
+signing.
+
+**Backward compatibility**: This is a breaking change:
+- Old 6-signal proofs (without relayer_address) will fail verification with
+  new 7-signal verification keys
+- Clients must upgrade to new circuit version to generate compatible proofs
+- Old proofs are explicitly rejected by the new contract
+
+**Code changes**:
+- `circuits/vote.circom`: `signal input relayerAddress` added to template,
+  included in public signals list
+- `circuits/vote_v2.circom`: Same changes for re-voting circuit (10 signals total)
+- `contracts/voting/src/lib.rs`: 
+  - Constants: `NUM_PUBLIC_SIGNALS = 7`, `VOTE_CIRCUIT_IC_LEN = 8`
+  - Error codes: `InvalidRelayerAddress = 69`, `RelayerMismatch = 70`
+  - Helper: `address_to_u256()` converts address to field element
+  - Both `vote()` and `vote_bls381()` validate and include relayer signal
+- `frontend/src/lib/zkproof.ts`: Pass relayer address when generating proofs
+- `backend/src/services/stellar.ts`: Extract relayer from keypair, pass to frontend
+
+**Deployment impact**:
+- New verification keys must be generated (IC vector length: 7 → 8)
+- Groth16 trusted setup must be rerun (new circuit, new parameters)
+- KAT (Known Answer Test) must validate circuit and on-chain match
+- All clients must upgrade to new frontend/backend before voting
+
 ## Voter Deanonymization at Registration (Issue #122)
 
 **Threat**: during credential/registration flows where a voter submits an
@@ -361,3 +497,106 @@ larger change with its own migration and abuse-prevention design (e.g.
 preventing a single eligible voter from requesting many blind signatures)
 and is intentionally out of scope for this PR — see the PR description for
 the full list of deferred acceptance criteria.
+
+## End-to-End Encrypted Governance Content (Issue #324)
+
+Before this change, only member *aliases* were encrypted
+(`frontend/src/lib/encryption.ts`). Proposal and comment **bodies** were
+plaintext to anyone who could read the relay's SQLite file, an IPFS pin, or a
+database backup. Deliberation content is often more sensitive than the tally —
+it names people, discloses treasury positions, and reveals internal
+disagreement — so this closes a gap the anonymity work around voting never
+covered.
+
+Implementation: `backend/src/services/encryption.ts` (relay side, ciphertext
+only), `frontend/src/lib/groupEncryption.ts` (browser side, WebCrypto),
+migration `005_add_encrypted_content.sql`, routes under
+`/api/v1/encryption`.
+
+### Scheme
+
+- **Group key**: 256-bit AES-GCM key, DAO-scoped, generated on a member device.
+  The relay never receives it in any form it can open.
+- **Distribution**: the key is sealed to each member individually
+  (`wrapGroupKeyForMember`) using a key derived by HKDF from that member's
+  long-term secret, bound to `(daoId, memberId)`. The relay stores these wraps
+  as opaque blobs.
+- **Recovery**: the group key is additionally split with Shamir secret sharing
+  over GF(2^8) into `n` shares with threshold `t`, so a DAO that loses every
+  member device can reconstruct the epoch key from a quorum. Below `t`, shares
+  are information-theoretically useless.
+- **Commitment**: `SHA-256("zkvote/e2e/v1/key-commitment" || key)` is published
+  per epoch. It lets a client confirm it reconstructed the right key without
+  revealing the key, and lets the relay distinguish epochs. Comparison is
+  constant time (`verifyGroupKey`).
+- **Nonce domain**: every ciphertext is bound to
+  `zkvote/e2e/v1/content/dao=<id>/epoch=<n>/type=<t>/id=<cid>`. The domain seeds
+  a deterministic 4-byte nonce prefix (partitioning the nonce space per content)
+  and is authenticated as GCM AAD. A ciphertext therefore cannot be moved
+  between DAOs, proposals, comment threads, or epochs.
+
+### Rotation
+
+Membership changes rotate the key into a new epoch:
+
+| Event | New epoch wraps | Effect |
+| --- | --- | --- |
+| Member joins | existing members + joiner | joiner reads from the join epoch forward, not history |
+| Member leaves / is revoked | remaining members only | leaver cannot read anything written after departure |
+
+Rotation gives forward and backward secrecy **at the epoch boundary**. It is
+deliberately not retroactive: a departed member keeps whatever they could
+already decrypt while a member, because they could have copied the plaintext at
+the time. Claiming otherwise would be security theatre.
+
+### What the relay learns
+
+- **Can learn**: that a body exists for `(daoId, contentType, contentId)`, its
+  ciphertext length, its epoch, when it was written, and the size and membership
+  *count* of each epoch. Fetches are not gated on membership, so read access is
+  not a membership oracle — the trade-off is that the relay does not learn who
+  is reading either.
+- **Cannot learn**: any body's plaintext; the group key; which member a wrap
+  will actually be opened by (it stores the mapping, but cannot verify or use
+  it); whether a decryption attempt succeeded.
+- **Can do (malicious)**: withhold or delete ciphertext; serve a stale epoch's
+  ciphertext; refuse to hand a member their wrap. All are availability attacks,
+  detectable by the client (the epoch endpoint publishes the active epoch and
+  its commitment).
+- **Cannot do (malicious)**: substitute a body from another proposal or epoch
+  (AAD binding fails); forge a body (no key); silently downgrade a member to an
+  old epoch's content without the client noticing the epoch mismatch.
+
+### Redaction
+
+`redactContent` overwrites the `nonce`, `ciphertext` and `tag` columns with
+NULL and sets a tombstone (`redacted`, `redacted_at`, `redaction_reason`); a
+table CHECK constraint enforces that a redacted row carries no ciphertext and a
+live row is never half written. The row itself survives so governance
+references still resolve, and the API answers `410 Gone` with the tombstone
+rather than `404`.
+
+This is the only erasure the relay can perform, and its limits are worth
+stating plainly: it destroys the relay's copy, not copies already fetched by
+members, mirrored to IPFS, or present in backups taken before the redaction.
+Redaction is a moderation and compliance primitive, not a guarantee of
+unavailability.
+
+### Residual risks
+
+- **Endpoint compromise**: a member's device holds the group key for every
+  epoch it was wrapped into. Compromising one member exposes every body that
+  member could read. Rotation limits the *future* damage once the compromise is
+  known, not the past.
+- **Metadata**: ciphertext length, write timing, and the per-epoch member count
+  remain visible to the relay and to anyone with database access. Padding is not
+  implemented.
+- **Rotation is client-driven**: the relay accepts an epoch from an
+  authenticated caller and cannot verify that the wraps really contain the
+  committed key. A malicious rotator cannot read existing content, but can
+  publish an epoch whose key only they hold, causing future content to be
+  encrypted where honest members cannot read it. Clients detect this the first
+  time they fail to open their own wrap; detecting it *before* writing would
+  need a proof of correct wrapping, which is deferred.
+- **No per-content forward secrecy**: all content in an epoch shares one key, so
+  compromising it exposes the whole epoch rather than a single body.

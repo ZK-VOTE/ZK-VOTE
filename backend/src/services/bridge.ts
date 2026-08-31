@@ -6,17 +6,55 @@
  */
 
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config } from "../config.js";
-import { log } from "./logger.js";
-import {
-  server,
-  relayerKeypair,
-  callWithTimeout,
-  simulateWithBackoff,
-  waitForTransaction,
-  withSequenceLock,
-  u256ToScVal,
-} from "./stellar.js";
+import type { LoggerPort, RpcServerPort } from "./interfaces.js";
+
+//__BRIDGE_DEPS_START__
+/**
+ * Dependencies injected via `initBridgeRelay` (#358) so this module never
+ * imports the `stellar.js`/`config.js`/`logger.js` module singletons directly.
+ */
+export interface BridgeDeps {
+  /** Active RPC server (pool-backed proxy in production). */
+  server: RpcServerPort;
+  /** Relayer keypair used to sign relay transactions. */
+  relayerKeypair: { publicKey(): string } & Partial<StellarSdk.Keypair>;
+  /** Config: relayer test mode (relay short-circuits as failed). */
+  testMode: boolean;
+  /** Config: Soroban bridge contract id (C...). */
+  bridgeContractId?: string;
+  /** Config: Stellar network passphrase. */
+  networkPassphrase: string;
+  /** Run `fn` with a timeout, labelled for logs/metrics. */
+  callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
+  /** Serialize transaction submissions against the relayer account. */
+  withSequenceLock<T>(fn: () => Promise<T>): Promise<T>;
+  /** Simulate a transaction with retry/backoff. */
+  simulateWithBackoff<T>(fn: () => Promise<T>, attempts?: number): Promise<T>;
+  /** Wait for an on-chain transaction to settle. */
+  waitForTransaction(
+    hash: string,
+    timeoutSeconds?: number,
+  ): Promise<{ status: string }>;
+  /** Convert a U256 hex string into an ScVal argument. */
+  u256ToScVal(hexString: string): StellarSdk.xdr.ScVal;
+  /** Structured logger (called as `deps.log(level, event, meta)`). */
+  log: LoggerPort["log"];
+}
+
+let bridgeDeps: BridgeDeps | null = null;
+
+/** Explicitly wire the bridge relay service (composition root only). */
+export function initBridgeRelay(d: BridgeDeps): void {
+  bridgeDeps = d;
+}
+
+function deps(): BridgeDeps {
+  if (!bridgeDeps) {
+    throw new Error("bridge: initBridgeRelay() must be called before use");
+  }
+  return bridgeDeps;
+}
+//__BRIDGE_DEPS_END__
 
 // ============================================
 // TYPES
@@ -62,7 +100,7 @@ export async function pollEVMEvents(): Promise<EVMVoteEvent[]> {
   // 3. Parse VoteForwarded events
   //
   // For now, return empty array (placeholder)
-  log("info", "evm_poll", { lastBlock: lastProcessedBlock });
+  deps().log("info", "evm_poll", { lastBlock: lastProcessedBlock });
   return [];
 }
 
@@ -71,22 +109,22 @@ export async function pollEVMEvents(): Promise<EVMVoteEvent[]> {
  */
 export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
   try {
-    log("info", "relay_vote_start", {
+    deps().log("info", "relay_vote_start", {
       daoId: event.daoId,
       proposalId: event.proposalId,
       nullifier: event.nullifier,
     });
 
     // Convert inputs to Soroban types
-    const scNullifier = u256ToScVal(event.nullifier);
-    const scVoteRoot = u256ToScVal(event.voteRoot);
+    const scNullifier = deps().u256ToScVal(event.nullifier);
+    const scVoteRoot = deps().u256ToScVal(event.voteRoot);
 
-    if (config.testMode) {
+    if (deps().testMode) {
       return { success: false, error: "Simulation failed (test mode)" };
     }
 
     // Build contract call to Soroban bridge
-    const contract = new StellarSdk.Contract(config.bridgeContractId!);
+    const contract = new StellarSdk.Contract(deps().bridgeContractId!);
 
     const args = [
       StellarSdk.nativeToScVal(event.daoId, { type: "u64" }),
@@ -99,24 +137,24 @@ export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
     const operation = contract.call("relay_vote", ...args);
 
     // Submit under sequence lock
-    const { sendResult } = await withSequenceLock(async () => {
-      const account = await (server as StellarSdk.rpc.Server).getAccount(
-        relayerKeypair.publicKey(),
+    const { sendResult } = await deps().withSequenceLock(async () => {
+      const account = await (deps().server as StellarSdk.rpc.Server).getAccount(
+        deps().relayerKeypair.publicKey(),
       );
 
       const tx = new StellarSdk.TransactionBuilder(account, {
         fee: "100000",
-        networkPassphrase: config.networkPassphrase,
+        networkPassphrase: deps().networkPassphrase,
       })
         .addOperation(operation)
         .setTimeout(30)
         .build();
 
       // Simulate
-      const simResult = await callWithTimeout(
+      const simResult = await deps().callWithTimeout(
         () =>
-          simulateWithBackoff(() =>
-            (server as StellarSdk.rpc.Server).simulateTransaction(tx),
+          deps().simulateWithBackoff(() =>
+            (deps().server as StellarSdk.rpc.Server).simulateTransaction(tx),
           ),
         "simulate_relay",
       );
@@ -129,11 +167,11 @@ export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
       const preparedTx = StellarSdk.rpc
         .assembleTransaction(tx, simResult)
         .build();
-      preparedTx.sign(relayerKeypair as StellarSdk.Keypair);
+      preparedTx.sign(deps().relayerKeypair as StellarSdk.Keypair);
 
       // Submit
-      const sr = await callWithTimeout(
-        () => (server as StellarSdk.rpc.Server).sendTransaction(preparedTx),
+      const sr = await deps().callWithTimeout(
+        () => (deps().server as StellarSdk.rpc.Server).sendTransaction(preparedTx),
         "send_relay",
       );
 
@@ -142,15 +180,15 @@ export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
       }
 
       // Wait for confirmation
-      const r = await callWithTimeout(
-        () => waitForTransaction(sr.hash),
+      const r = await deps().callWithTimeout(
+        () => deps().waitForTransaction(sr.hash),
         "wait_relay",
       );
 
       return { sendResult: sr, result: r };
     });
 
-    log("info", "relay_vote_success", {
+    deps().log("info", "relay_vote_success", {
       stellarTxHash: sendResult.hash,
       daoId: event.daoId,
       proposalId: event.proposalId,
@@ -159,7 +197,7 @@ export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
     return { success: true, stellarTxHash: sendResult.hash };
   } catch (err) {
     const errMsg = (err as Error).message || "";
-    log("error", "relay_vote_failed", {
+    deps().log("error", "relay_vote_failed", {
       daoId: event.daoId,
       proposalId: event.proposalId,
       error: errMsg,
@@ -193,7 +231,7 @@ async function processEvents(): Promise<void> {
     for (const event of events) {
       const result = await relayVote(event);
       if (!result.success) {
-        log("warn", "relay_event_failed", {
+        deps().log("warn", "relay_event_failed", {
           txHash: event.txHash,
           error: result.error,
         });
@@ -201,7 +239,7 @@ async function processEvents(): Promise<void> {
       lastProcessedBlock = Math.max(lastProcessedBlock, event.blockNumber);
     }
   } catch (err) {
-    log("error", "relay_loop_error", { error: (err as Error).message });
+    deps().log("error", "relay_loop_error", { error: (err as Error).message });
   } finally {
     relayRunning = false;
   }
@@ -213,7 +251,7 @@ async function processEvents(): Promise<void> {
 export function startRelay(intervalMs: number = 10000): void {
   if (relayInterval) return;
 
-  log("info", "relay_started", { intervalMs });
+  deps().log("info", "relay_started", { intervalMs });
   relayInterval = setInterval(processEvents, intervalMs);
 
   // Process immediately
@@ -227,6 +265,6 @@ export function stopRelay(): void {
   if (relayInterval) {
     clearInterval(relayInterval);
     relayInterval = null;
-    log("info", "relay_stopped");
+    deps().log("info", "relay_stopped");
   }
 }

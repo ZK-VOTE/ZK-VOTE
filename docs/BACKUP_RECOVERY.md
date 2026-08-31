@@ -6,9 +6,10 @@ The ZK-VOTE database (`data/zkvote.db`) stores critical blockchain indexer event
 
 1. **Automated Daily Online Backups**: Uses SQLite's `backup()` API (`better-sqlite3`) to create consistent database snapshots without interrupting service.
 2. **Backup Verification**: Immediate `PRAGMA integrity_check` validation on created backups.
-3. **Point-in-Time Recovery (PITR)**: Safe automated and manual restoration capabilities from backup snapshots.
-4. **Litestream Continuous WAL Replication**: Continuous streaming of Write-Ahead Log (WAL) changes to external S3-compatible object storage (ideal for Fly.io deployments).
-5. **Health Endpoint Monitoring**: Exposes real-time backup metrics on `GET /health`.
+3. **Encrypted Snapshots**: Optional AES-256-GCM encrypted snapshots so disaster-recovery copies never contain plaintext relay data. See [`ENCRYPTED_BACKUPS.md`](./ENCRYPTED_BACKUPS.md) for the full runbook (key management, rotation, restore drills).
+4. **Point-in-Time Recovery (PITR)**: Safe automated and manual restoration capabilities from backup snapshots.
+5. **Litestream Continuous WAL Replication**: Continuous streaming of Write-Ahead Log (WAL) changes to external S3-compatible object storage (ideal for Fly.io deployments).
+6. **Health Endpoint Monitoring**: Exposes real-time backup metrics on `GET /health`.
 
 ---
 

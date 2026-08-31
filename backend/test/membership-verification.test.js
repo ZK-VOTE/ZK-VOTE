@@ -1,7 +1,23 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 
-process.env.MEMBERSHIP_SBT_CONTRACT_ID = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+const TEST_SBT_ID = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+
+// The SBT contract id must be visible to the sync service BEFORE wiring —
+// refactored services capture config values at wiring time (#358 DI). Static
+// imports hoist above any env assignment in this file, and dotenvx re-loads
+// .env.development with override during config evaluation, so env vars alone
+// are non-deterministic here. Load config dynamically, force the field
+// directly on the validated config object, then wire.
+process.env.MEMBERSHIP_SBT_CONTRACT_ID = TEST_SBT_ID;
+const { config } = await import("../src/config.js");
+config.membershipSbtContractId = TEST_SBT_ID;
+
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+const { buildAppServices } = await import("../src/composition-root.js");
+buildAppServices();
 
 test("verifyMembership: real-time on-chain check reflects revocation immediately, even with a stale periodic cache", async () => {
   const StellarSdk = await import("@stellar/stellar-sdk");
@@ -59,9 +75,13 @@ test("verifyMembership: throws when the SBT contract isn't configured, so caller
 
   const prev = config.membershipSbtContractId;
   config.membershipSbtContractId = undefined;
+  // Re-wire so the service's injected snapshot of the config reflects the
+  // cleared field (deps are captured at wiring time, #358).
+  buildAppServices();
   try {
     await assert.rejects(() => verifyMembership(1, "GABC"), /not configured/);
   } finally {
     config.membershipSbtContractId = prev;
+    buildAppServices();
   }
 });

@@ -9,7 +9,8 @@ import {
   getCurrentVersion,
   isStaleVersion,
 } from "../services/circuit-registry.js";
-import { queryLimiter } from "../middleware/index.js";
+import { queryLimiter, validateParams } from "../middleware/index.js";
+import { circuitParamsSchema } from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();

@@ -23,6 +23,12 @@ import os from "node:os";
 import path from "node:path";
 import * as StellarSdk from "@stellar/stellar-sdk";
 
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+import { buildAppServices } from "../src/composition-root.js";
+buildAppServices();
+
 process.env.RELAYER_TEST_MODE = "true";
 process.env.SOROBAN_RPC_URL = "http://localhost";
 process.env.NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
@@ -174,6 +180,7 @@ test("alertAdmin logs only when no webhook is configured", async (t) => {
 test("alertAdmin posts to the configured webhook and marks the service healthy", async (t) => {
   const original = config.adminAlertWebhookUrl;
   config.adminAlertWebhookUrl = "https://example.test/alert";
+  buildAppServices();
   t.after(() => {
     config.adminAlertWebhookUrl = original;
     resetServiceHealth();
@@ -202,6 +209,7 @@ test("alertAdmin posts to the configured webhook and marks the service healthy",
 test("alertAdmin marks the service degraded when the webhook fails, and never throws", async (t) => {
   const original = config.adminAlertWebhookUrl;
   config.adminAlertWebhookUrl = "https://example.test/alert";
+  buildAppServices();
   t.after(() => {
     config.adminAlertWebhookUrl = original;
     resetServiceHealth();
@@ -227,6 +235,7 @@ test("alertAdmin marks the service degraded when the webhook fails, and never th
 test("alertAdmin marks the service degraded on a non-2xx webhook response", async (t) => {
   const original = config.adminAlertWebhookUrl;
   config.adminAlertWebhookUrl = "https://example.test/alert";
+  buildAppServices();
   t.after(() => {
     config.adminAlertWebhookUrl = original;
     resetServiceHealth();

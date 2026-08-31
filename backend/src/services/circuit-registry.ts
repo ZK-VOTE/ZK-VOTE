@@ -1,7 +1,45 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config } from "../config.js";
-import { logger } from "./logger.js";
-import { server, relayerKeypair, callWithTimeout } from "./stellar.js";
+import type { LoggerPort, RpcServerPort } from "./interfaces.js";
+
+/**
+ * Dependencies the circuit-registry service needs, injected explicitly via
+ * `initCircuitRegistry` (called by the composition root at startup) so the
+ * service never imports `stellar.js`'s module globals (#358).
+ */
+export interface CircuitRegistryDeps {
+  /** Soroban RPC server (real or test stub). */
+  server: RpcServerPort;
+  /** Relayer keypair used to source simulation transactions. */
+  relayerKeypair: { publicKey(): string };
+  /** Run `fn` with a timeout, labelled for logs/metrics. */
+  callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
+  /** circuit-registry contract id (may be unset → simulated calls return null). */
+  circuitRegistryContractId: string | undefined;
+  /** Network passphrase for transaction building. */
+  networkPassphrase: string;
+  /** Logger (defaults to the module logger if not provided). */
+  logger: LoggerPort;
+}
+
+let deps: CircuitRegistryDeps | null = null;
+
+/**
+ * Explicitly wire the circuit-registry service's dependencies. Must be called
+ * once at startup by the composition root before any request reaches the
+ * /circuits routes.
+ */
+export function initCircuitRegistry(d: CircuitRegistryDeps): void {
+  deps = d;
+}
+
+function getDeps(): CircuitRegistryDeps {
+  if (!deps) {
+    throw new Error(
+      "circuit-registry: initCircuitRegistry() must be called before use",
+    );
+  }
+  return deps;
+}
 
 export interface CircuitInfo {
   circuitId: string;
@@ -114,8 +152,9 @@ async function simulateContractCall(
   method: string,
   args: StellarSdk.xdr.ScVal[],
 ): Promise<StellarSdk.rpc.Api.SimulateTransactionSuccessResponse | null> {
-  const rpcServer = server as StellarSdk.rpc.Server;
-  const contractId = config.circuitRegistryContractId;
+  const { server, relayerKeypair, callWithTimeout, circuitRegistryContractId, networkPassphrase, logger } = getDeps();
+  const rpcServer = server as unknown as StellarSdk.rpc.Server;
+  const contractId = circuitRegistryContractId;
   if (!contractId) {
     logger.error("circuit_registry_not_configured");
     return null;
@@ -129,7 +168,7 @@ async function simulateContractCall(
 
     const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
       fee: "100000",
-      networkPassphrase: config.networkPassphrase,
+      networkPassphrase,
     })
       .addOperation(contract.call(method, ...args))
       .setTimeout(30)

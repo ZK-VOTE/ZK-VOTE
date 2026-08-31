@@ -16,16 +16,11 @@
 import { Router, type Request, type Response } from "express";
 import { authGuard, queryLimiter } from "../middleware/index.js";
 import {
-  appendAudit,
-  isIdempotencyKeyUsed,
-  markIdempotencyKey,
-  deriveActor,
-  redactPii,
-} from "../middleware/audit.js";
-import { hashIp } from "../services/logger.js";
-import { log } from "../services/logger.js";
-import type { AsyncHandler } from "../types/index.js";
-import crypto from "crypto";
+  getRemediationHistory,
+  getMTTRStats,
+} from "../services/remediation.js";
+import { validateQuery } from "../middleware/index.js";
+import { remediationHistoryQuerySchema } from "../validation/schemas.js";
 
 const router = Router();
 
@@ -205,65 +200,23 @@ router.post("/remediation/action", authGuard, (async (req: Request, res: Respons
  * GET /remediation/log - Query remediation audit trail
  * Requires auth, supports filters: action, target, from, to, limit, offset
  */
-router.get("/remediation/log", authGuard, queryLimiter, (req: Request, res: Response) => {
-  const { action, target, from, to, limit, offset } = req.query;
-  let filtered = [...remediationLog];
+router.get(
+  "/remediation/history",
+  validateQuery(remediationHistoryQuerySchema),
+  (req: Request, res: Response) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { limit } = (req as any).validatedQuery;
+    const history = getRemediationHistory(limit);
+    const stats = getMTTRStats();
 
-  if (action) filtered = filtered.filter((r) => r.action === String(action));
-  if (target) filtered = filtered.filter((r) => r.target === String(target));
-  if (from) {
-    const fromTs = new Date(String(from)).getTime();
-    if (!isNaN(fromTs)) filtered = filtered.filter((r) => new Date(r.timestamp).getTime() >= fromTs);
-  }
-  if (to) {
-    const toTs = new Date(String(to)).getTime();
-    if (!isNaN(toTs)) filtered = filtered.filter((r) => new Date(r.timestamp).getTime() <= toTs);
-  }
-
-  const total = filtered.length;
-  const off = Math.max(0, parseInt(String(offset || "0"), 10) || 0);
-  const lim = Math.min(Math.max(1, parseInt(String(limit || "50"), 10) || 50), 100);
-
-  const entries = filtered.slice(off, off + lim);
-  // Return redacted view - idempotencyKey always redacted
-  const sanitized = entries.map((e) => ({
-    id: e.id,
-    timestamp: e.timestamp,
-    action: e.action,
-    target: e.target,
-    reason: e.reason,
-    actor: e.actor,
-    actorIpHash: e.actorIpHash,
-    metadata: e.metadata,
-    txHash: e.txHash,
-    immutable: true,
-    idempotencyKey: "[REDACTED]",
-  }));
-
-  res.json({ entries: sanitized, total, limit: lim, offset: off });
-});
-
-/**
- * GET /remediation/:id - Get single remediation record by id
- */
-router.get("/remediation/:id", authGuard, queryLimiter, (req: Request, res: Response) => {
-  const { id } = req.params;
-  const rec = getRemediationById(id);
-  if (!rec) return res.status(404).json({ error: "Remediation record not found" });
-  res.json({
-    id: rec.id,
-    timestamp: rec.timestamp,
-    action: rec.action,
-    target: rec.target,
-    reason: rec.reason,
-    actor: rec.actor,
-    actorIpHash: rec.actorIpHash,
-    metadata: rec.metadata,
-    txHash: rec.txHash,
-    immutable: true,
-    idempotencyKey: "[REDACTED]",
-  });
-});
+    res.json({
+      status: "ok",
+      historyCount: history.length,
+      history,
+      stats,
+    });
+  },
+);
 
 /**
  * POST /remediation/verify - Verify remediation log integrity (immutable check)

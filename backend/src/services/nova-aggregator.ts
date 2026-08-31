@@ -41,12 +41,21 @@ export interface RecursiveProofPayload {
 
 export class NovaAggregatorService {
   private tempDir: string;
+  private _exec: typeof execAsync;
 
   constructor(tempDir?: string) {
     this.tempDir = tempDir || path.join(process.cwd(), "temp", "nova");
+    this._exec = execAsync;
     if (!fs.existsSync(this.tempDir)) {
       fs.mkdirSync(this.tempDir, { recursive: true });
     }
+  }
+
+  /**
+   * Allows tests to inject a mock exec function to avoid spawning cargo.
+   */
+  _setExecForTest(mockFn: typeof execAsync): void {
+    this._exec = mockFn;
   }
 
   /**
@@ -75,15 +84,15 @@ export class NovaAggregatorService {
       // 2. Invoke nova-aggregator CLI tool
       const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --batch "${batchPath}" --out "${outputPath}" --root "${root}" --benchmark`;
 
-      const { stdout, stderr } = await execAsync(cargoCmd, {
-        cwd: path.resolve(__dirname, "../../../"),
+      const { stdout } = await this._exec(cargoCmd, {
+        cwd: path.resolve(process.cwd(), ".."),
       });
 
       console.info("[NovaService] Aggregation CLI output:", stdout);
 
       if (!fs.existsSync(outputPath)) {
         throw new Error(
-          `Nova aggregator failed to create output proof file: ${stderr}`,
+          `Nova aggregator failed to create output proof file`,
         );
       }
 
@@ -96,6 +105,50 @@ export class NovaAggregatorService {
       // Cleanup transient files
       if (fs.existsSync(batchPath)) fs.unlinkSync(batchPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    }
+  }
+
+  /**
+   * Verifies a previously generated recursive proof by invoking the CLI --verify mode.
+   * Returns { verified: true } on exit code 0, { verified: false } on exit code 1.
+   * Never throws — returns { verified: false } on any error.
+   */
+  async verifyProof(
+    payload: RecursiveProofPayload,
+  ): Promise<{ verified: boolean }> {
+    const timestamp = Date.now();
+    const proofPath = path.join(this.tempDir, `verify_${timestamp}.json`);
+
+    try {
+      fs.writeFileSync(proofPath, JSON.stringify(payload, null, 2), "utf8");
+
+      const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --verify "${proofPath}"`;
+
+      try {
+        const { stdout } = await this._exec(cargoCmd, {
+          cwd: path.resolve(process.cwd(), ".."),
+        });
+        // Exit code 0 → stdout contains {"verified":true}
+        const result = JSON.parse(stdout.trim());
+        return { verified: result.verified === true };
+      } catch (err: any) {
+        // execAsync rejects on non-zero exit code
+        // exit code 1 → {"verified":false} on stdout
+        if (err.stdout) {
+          try {
+            const result = JSON.parse(err.stdout.trim());
+            if (typeof result.verified === "boolean") {
+              return { verified: result.verified };
+            }
+          } catch {
+            // stdout not parseable — fall through to false
+          }
+        }
+        // exit code 2 or any other unexpected error
+        return { verified: false };
+      }
+    } finally {
+      if (fs.existsSync(proofPath)) fs.unlinkSync(proofPath);
     }
   }
 }

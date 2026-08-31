@@ -1,6 +1,6 @@
 // Merkle tree path computation for Poseidon tree
-import { buildPoseidon } from "circomlibjs";
-import { getZkVoteClient } from "./client";
+// Lazy load circomlibjs
+import { initializeContractClients } from "./contracts";
 
 const TREE_DEPTH = 18;
 
@@ -29,7 +29,8 @@ let poseidonCache: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function getPoseidon(): Promise<any> {
   if (!poseidonCache) {
-    poseidonCache = await buildPoseidon();
+    const circomlibjs = await import("circomlibjs");
+    poseidonCache = await circomlibjs.buildPoseidon();
   }
   return poseidonCache;
 }

@@ -2,7 +2,9 @@
  * Request Logging Middleware
  *
  * Provides request context and structured logging for all requests.
- * Supports PII redaction via the enhanced logger.
+ * Supports PII redaction via the enhanced logger and correlation ID
+ * propagation via AsyncLocalStorage so every downstream log call from
+ * services/routes automatically carries the request's correlation + trace ID.
  */
 
 import type { Request, Response, NextFunction } from "express";
@@ -13,15 +15,20 @@ declare global {
     interface Request {
       ctx?: string;
       traceId?: string;
+      spanId?: string;
     }
   }
 }
 import crypto from "crypto";
 // import { config } from "../config.js"; // Unused - kept for reference
 import { log, hashIp, getRedactionPolicy } from "../services/logger.js";
-
-const TRACEPARENT_RE =
-  /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
+import {
+  createSpanContext,
+  formatTraceparent,
+  parseTraceparent,
+  runWithSpanContext,
+  type SpanContext,
+} from "../services/tracing.js";
 
 /**
  * Parses an inbound W3C `traceparent` header (version-traceid-parentid-flags,
@@ -31,18 +38,13 @@ const TRACEPARENT_RE =
 export function parseIncomingTraceId(
   header: string | undefined,
 ): string | undefined {
-  if (!header) return undefined;
-  const match = TRACEPARENT_RE.exec(header.trim());
-  if (!match) return undefined;
-  const traceId = match[2];
-  // An all-zero trace ID is explicitly invalid per the spec.
-  if (/^0+$/.test(traceId)) return undefined;
-  return traceId;
+  return parseTraceparent(header)?.traceId;
 }
 
 /**
- * Request logging middleware
- * Adds context ID and logs request start/end
+ * Builds the correlation context for a request and runs the downstream
+ * middleware chain within it, so every nested log call (routes, services)
+ * automatically inherits the request's correlation + trace ID.
  */
 export function requestLogger(
   req: Request,
@@ -55,49 +57,41 @@ export function requestLogger(
   // W3C Trace Context (#141): continue an inbound trace ID when present so
   // this request can be correlated across services, otherwise start a new
   // trace. The span ID always identifies this hop.
-  const traceId =
-    parseIncomingTraceId(req.get("traceparent")) ||
-    crypto.randomBytes(16).toString("hex");
-  const spanId = crypto.randomBytes(8).toString("hex");
-  req.traceId = traceId;
-  res.setHeader("traceparent", `00-${traceId}-${spanId}-01`);
+  //
+  // The context is also installed as ambient for the rest of the chain (#321),
+  // which is what lets a database write or a Soroban RPC call opened deep
+  // inside a handler attach itself to this request's trace without every
+  // intervening signature having to carry a context argument.
+  const inbound = parseTraceparent(req.get("traceparent"));
+  const spanContext: SpanContext = createSpanContext(inbound);
+  req.traceId = spanContext.traceId;
+  req.spanId = spanContext.spanId;
+  res.setHeader("traceparent", formatTraceparent(spanContext));
 
-  // Build IP meta based on configuration
-  const policy = getRedactionPolicy();
-  let ipMeta: Record<string, string> = {};
-
-  if (policy.showClientIp === "plain") {
-    ipMeta = { ip: req.ip || "" };
-  } else if (policy.showClientIp === "hash") {
-    ipMeta = { ipHash: hashIp(req.ip) };
-  }
-  // If "none", ipMeta stays empty
-
-  // Build body meta (only log body keys, not values)
-  const bodyMeta = policy.showBodyKeysOnly
-    ? { bodyKeys: Object.keys(req.body || {}) }
-    : {};
-
-  log("info", "request_start", {
+  const context: RequestContext = {
     ctx,
-    traceId,
+    traceId: spanContext.traceId,
     path: req.path,
     method: req.method,
-    ...ipMeta,
-    ...bodyMeta,
-  });
+  };
+
+  runWithContext(context, () => {
+    // Build IP meta based on configuration
+    const policy = getRedactionPolicy();
+    let ipMeta: Record<string, string> = {};
 
   // Log request end on finish
   res.on("finish", () => {
     log("info", "request_end", {
       ctx,
-      traceId,
+      traceId: spanContext.traceId,
       path: req.path,
-      status: res.statusCode,
+      method: req.method,
+      ...ipMeta,
+      ...bodyMeta,
     });
-  });
 
-  next();
+  runWithSpanContext(spanContext, next);
 }
 
 /**
@@ -110,13 +104,11 @@ export function errorLogger(
   res: Response,
   next: NextFunction,
 ): void {
-  const ctx = req.ctx || "unknown";
   const isProduction = process.env.NODE_ENV === "production";
 
-  // Log the error with redaction
+  // Log the error with redaction; correlation IDs are attached automatically
+  // via the active request context.
   log("error", "request_error", {
-    ctx,
-    traceId: req.traceId,
     path: req.path,
     method: req.method,
     error: err.message,

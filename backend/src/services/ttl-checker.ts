@@ -1,12 +1,42 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { server } from "./stellar.js";
-import { config } from "../config.js";
-import { log } from "./logger.js";
-import {
-  getTTLTracking,
-  upsertTTLTracking,
-  type TTLTrackingEntry,
-} from "./db.js";
+import type { TTLTrackingEntry } from "./db.js";
+import type { LoggerPort, StellarContext } from "./interfaces.js";
+
+//__TTL_CHECKER_DEPS_START__
+/**
+ * Dependencies injected via `initTtlChecker` (#358) so this module never
+ * imports the `stellar.js`/`config.js`/`logger.js`/`db.js` module singletons
+ * directly (the `db.js` import above is type-only).
+ */
+export interface TtlCheckerDeps {
+  /** Soroban RPC surface for on-chain TTL queries. */
+  server: StellarContext["server"];
+  /** Config: TTL urgency thresholds (ms). */
+  ttlGracePeriodMs: number;
+  ttlRenewalThresholdMs: number;
+  /** Config: relayer test mode (skips on-chain queries). */
+  testMode: boolean;
+  /** TTL tracking persistence (events store). */
+  getTTLTracking(entryId: string): TTLTrackingEntry | null;
+  upsertTTLTracking(entry: TTLTrackingEntry): void;
+  /** Structured logger (called as `deps.log(level, event, meta)`). */
+  log: LoggerPort["log"];
+}
+
+let checkerDeps: TtlCheckerDeps | null = null;
+
+/** Explicitly wire the TTL checker (composition root only). */
+export function initTtlChecker(d: TtlCheckerDeps): void {
+  checkerDeps = d;
+}
+
+function deps(): TtlCheckerDeps {
+  if (!checkerDeps) {
+    throw new Error("ttl-checker: initTtlChecker() must be called before use");
+  }
+  return checkerDeps;
+}
+//__TTL_CHECKER_DEPS_END__
 
 const SOROBAN_TTL_LEDGERS = 31 * 17280;
 const LEDGER_DURATION_MS = 5000;
@@ -25,8 +55,8 @@ export interface TTLInfo {
 }
 
 function categorizeUrgency(remainingMs: number): Urgency {
-  if (remainingMs < config.ttlGracePeriodMs) return "grace";
-  if (remainingMs < config.ttlRenewalThresholdMs) return "warning";
+  if (remainingMs < deps().ttlGracePeriodMs) return "grace";
+  if (remainingMs < deps().ttlRenewalThresholdMs) return "warning";
   return "healthy";
 }
 
@@ -64,7 +94,7 @@ export async function queryContractInstanceTTL(contractId: string): Promise<{
   latestLedger: number;
 } | null> {
   try {
-    if (config.testMode) return null;
+    if (deps().testMode) return null;
 
     const rawId = StellarSdk.StrKey.decodeContract(
       contractId,
@@ -77,7 +107,7 @@ export async function queryContractInstanceTTL(contractId: string): Promise<{
       }),
     );
 
-    const response = await (server as StellarSdk.rpc.Server).getLedgerEntries(
+    const response = await (deps().server as StellarSdk.rpc.Server).getLedgerEntries(
       ledgerKey,
     );
     if (!response || !response.entries || response.entries.length === 0)
@@ -95,7 +125,7 @@ export async function queryContractInstanceTTL(contractId: string): Promise<{
       latestLedger,
     };
   } catch (err) {
-    log("debug", "ttl_query_instance_failed", {
+    deps().log("debug", "ttl_query_instance_failed", {
       contract: contractId.slice(0, 8) + "...",
       error: (err as Error).message,
     });
@@ -117,7 +147,7 @@ export async function queryInstanceTTLWithFallback(
     const remainingMs = remainingLedgers * LEDGER_DURATION_MS;
     urgency = categorizeUrgency(remainingMs);
 
-    upsertTTLTracking({
+    deps().upsertTTLTracking({
       entryId,
       contractId,
       daoId: null,
@@ -127,7 +157,7 @@ export async function queryInstanceTTLWithFallback(
       urgency,
     });
   } else {
-    const tracked = getTTLTracking(entryId);
+    const tracked = deps().getTTLTracking(entryId);
     const estimated = estimateRemainingFromTracked(tracked);
 
     if (estimated) {
@@ -159,7 +189,7 @@ export async function queryPersistentTTLWithFallback(
   method: string,
   entryId: string,
 ): Promise<TTLInfo> {
-  const tracked = getTTLTracking(entryId);
+  const tracked = deps().getTTLTracking(entryId);
   const estimated = estimateRemainingFromTracked(tracked);
 
   if (estimated) {
@@ -181,7 +211,7 @@ export async function queryPersistentTTLWithFallback(
 }
 
 export function needsRenewal(info: TTLInfo): boolean {
-  return info.remainingMs < config.ttlRenewalThresholdMs;
+  return info.remainingMs < deps().ttlRenewalThresholdMs;
 }
 
 export function isInGracePeriod(info: TTLInfo): boolean {

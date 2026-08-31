@@ -1,11 +1,35 @@
 #!/usr/bin/env node
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendConfigPath = path.resolve(__dirname, "../frontend/src/config/contracts.ts");
+const frontendRoot = path.resolve(__dirname, "../frontend");
+
+function walk(dir, exts, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (["node_modules", ".git", "dist", "build", ".cache"].includes(entry.name)) continue;
+      walk(path.join(dir, entry.name), exts, out);
+    } else if (exts.includes(path.extname(entry.name))) {
+      out.push(path.join(dir, entry.name));
+    }
+  }
+  return out;
+}
+
+function findLegacyRefs() {
+  const files = walk(frontendRoot, [".ts", ".tsx"]);
+  const hits = [];
+  for (const file of files) {
+    const content = fs.readFileSync(file, "utf-8");
+    if (content.includes("initializeContractClients")) {
+      hits.push(file);
+    }
+  }
+  return hits;
+}
 
 function parseContracts() {
   const content = fs.readFileSync(frontendConfigPath, "utf-8");
@@ -33,9 +57,9 @@ for (const [k, v] of Object.entries(contracts)) {
 }
 
 try {
-  const out = execSync('grep -r "initializeContractClients" frontend --include="*.ts" --include="*.tsx" || true', { encoding: "utf-8" });
-  if (out.trim()) {
-    console.error("❌ Legacy initializer still present:\n", out);
+  const legacyRefs = findLegacyRefs();
+  if (legacyRefs.length) {
+    console.error("❌ Legacy initializer still present:\n" + legacyRefs.join("\n"));
     mismatches.push("legacy_initializer");
   } else {
     console.log("✓ No legacy initializer found");

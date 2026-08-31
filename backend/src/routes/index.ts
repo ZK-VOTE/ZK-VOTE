@@ -13,4 +13,6 @@ export { default as claimRoutes } from "./claim.js";
 export { default as indexerRoutes, initIndexerRoutes } from "./indexer.js";
 export { default as bridgeRoutes } from "./bridge.js";
 export { default as circuitRoutes } from "./circuits.js";
-export { default as thresholdRoutes } from "./threshold.js";
+export { default as sybilRoutes } from "./sybil.js";
+export { default as vdfRoutes } from "./vdf.js";
+export { default as delegationRoutes } from "./delegation.js";

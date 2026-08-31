@@ -14,6 +14,43 @@ const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
 const PERSISTENT_TTL_EXTEND: u32 = 535_680;
 
+// ── Sybil-resistance parameters (#301) ─────────────────────────────────────
+//
+// The weight a member carries is
+//
+//     weight = min(MAX_SYBIL_WEIGHT, BASE_WEIGHT + age_weight + rep_weight)
+//
+// where `age_weight` and `rep_weight` are *step* functions: one point per
+// threshold crossed. Two properties matter and both fall out of that shape:
+//
+//   1. **Bounded.** Every identity, however old or well-regarded, is worth at
+//      most MAX_SYBIL_WEIGHT. A fresh identity is worth BASE_WEIGHT. So the
+//      most an attacker gains per Sybil relative to an honest member is a
+//      fixed ratio (MAX_SYBIL_WEIGHT : BASE_WEIGHT), never unbounded.
+//   2. **Concave.** Thresholds widen as they go (7 → 30 → 90 → 180 → 365
+//      days), so the marginal value of waiting falls. Farming age is a losing
+//      strategy well before the cap.
+//
+// The thresholds are duplicated in exactly three places, and all three MUST
+// agree or a proof will verify against a weight the chain disagrees with:
+//   * here (on-chain enforcement / the queryable source of truth),
+//   * `circuits/weighted_vote.circom` (in-proof enforcement),
+//   * `backend/src/services/sybil.ts` (the API the UI reads).
+// `backend/test/sybil.test.ts` asserts the TypeScript mirror matches these.
+
+/// Age thresholds in days. Crossing each one adds a point of weight.
+pub const AGE_THRESHOLD_DAYS: [u64; 5] = [7, 30, 90, 180, 365];
+/// Reputation thresholds. Crossing each one adds a point of weight.
+pub const REPUTATION_THRESHOLDS: [u32; 5] = [1, 5, 15, 40, 100];
+/// Weight every non-revoked member carries — one member, one vote as a floor.
+pub const BASE_WEIGHT: u32 = 1;
+/// Hard cap on any single identity's weight.
+pub const MAX_SYBIL_WEIGHT: u32 = 10;
+/// Upper bound on a stored reputation score, so accrual cannot overflow.
+pub const MAX_REPUTATION: u32 = 10_000;
+/// Seconds per day, for age bucketing.
+pub const SECONDS_PER_DAY: u64 = 86_400;
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum SbtError {
@@ -26,6 +63,12 @@ pub enum SbtError {
     /// Raised by transfer/transfer_from/approve: membership SBTs are
     /// soulbound and can never change hands (#357).
     TransferAttempted = 7,
+    /// Reputation accrual/slash would overflow or underflow the u32 score (#301).
+    ReputationOutOfRange = 8,
+    /// Caller is not an accredited reputation attestor for this DAO (#301).
+    NotReputationAttestor = 9,
+    /// Reputation weight parameters are not monotonically increasing (#301).
+    InvalidWeightCurve = 10,
 }
 
 #[contracttype]
@@ -40,6 +83,19 @@ pub enum DataKey {
     TransferCooldown(u64, Address), // (dao_id, address) -> u64 (cooldown end timestamp)
     /// Election participation flag: true if member is registered in an active election
     InActiveElection(u64, Address), // (dao_id, address) -> bool
+
+    // ── Sybil-resistance layer (#301) ──────────────────────────────────────
+    // Appended at the end so existing storage discriminants stay stable.
+    /// Ledger timestamp the member's SBT was first minted. This is the anchor
+    /// for SBT-age weighting — it is set once on first mint and deliberately
+    /// NOT reset by revoke/re-mint or leave/re-join, so churning an identity
+    /// cannot be used to reset (or preserve) age.
+    MintedAt(u64, Address), // (dao_id, address) -> u64 (unix seconds)
+    /// Accrued reputation score for a member within a DAO.
+    Reputation(u64, Address), // (dao_id, address) -> u32
+    /// Addresses permitted to accrue/slash reputation for a DAO (the voting
+    /// contract, plus any DAO-nominated attestor).
+    ReputationAttestor(u64, Address), // (dao_id, address) -> bool
 }
 
 // Typed Events
@@ -69,6 +125,17 @@ pub struct SbtLeaveEvent {
 
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
+pub struct ReputationChangedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub member: Address,
+    pub old_score: u32,
+    pub new_score: u32,
+    pub reason: soroban_sdk::Symbol,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContractUpgraded {
     pub from: u32,
     pub to: u32,
@@ -89,6 +156,24 @@ impl MembershipSbt {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
+
+    /// Record the first-ever mint time for a member (#301).
+    ///
+    /// Written once and never overwritten. Age is the scarce resource the
+    /// Sybil bound rests on, so it must survive a revoke/re-mint cycle — but it
+    /// must equally not be *reset* by one, which would let an attacker recycle
+    /// a burned identity into a fresh-looking one. Both directions are handled
+    /// by simply refusing to write twice.
+    fn record_mint_time(env: &Env, dao_id: u64, member: &Address) {
+        let key = DataKey::MintedAt(dao_id, member.clone());
+        if env.storage().persistent().has(&key) {
+            Self::bump_persistent(env, &key);
+            return;
+        }
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &now);
+        Self::bump_persistent(env, &key);
     }
 
     /// Constructor: Initialize contract with DAO Registry address
@@ -188,6 +273,9 @@ impl MembershipSbt {
             Self::add_member_to_list(&env, dao_id, &to);
         }
 
+        // Anchor SBT age on first mint (#301)
+        Self::record_mint_time(&env, dao_id, &to);
+
         SbtMintEvent { dao_id, to }.publish(&env);
     }
 
@@ -213,6 +301,9 @@ impl MembershipSbt {
 
         // Add to enumeration list
         Self::add_member_to_list(&env, dao_id, &to);
+
+        // Anchor SBT age on first mint (#301)
+        Self::record_mint_time(&env, dao_id, &to);
 
         SbtMintEvent { dao_id, to }.publish(&env);
     }
@@ -377,6 +468,9 @@ impl MembershipSbt {
             Self::add_member_to_list(&env, dao_id, &member);
         }
 
+        // Anchor SBT age on first mint (#301)
+        Self::record_mint_time(&env, dao_id, &member);
+
         SbtMintEvent { dao_id, to: member }.publish(&env);
     }
 
@@ -516,6 +610,229 @@ impl MembershipSbt {
             .instance()
             .get(&VERSION_KEY)
             .unwrap_or(VERSION)
+    }
+
+    // ── Sybil-resistance layer: SBT age + reputation (#301) ────────────────
+    //
+    // THREAT_MODEL §"Sybil bounds" requires that Vote-to-Earn and quadratic
+    // voting cannot be drained by minting identities. Flat per-identity rewards
+    // are Sybil-vulnerable by construction; the mitigation is to make an
+    // identity's *weight* a function of two things an attacker cannot mint:
+    // elapsed time and accrued reputation.
+
+    /// Age of a member's SBT in whole days, measured from first mint.
+    ///
+    /// Returns 0 for a non-member and for anyone whose mint time predates
+    /// nothing (i.e. was never recorded), so an unrecorded member can never
+    /// accidentally read as ancient.
+    pub fn member_age_days(env: Env, dao_id: u64, member: Address) -> u64 {
+        Self::bump_instance(&env);
+        let key = DataKey::MintedAt(dao_id, member);
+        let minted_at: u64 = match env.storage().persistent().get(&key) {
+            Some(t) => t,
+            None => return 0,
+        };
+        let now = env.ledger().timestamp();
+        now.saturating_sub(minted_at) / SECONDS_PER_DAY
+    }
+
+    /// Raw stored reputation score for a member.
+    pub fn reputation(env: Env, dao_id: u64, member: Address) -> u32 {
+        Self::bump_instance(&env);
+        let key = DataKey::Reputation(dao_id, member);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Points contributed by SBT age: one per threshold in
+    /// [`AGE_THRESHOLD_DAYS`] that the member has crossed.
+    pub fn age_weight(env: Env, dao_id: u64, member: Address) -> u32 {
+        let age_days = Self::member_age_days(env, dao_id, member);
+        let mut points = 0u32;
+        for threshold in AGE_THRESHOLD_DAYS.iter() {
+            if age_days >= *threshold {
+                points += 1;
+            }
+        }
+        points
+    }
+
+    /// Points contributed by reputation: one per threshold in
+    /// [`REPUTATION_THRESHOLDS`] that the member has crossed.
+    pub fn reputation_weight(env: Env, dao_id: u64, member: Address) -> u32 {
+        let score = Self::reputation(env, dao_id, member);
+        let mut points = 0u32;
+        for threshold in REPUTATION_THRESHOLDS.iter() {
+            if score >= *threshold {
+                points += 1;
+            }
+        }
+        points
+    }
+
+    /// The Sybil-bounded voting weight for a member.
+    ///
+    /// A revoked or non-existent member is worth 0 — not BASE_WEIGHT — so
+    /// revocation genuinely removes influence rather than merely capping it.
+    pub fn sybil_weight(env: Env, dao_id: u64, member: Address) -> u32 {
+        if !Self::has(env.clone(), dao_id, member.clone()) {
+            return 0;
+        }
+        let age = Self::age_weight(env.clone(), dao_id, member.clone());
+        let rep = Self::reputation_weight(env, dao_id, member);
+        let raw = BASE_WEIGHT + age + rep;
+        if raw > MAX_SYBIL_WEIGHT {
+            MAX_SYBIL_WEIGHT
+        } else {
+            raw
+        }
+    }
+
+    /// Nominate an address that may accrue or slash reputation for a DAO.
+    ///
+    /// Typically the voting contract (so participation credits are awarded by
+    /// the same code that verified the vote) plus whatever attestor the DAO
+    /// chooses. Reputation is deliberately *not* self-serve: an identity that
+    /// could credit itself would defeat the whole layer.
+    pub fn set_reputation_attestor(
+        env: Env,
+        dao_id: u64,
+        attestor: Address,
+        allowed: bool,
+        admin: Address,
+    ) {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        let registry: Address = Self::registry_addr(&env);
+        let dao_admin: Address = env.invoke_contract(
+            &registry,
+            &symbol_short!("get_admin"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env)],
+        );
+        if dao_admin != admin {
+            panic_with_error!(&env, SbtError::NotDaoAdmin);
+        }
+
+        let key = DataKey::ReputationAttestor(dao_id, attestor);
+        if allowed {
+            env.storage().persistent().set(&key, &true);
+            Self::bump_persistent(&env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+    }
+
+    /// Whether an address may accrue/slash reputation for a DAO.
+    pub fn is_reputation_attestor(env: Env, dao_id: u64, who: Address) -> bool {
+        Self::bump_instance(&env);
+        let key = DataKey::ReputationAttestor(dao_id, who);
+        env.storage().persistent().get(&key).unwrap_or(false)
+    }
+
+    fn assert_attestor(env: &Env, dao_id: u64, attestor: &Address) {
+        attestor.require_auth();
+        let key = DataKey::ReputationAttestor(dao_id, attestor.clone());
+        let allowed: bool = env.storage().persistent().get(&key).unwrap_or(false);
+        if !allowed {
+            panic_with_error!(env, SbtError::NotReputationAttestor);
+        }
+    }
+
+    /// Credit reputation to a member for a governance action.
+    ///
+    /// Saturates at [`MAX_REPUTATION`] rather than wrapping, and rejects a
+    /// credit for a non-member outright so reputation cannot be parked on an
+    /// address before it joins.
+    pub fn accrue_reputation(
+        env: Env,
+        dao_id: u64,
+        member: Address,
+        amount: u32,
+        attestor: Address,
+        reason: Symbol,
+    ) -> u32 {
+        Self::bump_instance(&env);
+        Self::assert_attestor(&env, dao_id, &attestor);
+
+        if !Self::has(env.clone(), dao_id, member.clone()) {
+            panic_with_error!(&env, SbtError::NotMember);
+        }
+        if amount > MAX_REPUTATION {
+            panic_with_error!(&env, SbtError::ReputationOutOfRange);
+        }
+
+        let key = DataKey::Reputation(dao_id, member.clone());
+        let old_score: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_score = old_score.saturating_add(amount).min(MAX_REPUTATION);
+
+        env.storage().persistent().set(&key, &new_score);
+        Self::bump_persistent(&env, &key);
+
+        ReputationChangedEvent {
+            dao_id,
+            member,
+            old_score,
+            new_score,
+            reason,
+        }
+        .publish(&env);
+
+        new_score
+    }
+
+    /// Debit reputation from a member — the abuse response.
+    ///
+    /// Saturates at 0. Slashing is what makes reputation cost something to
+    /// misuse: without it, an attacker who farms reputation keeps it forever
+    /// and the score is only ever a one-way ratchet.
+    pub fn slash_reputation(
+        env: Env,
+        dao_id: u64,
+        member: Address,
+        amount: u32,
+        attestor: Address,
+        reason: Symbol,
+    ) -> u32 {
+        Self::bump_instance(&env);
+        Self::assert_attestor(&env, dao_id, &attestor);
+
+        let key = DataKey::Reputation(dao_id, member.clone());
+        let old_score: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_score = old_score.saturating_sub(amount);
+
+        env.storage().persistent().set(&key, &new_score);
+        Self::bump_persistent(&env, &key);
+
+        ReputationChangedEvent {
+            dao_id,
+            member,
+            old_score,
+            new_score,
+            reason,
+        }
+        .publish(&env);
+
+        new_score
+    }
+
+    /// The weight-curve parameters, so the circuit build and the backend can
+    /// read the on-chain source of truth instead of hardcoding a second copy.
+    ///
+    /// Returned as a flat vector: [BASE_WEIGHT, MAX_SYBIL_WEIGHT,
+    /// MAX_REPUTATION, age thresholds…, reputation thresholds…].
+    pub fn weight_curve_params(env: Env) -> soroban_sdk::Vec<u32> {
+        Self::bump_instance(&env);
+        let mut out = soroban_sdk::Vec::new(&env);
+        out.push_back(BASE_WEIGHT);
+        out.push_back(MAX_SYBIL_WEIGHT);
+        out.push_back(MAX_REPUTATION);
+        for t in AGE_THRESHOLD_DAYS.iter() {
+            out.push_back(*t as u32);
+        }
+        for t in REPUTATION_THRESHOLDS.iter() {
+            out.push_back(*t);
+        }
+        out
     }
 
     // ── Soulbound guarantee: reject transfer/approval attempts (#357) ───────

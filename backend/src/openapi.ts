@@ -152,4 +152,59 @@ export function buildOpenApiDocument(): Record<string, unknown> {
 /** The complete OpenAPI spec (default export for app server integration). */
 export const openApiSpec = buildOpenApiDocument();
 
-export default openApiSpec;
+  for (const ep of ENDPOINTS) {
+    const responses: Record<string, ResponseConfig> = {
+      200: {
+        description: "Success",
+        content: {
+          "application/json": {
+            schema: ep.responseSchema ?? z.any(),
+            example: ep.responseExample,
+          },
+        },
+      },
+    };
+
+    for (const status of ep.errorStatuses ?? []) {
+      responses[status] = {
+        description: `Error (HTTP ${status})`,
+        content: { "application/json": { schema: errorResponseSchema } },
+      };
+    }
+
+    registry.registerPath({
+      method: ep.method,
+      path: toOpenApiPath(ep.path),
+      tags: [ep.tag],
+      summary: ep.summary,
+      description: ep.rateLimit
+        ? `Rate limit: ${ep.rateLimit}.`
+        : "No rate limit.",
+      security: ep.auth ? [{ [SECURITY_SCHEME]: [] }] : [],
+      request: {
+        ...(ep.params ? { params: z.object(ep.params) } : {}),
+        ...(ep.query ? { query: z.object(ep.query) } : {}),
+        ...(ep.body
+          ? { body: { content: { "application/json": { schema: ep.body } } } }
+          : {}),
+      },
+      responses,
+    });
+  }
+
+  const generator = new OpenApiGeneratorV31(registry.definitions);
+  return generator.generateDocument({
+    openapi: "3.1.0",
+    info: {
+      title: "ZK-VOTE Relayer API",
+      version: "1.0.0",
+      description:
+        "Backend relayer for anonymous voting on Stellar/Soroban. Generated from route " +
+        "definitions and Zod validation schemas — see backend/API.md for prose docs and " +
+        "GET /api-docs for interactive documentation.",
+    },
+    servers: [
+      { url: "http://localhost:3001", description: "Local development" },
+    ],
+  });
+}

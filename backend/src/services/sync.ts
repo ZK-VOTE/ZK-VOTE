@@ -10,17 +10,10 @@
 import { EventEmitter } from "events";
 import * as StellarSdk from "@stellar/stellar-sdk";
 
-import { config, isValidContractId } from "../config.js";
-import { log } from "./logger.js";
-import * as dbService from "./db.js";
-import { ensureDaoCreateEvent } from "./indexer.js";
-import {
-  server,
-  relayerKeypair,
-  callWithTimeout,
-  simulateWithBackoff,
-  sequenceManager,
-} from "./stellar.js";
+import { isValidContractId } from "../config.js";
+import type { DaoInput } from "./db.js";
+import type { DaoData } from "./indexer.js";
+import type { RpcServerPort, LoggerPort } from "./interfaces.js";
 import type { Dao } from "../types/index.js";
 import {
   serviceLastRunTime,
@@ -29,8 +22,77 @@ import {
   daosSynced,
   membershipSyncsTotal,
 } from "./metrics.js";
-import { markDegraded, markHealthy } from "./service-health.js";
 import { sharedSingleFlight } from "../utils/singleflight.js";
+
+//__SYNC_DEPS_START__
+/**
+ * Persistence surface needed by the sync service (#358). Structurally typed
+ * so unit tests can inject an in-memory fake.
+ */
+export interface SyncDbPort {
+  getAllCachedDaos(): Array<Pick<Dao, "id" | "creator">>;
+  upsertDaos(daos: DaoInput[]): void;
+  setDaosSyncTime(timestamp: string): void;
+}
+
+/**
+ * Dependencies of the sync service, injected explicitly via `initSyncService`
+ * (called by the composition root) so this module never imports the
+ * `stellar.js`/`db.js`/`logger.js`/`service-health.js`/`indexer.js` module
+ * singletons to get what it needs (#358). Prometheus metrics (`metrics.js`)
+ * are intentionally still module-scoped — they are process-global counters
+ * by design and outside #358's scope.
+ */
+export interface SyncDeps {
+  /** Active RPC server (pool-backed proxy in production). */
+  server: RpcServerPort;
+  /** Relayer keypair used for read calls to the contracts. */
+  relayerKeypair: { publicKey(): string } & Partial<StellarSdk.Keypair>;
+  /** Run `fn` with a timeout, labelled for logs/metrics. */
+  callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
+  /** Simulate a transaction with retry/backoff. */
+  simulateWithBackoff<T>(fn: () => Promise<T>, attempts?: number): Promise<T>;
+  /** Sequence manager used to flush state at shutdown. */
+  sequenceManager: {
+    forceResync(server: StellarSdk.rpc.Server): Promise<void>;
+  };
+  /** Config: max entries per snapshot cache (FIFO eviction, #191). */
+  maxCachedDaos: number;
+  /** Config: DAO registry contract id. */
+  daoRegistryContractId?: string;
+  /** Config: membership SBT contract id. */
+  membershipSbtContractId?: string;
+  /** Config: Stellar network passphrase. */
+  networkPassphrase: string;
+  /** Config: DAO sync interval (ms). */
+  daoSyncIntervalMs: number;
+  /** Config: membership sync interval (ms). */
+  membershipSyncIntervalMs: number;
+  /** DAO/metadata persistence (events store). */
+  dbService: SyncDbPort;
+  /** Backfill the dao_create event for a freshly synced DAO. */
+  ensureDaoCreateEvent(daoId: number, daoData: DaoData): boolean;
+  /** Health reporting for the background sync loops. */
+  markHealthy(service: "dao_sync"): void;
+  markDegraded(service: "dao_sync", reason?: string): void;
+  /** Structured logger (called as `deps.log(level, event, meta)`). */
+  log: LoggerPort["log"];
+}
+
+let syncDeps: SyncDeps | null = null;
+
+/** Explicitly wire the sync service (composition root only). */
+export function initSyncService(d: SyncDeps): void {
+  syncDeps = d;
+}
+
+function deps(): SyncDeps {
+  if (!syncDeps) {
+    throw new Error("sync: initSyncService() must be called before use");
+  }
+  return syncDeps;
+}
+//__SYNC_DEPS_END__
 
 // ============================================
 // IMMUTABLE CACHE SNAPSHOT & CONCURRENCY STATE
@@ -162,8 +224,8 @@ function swapCacheSnapshot(
   newAdmins: Map<number, string>,
 ): CacheSnapshot {
   const nextVersion = currentSnapshot.version + 1;
-  const boundedMembers = evictOldestOverflow(newMembers, config.maxCachedDaos);
-  const boundedAdmins = evictOldestOverflow(newAdmins, config.maxCachedDaos);
+  const boundedMembers = evictOldestOverflow(newMembers, deps().maxCachedDaos);
+  const boundedAdmins = evictOldestOverflow(newAdmins, deps().maxCachedDaos);
   const nextSnapshot: CacheSnapshot = {
     daoMembers: boundedMembers,
     daoAdmins: boundedAdmins,
@@ -177,7 +239,7 @@ function swapCacheSnapshot(
   // Emit invalidation notification to connected clients/subscribers
   cacheEmitter.emit("cache:invalidated", currentSnapshot);
 
-  log("debug", "cache_snapshot_swapped", {
+  deps().log("debug", "cache_snapshot_swapped", {
     version: nextVersion,
     daoCount: newMembers.size,
     adminCount: newAdmins.size,
@@ -249,54 +311,52 @@ export const daoAdminsCache = new Proxy(new Map<number, string>(), {
  */
 export async function syncDaosFromContract(): Promise<number> {
   return sharedSingleFlight.do("daos", async () => {
-    if (
-      !config.daoRegistryContractId ||
-      !isValidContractId(config.daoRegistryContractId)
-    ) {
-      log("warn", "dao_sync_skipped", {
+    const daoRegistryContractId = deps().daoRegistryContractId;
+    if (!daoRegistryContractId || !isValidContractId(daoRegistryContractId)) {
+      deps().log("warn", "dao_sync_skipped", {
         reason: "DAO_REGISTRY_CONTRACT_ID not configured",
       });
       return 0;
     }
 
     try {
-      log("info", "dao_sync_start");
+      deps().log("info", "dao_sync_start");
 
-      const contract = new StellarSdk.Contract(config.daoRegistryContractId);
-      const account = await (server as StellarSdk.rpc.Server).getAccount(
-        relayerKeypair.publicKey(),
+      const contract = new StellarSdk.Contract(daoRegistryContractId);
+      const account = await (deps().server as StellarSdk.rpc.Server).getAccount(
+        deps().relayerKeypair.publicKey(),
       );
 
       // Get DAO count
       const countOp = contract.call("dao_count");
       const countTx = new StellarSdk.TransactionBuilder(account, {
         fee: "100",
-        networkPassphrase: config.networkPassphrase,
+        networkPassphrase: deps().networkPassphrase,
       })
         .addOperation(countOp)
         .setTimeout(30)
         .build();
 
-      const countSimResult = await callWithTimeout(
+      const countSimResult = await deps().callWithTimeout(
         () =>
-          simulateWithBackoff(() =>
-            (server as StellarSdk.rpc.Server).simulateTransaction(countTx),
+          deps().simulateWithBackoff(() =>
+            (deps().server as StellarSdk.rpc.Server).simulateTransaction(countTx),
           ),
         "simulate_dao_count",
       );
 
       if (!StellarSdk.rpc.Api.isSimulationSuccess(countSimResult)) {
-        log("warn", "dao_count_failed", { error: countSimResult.error });
+        deps().log("warn", "dao_count_failed", { error: countSimResult.error });
         return 0;
       }
 
       const daoCount = Number(
         StellarSdk.scValToNative(countSimResult.result!.retval!),
       );
-      log("info", "dao_count_fetched", { count: daoCount });
+      deps().log("info", "dao_count_fetched", { count: daoCount });
 
       if (daoCount === 0) {
-        dbService.setDaosSyncTime(new Date().toISOString());
+        deps().dbService.setDaosSyncTime(new Date().toISOString());
         return 0;
       }
 
@@ -307,8 +367,8 @@ export async function syncDaosFromContract(): Promise<number> {
 
       const fetchDao = async (i: number): Promise<void> => {
         try {
-          const daoAccount = await (server as StellarSdk.rpc.Server).getAccount(
-            relayerKeypair.publicKey(),
+          const daoAccount = await (deps().server as StellarSdk.rpc.Server).getAccount(
+            deps().relayerKeypair.publicKey(),
           );
           const getOp = contract.call(
             "get_dao",
@@ -316,16 +376,16 @@ export async function syncDaosFromContract(): Promise<number> {
           );
           const getTx = new StellarSdk.TransactionBuilder(daoAccount, {
             fee: "100",
-            networkPassphrase: config.networkPassphrase,
+            networkPassphrase: deps().networkPassphrase,
           })
             .addOperation(getOp)
             .setTimeout(30)
             .build();
 
-          const getSimResult = await callWithTimeout(
+          const getSimResult = await deps().callWithTimeout(
             () =>
-              simulateWithBackoff(() =>
-                (server as StellarSdk.rpc.Server).simulateTransaction(getTx),
+              deps().simulateWithBackoff(() =>
+                (deps().server as StellarSdk.rpc.Server).simulateTransaction(getTx),
               ),
             `simulate_get_dao_${i}`,
           );
@@ -348,7 +408,7 @@ export async function syncDaosFromContract(): Promise<number> {
             });
           }
         } catch (err) {
-          log("warn", "dao_fetch_failed", {
+          deps().log("warn", "dao_fetch_failed", {
             daoId: i,
             error: (err as Error).message,
           });
@@ -362,18 +422,18 @@ export async function syncDaosFromContract(): Promise<number> {
 
       // Save to database
       if (daos.length > 0) {
-        dbService.upsertDaos(daos);
+        deps().dbService.upsertDaos(daos);
 
         // Ensure dao_create events exist
         for (const dao of daos) {
-          ensureDaoCreateEvent(dao.id, dao);
+          deps().ensureDaoCreateEvent(dao.id, dao);
         }
       }
 
-      dbService.setDaosSyncTime(new Date().toISOString());
+      deps().dbService.setDaosSyncTime(new Date().toISOString());
       daosSynced.inc(daos.length);
       serviceLastRunTime.set({ service: "dao_sync" }, Date.now() / 1000);
-      log("info", "dao_sync_complete", {
+      deps().log("info", "dao_sync_complete", {
         synced: daos.length,
         total: daoCount,
       });
@@ -381,7 +441,7 @@ export async function syncDaosFromContract(): Promise<number> {
       return daos.length;
     } catch (err) {
       serviceErrors.inc({ service: "dao_sync" });
-      log("error", "dao_sync_error", { error: (err as Error).message });
+      deps().log("error", "dao_sync_error", { error: (err as Error).message });
       return 0;
     }
   });
@@ -401,28 +461,28 @@ export function startDaoSync(): void {
 
   syncDaosFromContract()
     .then((count) => {
-      log("info", "initial_dao_sync", { count });
-      markHealthy("dao_sync");
+      deps().log("info", "initial_dao_sync", { count });
+      deps().markHealthy("dao_sync");
     })
     .catch((err) => {
-      markDegraded("dao_sync", (err as Error).message);
-      log("error", "initial_dao_sync_failed", {
+      deps().markDegraded("dao_sync", (err as Error).message);
+      deps().log("error", "initial_dao_sync_failed", {
         error: (err as Error).message,
       });
     });
 
   daoSyncInterval = setInterval(() => {
     syncDaosFromContract()
-      .then(() => markHealthy("dao_sync"))
+      .then(() => deps().markHealthy("dao_sync"))
       .catch((err) => {
-        markDegraded("dao_sync", (err as Error).message);
-        log("error", "periodic_dao_sync_failed", {
+        deps().markDegraded("dao_sync", (err as Error).message);
+        deps().log("error", "periodic_dao_sync_failed", {
           error: (err as Error).message,
         });
       });
-  }, config.daoSyncIntervalMs);
+  }, deps().daoSyncIntervalMs);
 
-  log("info", "dao_sync_started", { intervalMs: config.daoSyncIntervalMs });
+  deps().log("info", "dao_sync_started", { intervalMs: deps().daoSyncIntervalMs });
 }
 
 /**
@@ -433,7 +493,7 @@ export function stopDaoSync(): void {
     clearInterval(daoSyncInterval);
     daoSyncInterval = null;
     serviceRunning.set({ service: "dao_sync" }, 0);
-    log("info", "dao_sync_stopped");
+    deps().log("info", "dao_sync_stopped");
   }
 }
 
@@ -445,23 +505,21 @@ export function stopDaoSync(): void {
  * Sync members for a single DAO (uses Copy-on-Write atomic snapshot update)
  */
 export async function syncDaoMembership(daoId: number): Promise<void> {
-  if (
-    !config.membershipSbtContractId ||
-    !isValidContractId(config.membershipSbtContractId)
-  ) {
+  const sbtContractId = deps().membershipSbtContractId;
+  if (!sbtContractId || !isValidContractId(sbtContractId)) {
     return;
   }
 
   try {
-    const sbtContract = new StellarSdk.Contract(config.membershipSbtContractId);
+    const sbtContract = new StellarSdk.Contract(sbtContractId);
     const members = new Set<string>();
     const BATCH_SIZE = 50;
     let offset = 0;
     let hasMore = true;
 
     while (hasMore) {
-      const account = await (server as StellarSdk.rpc.Server).getAccount(
-        relayerKeypair.publicKey(),
+      const account = await (deps().server as StellarSdk.rpc.Server).getAccount(
+        deps().relayerKeypair.publicKey(),
       );
       const getMembersOp = sbtContract.call(
         "get_members",
@@ -471,16 +529,16 @@ export async function syncDaoMembership(daoId: number): Promise<void> {
       );
       const getMembersTx = new StellarSdk.TransactionBuilder(account, {
         fee: "100",
-        networkPassphrase: config.networkPassphrase,
+        networkPassphrase: deps().networkPassphrase,
       })
         .addOperation(getMembersOp)
         .setTimeout(30)
         .build();
 
-      const simResult = await callWithTimeout(
+      const simResult = await deps().callWithTimeout(
         () =>
-          simulateWithBackoff(() =>
-            (server as StellarSdk.rpc.Server).simulateTransaction(getMembersTx),
+          deps().simulateWithBackoff(() =>
+            (deps().server as StellarSdk.rpc.Server).simulateTransaction(getMembersTx),
           ),
         `simulate_get_members_${daoId}_${offset}`,
       );
@@ -511,9 +569,9 @@ export async function syncDaoMembership(daoId: number): Promise<void> {
     nextMembersMap.set(daoId, members);
     swapCacheSnapshot(nextMembersMap, currentSnapshot.daoAdmins);
 
-    log("info", "dao_membership_synced", { daoId, memberCount: members.size });
+    deps().log("info", "dao_membership_synced", { daoId, memberCount: members.size });
   } catch (err) {
-    log("warn", "dao_membership_sync_failed", {
+    deps().log("warn", "dao_membership_sync_failed", {
       daoId,
       error: (err as Error).message,
     });
@@ -525,22 +583,22 @@ export async function syncDaoMembership(daoId: number): Promise<void> {
  */
 export async function syncAllMemberships(): Promise<void> {
   if (
-    !config.membershipSbtContractId ||
-    !isValidContractId(config.membershipSbtContractId)
+    !deps().membershipSbtContractId ||
+    !isValidContractId(deps().membershipSbtContractId)
   ) {
-    log("warn", "membership_sync_skipped", {
+    deps().log("warn", "membership_sync_skipped", {
       reason: "MEMBERSHIP_SBT_CONTRACT_ID not configured",
     });
     return;
   }
 
-  const daos = dbService.getAllCachedDaos();
+  const daos = deps().dbService.getAllCachedDaos();
   if (daos.length === 0) {
-    log("info", "membership_sync_skipped", { reason: "no DAOs in cache" });
+    deps().log("info", "membership_sync_skipped", { reason: "no DAOs in cache" });
     return;
   }
 
-  log("info", "membership_sync_start", { daoCount: daos.length });
+  deps().log("info", "membership_sync_start", { daoCount: daos.length });
 
   // Prepare admin addresses copy
   const nextAdminsMap = new Map(currentSnapshot.daoAdmins);
@@ -557,7 +615,7 @@ export async function syncAllMemberships(): Promise<void> {
     await Promise.all(chunk.map((dao) => syncDaoMembership(dao.id)));
   }
 
-  log("info", "membership_sync_complete", { daoCount: daos.length });
+  deps().log("info", "membership_sync_complete", { daoCount: daos.length });
   membershipSyncsTotal.inc({ status: "success" });
   serviceLastRunTime.set({ service: "membership_sync" }, Date.now() / 1000);
 }
@@ -577,7 +635,7 @@ export function startMembershipSync(): void {
   // Initial sync after DAO sync
   setTimeout(() => {
     syncAllMemberships().catch((err) => {
-      log("error", "initial_membership_sync_failed", {
+      deps().log("error", "initial_membership_sync_failed", {
         error: (err as Error).message,
       });
     });
@@ -585,14 +643,14 @@ export function startMembershipSync(): void {
 
   membershipSyncInterval = setInterval(() => {
     syncAllMemberships().catch((err) => {
-      log("error", "periodic_membership_sync_failed", {
+      deps().log("error", "periodic_membership_sync_failed", {
         error: (err as Error).message,
       });
     });
-  }, config.membershipSyncIntervalMs);
+  }, deps().membershipSyncIntervalMs);
 
-  log("info", "membership_sync_started", {
-    intervalMs: config.membershipSyncIntervalMs,
+  deps().log("info", "membership_sync_started", {
+    intervalMs: deps().membershipSyncIntervalMs,
   });
 }
 
@@ -604,7 +662,7 @@ export function stopMembershipSync(): void {
     clearInterval(membershipSyncInterval);
     membershipSyncInterval = null;
     serviceRunning.set({ service: "membership_sync" }, 0);
-    log("info", "membership_sync_stopped");
+    deps().log("info", "membership_sync_stopped");
   }
 }
 
@@ -616,12 +674,12 @@ export async function gracefulShutdownSync(): Promise<void> {
   stopDaoSync();
   stopMembershipSync();
   try {
-    await sequenceManager.forceResync(
-      server as import("@stellar/stellar-sdk").rpc.Server,
+    await deps().sequenceManager.forceResync(
+      deps().server as import("@stellar/stellar-sdk").rpc.Server,
     );
-    log("info", "sequence_persisted_on_shutdown");
+    deps().log("info", "sequence_persisted_on_shutdown");
   } catch (err) {
-    log("warn", "sequence_resync_on_shutdown_failed", {
+    deps().log("warn", "sequence_resync_on_shutdown_failed", {
       error: (err as Error).message,
     });
   }
@@ -631,7 +689,7 @@ export async function gracefulShutdownSync(): Promise<void> {
  * Trigger membership sync for specific DAO
  */
 export async function triggerDaoMembershipSync(daoId: number): Promise<void> {
-  log("info", "triggered_membership_sync", { daoId });
+  deps().log("info", "triggered_membership_sync", { daoId });
   await syncDaoMembership(daoId);
 }
 
@@ -744,10 +802,8 @@ export async function verifyMembership(
     return cached.result;
   }
 
-  if (
-    !config.membershipSbtContractId ||
-    !isValidContractId(config.membershipSbtContractId)
-  ) {
+  const sbtContractId = deps().membershipSbtContractId;
+  if (!sbtContractId || !isValidContractId(sbtContractId)) {
     throw new Error(
       "Membership verification unavailable: MEMBERSHIP_SBT_CONTRACT_ID not configured",
     );
@@ -755,9 +811,9 @@ export async function verifyMembership(
 
   const start = Date.now();
   try {
-    const sbtContract = new StellarSdk.Contract(config.membershipSbtContractId);
-    const account = await (server as StellarSdk.rpc.Server).getAccount(
-      relayerKeypair.publicKey(),
+    const sbtContract = new StellarSdk.Contract(sbtContractId);
+    const account = await (deps().server as StellarSdk.rpc.Server).getAccount(
+      deps().relayerKeypair.publicKey(),
     );
     const operation = sbtContract.call(
       "has",
@@ -768,16 +824,16 @@ export async function verifyMembership(
     );
     const tx = new StellarSdk.TransactionBuilder(account, {
       fee: "100",
-      networkPassphrase: config.networkPassphrase,
+      networkPassphrase: deps().networkPassphrase,
     })
       .addOperation(operation)
       .setTimeout(30)
       .build();
 
-    const simResult = await callWithTimeout(
+    const simResult = await deps().callWithTimeout(
       () =>
-        simulateWithBackoff(() =>
-          (server as StellarSdk.rpc.Server).simulateTransaction(tx),
+        deps().simulateWithBackoff(() =>
+          (deps().server as StellarSdk.rpc.Server).simulateTransaction(tx),
         ),
       `simulate_verify_membership_${daoId}`,
     );
@@ -802,7 +858,7 @@ export async function verifyMembership(
     const cachedSaysMember = cachedMembers?.has(address) ?? false;
     if (cachedSaysMember !== isMember) {
       membershipVerificationMetrics.mismatches++;
-      log("warn", "membership_cache_mismatch", {
+      deps().log("warn", "membership_cache_mismatch", {
         daoId,
         cachedMember: cachedSaysMember,
         onChainMember: isMember,
@@ -814,7 +870,7 @@ export async function verifyMembership(
       expiresAt: Date.now() + MEMBERSHIP_VERIFICATION_TTL_MS,
     });
 
-    log("debug", "membership_verified_realtime", {
+    deps().log("debug", "membership_verified_realtime", {
       daoId,
       isMember,
       latencyMs,
@@ -822,7 +878,7 @@ export async function verifyMembership(
     return isMember;
   } catch (err) {
     membershipVerificationMetrics.errors++;
-    log("error", "membership_verify_failed", {
+    deps().log("error", "membership_verify_failed", {
       daoId,
       error: (err as Error).message,
     });

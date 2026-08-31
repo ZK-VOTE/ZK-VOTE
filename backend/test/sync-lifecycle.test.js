@@ -1,4 +1,11 @@
 import test from "node:test";
+
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+import { buildAppServices } from "../src/composition-root.js";
+buildAppServices();
+
 import assert from "node:assert/strict";
 
 process.env.RELAYER_TEST_MODE = "true";
@@ -66,7 +73,11 @@ test("sync services handle missing contracts and timer lifecycle", async (t) => 
   sync.startMembershipSync();
 
   assert.equal(intervalCallbacks.length, 4);
-  assert.equal(timeoutCallbacks.length, 2);
+  // Four deferred callbacks are expected, not two: two membership initial-sync
+  // setTimeouts (startMembershipSync is invoked twice, each call schedules one)
+  // plus one SingleFlight timeout guard per syncDaosFromContract invocation
+  // (the direct call above and the one inside startDaoSync).
+  assert.equal(timeoutCallbacks.length, 4);
 
   for (const callback of timeoutCallbacks) {
     callback();

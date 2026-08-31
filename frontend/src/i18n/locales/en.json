@@ -17,5 +17,17 @@
   "common.close": "Close",
   "common.save": "Save",
   "common.cancel": "Cancel",
-  "language.select": "Select Language"
+  "language.select": "Select Language",
+  "home.hero.title": "Private voting for",
+  "home.hero.subtitle": "decentralized organizations",
+  "home.hero.description": "Zero-knowledge proof voting on Stellar. Cast your vote privately while maintaining full verifiability through Groth16 SNARKs.",
+  "home.hero.startVoting": "Start voting",
+  "home.hero.documentation": "Documentation",
+  "home.techStack": "Built on Stellar with cutting-edge cryptographic primitives",
+  "dao.member_one": "member",
+  "dao.member_other": "members",
+  "dao.vote_one": "vote",
+  "dao.vote_other": "votes",
+  "dao.proposal_one": "proposal",
+  "dao.proposal_other": "proposals"
 }

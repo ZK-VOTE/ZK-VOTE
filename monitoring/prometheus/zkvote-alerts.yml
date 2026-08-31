@@ -1,0 +1,39 @@
+groups:
+  - name: zkvote-relayer
+    rules:
+      - alert: ZKVoteRelayerHighErrorRate
+        expr: sum(rate(zkvote_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(zkvote_http_requests_total[5m])), 1) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: ZKVote relayer error rate is elevated
+          description: More than 5% of relayer requests have returned 5xx for 10 minutes.
+      - alert: ZKVoteRelayerHighLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(zkvote_http_request_duration_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: ZKVote relayer latency is high
+          description: HTTP request p95 latency has exceeded 2 seconds for 10 minutes.
+      - alert: ZKVoteRelayerIndexerStalled
+        expr: zkvote_service_running{service="indexer"} == 1 and time() - zkvote_service_last_run_timestamp_seconds{service="indexer"} > 600
+        for: 5m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: ZKVote indexer appears stalled
+          description: The indexer has not completed a successful run for more than 10 minutes.
+      - alert: ZKVoteRelayerDatabaseUnavailable
+        expr: zkvote_db_write_healthy == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: ZKVote database write connection is unhealthy
+          description: The relayer write database connection has been unhealthy for 5 minutes.

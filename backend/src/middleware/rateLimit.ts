@@ -13,6 +13,7 @@ import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
 import { ClusterRateLimitStore } from "../services/cluster.js";
+import { membershipRegistrationLimited } from "../services/metrics.js";
 
 const isTestMode = process.env.RELAYER_TEST_MODE === "true";
 
@@ -326,4 +327,73 @@ export const claimLimiter = isTestMode
       standardHeaders: true,
       legacyHeaders: false,
       keyGenerator,
+    });
+
+// ============================================
+// PER-MEMBER RATE LIMITING (#371)
+// ============================================
+
+/**
+ * Key generator for per-member limiters. Uses the explicit `caller` address
+ * from the request body (the member registering a commitment), falling back
+ * to the wallet address header and finally to a hashed IP.
+ */
+const memberKeyGenerator = (req: Express.Request): string => {
+  const member =
+    (req as any).body?.caller ||
+    (req as any).body?.walletAddress ||
+    (req as any).headers?.["x-wallet-address"] ||
+    (req as any).ip ||
+    "";
+  return crypto.createHash("sha256").update(String(member)).digest("hex");
+};
+
+interface PerMemberLimiterOptions {
+  name: string;
+  max: number;
+  windowMs: number;
+  message: string;
+  onBlocked?: (req: Request, res: Response) => void;
+}
+
+/**
+ * Build a per-member rate limiter (exports the `commitmentRegistrationLimiter`
+ * singleton below). Exported as a factory so the {@link #371} route tests can
+ * exercise real limiting behavior with a small window without test mode.
+ */
+export function createPerMemberLimiter(
+  opts: PerMemberLimiterOptions,
+): RequestHandler {
+  const structuredHandler = makeHandler(opts.name, opts.message);
+  return withMetrics(
+    opts.name,
+    rateLimit({
+      windowMs: opts.windowMs,
+      max: opts.max,
+      ...headerOptions,
+      store: getStore(opts.name),
+      keyGenerator: memberKeyGenerator,
+      handler: (req, res) => {
+        opts.onBlocked?.(req, res);
+        structuredHandler(req, res);
+      },
+    }),
+  );
+}
+
+/**
+ * Rate limiter for commitment registration submissions, keyed per member.
+ * Config-driven (COMMITMENT_REGISTRATION_RATE_LIMIT /
+ * COMMITMENT_REGISTRATION_RATE_WINDOW_MS); mirrors the on-chain per-member
+ * cooldown in the membership-tree contract (#371).
+ */
+export const commitmentRegistrationLimiter = isTestMode
+  ? noopMiddleware
+  : createPerMemberLimiter({
+      name: "commitmentRegistration",
+      max: config.commitmentRegistrationRateLimit,
+      windowMs: config.commitmentRegistrationRateWindowMs,
+      message:
+        "Too many commitment registrations for this member, please try again later",
+      onBlocked: () => membershipRegistrationLimited.inc({ reason: "api_rate_limit" }),
     });

@@ -13,9 +13,13 @@ const REGISTRY: Symbol = symbol_short!("registry");
 const MAX_ROOT_HISTORY: u32 = 30;
 // Circuit depth must match vote.circom. Supports ~262K members (2^18 = 262,144)
 const MAX_TREE_DEPTH: u32 = 18;
+// Per-member registration cooldown: minimum seconds a member must wait before
+// registering another commitment in the tree. Prevents tree spam from members
+// churning commitments (e.g. re-registering after reinstate) (#371).
+const MIN_REGISTRATION_INTERVAL_SECS: u64 = 3600;
 const ZEROS_CACHE: Symbol = symbol_short!("zeros");
 const ZEROS_CACHE_BLS: Symbol = symbol_short!("z_bls");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
 // TTL management: bump on every interaction to keep contract alive
@@ -50,26 +54,28 @@ pub enum TreeError {
     AlreadyInitialized = 14,
     MemberNotRevoked = 15, // Member hasn't been revoked (for reinstatement)
     CommitmentAlreadyUsed = 16,
+    RateLimited = 17, // Member exceeded per-member registration cooldown (#371)
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    TreeDepth(u64),                // dao_id -> depth
-    NextLeafIndex(u64),            // dao_id -> next index
-    FilledSubtrees(u64),           // dao_id -> Vec<U256>
-    Roots(u64),                    // dao_id -> Vec<U256> (history)
-    LeafIndex(u64, U256),          // (dao_id, commitment) -> index
-    MemberLeafIndex(u64, Address), // (dao_id, member) -> index
-    LeafValue(u64, u32),           // (dao_id, index) -> commitment (or 0 if removed)
-    NextRootIndex(u64),            // dao_id -> next root index counter
-    RootIndex(u64, U256),          // (dao_id, root) -> root index
-    RevokedAt(u64, U256),          // (dao_id, commitment) -> timestamp when revoked
-    ReinstatedAt(u64, U256),       // (dao_id, commitment) -> timestamp when reinstated
-    NodeHash(u64, u32, u32),       // (dao_id, level, node_index) -> hash value at that position
-    MinValidRootIdx(u64),          // dao_id -> minimum valid root index (after member removals)
-    PoseidonField(u64),            // dao_id -> Symbol("BN254") or Symbol("BLS12_381")
-    CommitmentUsed(u64, U256),     // (dao_id, commitment) -> true
+    TreeDepth(u64),                   // dao_id -> depth
+    NextLeafIndex(u64),               // dao_id -> next index
+    FilledSubtrees(u64),              // dao_id -> Vec<U256>
+    Roots(u64),                       // dao_id -> Vec<U256> (history)
+    LeafIndex(u64, U256),             // (dao_id, commitment) -> index
+    MemberLeafIndex(u64, Address),    // (dao_id, member) -> index
+    LeafValue(u64, u32),              // (dao_id, index) -> commitment (or 0 if removed)
+    NextRootIndex(u64),               // dao_id -> next root index counter
+    RootIndex(u64, U256),             // (dao_id, root) -> root index
+    RevokedAt(u64, U256),             // (dao_id, commitment) -> timestamp when revoked
+    ReinstatedAt(u64, U256),          // (dao_id, commitment) -> timestamp when reinstated
+    NodeHash(u64, u32, u32),          // (dao_id, level, node_index) -> hash value at that position
+    MinValidRootIdx(u64),             // dao_id -> minimum valid root index (after member removals)
+    PoseidonField(u64),               // dao_id -> Symbol("BN254") or Symbol("BLS12_381")
+    CommitmentUsed(u64, U256),        // (dao_id, commitment) -> true
+    LastRegistrationAt(u64, Address), // (dao_id, member) -> ledger timestamp of last registration (#371)
 }
 
 // Typed Events
@@ -339,6 +345,27 @@ impl MembershipTree {
         Self::bump_persistent(env, &used_key);
     }
 
+    /// Enforce the per-member registration cooldown (#371): a member may not
+    /// register another commitment until MIN_REGISTRATION_INTERVAL_SECS have
+    /// elapsed since their previous registration in this DAO.
+    fn enforce_registration_cooldown(env: &Env, dao_id: u64, member: &Address) {
+        let key = DataKey::LastRegistrationAt(dao_id, member.clone());
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+            if env.ledger().timestamp() < last.saturating_add(MIN_REGISTRATION_INTERVAL_SECS) {
+                panic_with_error!(env, TreeError::RateLimited);
+            }
+        }
+    }
+
+    /// Record the ledger timestamp of a member's successful registration (#371).
+    fn record_registration(env: &Env, dao_id: u64, member: &Address) {
+        let key = DataKey::LastRegistrationAt(dao_id, member.clone());
+        env.storage()
+            .persistent()
+            .set(&key, &env.ledger().timestamp());
+        Self::bump_persistent(env, &key);
+    }
+
     /// Register a commitment from registry during DAO initialization
     /// This function is called by the registry contract during create_and_init_dao
     /// to automatically register the creator's commitment.
@@ -359,6 +386,7 @@ impl MembershipTree {
             panic_with_error!(&env, TreeError::TreeNotInitialized);
         }
 
+        Self::enforce_registration_cooldown(&env, dao_id, &member);
         Self::reserve_commitment(&env, dao_id, &commitment);
 
         let leaf_key = DataKey::LeafIndex(dao_id, commitment.clone());
@@ -419,6 +447,8 @@ impl MembershipTree {
             root_index,
         }
         .publish(&env);
+
+        Self::record_registration(&env, dao_id, &member);
     }
 
     /// Register a commitment with explicit caller (requires SBT membership)
@@ -437,6 +467,8 @@ impl MembershipTree {
         if !has_sbt {
             panic_with_error!(&env, TreeError::NoSbt);
         }
+
+        Self::enforce_registration_cooldown(&env, dao_id, &caller);
 
         // Check tree is initialized
         let depth_key = DataKey::TreeDepth(dao_id);
@@ -504,6 +536,8 @@ impl MembershipTree {
             root_index,
         }
         .publish(&env);
+
+        Self::record_registration(&env, dao_id, &caller);
     }
 
     /// Self-register a commitment in a public DAO (requires SBT membership)
@@ -541,6 +575,8 @@ impl MembershipTree {
         if !membership_open {
             panic_with_error!(&env, TreeError::NotOpenMembership);
         }
+
+        Self::enforce_registration_cooldown(&env, dao_id, &member);
 
         // Check tree is initialized
         let depth_key = DataKey::TreeDepth(dao_id);
@@ -608,6 +644,8 @@ impl MembershipTree {
             root_index,
         }
         .publish(&env);
+
+        Self::record_registration(&env, dao_id, &member);
     }
 
     /// Get current root for a DAO
@@ -976,14 +1014,22 @@ impl MembershipTree {
         }
 
         let leaf_index_key = DataKey::LeafIndex(dao_id, commitment.clone());
-        let leaf_value_key = if let Some(index) = env.storage().persistent().get::<_, Option<u32>>(&leaf_index_key) {
+        let leaf_value_key = if let Some(index) = env
+            .storage()
+            .persistent()
+            .get::<_, Option<u32>>(&leaf_index_key)
+        {
             Some(DataKey::LeafValue(dao_id, index.unwrap_or(0)))
         } else {
             None
         };
 
         if let Some(key) = leaf_value_key {
-            let current_value: U256 = env.storage().persistent().get(&key).unwrap_or_else(|| U256::zero(&env));
+            let current_value: U256 = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| U256::from_u32(&env, 0));
             current_value == Self::zero_value(&env)
         } else {
             true

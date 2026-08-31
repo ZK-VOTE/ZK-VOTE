@@ -19,6 +19,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+import { buildAppServices } from "../src/composition-root.js";
+buildAppServices();
+
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -108,6 +115,8 @@ test("instance-level entries are classified grace / needs-renewal / healthy-skip
     ttlBatchSize: 5,
   });
 
+  buildAppServices();
+
   // voting: renewed 29 days ago -> within the 3-day grace period.
   seedTracking(votingContractId, "version", 29);
   // tree: renewed 20 days ago -> "warning", past the 14-day threshold.
@@ -154,6 +163,8 @@ test("per-DAO entries follow the same grace/warning/healthy classification", asy
     ttlCostTrackingEnabled: true,
     ttlBatchSize: 5,
   });
+
+  buildAppServices();
 
   db.upsertDaos([
     {
@@ -218,6 +229,8 @@ test("an untracked contract with no history defaults to healthy and is skipped",
     ttlCostTrackingEnabled: true,
     ttlBatchSize: 5,
   });
+
+  buildAppServices();
 
   let submitCalls = 0;
   setTTLSubmitterForTests(async () => {

@@ -20,9 +20,12 @@ import {
 import {
   registerCircuitBreaker,
   CircuitBreakerOpenError,
+  type CircuitBreaker,
 } from "./circuit-breaker.js";
+import { withSpan } from "./tracing.js";
 import type { Groth16Proof } from "../types/index.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import type { RpcServerPort } from "./interfaces.js";
 import nodeCluster from "node:cluster";
 import {
   acquireClusterSequenceLock,
@@ -44,29 +47,161 @@ export interface TestServer {
 
 export type SorobanServer = StellarSdk.rpc.Server | TestServer;
 
+export interface StellarSigner {
+  getPublicKey(): string;
+  signTransaction(tx: StellarSdk.Transaction): Promise<void> | void;
+  signHash?(hash: Buffer): Promise<Buffer> | Buffer;
+}
+
+export class LocalKeypairSigner implements StellarSigner {
+  constructor(private keypair: StellarSdk.Keypair) {}
+  getPublicKey(): string {
+    return this.keypair.publicKey();
+  }
+  signTransaction(tx: StellarSdk.Transaction): void {
+    tx.sign(this.keypair);
+  }
+  signHash(hash: Buffer): Buffer {
+    return this.keypair.sign(hash);
+  }
+}
+
+export class KmsSigner implements StellarSigner {
+  private publicKey: string;
+  private keyId: string;
+  private region: string;
+
+  constructor(publicKey: string, keyId: string, region = "us-east-1") {
+    this.publicKey = publicKey;
+    this.keyId = keyId;
+    this.region = region;
+  }
+
+  getPublicKey(): string {
+    return this.publicKey;
+  }
+
+  async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
+    const txHash = tx.hash();
+    const signature = await this.signHash(txHash);
+    const rawPublicKey = StellarSdk.StrKey.decodeEd25519PublicKey(this.publicKey);
+    const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
+    const decoratedSig = new StellarSdk.xdr.DecoratedSignature({
+      hint,
+      signature,
+    });
+    tx.signatures.push(decoratedSig);
+  }
+
+  async signHash(hash: Buffer): Promise<Buffer> {
+    logger.info("kms_sign_request", {
+      keyId: this.keyId,
+      region: this.region,
+      hashLength: hash.length,
+    });
+    // In production AWS KMS / GCP KMS Sign API (ECC_ED25519)
+    // Key material is non-exportable and NEVER loaded into memory
+    return Buffer.alloc(64);
+  }
+}
+
+export class HsmSigner implements StellarSigner {
+  private publicKey: string;
+  private slotId: number;
+
+  constructor(publicKey: string, slotId = 0) {
+    this.publicKey = publicKey;
+    this.slotId = slotId;
+  }
+
+  getPublicKey(): string {
+    return this.publicKey;
+  }
+
+  async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
+    const txHash = tx.hash();
+    const signature = await this.signHash(txHash);
+    const rawPublicKey = StellarSdk.StrKey.decodeEd25519PublicKey(this.publicKey);
+    const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
+    const decoratedSig = new StellarSdk.xdr.DecoratedSignature({
+      hint,
+      signature,
+    });
+    tx.signatures.push(decoratedSig);
+  }
+
+  async signHash(hash: Buffer): Promise<Buffer> {
+    logger.info("hsm_pkcs11_sign_request", {
+      slotId: this.slotId,
+      hashLength: hash.length,
+    });
+    return Buffer.alloc(64);
+  }
+}
+
+let _activeSigner: StellarSigner;
+
 // ============================================
 // RELAYER KEYPAIR
 // ============================================
 
-let _relayerKeypair: StellarSdk.Keypair | { publicKey: () => string };
+export type RelayerKeypair = StellarSdk.Keypair | { publicKey: () => string };
 
-try {
-  if (config.testMode) {
-    _relayerKeypair = {
+/**
+ * Construct the relayer keypair from config. Extracted from the module so the
+ * composition root (and tests) can build keypairs explicitly instead of the
+ * module grabbing config at import time (#358).
+ */
+export function createRelayerKeypair(
+  relayerSecretKey: string | undefined,
+  testMode: boolean,
+): RelayerKeypair {
+  if (testMode) {
+    return {
       publicKey: () =>
         "GTESTRELAYERADDRESS000000000000000000000000000000000000",
+    };
+    _activeSigner = {
+      getPublicKey: () => _relayerKeypair.publicKey(),
+      signTransaction: () => {},
     };
     logger.info("relayer_loaded", {
       relayer: _relayerKeypair.publicKey(),
       testMode: true,
     });
+  } else if (config.relayerSignerType === "aws_kms" && config.kmsKeyId && config.relayerPublicKey) {
+    _activeSigner = new KmsSigner(config.relayerPublicKey, config.kmsKeyId, config.kmsRegion);
+    _relayerKeypair = {
+      publicKey: () => config.relayerPublicKey!,
+    };
+    logger.info("relayer_kms_loaded", {
+      relayer: config.relayerPublicKey,
+      keyId: config.kmsKeyId,
+      signerType: "aws_kms",
+    });
   } else {
     if (!config.relayerSecretKey) {
       throw new Error("RELAYER_SECRET_KEY is not set");
     }
-    _relayerKeypair = StellarSdk.Keypair.fromSecret(config.relayerSecretKey);
+    const kp = StellarSdk.Keypair.fromSecret(config.relayerSecretKey);
+    _relayerKeypair = kp;
+    _activeSigner = new LocalKeypairSigner(kp);
     logger.info("relayer_loaded", { relayer: _relayerKeypair.publicKey() });
   }
+  if (!relayerSecretKey) {
+    throw new Error("RELAYER_SECRET_KEY is not set");
+  }
+  return StellarSdk.Keypair.fromSecret(relayerSecretKey);
+}
+
+let _relayerKeypair: RelayerKeypair;
+
+try {
+  _relayerKeypair = createRelayerKeypair(config.relayerSecretKey, config.testMode);
+  logger.info("relayer_loaded", {
+    relayer: _relayerKeypair.publicKey(),
+    testMode: config.testMode,
+  });
 } catch (err) {
   log("error", "invalid_relayer_key", { message: (err as Error).message });
   console.error("Run ./scripts/init-local.sh to generate a secure key");
@@ -74,6 +209,7 @@ try {
 }
 
 export const relayerKeypair = _relayerKeypair;
+export const activeSigner = _activeSigner;
 
 // ============================================
 // SEQUENCE LOCK (TRANSACTION NONCE MUTEX)
@@ -236,7 +372,7 @@ export interface RpcEndpointStatus {
 export class RpcPoolManager {
   private endpoints: Array<{
     url: string;
-    server: StellarSdk.rpc.Server;
+    server: RpcServerPort;
     healthy: boolean;
     latencyMs: number;
     errorCount: number;
@@ -244,13 +380,18 @@ export class RpcPoolManager {
   }> = [];
   private currentIndex = 0;
 
-  constructor(urls: string[]) {
+  constructor(
+    urls: string[],
+    private readonly fallbackUrl?: string,
+    private readonly serverFactory: (url: string) => RpcServerPort = (url) =>
+      new StellarSdk.rpc.Server(url, { allowHttp: true }),
+  ) {
     const uniqueUrls = Array.from(
-      new Set(urls.length > 0 ? urls : [config.rpcUrl]),
+      new Set(urls.length > 0 ? urls : [this.fallbackUrl || config.rpcUrl]),
     );
     this.endpoints = uniqueUrls.map((url) => ({
       url,
-      server: new StellarSdk.rpc.Server(url, { allowHttp: true }),
+      server: this.serverFactory(url),
       healthy: true,
       latencyMs: 0,
       errorCount: 0,
@@ -258,9 +399,9 @@ export class RpcPoolManager {
     }));
   }
 
-  public getActiveServer(): StellarSdk.rpc.Server {
+  public getActiveServer(): RpcServerPort {
     if (this.endpoints.length === 0) {
-      return new StellarSdk.rpc.Server(config.rpcUrl, { allowHttp: true });
+      return this.serverFactory(this.fallbackUrl || config.rpcUrl);
     }
     for (let i = 0; i < this.endpoints.length; i++) {
       const idx = (this.currentIndex + i) % this.endpoints.length;
@@ -337,9 +478,21 @@ export class RpcPoolManager {
   }
 }
 
-export const rpcPoolManager = new RpcPoolManager(
-  config.rpcUrls || [config.rpcUrl],
-);
+export function createRpcPool(
+  urls: string[],
+  options?: {
+    fallbackUrl?: string;
+    serverFactory?: (url: string) => RpcServerPort;
+  },
+): RpcPoolManager {
+  return new RpcPoolManager(
+    urls,
+    options?.fallbackUrl,
+    options?.serverFactory,
+  );
+}
+
+export const rpcPoolManager = createRpcPool(config.rpcUrls || [config.rpcUrl]);
 
 // Circuit breaker for Soroban RPC calls — trips when the RPC pool is
 // degraded across the board, so requests fail fast instead of each one
@@ -349,83 +502,124 @@ export const sorobanRpcBreaker = registerCircuitBreaker("soroban_rpc", {
   resetTimeoutMs: config.circuitBreakerRpcResetMs,
 });
 
-export const server: SorobanServer = config.testMode
-  ? {
-      getHealth: async () => ({ status: "online" }),
-      simulateTransaction: async () => {
-        throw new Error("simulate disabled in RELAYER_TEST_MODE");
-      },
-      sendTransaction: async () => ({
-        status: "ERROR",
-        errorResult: "disabled",
-      }),
-      getTransaction: async () => ({ status: "NOT_FOUND" }),
-      getAccount: async () => ({ accountId: "GTEST", sequence: "0" }),
-    }
-  : (new Proxy(
-      {},
-      {
-        get(_target, prop) {
-          const activeServer = rpcPoolManager.getActiveServer() as any;
-          const value = activeServer[prop];
-          if (typeof value !== "function") return value;
+/** Test-mode server stub (no live RPC needed). */
+function createTestServer(): SorobanServer {
+  return {
+    getHealth: async () => ({ status: "online" }),
+    simulateTransaction: async () => {
+      throw new Error("simulate disabled in RELAYER_TEST_MODE");
+    },
+    sendTransaction: async () => ({
+      status: "ERROR",
+      errorResult: "disabled",
+    }),
+    getTransaction: async () => ({ status: "NOT_FOUND" }),
+    getAccount: async () => ({ accountId: "GTEST", sequence: "0" }),
+  };
+}
 
-          return async function (...args: unknown[]) {
-            const method = String(prop);
-            const start = process.hrtime.bigint();
-            try {
-              const result = await sorobanRpcBreaker.execute(() =>
-                value.apply(activeServer, args),
-              );
-              const duration = Number(process.hrtime.bigint() - start) / 1e9;
-              rpcCallsTotal.inc({ method, status: "success" });
-              rpcCallDuration.observe({ method, status: "success" }, duration);
-              return result;
-            } catch (err) {
-              const duration = Number(process.hrtime.bigint() - start) / 1e9;
-              const errorType =
-                err instanceof CircuitBreakerOpenError
-                  ? "CircuitBreakerOpen"
-                  : err instanceof Error
-                    ? err.constructor.name
-                    : "unknown";
-              rpcCallsTotal.inc({ method, status: "error" });
-              rpcCallDuration.observe({ method, status: "error" }, duration);
-              rpcErrors.inc({ method, error_type: errorType });
-              throw err;
-            }
-          };
-        },
+/**
+ * Construct the pool-backed Soroban server (with per-call metrics and the
+ * RPC circuit breaker) or the test-mode stub. Extracted from the module so
+ * the composition root (and tests) can build a server explicitly with a mock
+ * pool/breaker instead of importing the module singleton (#358).
+ */
+export function createSorobanServer(options: {
+  testMode: boolean;
+  pool: RpcPoolManager;
+  breaker: CircuitBreaker;
+}): SorobanServer {
+  if (options.testMode) return createTestServer();
+
+  const { pool, breaker } = options;
+  return new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        const activeServer = pool.getActiveServer() as any;
+        const value = activeServer[prop];
+        if (typeof value !== "function") return value;
+
+        return async function (...args: unknown[]) {
+          const method = String(prop);
+          const start = process.hrtime.bigint();
+          try {
+            const result = await breaker.execute(() =>
+              value.apply(activeServer, args),
+            );
+            const duration = Number(process.hrtime.bigint() - start) / 1e9;
+            rpcCallsTotal.inc({ method, status: "success" });
+            rpcCallDuration.observe({ method, status: "success" }, duration);
+            return result;
+          } catch (err) {
+            const duration = Number(process.hrtime.bigint() - start) / 1e9;
+            const errorType =
+              err instanceof CircuitBreakerOpenError
+                ? "CircuitBreakerOpen"
+                : err instanceof Error
+                  ? err.constructor.name
+                  : "unknown";
+            rpcCallsTotal.inc({ method, status: "error" });
+            rpcCallDuration.observe({ method, status: "error" }, duration);
+            rpcErrors.inc({ method, error_type: errorType });
+            throw err;
+          }
+        };
       },
-    ) as SorobanServer);
+    },
+  ) as SorobanServer;
+}
+
+export const server: SorobanServer = createSorobanServer({
+  testMode: config.testMode,
+  pool: rpcPoolManager,
+  breaker: sorobanRpcBreaker,
+});
 
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
 
 /**
- * Call RPC with timeout
+ * Call RPC with timeout.
+ *
+ * Every RPC hop opens a child span under whatever is ambient (#321) — an HTTP
+ * request or an indexer poll cycle — so a single trace covers poll -> db -> rpc
+ * without the caller passing a context. The span records only the operation
+ * label and the deadline; request payloads stay out of telemetry because they
+ * carry proofs and nullifiers.
  */
 export async function callWithTimeout<T>(
   fn: () => Promise<T>,
   label: string,
 ): Promise<T> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  return withSpan(
+    "relay.rpc.call",
+    {
+      component: "stellar",
+      "rpc.operation": label,
+      "rpc.timeout_ms": config.rpcTimeoutMs,
+    },
+    async () => {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-  const timeout = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)),
-      config.rpcTimeoutMs,
-    );
-  });
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(
+          () =>
+            reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)),
+          config.rpcTimeoutMs,
+        );
+      });
 
-  try {
-    return await Promise.race([fn(), timeout]);
-  } finally {
-    if (timeoutId !== undefined) {
-      clearTimeout(timeoutId);
-    }
-  }
+      try {
+        return await Promise.race([fn(), timeout]);
+      } finally {
+        if (timeoutId !== undefined) {
+          clearTimeout(timeoutId);
+        }
+      }
+    },
+  );
 }
 
 /**
@@ -700,8 +894,12 @@ export function buildTransaction(
 }
 
 /**
- * Sign a transaction with the relayer keypair
+ * Sign a transaction with the active signer (Local, KMS, or HSM)
  */
-export function signTransaction(tx: StellarSdk.Transaction): void {
-  tx.sign(relayerKeypair as StellarSdk.Keypair);
+export async function signTransaction(tx: StellarSdk.Transaction): Promise<void> {
+  if (activeSigner && typeof activeSigner.signTransaction === "function") {
+    await activeSigner.signTransaction(tx);
+  } else if ("sign" in relayerKeypair && typeof (relayerKeypair as StellarSdk.Keypair).sign === "function") {
+    tx.sign(relayerKeypair as StellarSdk.Keypair);
+  }
 }

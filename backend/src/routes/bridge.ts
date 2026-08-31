@@ -23,29 +23,20 @@ import {
   u256ToScVal,
 } from "../services/stellar.js";
 
-import { authGuard, queryLimiter, validateBody } from "../middleware/index.js";
-import { z } from "zod";
+import {
+  authGuard,
+  queryLimiter,
+  validateBody,
+  validateParams,
+  bodyLimit,
+} from "../middleware/index.js";
+import {
+  nullifierParamsSchema,
+  bridgeVoteSchema,
+} from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();
-
-// ============================================
-// VALIDATION SCHEMAS
-// ============================================
-
-const bridgeVoteSchema = z.object({
-  daoId: z.number().int().positive(),
-  proposalId: z.number().int().positive(),
-  voteChoice: z.number().int().min(0).max(1),
-  nullifier: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
-  voteRoot: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
-  sbtRoot: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
-  proof: z.object({
-    a: z.string().regex(/^0x[0-9a-fA-F]{128}$/),
-    b: z.string().regex(/^0x[0-9a-fA-F]{256}$/),
-    c: z.string().regex(/^0x[0-9a-fA-F]{128}$/),
-  }),
-});
 
 // ============================================
 // ROUTES

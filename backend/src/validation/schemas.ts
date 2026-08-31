@@ -29,7 +29,7 @@ const hexString = (maxHexChars: number) =>
 /**
  * BN254 field element - hex string less than field modulus
  */
-const bn254Field = z.string().refine(
+export const bn254Field = z.string().refine(
   (val) => {
     const hex = val.startsWith("0x") ? val.slice(2) : val;
     if (hex.length === 0 || hex.length > 64) return false;
@@ -131,7 +131,7 @@ export const groth16Proof = z.object({
 /**
  * Positive integer validator for DAO/Proposal/Comment IDs
  */
-const positiveInteger = z
+export const positiveInteger = z
   .string()
   .pipe(
     z.coerce
@@ -144,21 +144,17 @@ const positiveInteger = z
 /**
  * IPFS CID validator (CIDv0 or CIDv1)
  */
-const CIDV0_REGEX = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
-const CIDV1_REGEX = /^baf[a-z2-7]{46,120}$/i;
-
-const ipfsCid = z.string().refine(
+/**
+ * IPFS CID validator (CIDv0 or CIDv1)
+ */
+export const ipfsCid = z.string().refine(
   (val) => {
-    // CIDv0: exact-length Bitcoin base58 encoding.
+    // CIDv0: exact-length base58-encoded Qm... digest.
     if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(val)) return true;
-    // CIDv1: bafy... or bafk... (59+ chars)
+    // CIDv1: bafy... or bafk... (59+ chars).
     if ((val.startsWith("bafy") || val.startsWith("bafk")) && val.length >= 59)
       return true;
     return false;
-    if (!val || typeof val !== "string") return false;
-    const trimmed = val.trim();
-    if (/[/?\\#\s\0\r\n\t]/.test(trimmed)) return false;
-    return CIDV0_REGEX.test(trimmed) || CIDV1_REGEX.test(trimmed);
   },
   { message: "Invalid IPFS CID format" },
 );
@@ -166,7 +162,7 @@ const ipfsCid = z.string().refine(
 /**
  * Hex string validator for nullifiers (64 hex chars max)
  */
-const nullifierHex = z.string().refine(
+export const nullifierHex = z.string().refine(
   (val) => {
     const hex = val.startsWith("0x") ? val.slice(2) : val;
     if (hex.length === 0 || hex.length > 64) return false;
@@ -178,7 +174,7 @@ const nullifierHex = z.string().refine(
 /**
  * Commitment hash validator (64 hex chars)
  */
-const commitmentHash = z.string().refine(
+export const commitmentHash = z.string().refine(
   (val) => {
     const hex = val.startsWith("0x") ? val.slice(2) : val;
     return hex.length === 64 && /^[0-9a-fA-F]*$/.test(hex);
@@ -247,7 +243,7 @@ export const archiveParamsSchema = z.object({
 /**
  * Stellar address validator
  */
-const stellarAddress = z
+export const stellarAddress = z
   .string()
   .regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar address format");
 
@@ -261,7 +257,7 @@ export const contractAddress = z
 /**
  * Transaction hash validator (64 hex chars)
  */
-const txHash = z
+export const txHash = z
   .string()
   .regex(/^[0-9a-fA-F]{64}$/, "Invalid transaction hash format");
 
@@ -282,6 +278,27 @@ export const commitSchema = z.object({
 });
 
 export type CommitRequest = z.infer<typeof commitSchema>;
+
+// ============================================
+// MEMBERSHIP REGISTRATION SCHEMA (#371)
+// ============================================
+
+/**
+ * Membership commitment registration request body.
+ * `caller` is the Stellar address of the member registering (used as the
+ * per-member rate-limit key on the backend and auth'd on-chain).
+ */
+export const membershipRegisterSchema = z.object({
+  daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+  commitment: bn254Field,
+  caller: z
+    .string()
+    .regex(/^G[A-Z2-7]{55}$/, "caller must be a valid Stellar address"),
+});
+
+export type MembershipRegisterRequest = z.infer<
+  typeof membershipRegisterSchema
+>;
 
 // ============================================
 // VOTE SCHEMA
@@ -307,6 +324,14 @@ export const voteSchema = z
     encryptedPayload: z.union([z.string(), z.record(z.unknown())]).optional(),
     voterPublicKey: stellarAddress.optional(),
     voterSignature: z.string().min(1).optional(), // signed XDR from Freighter
+    sponsor: z.enum(["relayer", "voter"]).optional(),
+    feePayer: stellarAddress.optional(),
+    feeBudgetStroops: z.coerce
+      .number()
+      .int()
+      .positive("feeBudgetStroops must be a positive integer")
+      .max(1_000_000, "feeBudgetStroops exceeds the allowed relay cap")
+      .optional(),
   })
   .refine(
     (data) =>
@@ -533,3 +558,351 @@ export const claimSchema = z.object({
 });
 
 export type ClaimRequest = z.infer<typeof claimSchema>;
+
+// ============================================
+// BRIDGE VOTE SCHEMA
+// ============================================
+
+export const bridgeVoteSchema = z.object({
+  daoId: z.number().int().positive(),
+  proposalId: z.number().int().positive(),
+  voteChoice: z.number().int().min(0).max(1),
+  nullifier: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
+  voteRoot: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
+  sbtRoot: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
+  proof: z.object({
+    a: z.string().regex(/^0x[0-9a-fA-F]{128}$/),
+    b: z.string().regex(/^0x[0-9a-fA-F]{256}$/),
+    c: z.string().regex(/^0x[0-9a-fA-F]{128}$/),
+  }),
+});
+
+export type BridgeVoteRequest = z.infer<typeof bridgeVoteSchema>;
+
+// ============================================
+// CIRCUIT PARAMETER SCHEMA
+// ============================================
+
+export const circuitParamsSchema = z.object({
+  dao: positiveInteger,
+  type: z.enum(["comment", "vote"], {
+    errorMap: () => ({ message: "Type must be either 'comment' or 'vote'" }),
+  }),
+});
+
+// ============================================
+// AUTH TOKEN MANAGEMENT SCHEMAS
+// ============================================
+
+export const createTokenSchema = z.object({
+  clientId: z.string().min(1).max(100),
+  description: z.string().max(500).optional().nullable(),
+  lifetimeMs: z.number().int().positive().optional().nullable(),
+});
+
+export type CreateTokenRequest = z.infer<typeof createTokenSchema>;
+
+export const tokenIdSchema = z.object({
+  tokenId: z.string().min(1),
+});
+
+export type TokenIdParams = z.infer<typeof tokenIdSchema>;
+
+export const clientIdQuerySchema = z.object({
+  clientId: z.string().min(1).optional(),
+  activeOnly: z
+    .union([z.string(), z.boolean()])
+    .optional()
+    .transform((v) => v === "true" || v === true),
+});
+
+export const auditQuerySchema = z.object({
+  tokenId: z.string().min(1).optional(),
+  clientId: z.string().min(1).optional(),
+  action: z.string().min(1).optional(),
+  limit: z
+    .union([z.string(), z.number()])
+    .optional()
+    .transform((v) => Math.min(Number(v) || 100, 1000)),
+  offset: z
+    .union([z.string(), z.number()])
+    .optional()
+    .transform((v) => Math.max(Number(v) || 0, 0)),
+});
+
+export const didAttributeClaimSchema = z.object({
+  claim: z.object({
+    issuer: z.string().min(1).max(256),
+    subjectDid: z.string().min(1).max(512),
+    attributeKey: z.string().min(1).max(128),
+    attributeValue: z.number().int().nonnegative(),
+    issuedAt: z.number().int().nonnegative(),
+    expiresAt: z.number().int().nonnegative(),
+    signature: z.string().min(1).max(4096),
+  }),
+  minAttributeValue: z.number().int().nonnegative(),
+});
+
+export type DidAttributeClaimRequest = z.infer<typeof didAttributeClaimSchema>;
+
+// ============================================
+// QUADRATIC VOTING SCHEMAS
+// ============================================
+
+/**
+ * Max quadratic voting constants. Must match circuits/quadratic_vote_main.circom
+ * and the voting contract's MAX_QV_BUDGET.
+ */
+export const QV_MAX_BUDGET = 100;
+export const QV_MAX_CREDITS = 10;
+
+export const qvAllocationSchema = z.object({
+  proposalId: z.number().int().nonnegative(),
+  voiceCredits: z.number().int().min(0).max(QV_MAX_CREDITS),
+});
+
+export const qvCalculateSchema = z.object({
+  allocations: z.array(qvAllocationSchema).min(1).max(16),
+  budget: z.number().int().positive().max(QV_MAX_BUDGET).optional(),
+});
+
+export type QvCalculateRequest = z.infer<typeof qvCalculateSchema>;
+
+export const qvTallySchema = z.object({
+  ballots: z
+    .array(
+      z.object({ allocations: z.array(qvAllocationSchema).min(1).max(16) }),
+    )
+    .min(1),
+});
+
+export type QvTallyRequest = z.infer<typeof qvTallySchema>;
+
+export const qvParamsSchema = z.object({
+  dao: z.string().regex(/^\d+$/, "dao must be a numeric string"),
+});
+
+// ============================================
+// NOVA AGGREGATION SCHEMAS
+// ============================================
+
+export const novaWitnessSchema = z.object({
+  secret: z.string().min(1),
+  salt: z.string().min(1),
+  path_elements: z.array(z.string().min(1)),
+  path_indices: z.array(z.number().int().nonnegative()),
+  vote_choice: z.number().int().min(0).max(1),
+  nullifier: z.string().min(1),
+  dao_id: z.number().int().nonnegative(),
+  proposal_id: z.number().int().nonnegative(),
+});
+
+export const novaAggregateSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+  root: z
+    .string()
+    .regex(/^(0x)?[0-9a-fA-F]*$/, "root must be a hex string")
+    .optional(),
+  witnesses: z.array(novaWitnessSchema).min(1).max(1000),
+});
+
+export type NovaAggregateRequest = z.infer<typeof novaAggregateSchema>;
+
+// ============================================
+// THRESHOLD DECRYPTION SCHEMAS
+// ============================================
+
+export const ciphertextSchema = z.object({
+  c1: z.string().min(1),
+  c2: z.string().min(1),
+});
+
+export const thresholdInitSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+  thresholdN: z.coerce
+    .number()
+    .int()
+    .positive("thresholdN must be a positive integer"),
+  thresholdT: z.coerce
+    .number()
+    .int()
+    .positive("thresholdT must be a positive integer"),
+  creator: z.string().min(1).optional(),
+});
+
+export type ThresholdInitRequest = z.infer<typeof thresholdInitSchema>;
+
+export const thresholdAuthorityRegisterSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+  authorityAddress: z.string().min(1),
+  authorityName: z.string().min(1),
+  verifierId: z.string().min(1),
+});
+
+export type ThresholdAuthorityRegisterRequest = z.infer<
+  typeof thresholdAuthorityRegisterSchema
+>;
+
+export const thresholdFinalizeSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+});
+
+export type ThresholdFinalizeRequest = z.infer<typeof thresholdFinalizeSchema>;
+
+export const thresholdEncryptSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+  voteChoice: z.coerce.number().int().min(0).max(1),
+  voterNullifier: z.string().min(1),
+});
+
+export type ThresholdEncryptRequest = z.infer<typeof thresholdEncryptSchema>;
+
+export const thresholdTallyComputeSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+});
+
+export type ThresholdTallyComputeRequest = z.infer<
+  typeof thresholdTallyComputeSchema
+>;
+
+export const thresholdDecryptShareSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+  authorityAddress: z.string().min(1),
+  privateKeyShare: z
+    .string()
+    .regex(
+      /^-?\d+$|^0[xX][0-9a-fA-F]+$/,
+      "privateKeyShare must be an integer string",
+    ),
+  encryptedTally: ciphertextSchema,
+});
+
+export type ThresholdDecryptShareRequest = z.infer<
+  typeof thresholdDecryptShareSchema
+>;
+
+export const thresholdTallyDecryptSchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .nonnegative("daoId must be a non-negative integer"),
+  proposalId: z.coerce
+    .number()
+    .int()
+    .nonnegative("proposalId must be a non-negative integer"),
+  encryptedTally: ciphertextSchema,
+});
+
+export type ThresholdTallyDecryptRequest = z.infer<
+  typeof thresholdTallyDecryptSchema
+>;
+
+export const thresholdStateParamsSchema = z.object({
+  daoId: positiveInteger,
+  proposalId: positiveInteger,
+});
+
+// ============================================
+// ADMIN SCHEMAS
+// ============================================
+
+export const adminShutdownSchema = z.object({
+  reason: z.string().max(1000, "reason must be at most 1000 chars").optional(),
+});
+
+export const adminAuditLogQuerySchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, "limit must be at least 1")
+    .max(500, "limit must be at most 500")
+    .default(50),
+  offset: z.coerce
+    .number()
+    .int()
+    .min(0, "offset must be non-negative")
+    .default(0),
+  action: z.string().min(1).optional(),
+  format: z.enum(["json", "cef"]).default("json"),
+  verify: z.enum(["true", "false"]).optional(),
+});
+
+export const adminSbtTransferAttemptsQuerySchema = z.object({
+  daoId: z.coerce
+    .number()
+    .int()
+    .positive("daoId is required and must be a positive integer"),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, "limit must be at least 1")
+    .max(500, "limit must be at most 500")
+    .default(50),
+  offset: z.coerce
+    .number()
+    .int()
+    .min(0, "offset must be non-negative")
+    .default(0),
+});
+
+// ============================================
+// REMEDIATION SCHEMAS
+// ============================================
+
+export const remediationHistoryQuerySchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1, "limit must be at least 1")
+    .max(1000, "limit must be at most 1000")
+    .default(50),
+});

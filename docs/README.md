@@ -95,6 +95,7 @@ flowchart LR
 ## Build & Tooling
 
 - [PR-117-deterministic-compilation.md](PR-117-deterministic-compilation.md) — deterministic compilation for circuit artifacts
+- [frontend-contract-client-migration.md](frontend-contract-client-migration.md) — `initializeContractClients` call-site audit & unified client migration (issue #368)
 
 ---
 

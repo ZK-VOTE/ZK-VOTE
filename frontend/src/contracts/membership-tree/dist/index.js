@@ -28,7 +28,9 @@ export const TreeError = {
     12: { message: "MemberNotInTree" },
     13: { message: "RootNotFound" },
     14: { message: "AlreadyInitialized" },
-    15: { message: "MemberNotRevoked" }
+    15: { message: "MemberNotRevoked" },
+    16: { message: "CommitmentAlreadyUsed" },
+    17: { message: "RateLimited" }
 };
 export class Client extends ContractClient {
     options;

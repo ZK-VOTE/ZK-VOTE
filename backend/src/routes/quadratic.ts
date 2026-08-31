@@ -20,7 +20,6 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { z } from "zod";
 
 import { log } from "../services/logger.js";
 import {
@@ -29,14 +28,20 @@ import {
   validateParams,
   bodyLimit,
 } from "../middleware/index.js";
+import {
+  QV_MAX_BUDGET,
+  QV_MAX_CREDITS,
+  qvParamsSchema,
+  qvCalculateSchema,
+  qvTallySchema,
+  type QvCalculateRequest,
+  type QvTallyRequest,
+} from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
 
-const router = Router();
+export { QV_MAX_BUDGET, QV_MAX_CREDITS };
 
-// Must match circuits/quadratic_vote_main.circom and the voting contract's
-// MAX_QV_BUDGET.
-export const QV_MAX_BUDGET = 100;
-export const QV_MAX_CREDITS = 10;
+const router = Router();
 
 export interface QvAllocation {
   proposalId: number;
@@ -127,27 +132,7 @@ export function aggregateTally(ballots: QvBallotReveal[]): {
   return { tally, totalBallots: ballots.length };
 }
 
-// --- Validation schemas ---
-
-const allocationSchema = z.object({
-  proposalId: z.number().int().nonnegative(),
-  voiceCredits: z.number().int().min(0).max(QV_MAX_CREDITS),
-});
-
-const calculateSchema = z.object({
-  allocations: z.array(allocationSchema).min(1).max(16),
-  budget: z.number().int().positive().max(QV_MAX_BUDGET).optional(),
-});
-
-const tallySchema = z.object({
-  ballots: z
-    .array(z.object({ allocations: z.array(allocationSchema).min(1).max(16) }))
-    .min(1),
-});
-
-const daoParamsSchema = z.object({
-  dao: z.string().regex(/^\d+$/),
-});
+// --- Validation schemas live in validation/schemas.ts ---
 
 /**
  * POST /qv/proposals/:dao/calculate
@@ -157,10 +142,10 @@ router.post(
   "/qv/proposals/:dao/calculate",
   bodyLimit("100kb"),
   queryLimiter,
-  validateParams(daoParamsSchema),
-  validateBody(calculateSchema),
+  validateParams(qvParamsSchema),
+  validateBody(qvCalculateSchema),
   (async (req: Request, res: Response) => {
-    const { allocations, budget } = req.body as z.infer<typeof calculateSchema>;
+    const { allocations, budget } = req.body as QvCalculateRequest;
     const result = calculateQuadraticCost(allocations, budget ?? QV_MAX_BUDGET);
     log("info", "qv_calculate", {
       dao: req.params.dao,
@@ -179,9 +164,9 @@ router.post(
   "/qv/tally",
   bodyLimit("100kb"),
   queryLimiter,
-  validateBody(tallySchema),
+  validateBody(qvTallySchema),
   (async (req: Request, res: Response) => {
-    const { ballots } = req.body as z.infer<typeof tallySchema>;
+    const { ballots } = req.body as QvTallyRequest;
     const result = aggregateTally(ballots);
     log("info", "qv_tally", { ballots: result.totalBallots });
     return res.json(result);

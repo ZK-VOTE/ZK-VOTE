@@ -48,6 +48,15 @@ pub use zkvote_groth16::{
 // ZK quadratic voting with range proofs (issue #50)
 mod quadratic;
 
+// Sybil-resistance: SBT-age weighting + reputation score (issue #301)
+mod sybil;
+
+// VDF-gated vote commit–reveal (issue #302)
+mod commit_reveal;
+
+// Anonymous vote delegation / liquid democracy (issue #304)
+mod delegation;
+
 const TREE_CONTRACT: Symbol = symbol_short!("tree");
 const REGISTRY: Symbol = symbol_short!("registry");
 const CIRCUIT_REGISTRY: Symbol = symbol_short!("circ_reg");
@@ -100,6 +109,77 @@ pub enum VotingError {
     WeightOutOfRange = 27,
     /// Invalid domain tag
     InvalidDomainTag = 28,
+
+    // ── Variants referenced across the contract but never declared ─────────
+    //
+    // `panic_with_error!(&env, VotingError::…)` call sites for all of these
+    // already existed in `lib.rs` and `quadratic.rs`, so the crate did not
+    // build. They are declared here rather than in a separate change because
+    // the VDF and quadratic paths this PR extends are exactly the paths that
+    // reference them.
+    /// Contract is paused by the guardian.
+    ContractPaused = 29,
+    /// Caller is not the guardian.
+    NotGuardian = 30,
+    RandomnessCommitClosed = 31,
+    RandomnessRevealClosed = 32,
+    RandomnessAlreadyCommitted = 33,
+    RandomnessCommitmentMissing = 34,
+    RandomnessRevealMismatch = 35,
+    CandidateSeedFinalized = 36,
+    InsufficientRandomness = 37,
+    RandomnessAlreadyRevealed = 38,
+    RandomnessParticipantLimit = 39,
+    TooManyActiveProposals = 40,
+    ProposalCooldownActive = 41,
+    InvalidProposalDeposit = 42,
+    ProposalHasVotes = 43,
+    VotingNotStarted = 44,
+    ElectionDurationTooShort = 45,
+    ElectionDurationTooLong = 46,
+    InvalidNoticePeriod = 47,
+    InvalidRegistrationPeriod = 48,
+    InvalidRegistrationGap = 49,
+    /// Regular `vote` called on a Quadratic proposal (use `cast_qv_vote`), or
+    /// `cast_qv_vote` called on a non-Quadratic proposal
+    NotQuadraticProposal = 50,
+    /// Quadratic-voting verification key not set for this DAO
+    QvVkNotSet = 51,
+    /// Quadratic ballot exceeds the fixed credit budget (sum of squares > MAX_QV_BUDGET)
+    QvBudgetExceeded = 52,
+    /// Quadratic tally verification key not set for this DAO
+    QvTallyVkNotSet = 53,
+    /// Tally proposal_ids / tallies vectors have mismatched or empty length
+    QvTallyLengthMismatch = 54,
+    /// Candidate index >= numCandidates configured for this election
+    InvalidCandidateIndex = 65,
+    UpgradeVersionMismatch = 66,
+    StorageVersionDowngrade = 67,
+    UpgradePayloadTooLarge = 68,
+    /// Reentrant call detected (defense-in-depth against cross-contract reentrancy)
+    ReentrantCall = 56,
+    /// VDF proof verification failed
+    VdfVerificationFailed = 57,
+    /// VDF output already submitted for this election
+    VdfAlreadySubmitted = 58,
+    /// VDF delay period has not elapsed yet
+    VdfDelayNotElapsed = 59,
+    /// VDF delay parameter is invalid
+    VdfInvalidDelay = 60,
+    /// VDF input (block hash) is not available
+    VdfInputNotAvailable = 61,
+    /// Invalid Nova recursive proof or tally verification failure
+    RecursiveProofInvalid = 62,
+    /// Vote tally increment overflowed maximum integer capacity
+    TallyOverflow = 55,
+    /// Merkle root locked because proposal transitioned out of Registration phase
+    MerkleRootLocked = 63,
+    /// Commitment window for root updates has expired
+    CommitmentWindowExpired = 64,
+    /// Relayer address is zero or not in BN254 scalar field
+    InvalidRelayerAddress = 69,
+    /// Relayer address in proof does not match actual relayer submitting transaction
+    RelayerMismatch = 70,
 }
 
 // Maximum allowed IC vector length (num_public_inputs + 1)
@@ -113,8 +193,8 @@ const MAX_CID_LEN: u32 = 64; // Max IPFS CID length (CIDv1 is ~59 chars)
 const MAX_UPGRADE_PAYLOAD_LEN: u32 = 4096;
 
 // Circuit constants
-/// Vote circuit public signals: root, nullifier, dao_id, proposal_id, vote_choice, num_candidates
-const NUM_PUBLIC_SIGNALS: u32 = 6;
+/// Vote circuit public signals: root, nullifier, dao_id, proposal_id, vote_choice, num_candidates, relayer_address
+const NUM_PUBLIC_SIGNALS: u32 = 7;
 // IC (inner commitment) vector length for Groth16 VK = num_public_inputs + 1
 const VOTE_CIRCUIT_IC_LEN: u32 = NUM_PUBLIC_SIGNALS + 1;
 pub const MAX_PAUSE_DURATION: u64 = 72 * 60 * 60;
@@ -228,6 +308,50 @@ pub enum DataKey {
     UpgradeMigration(u32),
     /// Rollback marker by rolled-back contract version.
     UpgradeRollback(u32),
+
+    // ── Sybil-resistance layer (#301) ──────────────────────────────────────
+    // Appended at the end so existing storage discriminants stay stable.
+    /// Weighted tally: (dao_id, proposal_id) -> WeightedTally
+    WeightedTally(u64, u64),
+    /// Per-election Sybil weight cap: (dao_id, proposal_id) -> u32
+    SybilWeightCap(u64, u64),
+    /// Anchored eligibility-attestation root the weighted-vote circuit proves
+    /// against: (dao_id, proposal_id) -> U256
+    AttestationRoot(u64, u64),
+    /// Sybil-weighted vote VK: dao_id -> VerificationKey
+    SybilVotingKey(u64),
+
+    // ── VDF-gated commit–reveal (#302) ─────────────────────────────────────
+    /// Commit–reveal schedule: (dao_id, proposal_id) -> CommitRevealConfig
+    CommitRevealConfig(u64, u64),
+    /// Published vote commitment: (dao_id, proposal_id, nullifier) -> BytesN<32>
+    VoteCommit(u64, u64, U256),
+    /// Reveal marker: (dao_id, proposal_id, nullifier) -> bool
+    VoteRevealed(u64, u64, U256),
+    /// Number of commitments accepted: (dao_id, proposal_id) -> u64
+    VoteCommitCount(u64, u64),
+    /// Commit-phase eligibility VK: dao_id -> VerificationKey
+    CommitVotingKey(u64),
+
+    // ── Anonymous delegation (#304) ────────────────────────────────────────
+    /// Registered delegation: (dao_id, proposal_id, commitment) -> DelegationRecord
+    Delegation(u64, u64, U256),
+    /// Delegation spend marker: (dao_id, proposal_id, delegation_nullifier) -> bool
+    DelegationNullifier(u64, u64, U256),
+    /// Reclaim spend marker: (dao_id, proposal_id, reclaim_nullifier) -> bool
+    ReclaimNullifier(u64, u64, U256),
+    /// Delegation accumulator root: (dao_id, proposal_id) -> U256
+    DelegationRoot(u64, u64),
+    /// Registered delegation count: (dao_id, proposal_id) -> u64
+    DelegationCount(u64, u64),
+    /// Votes cast via delegation: (dao_id, proposal_id) -> u64
+    DelegatedVoteCount(u64, u64),
+    /// Delegation verification keys: dao_id -> VerificationKey, per circuit role
+    DelegationRegisterVk(u64),
+    DelegationVoteVk(u64),
+    DelegationRevokeVk(u64),
+    /// Whether delegation is enabled for an election: (dao_id, proposal_id) -> bool
+    DelegationEnabled(u64, u64),
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -252,6 +376,60 @@ pub struct RecursiveTallyInfo {
     pub no_votes: u64,
     pub final_nullifier_acc: U256,
     pub finalized_at: u64,
+}
+
+// ── Sybil-resistance layer (#301) ──────────────────────────────────────────
+
+/// Weighted tally alongside the plain head-count.
+///
+/// Kept separate from `ProposalInfo.yes_votes`/`no_votes` rather than replacing
+/// them: a DAO needs both numbers to reason about a result — the weighted total
+/// is what decides the vote, the head-count is what tells you whether the
+/// weighting changed the outcome.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightedTally {
+    pub yes_weight: u64,
+    pub no_weight: u64,
+    pub yes_ballots: u64,
+    pub no_ballots: u64,
+}
+
+// ── VDF-gated commit–reveal (#302) ─────────────────────────────────────────
+
+/// The commit–reveal schedule for one election.
+///
+/// The reveal phase does not open on `reveal_opens_at` alone: the election's
+/// VDF output must also have been submitted and verified. The timestamp is the
+/// *earliest* the phase can open; the VDF is what makes the delay verifiable
+/// rather than merely asserted by the ledger clock.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitRevealConfig {
+    /// Last timestamp at which a commitment is accepted.
+    pub commit_deadline: u64,
+    /// Earliest timestamp at which a reveal is accepted.
+    pub reveal_opens_at: u64,
+    /// Last timestamp at which a reveal is accepted. 0 means no deadline.
+    pub reveal_closes_at: u64,
+    /// Whether the VDF output must be finalized before reveals open.
+    pub require_vdf: bool,
+}
+
+// ── Anonymous delegation (#304) ────────────────────────────────────────────
+
+/// A registered delegation of one member's vote on one proposal.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationRecord {
+    /// Opaque handle for the delegate: `Poseidon(tag_domain, delegate_secret, dao_id)`.
+    pub delegate_tag: U256,
+    /// Ledger timestamp of registration.
+    pub registered_at: u64,
+    /// Revoked by the delegator; the delegate can no longer spend it.
+    pub revoked: bool,
+    /// Already spent on a vote.
+    pub used: bool,
 }
 
 #[contracttype]
@@ -514,6 +692,100 @@ pub struct QvVoteEvent {
     pub proposal_id: u64,
     pub nullifier: U256,
     pub total_credits_spent: u64,
+}
+
+// ── Sybil-resistance layer (#301) ──────────────────────────────────────────
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeightedVoteEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub choice: bool,
+    pub weight: u32,
+    pub nullifier: U256,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SybilWeightCapSetEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub cap: u32,
+}
+
+// ── VDF-gated commit–reveal (#302) ─────────────────────────────────────────
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoteCommittedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub nullifier: U256,
+    pub commit_index: u64,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoteRevealedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub nullifier: U256,
+    pub choice: bool,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitRevealConfiguredEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub commit_deadline: u64,
+    pub reveal_opens_at: u64,
+}
+
+// ── Anonymous delegation (#304) ────────────────────────────────────────────
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegationRegisteredEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub delegation_commitment: U256,
+    pub delegate_tag: U256,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegatedVoteEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub choice: bool,
+    pub delegation_nullifier: U256,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegationRevokedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub delegation_commitment: U256,
+    pub reclaim_nullifier: U256,
 }
 
 #[soroban_sdk::contractevent]
@@ -1760,6 +2032,19 @@ impl Voting {
         let proposal_signal = U256::from_u128(&env, proposal_id as u128);
         let num_candidates_signal = U256::from_u32(&env, election_config.num_candidates);
 
+        // Extract relayer address from transaction signer (the one paying fees)
+        // In Soroban, this is typically the contract invoker, but we get it from the auth context
+        let relayer_address: Address = env.invoker().clone();
+        let relayer_signal = Self::address_to_u256(&env, &relayer_address);
+
+        // Validate relayer address is in BN254 scalar field
+        Self::assert_in_field(&env, &relayer_signal);
+
+        // Validate relayer address is non-zero
+        if relayer_signal == U256::from_u32(&env, 0) {
+            panic_with_error!(&env, VotingError::InvalidRelayerAddress);
+        }
+
         let pub_signals = soroban_sdk::vec![
             &env,
             root.clone(),
@@ -1768,6 +2053,7 @@ impl Voting {
             proposal_signal,
             vote_signal,
             num_candidates_signal,
+            relayer_signal,
         ];
 
         if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
@@ -1963,6 +2249,18 @@ impl Voting {
         let proposal_signal = U256::from_u128(&env, proposal_id as u128);
         let num_candidates_signal = U256::from_u32(&env, election_config.num_candidates);
 
+        // Extract relayer address from transaction signer
+        let relayer_address: Address = env.invoker().clone();
+        let relayer_signal = Self::address_to_u256(&env, &relayer_address);
+
+        // Validate relayer address is in BLS12-381 scalar field
+        Self::assert_in_field_bls381(&env, &relayer_signal);
+
+        // Validate relayer address is non-zero
+        if relayer_signal == U256::from_u32(&env, 0) {
+            panic_with_error!(&env, VotingError::InvalidRelayerAddress);
+        }
+
         let pub_signals = soroban_sdk::vec![
             &env,
             root.clone(),
@@ -1971,6 +2269,7 @@ impl Voting {
             proposal_signal,
             vote_signal,
             num_candidates_signal,
+            relayer_signal,
         ];
 
         if !Self::verify_groth16_bls381(&env, &vk, &proof, &pub_signals) {
@@ -2105,6 +2404,14 @@ impl Voting {
         Self::bump_persistent(&env, &scoped_key);
         env.storage().persistent().remove(&legacy_key);
         true
+    }
+
+    /// Convert a Stellar address to a U256 field element
+    /// Hashes the address using Blake2-256 and converts to U256
+    fn address_to_u256(env: &Env, address: &Address) -> U256 {
+        let address_bytes = address.to_xdr(env);
+        let hash: BytesN<32> = env.crypto().sha256(&address_bytes);
+        U256::from_be_bytes(env, &hash.to_bytes(env))
     }
 
     /// Get tree contract address

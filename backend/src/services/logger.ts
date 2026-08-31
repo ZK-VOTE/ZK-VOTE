@@ -1,8 +1,17 @@
 /**
  * Structured Logger Service with PII Redaction
+ *
+ * Provides:
+ *  - Structured JSON logging to stdout
+ *  - PII redaction (field- and pattern-based)
+ *  - Per-request correlation context via AsyncLocalStorage so every nested
+ *    log call carries the request's correlation ID + trace ID automatically
+ *  - Trace sampling (`LOG_SAMPLE_RATE`) so high-volume requests can be
+ *    probabilistically dropped while keeping an entire request consistent
  */
 
 import crypto from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export type LogMeta = Record<string, any>;
@@ -13,6 +22,18 @@ export interface RedactionPolicy {
   showClientIp: "plain" | "hash" | "none";
   showBodyKeysOnly: boolean;
   stellarTruncateLength: number;
+}
+
+/**
+ * Per-request correlation context. Populated by the request logging
+ * middleware and propagated through AsyncLocalStorage to every nested
+ * log call (services, routes, background work spawned from a request).
+ */
+export interface RequestContext {
+  ctx: string;
+  traceId: string;
+  path?: string;
+  method?: string;
 }
 
 const DEFAULT_POLICY: RedactionPolicy = {
@@ -38,6 +59,85 @@ const DEFAULT_POLICY: RedactionPolicy = {
 };
 
 let currentPolicy: RedactionPolicy = { ...DEFAULT_POLICY };
+
+// Correlation context store: auto-attaches request correlation IDs to every
+// log call made within a request's async execution context.
+const requestContextStore = new AsyncLocalStorage<RequestContext>();
+
+/**
+ * Runs `fn` within the given correlation context. Every log call made
+ * synchronously or asynchronously (via awaited promises, timers, etc.)
+ * spawned from `fn` will automatically include `ctx` and `traceId`.
+ */
+export function runWithContext<T>(context: RequestContext, fn: () => T): T {
+  return requestContextStore.run(context, fn);
+}
+
+/**
+ * Returns the correlation context active for the current async execution,
+ * or `undefined` when no request context is present (e.g. background jobs).
+ */
+export function getRequestContext(): RequestContext | undefined {
+  return requestContextStore.getStore();
+}
+
+/**
+ * Trace sampling rate in [0, 1]. Defaults to 1 (log everything). Set via
+ * `LOG_SAMPLE_RATE` env or `setLogSampleRate` (tests/tuning).
+ */
+let sampleRate: number = clampSampleRate(
+  parseFloat(process.env.LOG_SAMPLE_RATE || "1"),
+);
+
+function clampSampleRate(value: number): number {
+  if (Number.isNaN(value)) return 1;
+  return Math.min(1, Math.max(0, value));
+}
+
+export function setLogSampleRate(rate: number): void {
+  sampleRate = clampSampleRate(rate);
+}
+
+export function getLogSampleRate(): number {
+  return sampleRate;
+}
+
+/**
+ * Applies sampling deterministically keyed on the request's trace ID (or
+ * correlation ID) so a single request is either fully sampled or fully
+ * dropped - keeping start/end spans and nested logs consistent.
+ */
+function shouldEmit(event: string, meta: LogMeta): boolean {
+  if (sampleRate >= 1) return true;
+  if (sampleRate <= 0) return false;
+
+  const context = getRequestContext();
+  const key =
+    meta.traceId ?? meta.ctx ?? context?.traceId ?? context?.ctx ?? event;
+
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  }
+  return (hash % 100) / 100 < sampleRate;
+}
+
+/**
+ * Merges the active correlation context into the log meta so downstream
+ * log calls (services/routes) automatically carry correlation IDs without
+ * threading `req` manually. Explicit meta values win over context.
+ */
+function withCorrelation(meta: LogMeta): LogMeta {
+  const context = getRequestContext();
+  if (!context) return meta;
+  return {
+    ...meta,
+    ctx: meta.ctx ?? context.ctx,
+    traceId: meta.traceId ?? context.traceId,
+    path: meta.path ?? context.path,
+    method: meta.method ?? context.method,
+  };
+}
 
 export function setRedactionPolicy(policy: Partial<RedactionPolicy>): void {
   currentPolicy = { ...currentPolicy, ...policy };
@@ -123,6 +223,12 @@ export function redact(meta: LogMeta, level: LogLevel = "info"): LogMeta {
   return safe;
 }
 
+function isEnabled(level: LogLevel): boolean {
+  const minLevel = (process.env.LOG_LEVEL || "info") as LogLevel;
+  const levels: LogLevel[] = ["debug", "info", "warn", "error"];
+  return levels.indexOf(level) >= levels.indexOf(minLevel);
+}
+
 export interface Logger {
   log(level: LogLevel, event: string, meta?: LogMeta): void;
   debug(event: string, meta?: LogMeta): void;
@@ -133,9 +239,7 @@ export interface Logger {
 
 export function createLogger(service: string): Logger {
   const log = (level: LogLevel, event: string, meta: LogMeta = {}): void => {
-    const minLevel = (process.env.LOG_LEVEL || "info") as LogLevel;
-    const levels = ["debug", "info", "warn", "error"];
-    if (levels.indexOf(level) < levels.indexOf(minLevel)) {
+    if (!shouldEmit(event, meta) || !isEnabled(level)) {
       return;
     }
 
@@ -146,7 +250,7 @@ export function createLogger(service: string): Logger {
       service,
       event,
       env: process.env.NODE_ENV || "development",
-      ...redactedMeta,
+      ...withCorrelation(redactedMeta),
     };
     console.log(JSON.stringify(entry));
   };
@@ -173,19 +277,18 @@ export function hashIp(ip: string | undefined): string {
 }
 
 export function log(level: LogLevel, event: string, meta: LogMeta = {}): void {
-  const safe = redact(meta, level);
-  const minLevel = (process.env.LOG_LEVEL || "info") as LogLevel;
-  const levels = ["debug", "info", "warn", "error"];
-  if (levels.indexOf(level) < levels.indexOf(minLevel)) {
+  if (!shouldEmit(event, meta) || !isEnabled(level)) {
     return;
   }
+
+  const safe = redact(meta, level);
   console.log(
     JSON.stringify({
       level,
       event,
       ts: new Date().toISOString(),
       env: process.env.NODE_ENV || "development",
-      ...safe,
+      ...withCorrelation(safe),
     }),
   );
 }

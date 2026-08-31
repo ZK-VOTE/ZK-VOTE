@@ -1,4 +1,11 @@
 import test from "node:test";
+
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+import { buildAppServices } from "../src/composition-root.js";
+buildAppServices();
+
 import assert from "node:assert/strict";
 
 test("DAO cache OCC, copy-on-write snapshot, version counter, invalidation events, and metrics", async () => {

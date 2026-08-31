@@ -12,7 +12,12 @@ import { getRateLimitMetrics } from "../middleware/rateLimit.js";
 import { bodyLimit } from "../middleware/index.js";
 import { getMembershipVerificationMetrics } from "../services/sync.js";
 import { log } from "../services/logger.js";
-import { getDbDiagnostics, getDbStatus, getDb } from "../services/db.js";
+import {
+  getDbDiagnostics,
+  getDbStatus,
+  getDb,
+  getCachedDaoCount,
+} from "../services/db.js";
 import { getBackupStatus } from "../services/backup.js";
 import { getWalHealth } from "../services/walResilience.js";
 
@@ -25,12 +30,44 @@ import {
   markHealthy,
   markUnavailable,
 } from "../services/service-health.js";
+import { getSupervisor } from "../services/supervisor.js";
 import v8 from "node:v8";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const router = Router();
+const PUBLIC_STATS_CACHE_TTL_MS = 60_000;
+
+let publicStatsCache: { expiresAt: number; stats: Record<string, number | string> } | null = null;
+
+function getPublicProtocolStats(): Record<string, number | string> {
+  const now = Date.now();
+  if (!publicStatsCache || now >= publicStatsCache.expiresAt) {
+    let totalEvents = 0;
+    let lastLedger = 0;
+
+    try {
+      const dbStatus = getDbStatus();
+      totalEvents = Number(dbStatus.totalEvents ?? 0);
+      lastLedger = Number(dbStatus.lastLedger ?? 0);
+    } catch {
+      // Database may not be initialized yet in early startup or test bootstrap.
+    }
+
+    publicStatsCache = {
+      expiresAt: now + PUBLIC_STATS_CACHE_TTL_MS,
+      stats: {
+        totalDaos: getCachedDaoCount(),
+        totalEvents,
+        lastLedger,
+        lastUpdated: new Date().toISOString(),
+      },
+    };
+  }
+
+  return publicStatsCache.stats;
+}
 
 // Dependencies injected during setup
 let server: StellarSdk.rpc.Server | null = null;
@@ -112,6 +149,22 @@ router.get("/healthz", async (req: Request, res: Response) => {
  * GET /health
  * Basic health check
  */
+router.get("/public-stats", async (_req: Request, res: Response) => {
+  try {
+    const data = getPublicProtocolStats();
+    return res.json({
+      status: "ok",
+      data,
+      cached: true,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      status: "error",
+      message: (err as Error).message,
+    });
+  }
+});
+
 router.get("/health", async (req: Request, res: Response) => {
   const rpc = config.healthcheckPing ? await rpcHealth() : { ok: true };
   if (rpc.ok) {
@@ -268,6 +321,29 @@ router.get("/ready", async (req: Request, res: Response) => {
     return res
       .status(503)
       .json({ status: "error", message: (err as Error).message });
+  }
+});
+
+/**
+ * GET /services
+ * Supervisor status for all background services (admin only)
+ * Exposes per-service health, failure counts, and restart history
+ */
+router.get("/services", async (req: Request, res: Response) => {
+  if (config.healthExposeDetails) {
+    const token = extractAuthToken(req);
+    if (token !== config.relayerAuthToken) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
+  try {
+    const supervisor = getSupervisor();
+    const status = supervisor.getStatus();
+    res.json(status);
+  } catch (err) {
+    log("error", "supervisor_status_failed", { error: (err as Error).message });
+    res.status(500).json({ error: "Failed to get supervisor status" });
   }
 });
 
