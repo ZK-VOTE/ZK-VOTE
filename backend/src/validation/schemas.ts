@@ -6,7 +6,7 @@
  */
 
 import { z } from "zod";
-import { BN254_MODULUS } from "../config.js";
+import { BN254_SCALAR_FIELD } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
 
 // ============================================
@@ -36,7 +36,7 @@ const bn254Field = z.string().refine(
     if (!/^[0-9a-fA-F]*$/.test(hex)) return false;
     try {
       const value = BigInt("0x" + hex);
-      return value < BN254_MODULUS;
+      return value < BN254_SCALAR_FIELD;
     } catch {
       return false;
     }
@@ -64,6 +64,12 @@ const bn254Field = z.string().refine(
  * Soroban host's job at proof-verification time (see module comment above).
  */
 function coordinatesInFieldRange(paddedHex: string, count: number): boolean {
+  // Zod runs every refinement in a chain and collects the issues rather than
+  // stopping at the first failure, so this is reached even when the preceding
+  // hex-shape check has already rejected the value. `BigInt()` throws on a
+  // non-hex string, and that throw escapes `safeParse` — turning what should
+  // be a 400 into an unhandled exception — so the shape is re-checked here.
+  if (!/^[0-9a-fA-F]+$/.test(paddedHex)) return false;
   const coordHexLen = paddedHex.length / count;
   for (let i = 0; i < count; i++) {
     const coordHex = paddedHex.slice(i * coordHexLen, (i + 1) * coordHexLen);

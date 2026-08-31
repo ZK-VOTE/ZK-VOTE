@@ -562,14 +562,21 @@ export const ALLOWED_IMAGE_MIMES = [
 // BN254 CONSTANTS
 // ============================================
 
-// BN254 field modulus (p)
+// BN254 base field modulus (p) - the field the curve's coordinates live in.
+// Proof points are checked against this; circuit signals are not.
 export const BN254_MODULUS = BigInt(
-  "218882428718392752222464057452572750885483644004160343698204186575808495617",
+  "0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47",
 );
 
-// BN254 scalar field modulus (r)
+// BN254 scalar field modulus (r) - the group order, and the field every
+// circuit signal (nullifier, Merkle root, commitment) is an element of.
+//
+// This must stay byte-identical to `BN254_FR_MODULUS` in
+// contracts/zkvote-groth16/src/lib.rs, which is what the chain enforces:
+// a bound that is too small rejects legitimate votes, and one that is too
+// large lets a request through only to have the contract panic on it.
 export const BN254_SCALAR_FIELD = BigInt(
-  "0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47",
+  "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001",
 );
 
 // ============================================
