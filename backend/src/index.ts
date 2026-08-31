@@ -807,6 +807,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           "/bridge/nullifier/:daoId/:proposalId/:nullifier",
           "/bridge/relay",
         ],
+        threshold: [
+          "/threshold/init",
+          "/threshold/authority/register",
+          "/threshold/dkg/finalize",
+          "/threshold/vote/encrypt",
+          "/threshold/tally/compute",
+          "/threshold/decrypt/share",
+          "/threshold/tally/decrypt",
+          "/threshold/state/:daoId/:proposalId",
+          "/threshold/status",
+        ],
         ipfs: config.ipfsEnabled
           ? [
               "/ipfs/image",

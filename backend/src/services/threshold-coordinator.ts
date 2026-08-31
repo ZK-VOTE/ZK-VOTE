@@ -92,10 +92,8 @@ class ProtocolState {
   private rounds: Map<string, DkgRound> = new Map();
   private encryptedVotes: Map<string, EncryptedVote[]> = new Map();
   private decryptionShares: Map<string, Map<number, string>> = new Map();
-  private relayNodes: Map<string, RelayNode[]> = new Map();
-  private relaySubmissions: Map<string, RelaySubmission[]> = new Map();
-  private missingVoteAlerts: Map<string, MissingVoteAlert[]> = new Map();
-  private coverTrafficTimer: ReturnType<typeof setInterval> | null = null;
+  private tallyResults: Map<string, { tally: bigint; proof: string }> =
+    new Map();
 
   getRoundKey(daoId: number, proposalId: number): string {
     return `${daoId}:${proposalId}`;
@@ -175,51 +173,22 @@ class ProtocolState {
     }));
   }
 
-  getRelayNodes(daoId: number, proposalId: number): RelayNode[] {
-    return this.relayNodes.get(this.getRoundKey(daoId, proposalId)) || [];
-  }
-
-  addRelayNode(daoId: number, proposalId: number, node: RelayNode): void {
-    const key = this.getRoundKey(daoId, proposalId);
-    if (!this.relayNodes.has(key)) {
-      this.relayNodes.set(key, []);
-    }
-    this.relayNodes.get(key)!.push(node);
-  }
-
-  addRelaySubmission(
+  setTallyResult(
     daoId: number,
     proposalId: number,
-    submission: RelaySubmission,
+    tally: bigint,
+    proof: string,
   ): void {
     const key = this.getRoundKey(daoId, proposalId);
-    if (!this.relaySubmissions.has(key)) {
-      this.relaySubmissions.set(key, []);
-    }
-    this.relaySubmissions.get(key)!.push(submission);
+    this.tallyResults.set(key, { tally, proof });
   }
 
-  recordMissingVote(alert: MissingVoteAlert): void {
-    if (!this.missingVoteAlerts.has(alert.electionId)) {
-      this.missingVoteAlerts.set(alert.electionId, []);
-    }
-    this.missingVoteAlerts.get(alert.electionId)!.push(alert);
+  getTallyResult(
+    daoId: number,
+    proposalId: number,
+  ): { tally: bigint; proof: string } | undefined {
+    return this.tallyResults.get(this.getRoundKey(daoId, proposalId));
   }
-
-  getMissingVoteAlerts(daoId: number, proposalId: number): MissingVoteAlert[] {
-    return this.missingVoteAlerts.get(this.getRoundKey(daoId, proposalId)) || [];
-  }
-
-  setCoverTrafficTimer(
-    timer: ReturnType<typeof setInterval> | null,
-  ): void {
-    this.coverTrafficTimer = timer;
-  }
-
-  getCoverTrafficTimer(): ReturnType<typeof setInterval> | null {
-    return this.coverTrafficTimer;
-  }
-
 }
 
 // Singleton state
@@ -586,6 +555,7 @@ export async function computeFinalTally(
     tally: tally.toString(),
   });
 
+  state.setTallyResult(daoId, proposalId, tally, proof);
   emitEvent({ type: "tally_decrypted", tally: tally.toString() });
 
   return { tally, proof, combinedShare };
@@ -601,19 +571,17 @@ export function getProtocolState(
   encryptedVoteCount: number;
   decryptionShareCount: number;
   isTallyDecrypted: boolean;
-  relayNodeCount: number;
-  missingVoteCount: number;
+  decryptedTally: string | null;
 } {
   const round = state.getRound(daoId, proposalId);
   const shares = state.getDecryptionShares(daoId, proposalId);
-  const isDecrypted = round?.jointPublicKey ? true : false;
+  const tallyResult = state.getTallyResult(daoId, proposalId);
 
   return {
     dkgRound: round,
     encryptedVoteCount: state.getEncryptedVotes(daoId, proposalId).length,
     decryptionShareCount: shares.length,
-    isTallyDecrypted: isDecrypted,
-    relayNodeCount: state.getRelayNodes(daoId, proposalId).length,
-    missingVoteCount: state.getMissingVoteAlerts(daoId, proposalId).length,
+    isTallyDecrypted: !!tallyResult,
+    decryptedTally: tallyResult ? tallyResult.tally.toString() : null,
   };
 }
