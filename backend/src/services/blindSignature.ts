@@ -37,8 +37,8 @@
  *
  * This module implements the cryptographic primitive (key generation,
  * blind/sign/unblind/verify) with real modular-exponentiation arithmetic.
- * Wiring it into the existing registration HTTP routes/DB schema is a
- * larger, separate change and is out of scope here (see PR description).
+ * It also provides the issuer-side one-credential-per-voter and
+ * anti-farming coordination needed by the registration HTTP routes.
  */
 
 import { createHash, generateKeyPairSync, KeyObject } from "node:crypto";
@@ -306,4 +306,142 @@ export function buildDidAttributeProofSeed(
     ).toString(),
     attributeValue: claim.attributeValue.toString(),
   };
+}
+/**
+ * Issued-credential table DDL for an anonymous credential issuance store.
+ * Only `voter_id` is retained. The blinded commitment and final RSA
+ * signature are intentionally not persisted; storing either would create
+ * a link between the voter and the later anonymous ZK proof.
+ */
+export const CREDENTIAL_ISSUANCE_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS issued_credentials (
+  voter_id TEXT PRIMARY KEY,
+  issued_at INTEGER NOT NULL
+);
+`;
+
+/** Persistence contract used by the end-to-end credential issuer. */
+export interface CredentialIssuerStore {
+  hasCredential(voterId: string): boolean;
+  markCredentialIssued(voterId: string, issuedAt: number): void;
+}
+
+/** In-memory implementation of [[CredentialIssuerStore]] for tests/dev. */
+export class InMemoryCredentialIssuerStore implements CredentialIssuerStore {
+  private readonly issued = new Set<string>();
+
+  hasCredential(voterId: string): boolean {
+    return this.issued.has(voterId);
+  }
+
+  markCredentialIssued(voterId: string, _issuedAt: number): void {
+    this.issued.add(voterId);
+  }
+}
+
+/** Sliding-window rate limiter for anti-farming of blind signatures. */
+export class SignatureFarmingRateLimiter {
+  private readonly requests = new Map<string, number[]>();
+
+  constructor(
+    private readonly maxRequests: number,
+    private readonly windowMs: number,
+  ) {
+    if (maxRequests <= 0 || windowMs <= 0) {
+      throw new BlindSignatureError(
+        "rate limiter requires positive maxRequests and windowMs",
+      );
+    }
+  }
+
+  /** Returns true if the request is allowed, false if it should be rejected. */
+  isAllowed(key: string, now = Date.now()): boolean {
+    const cutoff = now - this.windowMs;
+    const timestamps = (this.requests.get(key) ?? []).filter(
+      (timestamp) => timestamp > cutoff,
+    );
+    if (timestamps.length >= this.maxRequests) {
+      this.requests.set(key, timestamps);
+      return false;
+    }
+    timestamps.push(now);
+    this.requests.set(key, timestamps);
+    return true;
+  }
+}
+
+/**
+ * Issuer-side coordinator that signs blinded credentials while enforcing
+ * one credential per voter and optional anti-farming limits.
+ *
+ * The store keeps only the fact that a voter already received a credential.
+ * The blinded commitment is passed to [[signBlinded]] but is never recorded,
+ * so the issuer cannot later link `(message, signature)` to a voter id.
+ */
+export class BlindSignatureIssuer {
+  constructor(
+    private readonly key: RsaBlindKeyPair,
+    private readonly store: CredentialIssuerStore,
+    private readonly rateLimiter?: SignatureFarmingRateLimiter,
+  ) {}
+
+  hasCredential(voterId: string): boolean {
+    return this.store.hasCredential(voterId);
+  }
+
+  issue(voterId: string, blinded: bigint, rateLimitKey = voterId): bigint {
+    if (this.store.hasCredential(voterId)) {
+      throw new BlindSignatureError(
+        "voter has already been issued a credential",
+      );
+    }
+    if (this.rateLimiter && !this.rateLimiter.isAllowed(rateLimitKey)) {
+      throw new BlindSignatureError(
+        "too many blind signature requests; try again later",
+      );
+    }
+    const signature = signBlinded(blinded, this.key);
+    this.store.markCredentialIssued(voterId, Date.now());
+    return signature;
+  }
+}
+
+/**
+ * Server-side helper for a registration HTTP handler that has already
+ * received a blinded commitment from the voter.
+ */
+export function issueVoterCredential(
+  voterId: string,
+  blinded: bigint,
+  key: RsaBlindKeyPair,
+  store: CredentialIssuerStore,
+  rateLimiter?: SignatureFarmingRateLimiter,
+  rateLimitKey = voterId,
+): bigint {
+  const issuer = new BlindSignatureIssuer(key, store, rateLimiter);
+  return issuer.issue(voterId, blinded, rateLimitKey);
+}
+
+/**
+ * End-to-end registration helper for tests and local development. It
+ * blinds, obtains the issuer signature, and unblinds while enforcing the
+ * one-credential-per-voter store.
+ */
+export function issueCredentialForVoter(
+  voterId: string,
+  message: bigint,
+  pub: RsaBlindPublicKey,
+  key: RsaBlindKeyPair,
+  store: CredentialIssuerStore,
+  rateLimiter?: SignatureFarmingRateLimiter,
+  rateLimitKey = voterId,
+): { signature: bigint; blindedSentToIssuer: bigint } {
+  const { blinded, r } = blind(message, pub);
+  const blindSig = new BlindSignatureIssuer(key, store, rateLimiter).issue(
+    voterId,
+    blinded,
+    rateLimitKey,
+  );
+  const signature = unblind(blindSig, r, pub);
+  return { signature, blindedSentToIssuer: blinded };
 }
