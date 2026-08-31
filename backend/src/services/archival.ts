@@ -21,6 +21,8 @@ import { type Database as DatabaseType } from "better-sqlite3";
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import { config } from "../config.js";
+import { WatermarkScheduler } from "./indexer-scheduler.js";
+import { archivalRunsTotal, archivalDuration } from "./metrics.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,7 +56,7 @@ export interface ArchivalJobResult {
   error?: string;
 }
 
-let archivalTimer: NodeJS.Timeout | null = null;
+let archivalScheduler: WatermarkScheduler | null = null;
 
 /**
  * Ensure archive storage directory exists
@@ -98,6 +100,12 @@ export async function runArchivalJob(
     ageDays?: number;
     archiveDir?: string;
     batchSize?: number;
+    /**
+     * Aborts the job between DAO partitions and between delete batches (#323).
+     * Archival can run for minutes over a large database; without this a
+     * shutdown would either block on it or leave a half-deleted partition.
+     */
+    signal?: AbortSignal;
   } = {},
 ): Promise<ArchivalJobResult> {
   const db = getDb();
@@ -126,8 +134,22 @@ export async function runArchivalJob(
   ).toISOString();
   const targetDir = options.archiveDir || ensureArchiveDir();
   const batchSize = options.batchSize || 100;
+  const signal = options.signal;
+
+  /** Abort at a point where the database is in a consistent state. */
+  const throwIfAborted = (): void => {
+    if (!signal?.aborted) return;
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("Archival job cancelled");
+  };
 
   log("info", "archival_job_start", { ageDays, cutoffDate, dbSizeBytesBefore });
+
+  // Declared outside the try so a cancellation can still report how much work
+  // was durably completed before the abort.
+  let totalArchivedCount = 0;
+  const createdRecords: ArchiveRecord[] = [];
 
   try {
     // Step 1: Discover ended elections (proposals with proposal_closed or proposal_archived events)
@@ -136,10 +158,8 @@ export async function runArchivalJob(
       .all() as Array<{ dao_id: number }>;
     const registeredDaos = partitionRows.map((r) => r.dao_id);
 
-    let totalArchivedCount = 0;
-    const createdRecords: ArchiveRecord[] = [];
-
     for (const daoId of registeredDaos) {
+      throwIfAborted();
       const tableName = `events_${daoId}`;
       const tableExists = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
@@ -245,6 +265,7 @@ export async function runArchivalJob(
       // Step 3: Batch deletion of archived events from SQLite database
       const eventIds = eventsToArchive.map((e) => e.id);
       for (let i = 0; i < eventIds.length; i += batchSize) {
+        throwIfAborted();
         const batch = eventIds.slice(i, i + batchSize);
         const placeholders = batch.map(() => "?").join(",");
         db.prepare(
@@ -282,15 +303,19 @@ export async function runArchivalJob(
     };
   } catch (err) {
     const errorMsg = (err as Error).message;
-    log("error", "archival_job_failed", { error: errorMsg });
+    const cancelled = signal?.aborted === true;
+    log(cancelled ? "info" : "error", cancelled ? "archival_job_cancelled" : "archival_job_failed", {
+      error: errorMsg,
+      archivedEventsCount: totalArchivedCount,
+    });
     return {
       success: false,
-      archivedEventsCount: 0,
-      archivesCreatedCount: 0,
+      archivedEventsCount: totalArchivedCount,
+      archivesCreatedCount: createdRecords.length,
       dbSizeBytesBefore,
       dbSizeBytesAfter: dbSizeBytesBefore,
       savedSizeBytes: 0,
-      records: [],
+      records: createdRecords,
       error: errorMsg,
     };
   }
@@ -349,33 +374,67 @@ export function readArchivedEvents(archiveId: string): any[] {
 }
 
 /**
- * Start background periodic archival task
+ * Start the background periodic archival task.
+ *
+ * Uses the same single-flight, cancellable scheduler as the indexer (#323)
+ * rather than a bare `setInterval`. Two properties matter here: an archival run
+ * that outlives its interval must not have a second run start on top of it —
+ * both would be deleting rows from the same partition — and a shutdown must be
+ * able to abort a run mid-flight instead of waiting out a multi-minute job.
  */
 export function startArchivalTask(
   intervalMs: number = config.archivalIntervalMs || 86400000,
 ): void {
-  if (archivalTimer) {
-    clearInterval(archivalTimer);
-  }
+  void stopArchivalTask();
 
-  archivalTimer = setInterval(() => {
-    runArchivalJob().catch((err) => {
-      log("error", "periodic_archival_failed", {
-        error: (err as Error).message,
-      });
-    });
-  }, intervalMs);
+  archivalScheduler = new WatermarkScheduler({
+    intervalMs,
+    runCycle: async (signal) => {
+      const stopTimer = archivalDuration.startTimer();
+      try {
+        const result = await runArchivalJob({ signal });
+        archivalRunsTotal.inc({
+          result: result.success
+            ? "success"
+            : signal.aborted
+              ? "cancelled"
+              : "failed",
+        });
+      } finally {
+        stopTimer();
+      }
+    },
+    onOverrun: (skippedRuns, reason) => {
+      log("warn", "archival_run_skipped", { skippedRuns, reason });
+    },
+    onError: (error) => {
+      archivalRunsTotal.inc({ result: "failed" });
+      log("error", "periodic_archival_failed", { error: error.message });
+    },
+  });
+  archivalScheduler.start();
 
   log("info", "archival_task_started", { intervalMs });
 }
 
 /**
- * Stop background archival task
+ * Stop the background archival task, aborting any run in flight.
+ *
+ * Resolves only once that run has unwound, so callers can rely on no archival
+ * write still being in progress when the promise settles.
  */
-export function stopArchivalTask(): void {
-  if (archivalTimer) {
-    clearInterval(archivalTimer);
-    archivalTimer = null;
-    log("info", "archival_task_stopped");
-  }
+export async function stopArchivalTask(): Promise<void> {
+  const scheduler = archivalScheduler;
+  if (!scheduler) return;
+  archivalScheduler = null;
+
+  await scheduler.stop();
+  log("info", "archival_task_stopped");
+}
+
+/** Scheduler stats for the archival loop, or `null` when it is not running. */
+export function getArchivalSchedulerStats(): ReturnType<
+  WatermarkScheduler["stats"]
+> | null {
+  return archivalScheduler ? archivalScheduler.stats() : null;
 }

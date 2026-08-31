@@ -16,6 +16,7 @@ export interface OnChainStorageLayout {
   storage_version: number | bigint;
   latest_migration_at?: number | bigint;
   rollback_to_version?: number | bigint | null;
+  capabilities?: number[] | bigint[];
 }
 
 export const SUPPORTED_CONTRACT_RUNTIME: Record<

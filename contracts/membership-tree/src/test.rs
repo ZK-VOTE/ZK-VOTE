@@ -1,6 +1,8 @@
 use super::*;
 use soroban_sdk::{testutils::Address as _, Env};
 
+extern crate std;
+
 // Mock Registry contract for testing
 mod mock_registry {
     use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
@@ -489,4 +491,125 @@ fn test_leaf_is_domain_separated_before_tree_insertion() {
     }
 
     assert_eq!(current, tree_client.get_root(&1u64));
+}
+
+// #371: per-member commitment registration cooldown. A member cannot register
+// another commitment until MIN_REGISTRATION_INTERVAL_SECS (3600s) have elapsed.
+use soroban_sdk::testutils::Ledger as _;
+use soroban_sdk::Address;
+
+fn set_timestamp(env: &Env, timestamp: u64) {
+    let mut info = env.ledger().get();
+    info.timestamp = timestamp;
+    env.ledger().set(info);
+}
+
+/// Register `commitment` for a fresh member in `dao_id` at the given timestamp.
+/// Returns (env, tree_id, sbt_id, registry_id, admin, member).
+fn register_member(
+    dao_id: u64,
+    commitment: u32,
+    timestamp: u64,
+) -> (Env, Address, Address, Address, Address, Address) {
+    let (env, tree_id, sbt_id, registry_id, admin) = setup_env();
+    set_timestamp(&env, timestamp);
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let member = Address::generate(&env);
+
+    registry_client.set_admin(&dao_id, &admin);
+    tree_client.init_tree(&dao_id, &5u32, &Symbol::new(&env, "BN254"), &admin);
+    sbt_client.set_member(&dao_id, &member, &true);
+    tree_client.register_with_caller(&dao_id, &U256::from_u32(&env, commitment), &member);
+
+    (env, tree_id, sbt_id, registry_id, admin, member)
+}
+
+fn panic_message(
+    client: &MembershipTreeClient,
+    dao_id: u64,
+    commitment: U256,
+    member: &Address,
+) -> Option<std::string::String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.register_with_caller(&dao_id, &commitment, member);
+    }));
+    match result {
+        Ok(_) => None,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<std::string::String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                std::string::String::from(*s)
+            } else {
+                std::string::String::from("unknown panic payload")
+            };
+            Some(msg)
+        }
+    }
+}
+
+#[test]
+fn test_register_within_cooldown_rate_limited() {
+    let (env, tree_id, _sbt_id, _registry_id, _admin, member) =
+        register_member(1u64, 12345, 1_000_000);
+
+    // Advance inside the cooldown window and attempt a re-registration.
+    set_timestamp(&env, 1_001_800);
+    let client = MembershipTreeClient::new(&env, &tree_id);
+    let msg = panic_message(&client, 1u64, U256::from_u32(&env, 54321), &member);
+    let msg = msg.expect("re-registration within cooldown should panic");
+    assert!(
+        msg.contains("#17"),
+        "expected RateLimited error #17, got: {msg}"
+    );
+
+    // The original registration is untouched.
+    let client = MembershipTreeClient::new(&env, &tree_id);
+    assert_eq!(client.get_tree_info(&1u64).1, 1);
+}
+
+#[test]
+fn test_register_after_cooldown_allowed() {
+    let (env, tree_id, _sbt_id, _registry_id, _admin, member) =
+        register_member(1u64, 12345, 1_000_000);
+
+    // Past the cooldown window: the cooldown no longer blocks; the member is
+    // instead rejected by the existing member-exists rule (#6) — proving the
+    // window expired without letting a duplicate registration through.
+    set_timestamp(&env, 1_003_600);
+    let client = MembershipTreeClient::new(&env, &tree_id);
+    let msg = panic_message(&client, 1u64, U256::from_u32(&env, 54321), &member);
+    let msg = msg.expect("re-registration after cooldown should be rejected downstream");
+    assert!(
+        msg.contains("#6"),
+        "expected MemberExists error #6 after cooldown, got: {msg}"
+    );
+    assert!(
+        !msg.contains("#17"),
+        "cooldown should have expired, got RateLimited {msg}"
+    );
+}
+
+#[test]
+fn test_registration_cooldown_is_per_member_and_per_dao() {
+    let (env, tree_id, sbt_id, registry_id, admin, member) = register_member(1u64, 111, 1_000_000);
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+
+    // Different member in the same DAO/window is unaffected.
+    let other = Address::generate(&env);
+    sbt_client.set_member(&1u64, &other, &true);
+    tree_client.register_with_caller(&1u64, &U256::from_u32(&env, 222), &other);
+
+    // Same member in a different DAO/window is unaffected (per-dao scoping).
+    registry_client.set_admin(&2u64, &admin);
+    tree_client.init_tree(&2u64, &5u32, &Symbol::new(&env, "BN254"), &admin);
+    sbt_client.set_member(&2u64, &member, &true);
+    tree_client.register_with_caller(&2u64, &U256::from_u32(&env, 333), &member);
+
+    let (_, next_index, _) = tree_client.get_tree_info(&1u64);
+    assert_eq!(next_index, 2);
 }

@@ -6,13 +6,13 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { z } from "zod";
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
 import {
   masterKeyGuard,
   validateBody,
   validateParams,
+  validateQuery,
   bodyLimit,
 } from "../middleware/index.js";
 import {
@@ -29,57 +29,18 @@ import {
 } from "../services/authTokens.js";
 import { buildDidAttributeProofSeed } from "../services/blindSignature.js";
 import type { AsyncHandler } from "../types/index.js";
+import {
+  createTokenSchema,
+  tokenIdSchema,
+  clientIdQuerySchema,
+  auditQuerySchema,
+  didAttributeClaimSchema,
+  type CreateTokenRequest,
+  type DidAttributeClaimRequest,
+  type TokenIdParams,
+} from "../validation/schemas.js";
 
 const router = Router();
-
-// ============================================
-// SCHEMAS
-// ============================================
-
-const createTokenSchema = z.object({
-  clientId: z.string().min(1).max(100),
-  description: z.string().max(500).optional().nullable(),
-  lifetimeMs: z.number().int().positive().optional().nullable(),
-});
-
-const tokenIdSchema = z.object({
-  tokenId: z.string().min(1),
-});
-
-const clientIdQuerySchema = z.object({
-  clientId: z.string().min(1).optional(),
-  activeOnly: z
-    .union([z.string(), z.boolean()])
-    .optional()
-    .transform((v) => v === "true" || v === true),
-});
-
-const auditQuerySchema = z.object({
-  tokenId: z.string().min(1).optional(),
-  clientId: z.string().min(1).optional(),
-  action: z.string().min(1).optional(),
-  limit: z
-    .union([z.string(), z.number()])
-    .optional()
-    .transform((v) => Math.min(Number(v) || 100, 1000)),
-  offset: z
-    .union([z.string(), z.number()])
-    .optional()
-    .transform((v) => Math.max(Number(v) || 0, 0)),
-});
-
-const didAttributeClaimSchema = z.object({
-  claim: z.object({
-    issuer: z.string().min(1).max(256),
-    subjectDid: z.string().min(1).max(512),
-    attributeKey: z.string().min(1).max(128),
-    attributeValue: z.number().int().nonnegative(),
-    issuedAt: z.number().int().nonnegative(),
-    expiresAt: z.number().int().nonnegative(),
-    signature: z.string().min(1).max(4096),
-  }),
-  minAttributeValue: z.number().int().nonnegative(),
-});
 
 // ============================================
 // TOKEN MANAGEMENT ENDPOINTS
@@ -96,9 +57,7 @@ router.post(
   masterKeyGuard,
   validateBody(didAttributeClaimSchema),
   (async (req: Request, res: Response) => {
-    const { claim, minAttributeValue } = req.body as z.infer<
-      typeof didAttributeClaimSchema
-    >;
+    const { claim, minAttributeValue } = req.body as DidAttributeClaimRequest;
 
     try {
       const seed = buildDidAttributeProofSeed(claim, minAttributeValue);
@@ -125,9 +84,8 @@ router.post(
   masterKeyGuard,
   validateBody(createTokenSchema),
   (async (req: Request, res: Response) => {
-    const { clientId, description, lifetimeMs } = req.body as z.infer<
-      typeof createTokenSchema
-    >;
+    const { clientId, description, lifetimeMs } =
+      req.body as CreateTokenRequest;
 
     try {
       const token = createNewToken({
@@ -170,42 +128,44 @@ router.post(
  * Requires: AUTH_MASTER_KEY
  * Query params: clientId (optional filter), activeOnly (optional boolean)
  */
-router.get("/auth/tokens", masterKeyGuard, (async (
-  req: Request,
-  res: Response,
-) => {
-  const parsed = clientIdQuerySchema.safeParse(req.query);
-  const { clientId, activeOnly } = parsed.success ? parsed.data : {};
+router.get(
+  "/auth/tokens",
+  masterKeyGuard,
+  validateQuery(clientIdQuerySchema),
+  (async (req: Request, res: Response) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { clientId, activeOnly } = (req as any).validatedQuery;
 
-  let tokens;
-  if (clientId) {
-    tokens = listTokensForClient(clientId);
-  } else if (activeOnly) {
-    tokens = listActiveTokens();
-  } else {
-    tokens = listTokens();
-  }
+    let tokens;
+    if (clientId) {
+      tokens = listTokensForClient(clientId);
+    } else if (activeOnly) {
+      tokens = listActiveTokens();
+    } else {
+      tokens = listTokens();
+    }
 
-  const safeTokens = tokens.map((t) => ({
-    id: t.id,
-    clientId: t.clientId,
-    description: t.description,
-    status: t.status,
-    createdAt: t.createdAt,
-    expiresAt: t.expiresAt,
-    revokedAt: t.revokedAt,
-    lastUsedAt: t.lastUsedAt,
-    useCount: t.useCount,
-    rotationGroupId: t.rotationGroupId,
-    isLegacy: t.isLegacy,
-  }));
+    const safeTokens = tokens.map((t) => ({
+      id: t.id,
+      clientId: t.clientId,
+      description: t.description,
+      status: t.status,
+      createdAt: t.createdAt,
+      expiresAt: t.expiresAt,
+      revokedAt: t.revokedAt,
+      lastUsedAt: t.lastUsedAt,
+      useCount: t.useCount,
+      rotationGroupId: t.rotationGroupId,
+      isLegacy: t.isLegacy,
+    }));
 
-  return res.json({
-    success: true,
-    count: safeTokens.length,
-    tokens: safeTokens,
-  });
-}) as AsyncHandler);
+    return res.json({
+      success: true,
+      count: safeTokens.length,
+      tokens: safeTokens,
+    });
+  }) as AsyncHandler,
+);
 
 /**
  * GET /auth/tokens/:tokenId - Get a specific token by ID
@@ -216,7 +176,7 @@ router.get(
   masterKeyGuard,
   validateParams(tokenIdSchema),
   (async (req: Request, res: Response) => {
-    const { tokenId } = req.params as z.infer<typeof tokenIdSchema>;
+    const { tokenId } = req.params as TokenIdParams;
     const token = getToken(tokenId);
 
     if (!token) {
@@ -255,7 +215,7 @@ router.post(
   masterKeyGuard,
   validateParams(tokenIdSchema),
   (async (req: Request, res: Response) => {
-    const { tokenId } = req.params as z.infer<typeof tokenIdSchema>;
+    const { tokenId } = req.params as TokenIdParams;
     const token = getToken(tokenId);
 
     if (!token) {
@@ -294,7 +254,7 @@ router.post(
   masterKeyGuard,
   validateParams(tokenIdSchema),
   (async (req: Request, res: Response) => {
-    const { tokenId } = req.params as z.infer<typeof tokenIdSchema>;
+    const { tokenId } = req.params as TokenIdParams;
     const oldToken = getToken(tokenId);
 
     if (!oldToken) {
@@ -388,38 +348,40 @@ router.post("/auth/maintenance", bodyLimit("100kb"), masterKeyGuard, (async (
  * Requires: AUTH_MASTER_KEY
  * Query params: tokenId, clientId, action, limit, offset
  */
-router.get("/auth/audit", masterKeyGuard, (async (
-  req: Request,
-  res: Response,
-) => {
-  const parsed = auditQuerySchema.safeParse(req.query);
-  const options = (parsed.success ? parsed.data : {}) as any;
+router.get(
+  "/auth/audit",
+  masterKeyGuard,
+  validateQuery(auditQuerySchema),
+  (async (req: Request, res: Response) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const options = (req as any).validatedQuery;
 
-  const entries = getAuditEntries({
-    tokenId: options.tokenId,
-    clientId: options.clientId,
-    action: options.action,
-    limit: options.limit,
-    offset: options.offset,
-  });
+    const entries = getAuditEntries({
+      tokenId: options.tokenId,
+      clientId: options.clientId,
+      action: options.action,
+      limit: options.limit,
+      offset: options.offset,
+    });
 
-  return res.json({
-    success: true,
-    count: entries.length,
-    entries: entries.map((e) => ({
-      id: e.id,
-      tokenId: e.tokenId,
-      clientId: e.clientId,
-      action: e.action,
-      path: e.path,
-      method: e.method,
-      ipHash: e.ipHash,
-      success: e.success,
-      errorMessage: e.errorMessage,
-      createdAt: e.createdAt,
-    })),
-  });
-}) as AsyncHandler);
+    return res.json({
+      success: true,
+      count: entries.length,
+      entries: entries.map((e) => ({
+        id: e.id,
+        tokenId: e.tokenId,
+        clientId: e.clientId,
+        action: e.action,
+        path: e.path,
+        method: e.method,
+        ipHash: e.ipHash,
+        success: e.success,
+        errorMessage: e.errorMessage,
+        createdAt: e.createdAt,
+      })),
+    });
+  }) as AsyncHandler,
+);
 
 // ============================================
 // CONFIG ENDPOINT

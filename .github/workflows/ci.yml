@@ -86,6 +86,8 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Enforce lockfile integrity
+        run: npm ci --ignore-scripts --audit=false
       - name: Lint (includes JSDoc validation + type check)
         run: npm run lint
       - name: Format check
@@ -125,8 +127,10 @@ jobs:
           VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+      - name: Check config schema and .env.example are in sync
+        run: npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
       - name: Security audit
-        run: npm audit --audit-level=high || true
+        run: npm run audit:check
       - name: Build verification
         run: npm run build
 
@@ -165,6 +169,8 @@ jobs:
         run: npm ci
       - name: Run tests
         run: npm test
+      - name: Run Soroban BE conversion parity tests (#369)
+        run: npm run test:parity
       - name: Compile v2 circuits (if available)
         run: |
           if command -v circom &> /dev/null; then
@@ -174,3 +180,84 @@ jobs:
           else
             echo "circom not installed - v2 circuit compilation skipped"
           fi
+
+  circuit-kat:
+    name: Circuit KAT Test
+    runs-on: ubuntu-latest
+    needs: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: |
+          rustup component add clippy rustfmt
+          rustup target add wasm32v1-none
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Stellar CLI
+        run: |
+          curl -Lo stellar.tar.gz https://github.com/stellar/stellar-cli/releases/download/v21.0.0/stellar-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf stellar.tar.gz
+          sudo mv stellar /usr/local/bin/
+          stellar --version
+      - name: Build contracts
+        run: cargo build --target wasm32v1-none --release -p dao-registry -p membership-sbt -p membership-tree
+      - name: Make KAT script executable
+        run: chmod +x scripts/test/poseidon-kat.sh
+      - name: Run Poseidon KAT test
+        run: ./scripts/test/poseidon-kat.sh
+      - name: Upload KAT test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kat-test-results
+          path: |
+            target/wasm32v1-none/release/*.wasm
+          retention-days: 7
+
+  circuit-e2e:
+    name: Circuit E2E Test
+    runs-on: ubuntu-latest
+    needs: [contracts, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci --legacy-peer-deps
+      - name: Install Stellar CLI
+        run: |
+          curl -Lo stellar.tar.gz https://github.com/stellar/stellar-cli/releases/download/v21.0.0/stellar-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf stellar.tar.gz
+          sudo mv stellar /usr/local/bin/
+          stellar --version
+      - name: Install jq
+        run: sudo apt-get install -y jq
+      - name: Make e2e script executable
+        run: chmod +x scripts/test/e2e-zkproof.sh
+      - name: Run E2E ZK proof test
+        run: ./scripts/test/e2e-zkproof.sh
+        env:
+          STELLAR_NETWORK: futurenet
+      - name: Upload E2E test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: |
+            frontend/public/circuits/
+          retention-days: 7

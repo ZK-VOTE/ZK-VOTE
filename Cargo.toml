@@ -7,6 +7,7 @@ members = [
     "contracts/membership-tree",
     "contracts/voting",
     "contracts/comments",
+    "contracts/rewards",
     "contracts/bridge/soroban",
     "contracts/circuit-registry",
     "contracts/poc-bls12-381",
@@ -15,6 +16,11 @@ members = [
     "contracts/threshold-crypto",
     "contracts/rewards",
     "tests/integration",
+    "contracts/poc-bls12-381",
+    "contracts/token",
+    "contracts/vdf",
+    "contracts/threshold-crypto",
+    "contracts/rewards"
 ]
 default-members = [
     "contracts/zkvote-groth16",
@@ -23,12 +29,8 @@ default-members = [
     "contracts/membership-tree",
     "contracts/voting",
     "contracts/comments",
-    "contracts/poc-bls12-381",
     "contracts/bridge/soroban",
     "contracts/circuit-registry",
-    "contracts/token",
-    "contracts/vdf",
-    "contracts/threshold-crypto",
     "contracts/rewards",
 ]
 resolver = "2"

@@ -1,0 +1,184 @@
+// Fixed parity test vectors for the snarkjs -> Soroban big-endian conversion.
+//
+// All vectors come from REAL circuit runs, not synthetic data:
+//
+// 1. COMMENT_V2_PROOF_SOROBAN / COMMENT_V2_VK_SOROBAN / COMMENT_V2_PUBLIC_SIGNALS
+//    are the big-endian byte layout committed in
+//    contracts/zkvote-groth16/tests/comment_v2_real_proof.rs (#349). That Rust
+//    test VERIFIES the proof through the production BN254 pairing path on
+//    Soroban, and the bytes were produced by THIS repo's conversion scripts
+//    (circuits/convert_proof_to_soroban_be.js / convert_vkey_to_soroban_be.js),
+//    so they are an on-chain-confirmed anchor for the exact code path under
+//    test here.
+//
+// 2. VOTE_VKEY_SNARKJS / VOTE_VKEY_SOROBAN are the vote.circom verification
+//    key as snarkjs emits it (frontend/public/circuits/verification_key.json,
+//    decimal field elements) paired with its converted output
+//    (frontend/public/circuits/verification_key_soroban.json). The two files
+//    were generated independently of this test suite, so the pair is a fixed
+//    snarkjs -> Soroban vector that catches a *symmetric* bug a pure
+//    round-trip test would miss.
+
+// ---------------------------------------------------------------------------
+// comment_v2.circom real proof (Soroban big-endian hex)
+// Source: contracts/zkvote-groth16/tests/comment_v2_real_proof.rs
+// ---------------------------------------------------------------------------
+const COMMENT_V2_PROOF_SOROBAN = {
+    a: '06bc7ac89991d283d1aba5aecead26465ef57afefb8b1ecb8883a23386226d0d' +
+       '10c45024948d4763981da581b2a57a9dc970e8d7e5f41ea739f5489c09d672fd',
+    b: '0c6737c3025af7d1714f1c9d30ec07c0398fa04e502a1eebc6abe9dbfcde242c' +
+       '17901e13619411fa405f205a5b6911271a829dd9ffbb82cc3cbad2b723763e36' +
+       '0eb7e82f98b35377a04b4ff9024e679e6a5d48031332ce95345ceee0a8319f29' +
+       '303ea18c4b1e69bbc7c8b9ac2b8bc54c09f8da64069bf27a9948ca4e2ea14b87',
+    c: '0c8329caf463c89bd286539013511db465b51f51b3a8681451e43db44adb7b43' +
+       '1d05df37088acc0d3d81686b0ba540bc0484d46568393b2bce1b951e4708be34',
+};
+
+// comment_v2.circom public signals, decimal (matching the Rust fixture):
+// [root, nullifier, daoId, proposalId, commentNonce, commitment, parentCommentId]
+const COMMENT_V2_PUBLIC_SIGNALS = [
+    '19063480543795569527505138411558310026629493034983856872392401708979397511231', // root
+    '2641947707251819469292908877104203068915413249083212250229775202645667013128',  // nullifier
+    '1',                                                                             // daoId
+    '7',                                                                             // proposalId
+    '0',                                                                             // commentNonce
+    '12397843381798721067942805681421301491944795159742201171500746705812274464951', // commitment
+    '0',                                                                             // parentCommentId
+];
+
+// comment_v2.circom verification key (Soroban big-endian hex)
+// 8 IC points == 7 public signals + 1 (constant term).
+const COMMENT_V2_VK_SOROBAN = {
+    alpha:
+        '0dce85ea741d0742bc05b7aea215a61a5271058a733f31be5dea090b7f17a426' +
+        '14a961f0572933c659371f7ce1d15717d543e6ed656a6cce30e227fc5cef908d',
+    beta:
+        '063b17221a88a617899008f46c5c5ed331f1e7513602abc1643820e78aa14644' +
+        '05821c78deadeb64de97b295c5a7719966c6591be6309b5a043e61465f675f10' +
+        '0b1ebf2b82a67b4f5312f1fca2756fdab7dfdab67c2d15459740fcba33133cff' +
+        '05329f99775260b559bd563e4fcc5572fb6d68b42041103e8fc9539e14658086',
+    gamma:
+        '198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2' +
+        '1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed' +
+        '090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b' +
+        '12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa',
+    delta:
+        '0a590e94f03085db8e777eb3f41e287fddcdfd50b033b68aad35e3e4c12f1add' +
+        '1c09aeaef2f2f4068bb9444ba9026fffa7c0d4a3f8a84ee31ce90ca940b4e4fb' +
+        '1d077785456d89938b20b73aef152b73938de260a49b1f76c0b2385cf12c8e63' +
+        '09ef6b3b9326876d8817aec75a19f295c42f3dd628a67b44a0d4c46c367d0153',
+    ic: [
+        '04a4bcd10d1057fa8bd023492c3616ace2fa66adb5e13db8eacd4c549197e204' +
+        '17bf1028cf21368821385bfa5542eff606ba8ed6e8993c77e317c1d376777d0e',
+        '2f49c366de752904758f5c0f805d3a8a95024d08709d2185f85ace44a1efdb48' +
+        '0e79a947b8328263acfcd0e935574cbdf19b30c21de971f04e089c25177c20e9',
+        '1a7b8d39c400f806c26773d17a325d0059b79ba7d448b8c6233f05a944b13e79' +
+        '2ee07630ee92158b8cef5e14e61cc8c6a6581d8e8a26fa8ca994bb0431491f3e',
+        '27e155f4d936d840d3a5689117c38d102205fa53f561043b5b398c69a7c27fff' +
+        '0ab0d94ad33b1d1a000a30f42696b426a19e325b58e0e991a0873c21fd665fca',
+        '2299a882fa4bc600d9703f8dfabb743de19f1e86b0c57addf437ccde5e341f66' +
+        '0b9f47af9516eda886ac7e01dbd28352cd8a05769b4b05a884ddf279f27ba795',
+        '0660284e8a995a6e71f789b2e5759680280b97681d60c274b103d0d8beec22b8' +
+        '1a34f31e419ffec1c9f941de124285690be4f15de3b9c2dd0928647dbdb51335',
+        '2028288dddf009c64c5baf22f7a20727545b26cf0e0b112d9dbb81677159cabf' +
+        '0635f157002aa0ff9d35f4a36ad9c7f0de62828b4f56bf33af7dba274f358308',
+        '2da99a65bc47d39f197984f48edadc6c501992e6b3d66f18e5acaaca613fb8ef' +
+        '10bc013910d8196ed69583916e3e625e65092d0aaf17d5a72b1891016f35b136',
+    ],
+};
+
+
+// ---------------------------------------------------------------------------
+// vote.circom verification key, snarkjs decimal + its Soroban output
+// Source: frontend/public/circuits/verification_key.json and
+//         frontend/public/circuits/verification_key_soroban.json
+// ---------------------------------------------------------------------------
+const VOTE_VKEY_SNARKJS = {
+    protocol: 'groth16',
+    curve: 'bn128',
+    nPublic: 5,
+    vk_alpha_1: [
+        '20491192805390485299153009773594534940189261866228447918068658471970481763042',
+        '9383485363053290200918347156157836566562967994039712273449902621266178545958',
+        '1',
+    ],
+    vk_beta_2: [
+        ['6375614351688725206403948262868962793625744043794305715222011528459656738731',
+         '4252822878758300859123897981450591353533073413197771768651442665752259397132'],
+        ['10505242626370262277552901082094356697409835680220590971873171140371331206856',
+         '21847035105528745403288232691147584728191162732299865338377159692350059136679'],
+        ['1', '0'],
+    ],
+    vk_gamma_2: [
+        ['10857046999023057135944570762232829481370756359578518086990519993285655852781',
+         '11559732032986387107991004021392285783925812861821192530917403151452391805634'],
+        ['8495653923123431417604973247489272438418190587263600148770280649306958101930',
+         '4082367875863433681332203403145435568316851327593401208105741076214120093531'],
+        ['1', '0'],
+    ],
+    vk_delta_2: [
+        ['14447175087742641621643895687206931266034434685472392144569982671025175749509',
+         '6055406991542143820542327265907753340624917082052010403877615394487352814072'],
+        ['10316535605860759764035741718346228009698515088810275149571754832357288095429',
+         '2793191163911823143933136998558518770647077584178668120800463252304201575232'],
+        ['1', '0'],
+    ],
+    IC: [
+        ['1595079754786474524782634392987563200078137952100286780649827946580336693634',
+         '3350275067114545658850692684296785324189490349157628830225816103801571300687', '1'],
+        ['5226159380826280622891878139164070698235570497483745403512296783657180420061',
+         '5084800436341430671111330368580392146190551663960466012852891214621627384298', '1'],
+        ['8869340373666635786973199304329528618801301930595236789268270626489504065325',
+         '6484448204426976352275638990054430133517083520603784761841006257908654723706', '1'],
+        ['19221712929320638070180653200650643286006126032536585086578288734424870537827',
+         '21282912147644171219438260092912907891540176360498594928357477432066976028676', '1'],
+        ['4420166281304729446198596092957402310672852415136216065369462160887221103636',
+         '8224427082824250166817099354564333698862073642350890164729518039718424753002', '1'],
+        ['9152311534134845346901637818909244520217143828649616148501020661124846213243',
+         '8992436467847479337341047507780806901881655031011578921087455400032970239777', '1'],
+    ],
+};
+
+const VOTE_VKEY_SOROBAN = {
+    alpha:
+        '2d4d9aa7e302d9df41749d5507949d05dbea33fbb16c643b22f599a2be6df2e2' +
+        '14bedd503c37ceb061d8ec60209fe345ce89830a19230301f076caff004d1926',
+    beta:
+        '0967032fcbf776d1afc985f88877f182d38480a653f2decaa9794cbc3bf3060c' +
+        '0e187847ad4c798374d0d6732bf501847dd68bc0e071241e0213bc7fc13db7ab' +
+        '304cfbd1e08a704a99f5e847d93f8c3caafddec46b7a0d379da69a4d112346a7' +
+        '1739c1b1a457a8c7313123d24d2f9192f896b7c63eea05a9d57f06547ad0cec8',
+    gamma:
+        '198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2' +
+        '1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed' +
+        '090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b' +
+        '12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa',
+    delta:
+        '0d633d289456016e0c0e975e7da2d19153ca3b6a74dd83331df6407a68d9e9f8' +
+        '1ff0cfb2f48375ed6c03370d8a55e25777a3fb3f6c748bb9e83116bf19ef6385' +
+        '062ce3e273c849fdc51bb2cf34308828862f248134512541fde080ed08d0eb40' +
+        '16cef3c53afe73c871cd493e46139da661ed0d2875fd63c8044c38a68b4caec5',
+    ic: [
+        '0386c87c5f77037451fea91c60759229ca390a30e60d564e5ff0f0f95ffbd182' +
+        '07683040dab753f41635f947d3d13e057c73cb92a38d83400af26019ce24d54f',
+        '0b8de6c132c626e6aa4676f7ca94d9ebeb93375ea3584b6337f9f823ac4157dd' +
+        '0b3de52288f2f4473c0c5041cf9a754decd57e2c0f6b2979d3467a30570c01ea',
+        '139bde66aa5aa4311aca037419840a70fed606a0ed112e6686e1feb44183672d' +
+        '0e56114fa301c02ab1f0baac0973de2759bf26ccbbc594f8627054001f8ad27a',
+        '2a7f1a9e3de9411015b1c5652856bc7a467110344153252026c44ca55f5dca63' +
+        '2f0db38e6d0268092cba5ea0b5db9610e45bd8b4aac852527aeb6323c8f09804',
+        '09c5b9b793a6f8098f0ac918aa0a19a75b74e7f1428f726194a48af37da8ac14' +
+        '122edc5b3704f106fa3c095ac74f524032e460179c3e8ecd562ef050c884336a',
+        '143c06565aad1cacd0ddbc0cfc6dd131c70392d29c16d8c80ed7f62ada52587b' +
+        '13e189e68fe2fe8806b272da3c5762a18b23680cdeda63faef014b7dd6806f21',
+    ],
+};
+
+module.exports = {
+    COMMENT_V2_PROOF_SOROBAN,
+    COMMENT_V2_VK_SOROBAN,
+    COMMENT_V2_PUBLIC_SIGNALS,
+    VOTE_VKEY_SNARKJS,
+    VOTE_VKEY_SOROBAN,
+};
+

@@ -67,6 +67,10 @@ export type DataKey =
   | {
       tag: "MinValidRootIdx";
       values: readonly [u64];
+    }
+  | {
+      tag: "LastRegistrationAt";
+      values: readonly [u64, string];
     };
 export declare const TreeError: {
   1: {
@@ -112,6 +116,12 @@ export declare const TreeError: {
     message: string;
   };
   15: {
+    message: string;
+  };
+  16: {
+    message: string;
+  };
+  17: {
     message: string;
   };
 };

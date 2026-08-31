@@ -27,7 +27,14 @@ import { Button } from "./components/ui/Button";
 import { I18nProvider } from "./i18n/I18nContext";
 
 // Tab types for DAO pages
-type DAOTab = "info" | "proposals" | "members" | "create-proposal" | "settings";
+type DAOTab =
+  | "info"
+  | "proposals"
+  | "members"
+  | "create-proposal"
+  | "settings"
+  | "threshold"
+  | "analytics";
 
 // Component for DAO detail page
 function DAODetailPage({
@@ -397,6 +404,20 @@ function App() {
                       publicKey={publicKey}
                       isInitializing={isInitializing}
                       tab="settings"
+                    />
+                  </RouteErrorBoundary>
+                }
+              />
+
+              {/* DAO Analytics Route */}
+              <Route
+                path="/daos/:daoSlug/analytics"
+                element={
+                  <RouteErrorBoundary>
+                    <DAODetailPage
+                      publicKey={publicKey}
+                      isInitializing={isInitializing}
+                      tab="analytics"
                     />
                   </RouteErrorBoundary>
                 }

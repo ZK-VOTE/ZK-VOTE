@@ -25,6 +25,7 @@ import {
   cleanupAuditLog,
   getAuditLog,
   getAuthTokensByClient,
+  updateAuthTokenHash,
   type AuthToken,
   type AuthTokenAuditEntry,
 } from "./db.js";
@@ -124,14 +125,33 @@ export function migrateLegacyToken(): void {
   if (!legacyToken) return;
 
   const existing = getAuthTokenById(LEGACY_TOKEN_ID);
-  if (existing) {
-    logger.debug("legacy_token_already_migrated");
-    return;
-  }
-
   const tokenHash = hashToken(legacyToken);
   const lifetimeMs = config.defaultTokenLifetimeMs;
   const expiresAt = new Date(Date.now() + lifetimeMs).toISOString();
+
+  if (existing) {
+    // The RELAYER_AUTH_TOKEN env var is the source of truth for the legacy
+    // token. If it changed (or the stored record went stale), refresh the
+    // hash so the current value keeps validating — otherwise a replaced or
+    // rotated env token would lock every caller out. This also keeps test
+    // processes (each with its own RELAYER_AUTH_TOKEN) independent of the
+    // shared SQLite file, instead of the first process to migrate winning
+    // forever.
+    if (existing.tokenHash !== tokenHash) {
+      updateAuthTokenHash(LEGACY_TOKEN_ID, tokenHash, expiresAt);
+      recordAuthAudit({
+        tokenId: LEGACY_TOKEN_ID,
+        clientId: "legacy-client",
+        action: "token_legacy_refreshed",
+        success: true,
+      });
+      logger.info("legacy_token_refreshed", {
+        tokenId: LEGACY_TOKEN_ID,
+        expiresAt,
+      });
+    }
+    return;
+  }
 
   createAuthToken({
     id: LEGACY_TOKEN_ID,

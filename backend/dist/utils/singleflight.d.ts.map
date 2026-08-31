@@ -1,0 +1,1 @@
+{"version":3,"file":"singleflight.d.ts","sourceRoot":"","sources":["../../src/utils/singleflight.ts"],"names":[],"mappings":"AAUA,qBAAa,YAAY;IACvB,OAAO,CAAC,KAAK,CAA2B;IAExC;;;;;;;;;OASG;IACG,EAAE,CAAC,CAAC,EACR,GAAG,EAAE,MAAM,EACX,EAAE,EAAE,MAAM,OAAO,CAAC,CAAC,CAAC,EACpB,SAAS,GAAE,MAAc,GACxB,OAAO,CAAC,CAAC,CAAC;CA4Cd;AAED,eAAO,MAAM,kBAAkB,cAAqB,CAAC"}

@@ -43,7 +43,7 @@ use soroban_sdk::{
     Bytes, BytesN, Env, IntoVal, String, Symbol, Vec, U256,
 };
 
-pub use zkvote_groth16::{Groth16Error, Proof, VerificationKey};
+pub use zkvote_groth16::{Groth16Error, PathContext, Proof, VerificationKey};
 
 const TREE_CONTRACT: Symbol = symbol_short!("tree");
 const REGISTRY: Symbol = symbol_short!("registry");
@@ -82,10 +82,53 @@ pub enum RewardsError {
     InvalidRewardAmount = 21,
     FundingCapExceeded = 22,
     InvalidTreasury = 23,
+    // -- Coarse error codes (100-106) --
+    InvalidInput = 100,
+    EligibilityFailed = 101,
+    ProofInvalid = 102,
+    AlreadySubmitted = 103,
+    WindowClosed = 104,
+    InsufficientFunds = 105,
+    ConfigError = 106,
+}
+
+impl RewardsError {
+    /// Map fine-grained errors to coarse buckets when called from Anonymous path.
+    /// Admin path preserves full diagnostics (identity).
+    pub fn to_coarse(&self, ctx: PathContext) -> RewardsError {
+        match ctx {
+            PathContext::Admin => *self,
+            PathContext::Anonymous => match self {
+                RewardsError::SignalNotInField
+                | RewardsError::InvalidNullifier
+                | RewardsError::InvalidG1Point => RewardsError::InvalidInput,
+                RewardsError::NotVoted
+                | RewardsError::RootMismatch
+                | RewardsError::RootNotInHistory
+                | RewardsError::RootPredatesProposal
+                | RewardsError::RootPredatesRemoval => RewardsError::EligibilityFailed,
+                RewardsError::InvalidProof
+                | RewardsError::VkIcLengthMismatch
+                | RewardsError::VkIcTooLarge
+                | RewardsError::VkChanged
+                | RewardsError::VkVersionMismatch => RewardsError::ProofInvalid,
+                RewardsError::ClaimNullifierUsed => RewardsError::AlreadySubmitted,
+                RewardsError::TreasuryInsufficient => RewardsError::InsufficientFunds,
+                RewardsError::VkNotSet | RewardsError::InvalidState => RewardsError::ConfigError,
+                // pass-through: admin-only / structural / already-coarse
+                _ => *self,
+            },
+        }
+    }
+}
+
+#[inline]
+fn panic_coarse(env: &Env, ctx: PathContext, err: RewardsError) {
+    panic_with_error!(env, err.to_coarse(ctx));
 }
 
 const MAX_IC_LENGTH: u32 = 21;
-const NUM_PUBLIC_SIGNALS: u32 = 5;
+const NUM_PUBLIC_SIGNALS: u32 = 6;
 const CLAIM_CIRCUIT_IC_LEN: u32 = NUM_PUBLIC_SIGNALS + 1;
 
 // Funding / reward caps — Sybil bounds
@@ -215,9 +258,9 @@ impl Rewards {
             .set(&VOTING_CONTRACT, &voting_contract);
     }
 
-    fn assert_in_field(env: &Env, value: &U256) {
+    fn assert_in_field(env: &Env, ctx: PathContext, value: &U256) {
         if zkvote_groth16::assert_in_field(env, value).is_err() {
-            panic_with_error!(env, RewardsError::SignalNotInField);
+            panic_coarse(env, ctx, RewardsError::SignalNotInField);
         }
     }
 
@@ -445,19 +488,22 @@ impl Rewards {
         proof: Proof,
     ) {
         Self::bump_instance(&env);
+
+        let ctx = PathContext::Anonymous;
+
         // Field checks first (prevent modular reduction bypass)
-        Self::assert_in_field(&env, &vote_nullifier);
-        Self::assert_in_field(&env, &claim_nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, ctx, &vote_nullifier);
+        Self::assert_in_field(&env, ctx, &claim_nullifier);
+        Self::assert_in_field(&env, ctx, &root);
 
         if vote_nullifier == U256::from_u32(&env, 0) || claim_nullifier == U256::from_u32(&env, 0) {
-            panic_with_error!(&env, RewardsError::InvalidNullifier);
+            panic_coarse(&env, ctx, RewardsError::InvalidNullifier);
         }
 
         // Prevent double-claim
         let claim_key = DataKey::ClaimNullifier(dao_id, proposal_id, claim_nullifier.clone());
         if env.storage().persistent().has(&claim_key) {
-            panic_with_error!(&env, RewardsError::ClaimNullifierUsed);
+            panic_coarse(&env, ctx, RewardsError::ClaimNullifierUsed);
         }
 
         // Gate: only those who have voted can claim (check vote nullifier used)
@@ -473,7 +519,7 @@ impl Rewards {
             ],
         );
         if !voted {
-            panic_with_error!(&env, RewardsError::NotVoted);
+            panic_coarse(&env, ctx, RewardsError::NotVoted);
         }
 
         // Root verification based on proposal vote_mode
@@ -495,7 +541,7 @@ impl Rewards {
                     soroban_sdk::vec![&env, dao_id.into_val(&env), proposal_id.into_val(&env)],
                 );
                 if root != eligible_root {
-                    panic_with_error!(&env, RewardsError::RootMismatch);
+                    panic_coarse(&env, ctx, RewardsError::RootMismatch);
                 }
             }
             VoteMode::Trailing => {
@@ -505,7 +551,7 @@ impl Rewards {
                     soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
                 );
                 if !root_valid {
-                    panic_with_error!(&env, RewardsError::RootNotInHistory);
+                    panic_coarse(&env, ctx, RewardsError::RootNotInHistory);
                 }
                 let root_index: u32 = env.invoke_contract(
                     &tree_contract,
@@ -518,7 +564,7 @@ impl Rewards {
                     soroban_sdk::vec![&env, dao_id.into_val(&env), proposal_id.into_val(&env)],
                 );
                 if root_index < earliest {
-                    panic_with_error!(&env, RewardsError::RootPredatesProposal);
+                    panic_coarse(&env, ctx, RewardsError::RootPredatesProposal);
                 }
                 let min_valid: u32 = env.invoke_contract(
                     &tree_contract,
@@ -526,7 +572,7 @@ impl Rewards {
                     soroban_sdk::vec![&env, dao_id.into_val(&env)],
                 );
                 if root_index < min_valid {
-                    panic_with_error!(&env, RewardsError::RootPredatesRemoval);
+                    panic_coarse(&env, ctx, RewardsError::RootPredatesRemoval);
                 }
             }
         }
@@ -536,9 +582,9 @@ impl Rewards {
             .storage()
             .persistent()
             .get(&DataKey::VkVersion(dao_id))
-            .unwrap_or_else(|| panic_with_error!(&env, RewardsError::VkNotSet));
+            .unwrap_or_else(|| panic_coarse(&env, ctx, RewardsError::VkNotSet));
         if vk_ver == 0 {
-            panic_with_error!(&env, RewardsError::VkNotSet);
+            panic_coarse(&env, ctx, RewardsError::VkNotSet);
         }
         let vk: VerificationKey = Self::get_vk_by_version(&env, dao_id, vk_ver);
 
@@ -552,7 +598,7 @@ impl Rewards {
             .get(&reward_key)
             .unwrap_or(DEFAULT_REWARD);
         if treasury < reward {
-            panic_with_error!(&env, RewardsError::TreasuryInsufficient);
+            panic_coarse(&env, ctx, RewardsError::TreasuryInsufficient);
         }
 
         // Groth16 verification: public signals [root, vote_nullifier, claim_nullifier, dao_id, proposal_id]
@@ -567,7 +613,7 @@ impl Rewards {
             prop_sig
         ];
         if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, RewardsError::InvalidProof);
+            panic_coarse(&env, ctx, RewardsError::InvalidProof);
         }
 
         // Effects: mark claim nullifier used, debit treasury, increment counts

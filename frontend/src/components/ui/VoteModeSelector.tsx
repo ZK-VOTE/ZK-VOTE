@@ -1,3 +1,6 @@
+import { useState } from "react";
+import VoteModeExplainer from "./VoteModeExplainer";
+
 interface VoteModeSelectorProps {
   value: "fixed" | "trailing";
   onChange: (value: "fixed" | "trailing") => void;
@@ -9,6 +12,8 @@ export default function VoteModeSelector({
   onChange,
   disabled = false,
 }: VoteModeSelectorProps) {
+  const [showDetails, setShowDetails] = useState(false);
+
   return (
     <div className="space-y-2">
       <label className="block text-sm font-medium text-foreground">
@@ -16,6 +21,7 @@ export default function VoteModeSelector({
       </label>
       <div className="space-y-2">
         <label
+          data-testid="vote-mode-option-fixed"
           className={`flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${
             value === "fixed"
               ? "border-primary/50 bg-primary/5"
@@ -42,6 +48,7 @@ export default function VoteModeSelector({
           </div>
         </label>
         <label
+          data-testid="vote-mode-option-trailing"
           className={`flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${
             value === "trailing"
               ? "border-primary/50 bg-primary/5"
@@ -67,6 +74,22 @@ export default function VoteModeSelector({
             </p>
           </div>
         </label>
+      </div>
+
+      {/* Revocation-semantics explainer for the selected mode (issue #347) */}
+      <div className="space-y-1.5">
+        <button
+          type="button"
+          onClick={() => setShowDetails((v) => !v)}
+          disabled={disabled}
+          aria-expanded={showDetails}
+          className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {showDetails
+            ? "Hide revocation details"
+            : "How does revocation affect this mode?"}
+        </button>
+        {showDetails && <VoteModeExplainer mode={value} />}
       </div>
     </div>
   );

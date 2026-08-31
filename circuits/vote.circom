@@ -11,6 +11,6 @@ include "vote_template.circom";
 // depth-N election is a proof for `Vote(N)`, verified against the verification
 // key registered for depth N.
 //
-// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
+// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress] - 7 signals
 // Commitment is computed internally from secret+salt (private)
-component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates]} = Vote(18);
+component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]} = Vote(18);

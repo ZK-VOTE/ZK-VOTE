@@ -2,6 +2,7 @@
 //!
 //! Provides command-line entrypoint for off-chain aggregation service
 //! to load vote witnesses, run IVC folding, and output compressed proofs.
+//! Also supports --verify mode to verify a previously generated proof.
 
 use clap::Parser;
 use nova_aggregator::{IvcState, NovaAggregator, RecursiveProofPayload, VoteWitness};
@@ -12,15 +13,19 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Nova IVC Recursive Vote Aggregator CLI")]
 struct Args {
-    /// Path to JSON file containing vote witnesses array
-    #[arg(short, long)]
-    batch: PathBuf,
+    /// Path to JSON file containing vote witnesses array (aggregate mode)
+    #[arg(short, long, required_unless_present = "verify")]
+    batch: Option<PathBuf>,
 
-    /// Path to output JSON file for recursive proof payload
-    #[arg(short, long)]
-    out: PathBuf,
+    /// Path to output JSON file for recursive proof payload (aggregate mode)
+    #[arg(short, long, required_unless_present = "verify")]
+    out: Option<PathBuf>,
 
-    /// Merkle tree root (hex string)
+    /// Path to proof JSON file to verify (verify mode)
+    #[arg(long)]
+    verify: Option<PathBuf>,
+
+    /// Merkle tree root (hex string, aggregate mode only)
     #[arg(
         short,
         long,
@@ -28,7 +33,7 @@ struct Args {
     )]
     root: String,
 
-    /// Run in benchmark mode and print timing metrics
+    /// Run in benchmark mode and print timing metrics (aggregate mode only)
     #[arg(long, default_value_t = false)]
     benchmark: bool,
 }
@@ -36,12 +41,37 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
+    // --- VERIFY MODE ---
+    if let Some(proof_path) = args.verify {
+        let content = match fs::read_to_string(&proof_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}", serde_json::json!({"error": e.to_string()}));
+                std::process::exit(2);
+            }
+        };
+        let payload: RecursiveProofPayload = match serde_json::from_str(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", serde_json::json!({"error": e.to_string()}));
+                std::process::exit(2);
+            }
+        };
+        let verified = NovaAggregator::verify_proof(&payload);
+        println!("{}", serde_json::json!({"verified": verified}));
+        std::process::exit(if verified { 0 } else { 1 });
+    }
+
+    // --- AGGREGATE MODE ---
+    let batch_path = args.batch.unwrap();
+    let out_path = args.out.unwrap();
+
     println!(
         "[NovaAggregator] Loading vote witnesses from {:?}",
-        args.batch
+        batch_path
     );
     let batch_content =
-        fs::read_to_string(&args.batch).expect("Failed to read vote batch JSON file");
+        fs::read_to_string(&batch_path).expect("Failed to read vote batch JSON file");
 
     let witnesses: Vec<VoteWitness> =
         serde_json::from_str(&batch_content).expect("Failed to parse vote witnesses JSON array");
@@ -93,7 +123,7 @@ fn main() {
     let output_content = serde_json::to_string_pretty(&payload)
         .expect("Failed to serialize recursive proof payload");
 
-    fs::write(&args.out, output_content).expect("Failed to write output proof file");
+    fs::write(&out_path, output_content).expect("Failed to write output proof file");
 
-    println!("[NovaAggregator] Written recursive proof to {:?}", args.out);
+    println!("[NovaAggregator] Written recursive proof to {:?}", out_path);
 }

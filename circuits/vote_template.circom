@@ -36,6 +36,7 @@ template Vote(levels) {
     signal input proposalId;        // Which proposal this vote is for
     signal input voteChoice;        // Candidate index the voter selected
     signal input numCandidates;     // Total number of candidates (set by election config)
+    signal input relayerAddress;    // Relayer address binding proof to specific relayer (anti-front-running)
 
     // Private inputs
     signal input secret;            // Voter's secret (like password)

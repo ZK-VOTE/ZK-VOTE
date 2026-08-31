@@ -68,12 +68,12 @@ function render(depth) {
 // by the ${depth} Poseidon hashes of the Merkle path, so a smaller depth means a
 // proportionally cheaper proof for a smaller electorate.
 //
-// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
+// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress] - 7 signals
 // The commitment stays private; it is recomputed inside the circuit.
 
 include "vote_template.circom";
 
-component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates]} = Vote(${depth});
+component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]} = Vote(${depth});
 `;
 }
 

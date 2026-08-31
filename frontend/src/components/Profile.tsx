@@ -8,7 +8,7 @@ import {
   CardTitle,
   CardDescription,
 } from "./ui/Card";
-import { initializeContractClients } from "../lib/contracts";
+import { getZkVoteClient } from "../lib/client";
 import { truncateAddress } from "../lib/utils";
 import { CheckCircle, XCircle, Loader2, Download, Upload } from "lucide-react";
 import Alert from "./ui/Alert";
@@ -31,7 +31,7 @@ export default function Profile({ publicKey, isConnected }: ProfileProps) {
     setVerifying((prev) => ({ ...prev, [receipt.id]: true }));
 
     try {
-      const clients = initializeContractClients(publicKey);
+      const clients = getZkVoteClient(publicKey);
 
       // We convert hex string to bigint since U256 in JS bindings is usually bigint
       // Actually Soroban U256 is expected as bigint or string in generated bindings

@@ -9,7 +9,7 @@ import {
   CardDescription,
 } from "./ui/Card";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
-import { initializeContractClients } from "../lib/contracts";
+import { getZkVoteClient } from "../lib/client";
 import { relayerFetch } from "../lib/api";
 import {
   generateClaimProof,
@@ -63,7 +63,7 @@ export default function ClaimRewards({
     setStep("generating");
     setError(null);
     try {
-      const clients = initializeContractClients(publicKey);
+      const clients = getZkVoteClient(publicKey);
 
       setProgress("Loading voting credentials...");
       let secret: string, salt: string, leafIndex: number;

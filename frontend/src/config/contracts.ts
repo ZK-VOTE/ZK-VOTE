@@ -10,7 +10,7 @@ export const CONTRACTS = {
   // Thin rewards crate (Vote-to-Earn) — generated via REWARDS_CONTRACT_ID env or fallback mock for tests
   REWARDS_ID:
     (import.meta.env.VITE_REWARDS_CONTRACT_ID as string) ||
-    "CRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+    "CRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
 } as const;
 
 export const NETWORK_CONFIG = {

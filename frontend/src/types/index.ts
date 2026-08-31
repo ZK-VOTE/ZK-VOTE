@@ -24,8 +24,8 @@ export const BN254_FR_MODULUS_HEX =
  * Circuit constants
  */
 export const TREE_DEPTH = 18;
-export const NUM_PUBLIC_SIGNALS = 5;
-export const VK_IC_LENGTH = NUM_PUBLIC_SIGNALS + 1; // 6 elements
+export const NUM_PUBLIC_SIGNALS = 6;
+export const VK_IC_LENGTH = NUM_PUBLIC_SIGNALS + 1; // 7 elements
 
 // ============================================
 // PROOF TYPES
@@ -110,10 +110,15 @@ export function assertValidNullifier(nullifier: bigint | string): void {
 
 // ============================================
 // CONTRACT ERROR CODES
+//
+// These objects use the frontend-conventional { ErrorName: numericCode }
+// mapping.  The wire-format variants ({ numericCode: { message } }) are
+// available in src/generated/contract-types.ts as *ErrorRaw exports.
 // ============================================
 
 /**
  * DAO Registry contract error codes
+ * Source of truth: contracts/dao-registry/src/index.ts (RegistryError)
  */
 export const RegistryError = {
   NameTooLong: 1,
@@ -125,6 +130,7 @@ export type RegistryError = (typeof RegistryError)[keyof typeof RegistryError];
 
 /**
  * Membership SBT contract error codes
+ * Source of truth: contracts/membership-sbt/src/index.ts (SbtError)
  */
 export const SbtError = {
   NotDaoAdmin: 1,
@@ -137,6 +143,7 @@ export type SbtError = (typeof SbtError)[keyof typeof SbtError];
 
 /**
  * Membership Tree contract error codes
+ * Source of truth: contracts/membership-tree/src/index.ts (TreeError)
  */
 export const TreeError = {
   NotAdmin: 1,
@@ -154,11 +161,14 @@ export const TreeError = {
   RootNotFound: 13,
   AlreadyInitialized: 14,
   MemberNotRevoked: 15,
+  CommitmentAlreadyUsed: 16,
+  RateLimited: 17,
 } as const;
 export type TreeError = (typeof TreeError)[keyof typeof TreeError];
 
 /**
  * Voting contract error codes
+ * Source of truth: contracts/voting/src/index.ts (VotingError)
  */
 export const VotingError = {
   NotAdmin: 1,
@@ -187,11 +197,20 @@ export const VotingError = {
   RootPredatesRemoval: 24,
   SignalNotInField: 25,
   InvalidNullifier: 26,
+  // -- Coarse error codes (100-106) --
+  InvalidInput: 100,
+  EligibilityFailed: 101,
+  ProofInvalid: 102,
+  AlreadySubmitted: 103,
+  WindowClosed: 104,
+  InsufficientFunds: 105,
+  ConfigError: 106,
 } as const;
 export type VotingError = (typeof VotingError)[keyof typeof VotingError];
 
 /**
  * Comments contract error codes
+ * Source of truth: contracts/comments/src/index.ts (CommentsError)
  */
 export const CommentsError = {
   NotAdmin: 1,
@@ -213,6 +232,14 @@ export const CommentsError = {
   SignalNotInField: 31,
   InvalidNullifier: 32,
   RootPredatesRemoval: 33,
+  // -- Coarse error codes (100-106) --
+  InvalidInput: 100,
+  EligibilityFailed: 101,
+  ProofInvalid: 102,
+  AlreadySubmitted: 103,
+  WindowClosed: 104,
+  InsufficientFunds: 105,
+  ConfigError: 106,
 } as const;
 export type CommentsError = (typeof CommentsError)[keyof typeof CommentsError];
 
@@ -247,12 +274,26 @@ export interface DaoMigration {
   inOverlapWindow: boolean;
 }
 
+export interface VkProposal {
+  id: number;
+  circuitId: string;
+  circuitType: "Vote" | "Comment";
+  proposedBy: string;
+  proposedAt: number;
+  executeAfter: number;
+  requiredApprovals: number;
+  approvals: number;
+  status: "Pending" | "Approved" | "Executed" | "Cancelled";
+  daoId?: number;
+}
+
 export interface CircuitStatusResponse {
   daoId: number;
   circuitType: "Vote" | "Comment";
   currentCircuit: string;
   availableCircuits: CircuitInfo[];
   migration?: DaoMigration;
+  pendingVkProposal?: VkProposal;
 }
 
 export const CIRCUIT_VERSIONS = {
@@ -269,8 +310,54 @@ export const Groth16Error = {
   IcLengthMismatch: 30,
   SignalNotInField: 31,
   InvalidNullifier: 32,
+  // -- Coarse error codes (100-106) --
+  InvalidInput: 100,
+  EligibilityFailed: 101,
+  ProofInvalid: 102,
+  AlreadySubmitted: 103,
+  WindowClosed: 104,
+  InsufficientFunds: 105,
+  ConfigError: 106,
 } as const;
 export type Groth16Error = (typeof Groth16Error)[keyof typeof Groth16Error];
+
+/**
+ * Rewards (vote-to-earn) contract error codes
+ */
+export const RewardsError = {
+  NotAdmin: 1,
+  VkIcLengthMismatch: 2,
+  VkIcTooLarge: 3,
+  NotVoted: 4,
+  ClaimNullifierUsed: 5,
+  InvalidProof: 6,
+  VkNotSet: 7,
+  VkVersionMismatch: 8,
+  AlreadyInitialized: 9,
+  InvalidState: 10,
+  InvalidG1Point: 11,
+  SignalNotInField: 12,
+  InvalidNullifier: 13,
+  RootMismatch: 14,
+  RootNotInHistory: 15,
+  RootPredatesProposal: 16,
+  RootPredatesRemoval: 17,
+  VkChanged: 18,
+  Unauthorized: 19,
+  TreasuryInsufficient: 20,
+  InvalidRewardAmount: 21,
+  FundingCapExceeded: 22,
+  InvalidTreasury: 23,
+  // -- Coarse error codes (100-106) --
+  InvalidInput: 100,
+  EligibilityFailed: 101,
+  ProofInvalid: 102,
+  AlreadySubmitted: 103,
+  WindowClosed: 104,
+  InsufficientFunds: 105,
+  ConfigError: 106,
+} as const;
+export type RewardsError = (typeof RewardsError)[keyof typeof RewardsError];
 
 /**
  * Human-readable error messages for contract errors
@@ -306,6 +393,8 @@ export const ERROR_MESSAGES: Record<string, Record<number, string>> = {
     [TreeError.RootNotFound]: "Merkle root not found in history",
     [TreeError.AlreadyInitialized]: "Tree already initialized",
     [TreeError.MemberNotRevoked]: "Member has not been revoked",
+    [TreeError.CommitmentAlreadyUsed]: "Identity commitment already used",
+    [TreeError.RateLimited]: "Too many registrations: try again once the cooldown window has passed",
   },
   Voting: {
     [VotingError.NotAdmin]: "Only DAO admin can perform this action",
@@ -337,6 +426,15 @@ export const ERROR_MESSAGES: Record<string, Record<number, string>> = {
     [VotingError.RootPredatesRemoval]: "Root predates member removal",
     [VotingError.SignalNotInField]: "Public signal exceeds field modulus",
     [VotingError.InvalidNullifier]: "Invalid nullifier (cannot be zero)",
+    // -- Coarse error codes (100-106) --
+    [VotingError.InvalidInput]: "Invalid submission",
+    [VotingError.EligibilityFailed]: "Not eligible to perform this action",
+    [VotingError.ProofInvalid]: "Invalid proof",
+    [VotingError.AlreadySubmitted]: "Already submitted",
+    [VotingError.WindowClosed]: "Submission window is closed",
+    [VotingError.InsufficientFunds]: "Insufficient funds or treasury balance",
+    [VotingError.ConfigError]:
+      "System configuration error — please try again later",
   },
   CircuitRegistry: {
     [CircuitRegistryError.NotGovernance]:
@@ -371,15 +469,233 @@ export const ERROR_MESSAGES: Record<string, Record<number, string>> = {
     [CommentsError.SignalNotInField]: "Public signal exceeds field modulus",
     [CommentsError.InvalidNullifier]: "Invalid nullifier (cannot be zero)",
     [CommentsError.RootPredatesRemoval]: "Root predates member removal",
+    // -- Coarse error codes (100-106) --
+    [CommentsError.InvalidInput]: "Invalid submission",
+    [CommentsError.EligibilityFailed]: "Not eligible to perform this action",
+    [CommentsError.ProofInvalid]: "Invalid proof",
+    [CommentsError.AlreadySubmitted]: "Already submitted",
+    [CommentsError.WindowClosed]: "Submission window is closed",
+    [CommentsError.InsufficientFunds]: "Insufficient funds or treasury balance",
+    [CommentsError.ConfigError]:
+      "System configuration error — please try again later",
+  },
+  Groth16: {
+    [Groth16Error.IcLengthMismatch]: "Verification key IC length mismatch",
+    [Groth16Error.SignalNotInField]: "Public signal exceeds field modulus",
+    [Groth16Error.InvalidNullifier]: "Invalid nullifier (cannot be zero)",
+    // -- Coarse error codes (100-106) --
+    [Groth16Error.InvalidInput]: "Invalid submission",
+    [Groth16Error.EligibilityFailed]: "Not eligible to perform this action",
+    [Groth16Error.ProofInvalid]: "Invalid proof",
+    [Groth16Error.AlreadySubmitted]: "Already submitted",
+    [Groth16Error.WindowClosed]: "Submission window is closed",
+    [Groth16Error.InsufficientFunds]:
+      "Insufficient funds or treasury balance",
+    [Groth16Error.ConfigError]:
+      "System configuration error — please try again later",
+  },
+  Rewards: {
+    [RewardsError.NotAdmin]: "Only DAO admin can perform this action",
+    [RewardsError.VkIcLengthMismatch]: "Verification key IC length mismatch",
+    [RewardsError.VkIcTooLarge]: "Verification key IC vector too large",
+    [RewardsError.NotVoted]:
+      "Must have cast a vote on this proposal to claim reward",
+    [RewardsError.ClaimNullifierUsed]: "Reward already claimed (nullifier used)",
+    [RewardsError.InvalidProof]: "Invalid ZK proof",
+    [RewardsError.VkNotSet]: "Verification key not set for this DAO",
+    [RewardsError.VkVersionMismatch]: "VK version mismatch",
+    [RewardsError.AlreadyInitialized]: "Contract already initialized",
+    [RewardsError.InvalidState]: "Invalid contract state",
+    [RewardsError.InvalidG1Point]: "Invalid G1 point (not on BN254 curve)",
+    [RewardsError.SignalNotInField]: "Public signal exceeds field modulus",
+    [RewardsError.InvalidNullifier]: "Invalid nullifier (cannot be zero)",
+    [RewardsError.RootMismatch]: "Root does not match proposal snapshot",
+    [RewardsError.RootNotInHistory]: "Root not found in tree history",
+    [RewardsError.RootPredatesProposal]: "Root predates proposal creation",
+    [RewardsError.RootPredatesRemoval]: "Root predates member removal",
+    [RewardsError.VkChanged]: "Verification key changed unexpectedly",
+    [RewardsError.Unauthorized]: "Unauthorized",
+    [RewardsError.TreasuryInsufficient]:
+      "Insufficient reward treasury balance — please try again later",
+    [RewardsError.InvalidRewardAmount]: "Invalid reward amount",
+    [RewardsError.FundingCapExceeded]: "Maximum treasury funding cap exceeded",
+    [RewardsError.InvalidTreasury]: "Invalid treasury funding amount",
+    // -- Coarse error codes (100-106) --
+    [RewardsError.InvalidInput]: "Invalid submission",
+    [RewardsError.EligibilityFailed]: "Not eligible to perform this action",
+    [RewardsError.ProofInvalid]: "Invalid proof",
+    [RewardsError.AlreadySubmitted]: "Already submitted",
+    [RewardsError.WindowClosed]: "Submission window is closed",
+    [RewardsError.InsufficientFunds]:
+      "Insufficient funds or treasury balance",
+    [RewardsError.ConfigError]:
+      "System configuration error — please try again later",
   },
 };
 
 /**
- * Get human-readable error message from contract error
- * @param contract - Contract name (Registry, Sbt, Tree, Voting, Comments)
+ * Centralized fine-grained → coarse error mapping for every contract.
+ * Mirrors the Rust `to_coarse()` match arms in each contract's lib.rs so
+ * front-end and on-chain logic stay in sync.
+ *
+ * Use-case: even if a deployed contract version still emits fine-grained
+ * codes (legacy deployments), the client can collapse any received code
+ * into its bucket for user-facing display, providing defense-in-depth
+ * across mixed-version deployments.
+ */
+export const COARSE_MAPPING: Record<string, Record<number, number>> = {
+  Voting: {
+    // → InvalidInput (100)
+    [VotingError.SignalNotInField]: VotingError.InvalidInput,
+    [VotingError.InvalidNullifier]: VotingError.InvalidInput,
+    [VotingError.InvalidG1Point]: VotingError.InvalidInput,
+    [VotingError.TitleTooLong]: VotingError.InvalidInput,
+    [VotingError.EndTimeInvalid]: VotingError.InvalidInput,
+    [VotingError.InvalidContentCid]: VotingError.InvalidInput,
+    [VotingError.NotDaoMember]: VotingError.InvalidInput,
+    // → EligibilityFailed (101)
+    [VotingError.CommitmentRevokedAtCreation]: VotingError.EligibilityFailed,
+    [VotingError.CommitmentRevokedDuringVoting]: VotingError.EligibilityFailed,
+    [VotingError.RootMismatch]: VotingError.EligibilityFailed,
+    [VotingError.RootNotInHistory]: VotingError.EligibilityFailed,
+    [VotingError.RootPredatesProposal]: VotingError.EligibilityFailed,
+    [VotingError.RootPredatesRemoval]: VotingError.EligibilityFailed,
+    // → ProofInvalid (102)
+    [VotingError.VkIcLengthMismatch]: VotingError.ProofInvalid,
+    [VotingError.VkIcTooLarge]: VotingError.ProofInvalid,
+    [VotingError.VkChanged]: VotingError.ProofInvalid,
+    [VotingError.VkVersionMismatch]: VotingError.ProofInvalid,
+    [VotingError.InvalidProof]: VotingError.ProofInvalid,
+    // → AlreadySubmitted (103)
+    [VotingError.NullifierUsed]: VotingError.AlreadySubmitted,
+    // → WindowClosed (104)
+    [VotingError.VotingClosed]: VotingError.WindowClosed,
+    // → ConfigError (106)
+    [VotingError.VkNotSet]: VotingError.ConfigError,
+    [VotingError.InvalidState]: VotingError.ConfigError,
+  },
+  Comments: {
+    // → InvalidInput (100)
+    [CommentsError.SignalNotInField]: CommentsError.InvalidInput,
+    [CommentsError.InvalidNullifier]: CommentsError.InvalidInput,
+    [CommentsError.CommentContentTooLong]: CommentsError.InvalidInput,
+    [CommentsError.InvalidParentComment]: CommentsError.InvalidInput,
+    [CommentsError.NotDaoMember]: CommentsError.InvalidInput,
+    // → EligibilityFailed (101)
+    [CommentsError.CommitmentRevoked]: CommentsError.EligibilityFailed,
+    [CommentsError.RootMismatch]: CommentsError.EligibilityFailed,
+    [CommentsError.RootNotInHistory]: CommentsError.EligibilityFailed,
+    [CommentsError.RootPredatesProposal]: CommentsError.EligibilityFailed,
+    [CommentsError.RootPredatesRemoval]: CommentsError.EligibilityFailed,
+    // → ProofInvalid (102)
+    [CommentsError.InvalidProof]: CommentsError.ProofInvalid,
+    [CommentsError.ContractNotSet]: CommentsError.ConfigError,
+  },
+  Groth16: {
+    // → InvalidInput (100)
+    [Groth16Error.SignalNotInField]: Groth16Error.InvalidInput,
+    [Groth16Error.InvalidNullifier]: Groth16Error.InvalidInput,
+    // → ProofInvalid (102)
+    [Groth16Error.IcLengthMismatch]: Groth16Error.ProofInvalid,
+  },
+  Rewards: {
+    // → InvalidInput (100)
+    [RewardsError.SignalNotInField]: RewardsError.InvalidInput,
+    [RewardsError.InvalidNullifier]: RewardsError.InvalidInput,
+    [RewardsError.InvalidG1Point]: RewardsError.InvalidInput,
+    // → EligibilityFailed (101)
+    [RewardsError.NotVoted]: RewardsError.EligibilityFailed,
+    [RewardsError.RootMismatch]: RewardsError.EligibilityFailed,
+    [RewardsError.RootNotInHistory]: RewardsError.EligibilityFailed,
+    [RewardsError.RootPredatesProposal]: RewardsError.EligibilityFailed,
+    [RewardsError.RootPredatesRemoval]: RewardsError.EligibilityFailed,
+    // → ProofInvalid (102)
+    [RewardsError.InvalidProof]: RewardsError.ProofInvalid,
+    [RewardsError.VkIcLengthMismatch]: RewardsError.ProofInvalid,
+    [RewardsError.VkIcTooLarge]: RewardsError.ProofInvalid,
+    [RewardsError.VkChanged]: RewardsError.ProofInvalid,
+    [RewardsError.VkVersionMismatch]: RewardsError.ProofInvalid,
+    // → AlreadySubmitted (103)
+    [RewardsError.ClaimNullifierUsed]: RewardsError.AlreadySubmitted,
+    // → InsufficientFunds (105)
+    [RewardsError.TreasuryInsufficient]: RewardsError.InsufficientFunds,
+    // → ConfigError (106)
+    [RewardsError.VkNotSet]: RewardsError.ConfigError,
+    [RewardsError.InvalidState]: RewardsError.ConfigError,
+  },
+};
+
+/**
+ * User-facing coarse error messages for the 7 stable buckets (100–106).
+ * These are intentionally short, non-fingerprintable, and the same across
+ * every contract — an attacker cannot tell which subsystem tripped from
+ * the user-visible copy alone.
+ */
+export const COARSE_ERROR_MESSAGES: Record<number, string> = {
+  100: "Invalid submission",
+  101: "Not eligible to perform this action",
+  102: "Invalid proof",
+  103: "Already submitted",
+  104: "Submission window is closed",
+  105: "Insufficient funds or treasury balance",
+  106: "System configuration error — please try again later",
+};
+
+/**
+ * Map a fine-grained contract error code to its coarse bucket.
+ * If no mapping exists the original code is returned unchanged.
+ *
+ * @param contract - Contract name (Voting, Comments, Rewards, Groth16, …)
+ * @param code - Error code number (fine or already coarse)
+ * @returns Coarse bucket code (>= 100) or original `code` if no mapping applies
+ */
+export function getCoarseCode(contract: string, code: number): number {
+  // Already coarse codes are returned as-is
+  if (code >= 100 && code <= 106) return code;
+  return COARSE_MAPPING[contract]?.[code] ?? code;
+}
+
+/**
+ * Get human-readable error message from contract error.
+ *
+ * For anonymous-submission contexts (vote / claim / anonymous comment),
+ * callers typically want the user-facing coarse copy — pass `coarsen: true`
+ * to prefer `COARSE_ERROR_MESSAGES` (if code is already >= 100, or if
+ * `COARSE_MAPPING` has a bucket for it). Admin / debug callers can pass
+ * `coarsen: false` (default) to receive the specific diagnostic string.
+ *
+ * @param contract - Contract name (Registry, Sbt, Tree, Voting, Comments, Rewards, Groth16)
  * @param code - Error code number
+ * @param coarsen - If true, map fine → coarse and show the stable user-facing message
  * @returns Human-readable error message or generic message
  */
-export function getErrorMessage(contract: string, code: number): string {
+export function getErrorMessage(
+  contract: string,
+  code: number,
+  coarsen = false,
+): string {
+  if (coarsen) {
+    const bucket = getCoarseCode(contract, code);
+    if (bucket >= 100 && bucket <= 106) {
+      return COARSE_ERROR_MESSAGES[bucket];
+    }
+  }
   return ERROR_MESSAGES[contract]?.[code] ?? `Unknown error (code ${code})`;
 }
+
+// ============================================
+// CONTRACT TYPE RE-EXPORTS
+//
+// Structural types from generated stellar-sdk bindings exposed via a stable
+// import path.  Consumers can use either:
+//   import { VoteMode } from '@/types'
+//   import { VoteMode } from '@/generated/contract-types'
+// ============================================
+
+export type {
+  DaoInfo,
+  VoteMode,
+  ProposalInfo,
+  ProposalState,
+  CommentInfo,
+} from "../generated/contract-types.js";

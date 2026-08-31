@@ -3,8 +3,26 @@
  *
  * Handles pinning and fetching content from IPFS via Pinata.
  * Also propagates content to public IPFS gateways for redundancy.
+ * Integrates with the Pin Manager for backup, redundancy, and verification.
  */
+import fs from "node:fs";
 import { PinataSDK } from "pinata";
+import * as pinManager from "./ipfs-pin-manager.js";
+import { getMonitorStatus } from "./ipfs-monitor.js";
+import { ipfsPinsTotal, ipfsFetchDuration, ipfsCacheHits, ipfsCacheMisses, } from "./metrics.js";
+import { registerCircuitBreaker } from "./circuit-breaker.js";
+import { config } from "../config.js";
+// Circuit breakers for external IPFS dependencies. Trips fast when Pinata
+// or the public gateways are degraded, instead of letting every caller run
+// its own retry logic against a service that is known to be down.
+const pinataBreaker = registerCircuitBreaker("pinata", {
+    failureThreshold: config.circuitBreakerPinataFailureThreshold,
+    resetTimeoutMs: config.circuitBreakerPinataResetMs,
+});
+const ipfsGatewayBreaker = registerCircuitBreaker("ipfs_gateway", {
+    failureThreshold: config.circuitBreakerGatewayFailureThreshold,
+    resetTimeoutMs: config.circuitBreakerGatewayResetMs,
+});
 // ============================================
 // LOGGER
 // ============================================
@@ -44,21 +62,172 @@ export const COMMENT_METADATA_SCHEMA = {
 // SANITIZATION FUNCTIONS
 // ============================================
 /**
- * Sanitize string content to prevent XSS
- * Removes script tags and event handlers
+ * Maximum nesting depth accepted by sanitizeMetadata. Subtrees deeper than
+ * this are truncated to `null` so pathological payloads (JSON depth bombs)
+ * cannot exhaust the call stack or pin CPU (DoS hardening).
+ */
+export const MAX_METADATA_DEPTH = 32;
+/**
+ * Maximum rounds the string cleaner runs while looking for a fixed point.
+ * Bounded so adversarial inputs cannot keep re-assembling removed fragments
+ * (e.g. "<scr<script>ipt>") indefinitely.
+ */
+export const MAX_SANITIZE_ROUNDS = 10;
+/**
+ * Maximum rounds of HTML-entity decoding (defeats double-encoded payloads
+ * such as "&amp;#60;script&amp;#62;" without unbounded expansion).
+ */
+export const MAX_ENTITY_DECODE_ROUNDS = 3;
+/**
+ * Maximum depth for re-parsing string values that contain embedded JSON.
+ * Defends against JSON injection where a later JSON.parse would revive
+ * dangerous keys ("__proto__") or markup from inside a string field.
+ */
+export const MAX_EMBEDDED_JSON_DEPTH = 3;
+// Control characters, zero-width characters and soft hyphens that are used
+// to break up tag/scheme names ("<scr\u200Bipt>") while remaining invisible.
+// Horizontal tab, carriage return and line feed are preserved for Markdown.
+/* eslint-disable no-control-regex -- intentional: strips hostile control chars */
+const DANGEROUS_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u200B-\u200F\u2028\u2029\u2060\uFEFF]/g;
+/* eslint-enable no-control-regex */
+// Tags dropped together with their contents: executable script and CSS.
+const SCRIPT_TAG_RE = /<script\b[^<]*(?:(?!<\/script\s*>)<[^<]*)*<\/script\s*>/gi;
+const STYLE_TAG_RE = /<style\b[^<]*(?:(?!<\/style\s*>)<[^<]*)*<\/style\s*>/gi;
+// Leftover/standalone occurrences (including malformed split tags) of the
+// content-bearing elements above and of active-markup containers.
+const STANDALONE_TAG_RE = /<\/?\s*(?:script|style|svg|math|iframe|object|embed|applet|base|link|meta|form|input|button|select|textarea|option|frame|frameset|video|audio|source|track|param|isindex|keygen|marquee|animate|animatemotion|animatetransform|set|use|foreignobject|discard|listener|handler)\b[^>]*>?/gi;
+// Inline event handlers (onclick=..., onerror=...) quoted, backticked or bare.
+const EVENT_HANDLER_QUOTED_RE = /\bon\w+\s*=\s*("[^"]*"|'[^']*'|`[^`]*`)/gi;
+const EVENT_HANDLER_UNQUOTED_RE = /\bon\w+\s*=[^\s>]*/gi;
+// Inline style attributes: the primary CSS-injection carrier in markup.
+const STYLE_ATTR_QUOTED_RE = /\sstyle\s*=\s*("[^"]*"|'[^']*'|`[^`]*`)/gi;
+const STYLE_ATTR_UNQUOTED_RE = /\sstyle\s*=[^\s>]*/gi;
+// Script-capable URL schemes. Whitespace-tolerant because browsers ignore
+// tabs/newlines inside scheme names ("java\tscript:").
+const JS_SCHEME_RE = /j[\s]*a[\s]*v[\s]*a[\s]*s[\s]*c[\s]*r[\s]*i[\s]*p[\s]*t[\s]*:/gi;
+const VB_SCHEME_RE = /v[\s]*b[\s]*s[\s]*c[\s]*r[\s]*i[\s]*p[\s]*t[\s]*:/gi;
+const LIVESCRIPT_SCHEME_RE = /l[\s]*i[\s]*v[\s]*e[\s]*s[\s]*c[\s]*r[\s]*i[\s]*p[\s]*t[\s]*:/gi;
+const MOCHA_SCHEME_RE = /m[\s]*o[\s]*c[\s]*h[\s]*a[\s]*:/gi;
+// data: URLs whose mediatype can execute script when navigated/embedded.
+// Safe static image mediatypes (png/jpeg/gif/webp/avif) remain untouched.
+const SCRIPTABLE_DATA_URL_RE = /data[\s]*:[\s]*(?:text[\s]*\/[\s]*html|image[\s]*\/[\s]*svg[\s]*\+[\s]*xml|application[\s]*\/[\s]*(?:xhtml[\s]*\+[\s]*xml|x-shockwave-flash))/gi;
+// CSS constructs usable for code execution or request exfiltration.
+const CSS_EXPRESSION_RE = /expression\s*\(/gi;
+const CSS_IMPORT_RE = /@import\b/gi;
+const CSS_BEHAVIOR_RE = /(?:-moz-)?behavior\s*:/gi;
+const CSS_BINDING_RE = /(?:-moz-)?binding\s*:/gi;
+// Subset of named HTML entities needed to unmask obfuscated tags/schemes.
+const NAMED_ENTITIES = {
+    lt: "<",
+    gt: ">",
+    amp: "&",
+    quot: '"',
+    apos: "'",
+    colon: ":",
+    semi: ";",
+    sol: "/",
+    bsol: "\\",
+    tab: "\t",
+    newline: "\n",
+    equals: "=",
+    num: "#",
+    dollar: "$",
+};
+/**
+ * Convert a numeric HTML entity code point to a string, clamping invalid
+ * values (out-of-range / lone surrogates) to U+FFFD so decoding never throws.
+ */
+function codePointToString(cp) {
+    if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff)
+        return "�";
+    try {
+        return String.fromCodePoint(cp);
+    }
+    catch {
+        return "�";
+    }
+}
+/**
+ * Decode numeric and a curated set of named HTML entities, repeated a bounded
+ * number of times to unwrap double- and triple-encoded payloads.
+ */
+function decodeHtmlEntities(input) {
+    let out = input;
+    for (let i = 0; i < MAX_ENTITY_DECODE_ROUNDS; i++) {
+        const next = out
+            .replace(/&#[xX]([0-9a-fA-F]{1,6});?/g, (_m, hex) => codePointToString(parseInt(hex, 16)))
+            .replace(/&#(\d{1,7});?/g, (_m, dec) => codePointToString(parseInt(dec, 10)))
+            .replace(/&([a-zA-Z]{2,8});?/g, (m, name) => {
+            const decoded = NAMED_ENTITIES[name.toLowerCase()];
+            return decoded !== undefined ? decoded : m;
+        });
+        if (next === out)
+            break;
+        out = next;
+    }
+    return out;
+}
+/**
+ * Canonicalize a string so homoglyph and encoding tricks cannot disguise
+ * markup: decode HTML entities, apply NFKC (folds fullwidth characters such
+ * as U+FF1C "＜" to ASCII "<" and fullwidth letters to ASCII), then strip
+ * zero-width/control characters used to split dangerous tokens.
+ */
+function normalizeUnicode(input) {
+    const decoded = decodeHtmlEntities(input);
+    let normalized = decoded;
+    try {
+        normalized = decoded.normalize("NFKC");
+    }
+    catch {
+        // Extremely defensive: keep the decoded form if normalization fails.
+    }
+    return normalized.replace(DANGEROUS_CONTROL_CHARS, "");
+}
+/**
+ * Sanitize string content to prevent XSS and CSS/SVG/script injection.
+ *
+ * The input is first canonicalized (entity decoding + NFKC + control-char
+ * stripping) so Unicode confusables and encodings cannot smuggle payloads
+ * past the pattern checks, then dangerous constructs are removed in a loop
+ * until a fixed point is reached so nested fragments cannot re-assemble:
+ *
+ * - <script>/<style> elements including their contents
+ * - SVG/MathML and other active-markup tags (svg, iframe, object, embed, ...)
+ * - inline event handlers (onclick, onerror, ...)
+ * - inline style attributes (CSS injection carrier)
+ * - javascript:/vbscript:/livescript:/mocha: URL schemes
+ * - data: URLs with script-capable mediatypes (text/html, image/svg+xml, ...)
+ * - CSS expression(), import directives, behavior and binding constructs
+ *
+ * Benign markup and text are preserved unchanged.
  */
 export function sanitizeString(str) {
     if (typeof str !== "string")
         return str;
-    // Remove script tags and their content
-    let sanitized = str.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
-    // Remove event handlers (onclick, onerror, etc.)
-    sanitized = sanitized.replace(/\bon\w+\s*=\s*["'][^"']*["']/gi, "");
-    sanitized = sanitized.replace(/\bon\w+\s*=\s*[^\s>]*/gi, "");
-    // Remove javascript: URLs
-    sanitized = sanitized.replace(/javascript:/gi, "");
-    // Remove data: URLs that could contain scripts
-    sanitized = sanitized.replace(/data:\s*text\/html/gi, "data:blocked");
+    let sanitized = normalizeUnicode(str);
+    let previous;
+    let rounds = 0;
+    do {
+        previous = sanitized;
+        sanitized = sanitized
+            .replace(SCRIPT_TAG_RE, "")
+            .replace(STYLE_TAG_RE, "")
+            .replace(STANDALONE_TAG_RE, "")
+            .replace(EVENT_HANDLER_QUOTED_RE, "")
+            .replace(EVENT_HANDLER_UNQUOTED_RE, "")
+            .replace(STYLE_ATTR_QUOTED_RE, "")
+            .replace(STYLE_ATTR_UNQUOTED_RE, "")
+            .replace(JS_SCHEME_RE, "")
+            .replace(VB_SCHEME_RE, "")
+            .replace(LIVESCRIPT_SCHEME_RE, "")
+            .replace(MOCHA_SCHEME_RE, "")
+            .replace(SCRIPTABLE_DATA_URL_RE, "data:blocked")
+            .replace(CSS_EXPRESSION_RE, "blocked(")
+            .replace(CSS_IMPORT_RE, "@blocked-import")
+            .replace(CSS_BEHAVIOR_RE, "blocked:")
+            .replace(CSS_BINDING_RE, "blocked:");
+    } while (sanitized !== previous && ++rounds < MAX_SANITIZE_ROUNDS);
     return sanitized;
 }
 /**
@@ -102,25 +271,106 @@ export function validateMetadataSchema(data, schema) {
     return { valid: true };
 }
 /**
- * Sanitize metadata object recursively
+ * Check whether an object key can be abused for prototype pollution or
+ * other property-injection attacks ("__proto__", "constructor",
+ * "prototype", or any "__"-prefixed name).
+ */
+function isDangerousKey(key) {
+    return key.startsWith("__") || key === "constructor" || key === "prototype";
+}
+/**
+ * Canonicalize an object key so unicode-obfuscated dangerous names (e.g.
+ * fullwidth "＿＿proto＿＿") are recognized by isDangerousKey.
+ */
+function canonicalizeKey(key) {
+    return normalizeUnicode(key).trim();
+}
+/**
+ * Re-sanitize a string value that contains embedded JSON. If the string
+ * parses as a JSON document, its structure is sanitized (dangerous keys
+ * removed, string leaves cleaned) and re-serialized, so a later JSON.parse
+ * downstream cannot revive injected keys or markup. Bounded by
+ * MAX_EMBEDDED_JSON_DEPTH to also cover double-encoded payloads while
+ * keeping adversarial recursion in check.
+ */
+function sanitizeEmbeddedJson(value, jsonDepth) {
+    if (jsonDepth >= MAX_EMBEDDED_JSON_DEPTH)
+        return value;
+    const trimmed = value.trim();
+    if (trimmed.length < 2 || (trimmed[0] !== "{" && trimmed[0] !== "[")) {
+        return value;
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(trimmed);
+    }
+    catch {
+        return value; // Ordinary text that merely happens to start with { or [
+    }
+    const sanitized = sanitizeValue(parsed, 0, jsonDepth + 1);
+    try {
+        return JSON.stringify(sanitized) ?? value;
+    }
+    catch {
+        return value;
+    }
+}
+/**
+ * Internal recursive worker for sanitizeMetadata. Strings are cleaned with
+ * sanitizeString (plus embedded-JSON handling), arrays and plain objects are
+ * traversed, dangerous keys are dropped, and nesting is capped at
+ * MAX_METADATA_DEPTH so deeply nested payloads cannot exhaust the stack.
+ */
+function sanitizeValue(value, objectDepth, jsonDepth) {
+    if (typeof value === "string") {
+        return sanitizeEmbeddedJson(sanitizeString(value), jsonDepth);
+    }
+    if (value === null || typeof value !== "object") {
+        return value;
+    }
+    if (objectDepth >= MAX_METADATA_DEPTH) {
+        log("warn", "metadata_depth_truncated", { objectDepth });
+        return null;
+    }
+    if (Array.isArray(value)) {
+        return value.map((entry) => sanitizeValue(entry, objectDepth + 1, jsonDepth));
+    }
+    const sanitized = {};
+    for (const [key, entryValue] of Object.entries(value)) {
+        // Drop dangerous keys both before and after sanitization so that
+        // obfuscated variants (encoding/unicode tricks) cannot slip through.
+        if (isDangerousKey(key) || isDangerousKey(canonicalizeKey(key))) {
+            continue;
+        }
+        // Sanitize both keys and values
+        const sanitizedKey = sanitizeString(key);
+        if (isDangerousKey(sanitizedKey) ||
+            isDangerousKey(canonicalizeKey(sanitizedKey))) {
+            continue;
+        }
+        sanitized[sanitizedKey] = sanitizeValue(entryValue, objectDepth + 1, jsonDepth);
+    }
+    return sanitized;
+}
+/**
+ * Sanitize metadata objects recursively before pinning to IPFS.
+ *
+ * Beyond HTML/script stripping this defends against:
+ * - Unicode confusable bypasses (fullwidth "＜script＞", zero-width joiners)
+ *   via entity decoding + NFKC normalization before pattern matching
+ * - JSON injection: string values containing embedded JSON documents are
+ *   parsed, recursively sanitized and re-serialized so "__proto__",
+ *   "constructor" and "prototype" keys cannot be revived by a later parse
+ * - SVG-based XSS: <svg>/<math> and other active-markup tags plus
+ *   script-capable data: URLs (e.g. data:image/svg+xml) are removed
+ * - CSS injection: <style> blocks, inline style attributes, expression(),
+ *   CSS import directives, behavior and binding constructs are neutralized
+ *
+ * Non-string scalars (numbers, booleans, null) are preserved untouched and
+ * traversal is depth-capped for DoS resistance.
  */
 export function sanitizeMetadata(data) {
-    if (typeof data === "string") {
-        return sanitizeString(data);
-    }
-    if (Array.isArray(data)) {
-        return data.map(sanitizeMetadata);
-    }
-    if (data && typeof data === "object") {
-        const sanitized = {};
-        for (const [key, value] of Object.entries(data)) {
-            // Sanitize both keys and values
-            const sanitizedKey = sanitizeString(key);
-            sanitized[sanitizedKey] = sanitizeMetadata(value);
-        }
-        return sanitized;
-    }
-    return data;
+    return sanitizeValue(data, 0, 0);
 }
 // ============================================
 // PINATA CLIENT FUNCTIONS
@@ -147,18 +397,29 @@ export function initPinata(jwt, gateway) {
  * ensuring it's accessible even if our Pinata gateway goes down.
  */
 async function propagateToPublicGateways(cid) {
+    let cleanCid;
+    try {
+        cleanCid = sanitizeCid(cid);
+    }
+    catch {
+        return;
+    }
     // Fire off requests to public gateways in parallel (don't wait)
     const propagationPromises = PUBLIC_GATEWAYS.map(async (gateway) => {
         try {
+            const url = `${gateway}/${cleanCid}`;
+            if (!isAllowedGatewayUrl(url))
+                return;
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
-            const response = await fetch(`${gateway}/${cid}`, {
+            const response = await fetch(url, {
                 method: "HEAD", // Just request headers to trigger caching
                 signal: controller.signal,
+                redirect: "error",
             });
             clearTimeout(timeout);
             if (response.ok) {
-                log("debug", "ipfs_propagated", { gateway, cid });
+                log("debug", "ipfs_propagated", { gateway, cid: cleanCid });
             }
         }
         catch {
@@ -170,7 +431,7 @@ async function propagateToPublicGateways(cid) {
     Promise.allSettled(propagationPromises).then((results) => {
         const successful = results.filter((r) => r.status === "fulfilled").length;
         log("info", "ipfs_propagation_complete", {
-            cid,
+            cid: cleanCid,
             successful,
             total: PUBLIC_GATEWAYS.length,
         });
@@ -183,16 +444,42 @@ export async function pinJSON(data, name = "zkvote-metadata") {
     if (!pinata) {
         throw new Error("Pinata client not initialized");
     }
+    // 1. Backup to local disk before uploading (recovery safety net)
+    let backupPath;
+    try {
+        backupPath = pinManager.backupJSON(data, name);
+    }
+    catch (err) {
+        log("warn", "local_backup_failed", { name, error: err.message });
+        // Non-fatal — continue with the pin
+    }
+    // 2. Upload to Pinata (primary)
     // SDK v2.x: pinata.upload.public.json() with chainable methods
-    const result = await pinata.upload.public.json(data).name(name).keyvalues({
+    const result = await pinataBreaker.execute(async () => pinata.upload.public.json(data).name(name).keyvalues({
         app: "zkvote",
         type: "proposal-metadata",
-    });
-    // Propagate to public gateways in background
+    }));
+    const sizeBytes = result.size || JSON.stringify(data).length;
+    // 3. Register in pin tracker
+    try {
+        pinManager.registerPin(result.cid, "json", name, sizeBytes, "application/json", backupPath);
+    }
+    catch (err) {
+        log("warn", "pin_register_failed", {
+            cid: result.cid,
+            error: err.message,
+        });
+    }
+    ipfsPinsTotal.inc({ type: "json", status: "success" });
+    // 4. Secondary pin to Web3.Storage (best-effort, non-blocking)
+    if (backupPath) {
+        pinManager.pinToSecondary(result.cid, backupPath, "json").catch(() => { });
+    }
+    // 5. Propagate to public gateways in background
     propagateToPublicGateways(result.cid);
     return {
         cid: result.cid,
-        size: result.size || 0,
+        size: sizeBytes,
         publicUrl: `https://ipfs.io/ipfs/${result.cid}`,
     };
 }
@@ -203,43 +490,250 @@ export async function pinFile(buffer, filename, mimeType) {
     if (!pinata) {
         throw new Error("Pinata client not initialized");
     }
+    // 1. Backup to local disk before uploading (recovery safety net)
+    let backupPath;
+    try {
+        backupPath = pinManager.backupFile(buffer, filename);
+    }
+    catch (err) {
+        log("warn", "local_backup_failed", {
+            filename,
+            error: err.message,
+        });
+    }
+    // 2. Upload to Pinata (primary)
     // Create a File object from the buffer
     // Cast buffer to BlobPart to satisfy strict TypeScript checks
     const file = new File([buffer], filename, {
         type: mimeType,
     });
     // SDK v2.x: pinata.upload.public.file() with chainable methods
-    const result = await pinata.upload.public
-        .file(file)
-        .name(filename)
-        .keyvalues({
+    const result = await pinataBreaker.execute(async () => pinata.upload.public.file(file).name(filename).keyvalues({
         app: "zkvote",
         type: "proposal-image",
-    });
-    // Propagate to public gateways in background
+    }));
+    const sizeBytes = result.size || buffer.length;
+    // 3. Register in pin tracker
+    try {
+        pinManager.registerPin(result.cid, "file", filename, sizeBytes, mimeType, backupPath);
+    }
+    catch (err) {
+        log("warn", "pin_register_failed", {
+            cid: result.cid,
+            error: err.message,
+        });
+    }
+    ipfsPinsTotal.inc({ type: "file", status: "success" });
+    // 4. Secondary pin to Web3.Storage (best-effort, non-blocking)
+    if (backupPath) {
+        pinManager.pinToSecondary(result.cid, backupPath, "file").catch(() => { });
+    }
+    // 5. Propagate to public gateways in background
     propagateToPublicGateways(result.cid);
     return {
         cid: result.cid,
-        size: result.size || buffer.length,
+        size: sizeBytes,
         publicUrl: `https://ipfs.io/ipfs/${result.cid}`,
     };
 }
 /**
- * Validate CID format (CIDv0 or CIDv1)
+ * CID format regexes
+ * CIDv0: Base58 string starting with Qm, 46 characters long
+ * CIDv1: Base32 string starting with baf, 50-120 characters long
+ */
+const CIDV0_REGEX = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
+const CIDV1_REGEX = /^baf[a-z2-7]{46,120}$/i;
+/**
+ * Validate CID format (CIDv0 or CIDv1) strictly
  */
 export function isValidCid(cid) {
     if (!cid || typeof cid !== "string") {
         return false;
     }
-    // CIDv0: Starts with "Qm" and is 46 characters
-    if (cid.startsWith("Qm") && cid.length === 46) {
+    const trimmed = cid.trim();
+    // Reject path separators, query params, hash fragments, control characters, whitespace
+    if (/[/?\\#\s\0\r\n\t]/.test(trimmed)) {
+        return false;
+    }
+    return CIDV0_REGEX.test(trimmed) || CIDV1_REGEX.test(trimmed);
+}
+/**
+ * Sanitize CID before URL construction (reject path separators, query strings, etc.)
+ */
+export function sanitizeCid(cid) {
+    if (typeof cid !== "string") {
+        throw new Error("Invalid CID parameter type");
+    }
+    const trimmed = cid.trim();
+    if (/[/?\\#\s\0\r\n\t]/.test(trimmed)) {
+        throw new Error("CID contains forbidden characters, query parameters, or path separators");
+    }
+    if (!isValidCid(trimmed)) {
+        throw new Error("Invalid CID format");
+    }
+    return trimmed;
+}
+/**
+ * Check if a host or IP is in a private/internal network range
+ */
+export function isPrivateIP(host) {
+    if (!host)
+        return true;
+    const h = host.toLowerCase().trim();
+    // Localhost & local domain identifiers
+    if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local")) {
         return true;
     }
-    // CIDv1: Starts with "bafy" (base32) or "bafk" and is variable length
-    if ((cid.startsWith("bafy") || cid.startsWith("bafk")) && cid.length >= 50) {
+    // Strip IPv6 brackets if present
+    let ip = h.replace(/^\[|\]$/g, "");
+    if (ip.startsWith("::ffff:")) {
+        ip = ip.substring(7);
+    }
+    // Check IPv4 ranges
+    const ipv4Match = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4Match) {
+        const octets = ipv4Match.slice(1, 5).map(Number);
+        if (octets.some((o) => o > 255))
+            return true;
+        const [o1, o2, o3] = octets;
+        // 0.0.0.0/8
+        if (o1 === 0)
+            return true;
+        // 10.0.0.0/8 (Private network)
+        if (o1 === 10)
+            return true;
+        // 127.0.0.0/8 (Loopback)
+        if (o1 === 127)
+            return true;
+        // 169.254.0.0/16 (Link-local / Cloud Metadata)
+        if (o1 === 169 && o2 === 254)
+            return true;
+        // 172.16.0.0/12 (Private network: 172.16.0.0 – 172.31.255.255)
+        if (o1 === 172 && o2 >= 16 && o2 <= 31)
+            return true;
+        // 192.168.0.0/16 (Private network)
+        if (o1 === 192 && o2 === 168)
+            return true;
+        // 100.64.0.0/10 (Carrier-grade NAT)
+        if (o1 === 100 && o2 >= 64 && o2 <= 127)
+            return true;
+        // 192.0.0.0/24 (IETF Protocol Assignments)
+        if (o1 === 192 && o2 === 0 && o3 === 0)
+            return true;
+        // 192.0.2.0/24 (TEST-NET-1)
+        if (o1 === 192 && o2 === 0 && o3 === 2)
+            return true;
+        // 198.51.100.0/24 (TEST-NET-2)
+        if (o1 === 198 && o2 === 51 && o3 === 100)
+            return true;
+        // 203.0.113.0/24 (TEST-NET-3)
+        if (o1 === 203 && o2 === 0 && o3 === 113)
+            return true;
+        // 224.0.0.0/4 (Multicast) & 240.0.0.0/4 (Reserved)
+        if (o1 >= 224)
+            return true;
+        return false;
+    }
+    // Check IPv6 loopback, link-local, unique local
+    if (ip === "::1" ||
+        ip === "::" ||
+        ip.startsWith("fe80:") ||
+        ip.startsWith("fc") ||
+        ip.startsWith("fd")) {
         return true;
     }
     return false;
+}
+/**
+ * Validate that a URL belongs to an allowed IPFS gateway and does not target private IPs
+ */
+export function isAllowedGatewayUrl(urlString) {
+    try {
+        const parsed = new URL(urlString);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+            return false;
+        }
+        if (parsed.username || parsed.password) {
+            return false;
+        }
+        const hostname = parsed.hostname.toLowerCase();
+        if (isPrivateIP(hostname)) {
+            return false;
+        }
+        // Match against configured gateway URL
+        if (gatewayUrl) {
+            try {
+                const configuredHost = new URL(gatewayUrl).hostname.toLowerCase();
+                if (hostname === configuredHost ||
+                    hostname.endsWith("." + configuredHost)) {
+                    return true;
+                }
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        // Match against public gateways
+        for (const gw of PUBLIC_GATEWAYS) {
+            try {
+                const gwHost = new URL(gw).hostname.toLowerCase();
+                if (hostname === gwHost) {
+                    return true;
+                }
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        return false;
+    }
+    catch {
+        return false;
+    }
+}
+// Per-gateway timeout for the public-gateway fallback chain (issue #379).
+// Deliberately shorter than the primary Pinata fetch's 30s timeout since
+// there are multiple gateways to try in sequence before giving up.
+const PUBLIC_GATEWAY_TIMEOUT_MS = 10000;
+/**
+ * Try each public IPFS gateway in turn for a CID, returning the first
+ * successful response. Used as a fallback when the primary Pinata gateway
+ * fails or times out (issue #379), so a single degraded/down gateway
+ * doesn't make already-pinned content unreachable. Reuses the same
+ * `isAllowedGatewayUrl` SSRF/private-IP guard as the primary path.
+ */
+async function fetchFromPublicGateways(cleanCid) {
+    let lastError;
+    for (const gateway of PUBLIC_GATEWAYS) {
+        const url = `${gateway}/${cleanCid}`;
+        if (!isAllowedGatewayUrl(url))
+            continue;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), PUBLIC_GATEWAY_TIMEOUT_MS);
+        try {
+            const res = await fetch(url, {
+                signal: controller.signal,
+                redirect: "error",
+            });
+            if (!res.ok) {
+                throw new Error(`Failed to fetch from IPFS: ${res.status} ${res.statusText}`);
+            }
+            return res;
+        }
+        catch (err) {
+            lastError = err;
+            log("warn", "ipfs_public_gateway_failed", {
+                gateway,
+                cid: cleanCid,
+                error: lastError.message,
+            });
+            continue;
+        }
+        finally {
+            clearTimeout(timeout);
+        }
+    }
+    throw lastError || new Error("All public IPFS gateways failed");
 }
 /**
  * Fetch content from IPFS via Pinata gateway
@@ -248,16 +742,14 @@ export async function fetchContent(cid) {
     if (!gatewayUrl || !pinata) {
         throw new Error("Pinata client not initialized");
     }
-    // Validate CID format
-    if (!isValidCid(cid)) {
-        throw new Error("Invalid CID format");
-    }
+    // Validate and sanitize CID format
+    const cleanCid = sanitizeCid(cid);
     let url;
     if (isDedicatedGateway) {
         // SDK v2.x: Use gateways.private.createAccessLink for dedicated gateways
         try {
             const signedUrl = await pinata.gateways.private.createAccessLink({
-                cid: cid,
+                cid: cleanCid,
                 expires: 300, // 5 minutes
             });
             url = signedUrl;
@@ -271,30 +763,74 @@ export async function fetchContent(cid) {
     }
     else {
         // Public gateway - direct URL
-        url = `${gatewayUrl}/ipfs/${cid}`;
+        url = `${gatewayUrl}/ipfs/${cleanCid}`;
+    }
+    if (!isAllowedGatewayUrl(url)) {
+        throw new Error("Target URL is not an allowed gateway or resolves to a restricted IP address");
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
+    const fetchStart = performance.now();
     try {
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) {
-            throw new Error(`Failed to fetch from IPFS: ${response.status} ${response.statusText}`);
-        }
+        const response = await ipfsGatewayBreaker.execute(async () => {
+            const res = await fetch(url, {
+                signal: controller.signal,
+                redirect: "error",
+            });
+            if (!res.ok) {
+                throw new Error(`Failed to fetch from IPFS: ${res.status} ${res.statusText}`);
+            }
+            return res;
+        });
         const contentType = response.headers.get("content-type") || "application/json";
+        if (contentType.includes("text/html") ||
+            contentType.includes("application/javascript") ||
+            contentType.includes("text/javascript")) {
+            throw new Error(`Forbidden response content-type: ${contentType}`);
+        }
         let data;
         if (contentType.includes("application/json")) {
             data = await response.json();
+            ipfsCacheHits.inc();
         }
         else {
             data = await response.text();
+            ipfsCacheHits.inc();
         }
         return {
             data,
             contentType,
         };
     }
+    catch (err) {
+        // Issue #379: primary Pinata gateway failed — fail over to the public
+        // gateway chain before giving up.
+        try {
+            const fallbackRes = await fetchFromPublicGateways(cleanCid);
+            const contentType = fallbackRes.headers.get("content-type") || "application/json";
+            if (contentType.includes("text/html") ||
+                contentType.includes("application/javascript") ||
+                contentType.includes("text/javascript")) {
+                throw new Error(`Forbidden response content-type: ${contentType}`, {
+                    cause: err,
+                });
+            }
+            const data = contentType.includes("application/json")
+                ? await fallbackRes.json()
+                : await fallbackRes.text();
+            ipfsCacheHits.inc();
+            log("info", "ipfs_fallback_gateway_succeeded", { cid: cleanCid });
+            return { data, contentType };
+        }
+        catch {
+            ipfsCacheMisses.inc();
+            throw err;
+        }
+    }
     finally {
         clearTimeout(timeout);
+        const fetchDuration = (performance.now() - fetchStart) / 1000;
+        ipfsFetchDuration.observe({ type: "json" }, fetchDuration);
     }
 }
 /**
@@ -305,16 +841,14 @@ export async function fetchRawContent(cid) {
     if (!gatewayUrl || !pinata) {
         throw new Error("Pinata client not initialized");
     }
-    // Validate CID format
-    if (!isValidCid(cid)) {
-        throw new Error("Invalid CID format");
-    }
+    // Validate and sanitize CID format
+    const cleanCid = sanitizeCid(cid);
     let url;
     if (isDedicatedGateway) {
         // SDK v2.x: Use gateways.private.createAccessLink for dedicated gateways
         try {
             const signedUrl = await pinata.gateways.private.createAccessLink({
-                cid: cid,
+                cid: cleanCid,
                 expires: 300, // 5 minutes
             });
             url = signedUrl;
@@ -328,25 +862,67 @@ export async function fetchRawContent(cid) {
     }
     else {
         // Public gateway - direct URL
-        url = `${gatewayUrl}/ipfs/${cid}`;
+        url = `${gatewayUrl}/ipfs/${cleanCid}`;
+    }
+    if (!isAllowedGatewayUrl(url)) {
+        throw new Error("Target URL is not an allowed gateway or resolves to a restricted IP address");
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
+    const fetchStart = performance.now();
     try {
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) {
-            throw new Error(`Failed to fetch from IPFS: ${response.status} ${response.statusText}`);
-        }
+        const response = await ipfsGatewayBreaker.execute(async () => {
+            const res = await fetch(url, {
+                signal: controller.signal,
+                redirect: "error",
+            });
+            if (!res.ok) {
+                throw new Error(`Failed to fetch from IPFS: ${res.status} ${res.statusText}`);
+            }
+            return res;
+        });
         const contentType = response.headers.get("content-type") || "application/octet-stream";
+        if (contentType.includes("text/html") ||
+            contentType.includes("application/javascript") ||
+            contentType.includes("text/javascript")) {
+            throw new Error(`Forbidden response content-type: ${contentType}`);
+        }
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
+        ipfsCacheHits.inc();
         return {
             buffer,
             contentType,
         };
     }
+    catch (err) {
+        // Issue #379: primary Pinata gateway failed — fail over to the public
+        // gateway chain before giving up.
+        try {
+            const fallbackRes = await fetchFromPublicGateways(cleanCid);
+            const contentType = fallbackRes.headers.get("content-type") || "application/octet-stream";
+            if (contentType.includes("text/html") ||
+                contentType.includes("application/javascript") ||
+                contentType.includes("text/javascript")) {
+                throw new Error(`Forbidden response content-type: ${contentType}`, {
+                    cause: err,
+                });
+            }
+            const arrayBuffer = await fallbackRes.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            ipfsCacheHits.inc();
+            log("info", "ipfs_fallback_gateway_succeeded", { cid: cleanCid });
+            return { buffer, contentType };
+        }
+        catch {
+            ipfsCacheMisses.inc();
+            throw err;
+        }
+    }
     finally {
         clearTimeout(timeout);
+        const fetchDuration = (performance.now() - fetchStart) / 1000;
+        ipfsFetchDuration.observe({ type: "raw" }, fetchDuration);
     }
 }
 /**
@@ -368,6 +944,12 @@ export async function isHealthy() {
     }
 }
 /**
+ * Enhanced health check that includes pin verification status.
+ */
+export function getEnhancedHealth() {
+    return getMonitorStatus();
+}
+/**
  * Get public gateway URLs for a CID
  * These URLs are accessible without authentication and provide redundancy.
  */
@@ -384,6 +966,37 @@ export function getPublicUrls(cid) {
 export function ensurePublicAvailability(cid) {
     if (isValidCid(cid)) {
         propagateToPublicGateways(cid);
+    }
+}
+/**
+ * Re-pin callback for the pin monitor.
+ * Reads content from the backup path and re-uploads to Pinata.
+ */
+export async function repinCallback(backupPath, contentType, name, mimeType) {
+    if (!pinata) {
+        throw new Error("Pinata client not initialized");
+    }
+    if (contentType === "json") {
+        const raw = fs.readFileSync(backupPath, "utf-8");
+        const data = JSON.parse(raw);
+        const result = await pinata.upload.public.json(data).name(name).keyvalues({
+            app: "zkvote",
+            type: "proposal-metadata",
+        });
+        propagateToPublicGateways(result.cid);
+        return result.cid;
+    }
+    else {
+        const buffer = fs.readFileSync(backupPath);
+        const file = new File([buffer], name, {
+            type: mimeType || "application/octet-stream",
+        });
+        const result = await pinata.upload.public.file(file).name(name).keyvalues({
+            app: "zkvote",
+            type: "proposal-image",
+        });
+        propagateToPublicGateways(result.cid);
+        return result.cid;
     }
 }
 //# sourceMappingURL=ipfs.js.map

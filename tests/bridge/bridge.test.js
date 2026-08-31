@@ -229,7 +229,7 @@ describe("Bridge Circuit", () => {
     };
 
     await expect(
-      snarkjs.groth16.fullProbe(
+      snarkjs.groth16.fullProve(
         input,
         "build/bridge_js/bridge.wasm",
         "build/bridge_final.zkey"

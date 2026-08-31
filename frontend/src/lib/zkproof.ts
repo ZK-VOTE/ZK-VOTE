@@ -6,6 +6,9 @@
 // (Rust→WASM) it is never loaded. `CircuitSignals` is used only as a type.
 import type { CircuitSignals, Groth16Proof } from "snarkjs";
 
+// Shared BN254 field/nullifier validation helpers (#370)
+import { assertValidFieldElement, assertValidNullifier } from "../types/index";
+
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
 // (Node/tests). The value is read once at module load.
@@ -31,6 +34,7 @@ function rustProverEnabled(): boolean {
   return true;
 }
 const USE_RUST_PROVER = rustProverEnabled();
+let activeProofGenerationCount = 0;
 
 type RustProver = {
   prove_wtns: (
@@ -97,6 +101,20 @@ async function proveWithRust(
   return { proof: res.proof, publicSignals: res.publicSignals };
 }
 
+async function proveWithSnarkjs(
+  input: Record<string, unknown>,
+  wasmPath: string | Uint8Array,
+  zkeyPath: string | Uint8Array,
+): Promise<GeneratedProof> {
+  const { groth16 } = await import("snarkjs");
+  const { proof, publicSignals } = await groth16.fullProve(
+    input as CircuitSignals,
+    wasmPath,
+    zkeyPath,
+  );
+  return { proof, publicSignals };
+}
+
 // ============================================
 // Types
 // ============================================
@@ -110,6 +128,7 @@ export interface VoteProofInput {
   daoId: string;
   proposalId: string;
   voteChoice: string; // "0" for no, "1" for yes
+  relayerAddress: string; // Relayer Stellar address - public signal for relayer binding
   commitment: string; // Identity commitment - private input, computed internally in circuit
   pathElements: string[];
   pathIndices: number[];
@@ -179,9 +198,60 @@ export interface ClaimProofInput {
 // Distinct arity (4 vs 3) ensures vote and claim nullifiers never collide.
 export const CLAIM_TAG = "427020085613";
 
+export interface TallyProofInput {
+  daoId: string;
+  proposalId: string;
+  root: string;
+  tallyYes: string;
+  tallyNo: string;
+  nullifiers: string[];
+  voteChoices: string[];
+  weights?: string[];
+  pathElements: string[][];
+  pathIndices: number[][];
+}
+
 export interface GeneratedProof {
   proof: Groth16Proof;
   publicSignals: string[];
+  redundantProof?: Groth16Proof;
+}
+
+/**
+ * Generate a Snark proof for a final tally.
+ *
+ * The circuit proves that `tallyYes` and `tallyNo` are the correct sums of
+ * all valid votes that were cast for a proposal. The proof is verified
+ * on-chain by the `verify_tally_proof` entrypoint.
+ *
+ * @param input - All tally inputs (root, nullifiers, vote choices, weights,
+ *                merkle paths).
+ * @param wasmPath - Path to the compiled tally circuit WASM (or a Uint8Array
+ *                   containing the WASM bytes).
+ * @param zkeyPath - Path to the tally circuit final zkey (or a Uint8Array
+ *                   containing the zkey bytes).
+ * @returns The generated Groth16 proof and public signals.
+ */
+export async function generateTallyProof(
+  input: TallyProofInput,
+  wasmPath: string | Uint8Array,
+  zkeyPath: string | Uint8Array,
+): Promise<GeneratedProof> {
+  // Normalize input for the circuit.
+  const circuitInput = {
+    root: input.root,
+    daoId: input.daoId,
+    proposalId: input.proposalId,
+    tallyYes: input.tallyYes,
+    tallyNo: input.tallyNo,
+    nullifiers: input.nullifiers,
+    voteChoices: input.voteChoices,
+    weights: input.weights ?? input.voteChoices.map(() => "1"),
+    pathElements: input.pathElements,
+    pathIndices: input.pathIndices,
+  } as unknown as Record<string, unknown>;
+
+  return proveWithRust(circuitInput, wasmPath, zkeyPath);
 }
 
 // ============================================
@@ -206,14 +276,22 @@ export class VKMismatchError extends Error {
     public actualVersion: number,
     message?: string,
   ) {
-    super(message ?? `VK version mismatch: expected ${expectedVersion}, got ${actualVersion} (stale VK)`);
+    super(
+      message ??
+        `VK version mismatch: expected ${expectedVersion}, got ${actualVersion} (stale VK)`,
+    );
     this.name = "VKMismatchError";
   }
 }
 
 export class StaleVKError extends Error {
-  constructor(public circuitId: string, public version: number) {
-    super(`Stale VK: circuit ${circuitId} version ${version} is expired or not current`);
+  constructor(
+    public circuitId: string,
+    public version: number,
+  ) {
+    super(
+      `Stale VK: circuit ${circuitId} version ${version} is expired or not current`,
+    );
     this.name = "StaleVKError";
   }
 }
@@ -234,7 +312,10 @@ function persistVKCache(entry: VersionedVK): void {
   }
 }
 
-function loadVKFromStorage(circuitId: string, version: number): VersionedVK | null {
+function loadVKFromStorage(
+  circuitId: string,
+  version: number,
+): VersionedVK | null {
   try {
     const key = `${VK_CACHE_KEY_PREFIX}_${circuitId}_${version}`;
     const raw = localStorage.getItem(key);
@@ -261,13 +342,16 @@ export async function fetchVersionedVK(
   fetchFn: typeof fetch = fetch,
 ): Promise<VersionedVK> {
   const key = vkCacheKey(circuitId, version);
-  const cached = vkMemoryCache.get(key) ?? loadVKFromStorage(circuitId, version);
+  const cached =
+    vkMemoryCache.get(key) ?? loadVKFromStorage(circuitId, version);
   if (cached && Date.now() - cached.fetchedAt < VK_CACHE_TTL_MS) {
     return cached;
   }
 
   // Fetch from backend versioned VK API
-  const relayerUrl = (import.meta as unknown as { env: Record<string, string> })?.env?.VITE_RELAYER_URL ?? "http://localhost:3001";
+  const relayerUrl =
+    (import.meta as unknown as { env: Record<string, string> })?.env
+      ?.VITE_RELAYER_URL ?? "http://localhost:3001";
   const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}`;
 
   const res = await fetchFn(url);
@@ -278,13 +362,15 @@ export async function fetchVersionedVK(
   }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Failed to fetch VK ${circuitId} v${version}: ${res.status} ${body}`);
+    throw new Error(
+      `Failed to fetch VK ${circuitId} v${version}: ${res.status} ${body}`,
+    );
   }
 
   const data = await res.json();
   // Backend returns { vk, version, hash, numPublicSignals } or { verificationKey }
   const vk = data.vk ?? data.verificationKey ?? data;
-  const hash: string = data.hash ?? data.vkHash ?? await computeVKHash(vk);
+  const hash: string = data.hash ?? data.vkHash ?? (await computeVKHash(vk));
   const entry: VersionedVK = {
     circuitId,
     version: data.version ?? version,
@@ -312,7 +398,10 @@ export async function fetchVersionedVK(
 /**
  * Get cached VK if present and not expired
  */
-export function getCachedVK(circuitId: string, version: number): VersionedVK | null {
+export function getCachedVK(
+  circuitId: string,
+  version: number,
+): VersionedVK | null {
   const key = vkCacheKey(circuitId, version);
   let entry = vkMemoryCache.get(key);
   if (!entry) entry = loadVKFromStorage(circuitId, version);
@@ -335,14 +424,18 @@ export function invalidateVKCache(circuitId?: string, version?: number): void {
         const k = localStorage.key(i);
         if (k?.startsWith(VK_CACHE_KEY_PREFIX)) localStorage.removeItem(k);
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     return;
   }
   if (version !== undefined) {
     vkMemoryCache.delete(vkCacheKey(circuitId, version));
     try {
       localStorage.removeItem(`${VK_CACHE_KEY_PREFIX}_${circuitId}_${version}`);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     return;
   }
   // Invalidate all versions for circuitId
@@ -352,9 +445,12 @@ export function invalidateVKCache(circuitId?: string, version?: number): void {
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k?.startsWith(`${VK_CACHE_KEY_PREFIX}_${circuitId}_`)) localStorage.removeItem(k);
+      if (k?.startsWith(`${VK_CACHE_KEY_PREFIX}_${circuitId}_`))
+        localStorage.removeItem(k);
     }
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -368,7 +464,11 @@ export function detectVKMismatch(
 ): void {
   if (proposalVkVersion == null || clientVkVersion == null) return;
   if (proposalVkVersion !== clientVkVersion) {
-    throw new VKMismatchError(proposalVkVersion, clientVkVersion, `VK mismatch for ${circuitId}: proposal pinned to v${proposalVkVersion}, client has v${clientVkVersion}. Fetch correct VK.`);
+    throw new VKMismatchError(
+      proposalVkVersion,
+      clientVkVersion,
+      `VK mismatch for ${circuitId}: proposal pinned to v${proposalVkVersion}, client has v${clientVkVersion}. Fetch correct VK.`,
+    );
   }
 }
 
@@ -379,7 +479,9 @@ export async function computeVKHash(vk: unknown): Promise<string> {
   const str = JSON.stringify(vk);
   const bytes = new TextEncoder().encode(str);
   const hash = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 // For testing: expose cache internals
@@ -397,13 +499,31 @@ export const DOMAIN_TAG_WEIGHTED = "zkvote_weighted_domain_v1";
 export const DOMAIN_TAG_VOTE = "zkvote_vote_domain_v1";
 export const MAX_WEIGHT = BigInt(1_000_000); // inclusive upper bound for weighted voting
 export const MIN_WEIGHT = BigInt(1);
+let poseidonPromise: Promise<any> | null = null;
 
-export function validateWeight(weight: string | bigint, maxWeight: string | bigint = MAX_WEIGHT.toString()): void {
+async function getPoseidon() {
+  if (!poseidonPromise) {
+    poseidonPromise = import("circomlibjs").then(({ buildPoseidon }) =>
+      buildPoseidon(),
+    );
+  }
+  return poseidonPromise;
+}
+
+export function validateWeight(
+  weight: string | bigint,
+  maxWeight: string | bigint = MAX_WEIGHT.toString(),
+): void {
   const w = typeof weight === "string" ? BigInt(weight) : weight;
   const max = typeof maxWeight === "string" ? BigInt(maxWeight) : maxWeight;
-  if (w < MIN_WEIGHT) throw new Error(`Weight ${w} below minimum ${MIN_WEIGHT}`);
-  if (w > max) throw new Error(`Weight ${w} exceeds max ${max} (out-of-range weight rejected)`);
-  if (w > MAX_WEIGHT) throw new Error(`Weight ${w} exceeds global MAX_WEIGHT ${MAX_WEIGHT}`);
+  if (w < MIN_WEIGHT)
+    throw new Error(`Weight ${w} below minimum ${MIN_WEIGHT}`);
+  if (w > max)
+    throw new Error(
+      `Weight ${w} exceeds max ${max} (out-of-range weight rejected)`,
+    );
+  if (w > MAX_WEIGHT)
+    throw new Error(`Weight ${w} exceeds global MAX_WEIGHT ${MAX_WEIGHT}`);
 }
 
 export async function calculateWeightedNullifier(
@@ -413,11 +533,28 @@ export async function calculateWeightedNullifier(
   weight: string,
   domainTag: string = DOMAIN_TAG_WEIGHTED,
 ): Promise<string> {
-  const { buildPoseidon } = await import("circomlibjs");
-  const poseidon = await buildPoseidon();
+  const poseidon = await getPoseidon();
   // Domain-separated nullifier includes weight and domain tag
-  const tagField = BigInt("0x" + Array.from(new TextEncoder().encode(domainTag)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16)) % BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
-  const hash = poseidon.F.toString(poseidon([BigInt(secret), BigInt(daoId), BigInt(proposalId), BigInt(weight), tagField]));
+  const tagField =
+    BigInt(
+      "0x" +
+        Array.from(new TextEncoder().encode(domainTag))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+          .slice(0, 16),
+    ) %
+    BigInt(
+      "21888242871839275222246405745257275088548364400416034343698204186575808495617",
+    );
+  const hash = poseidon.F.toString(
+    poseidon([
+      BigInt(secret),
+      BigInt(daoId),
+      BigInt(proposalId),
+      BigInt(weight),
+      tagField,
+    ]),
+  );
   return hash;
 }
 
@@ -449,7 +586,8 @@ export const WEIGHTED_VOTE_KAT = {
   domainTag: DOMAIN_TAG_WEIGHTED,
   // Precomputed with circomlibjs Poseidon (checked against circuit)
   expectedCommitment: null as string | null,
-  description: "KAT for weighted vote circuit - validates constraint: weight <= maxWeight and domain tag binding",
+  description:
+    "KAT for weighted vote circuit - validates constraint: weight <= maxWeight and domain tag binding",
 };
 
 /**
@@ -474,25 +612,29 @@ export async function generateVoteProof(
     const circuitVersion = input.circuitVersion ?? "v1";
     let circuitInput: Record<string, unknown>;
     if (circuitVersion === "v2") {
+      // vote_v2.circom: 10 public signals
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
         daoId: input.daoId,
         proposalId: input.proposalId,
         voteChoice: input.voteChoice,
-        chainId: input.chainId ?? "0",
+        chainId: input.chainId || "0",
+        relayerAddress: input.relayerAddress,
         secret: input.secret,
         salt: input.salt,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
     } else {
+      // vote_v1.circom: 7 public signals (vote.circom with relayerAddress)
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
         daoId: input.daoId,
         proposalId: input.proposalId,
         voteChoice: input.voteChoice,
+        relayerAddress: input.relayerAddress,
         secret: input.secret,
         salt: input.salt,
         pathElements: input.pathElements,
@@ -500,17 +642,30 @@ export async function generateVoteProof(
       };
     }
 
-    // Generate proof using snarkjs
-    const { proof, publicSignals } = await groth16.fullProve(
-      circuitInput,
-      wasmPath,
-      zkeyPath,
-    );
-    return { proof, publicSignals };
+    if (USE_RUST_PROVER) {
+      try {
+        const primary = await proveWithRust(circuitInput, wasmPath, zkeyPath);
+        try {
+          const secondary = await proveWithSnarkjs(
+            circuitInput,
+            wasmPath,
+            zkeyPath,
+          );
+          return { ...primary, redundantProof: secondary.proof };
+        } catch (e) {
+          console.warn("Secondary snarkjs vote prover failed.", e);
+          return primary;
+        }
+      } catch (e) {
+        console.warn("Rust vote prover failed; falling back to snarkjs.", e);
+      }
+    }
+
+    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
   } catch (error) {
-    console.error("Failed to generate claim proof:", error);
+    console.error("Failed to generate vote proof:", error);
     throw new Error(
-      `Claim proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+      `Vote proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`,
     );
   } finally {
     activeProofGenerationCount = Math.max(0, activeProofGenerationCount - 1);
@@ -541,11 +696,57 @@ export async function generateWeightedVoteProof(
       pathElements: input.pathElements,
       pathIndices: input.pathIndices,
     };
-    const { proof, publicSignals } = await groth16.fullProve(circuitInput, wasmPath, zkeyPath);
-    return { proof, publicSignals };
+    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
   } catch (error) {
     console.error("Failed to generate weighted vote proof:", error);
-    throw new Error(`Weighted proof failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+    throw new Error(
+      `Weighted proof failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+    );
+  }
+}
+
+/**
+ * Generate a Groth16 tally proof for a proposal.
+ * The circuit proves the reported tallies are the sum of valid, unique votes
+ * in the nullifier set (bound to `root`).
+ */
+export async function generateTallyProof(
+  input: TallyProofInput,
+  wasmPath: string | Uint8Array = "/circuits/tally/tally.wasm",
+  zkeyPath: string | Uint8Array = "/circuits/tally/tally_final.zkey",
+): Promise<GeneratedProof> {
+  try {
+    const circuitInput: Record<string, unknown> = {
+      daoId: input.daoId,
+      proposalId: input.proposalId,
+      root: input.root,
+      tallyYes: input.tallyYes,
+      tallyNo: input.tallyNo,
+      nullifiers: input.nullifiers,
+      voteChoices: input.voteChoices,
+      pathElements: input.pathElements,
+      pathIndices: input.pathIndices,
+    };
+    if (input.weights) circuitInput.voteWeights = input.weights;
+
+    if (USE_RUST_PROVER) {
+      try {
+        return await proveWithRust(circuitInput, wasmPath, zkeyPath);
+      } catch (e) {
+        console.warn("Rust tally prover failed; falling back to snarkjs.", e);
+      }
+    }
+
+    const { groth16 } = await import("snarkjs");
+    const { proof, publicSignals } = await groth16.fullProve(
+      circuitInput,
+      wasmPath,
+      zkeyPath,
+    );
+    return { proof, publicSignals };
+  } catch (error) {
+    console.error("Failed to generate tally proof:", error);
+    throw new Error(`Tally proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`);
   }
 }
 
@@ -575,11 +776,12 @@ export async function generateBridgeProof(
       sbtPathIndices: input.sbtPathIndices,
       sbtLeaf: input.sbtLeaf,
     };
-    const { proof, publicSignals } = await groth16.fullProve(circuitInput, wasmPath, zkeyPath);
-    return { proof, publicSignals };
+    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
   } catch (error) {
     console.error("Failed to generate bridge proof:", error);
-    throw new Error(`Bridge proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+    throw new Error(
+      `Bridge proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+    );
   }
 }
 
@@ -597,36 +799,6 @@ export async function generateCommentProof(
 ): Promise<GeneratedProof> {
   try {
     const circuitVersion = input.circuitVersion ?? "v1";
-    let circuitInput: Record<string, unknown>;
-    if (circuitVersion === "v2") {
-      circuitInput = {
-        root: input.root,
-        nullifier: input.nullifier,
-        daoId: input.daoId,
-        proposalId: input.proposalId,
-        commentNonce: input.commentNonce,
-        commitment: input.commitment,
-        parentCommentId: input.parentCommentId ?? "0",
-        secret: input.secret,
-        salt: input.salt,
-        pathElements: input.pathElements,
-        pathIndices: input.pathIndices,
-      };
-    } else {
-      circuitInput = {
-        root: input.root,
-        nullifier: input.nullifier,
-        daoId: input.daoId,
-        proposalId: input.proposalId,
-        commentNonce: input.commentNonce,
-        commitment: input.commitment,
-        secret: input.secret,
-        salt: input.salt,
-        pathElements: input.pathElements,
-        pathIndices: input.pathIndices,
-      };
-    }
-
     let circuitInput: CircuitSignals;
 
     if (circuitVersion === "v2") {
@@ -671,16 +843,7 @@ export async function generateCommentProof(
       }
     }
 
-    // Fallback path: load `snarkjs` dynamically so it is NOT part of the
-    // default (Rust) production bundle.
-    const { groth16 } = await import("snarkjs");
-    const { proof, publicSignals } = await groth16.fullProve(
-      circuitInput,
-      wasmPath,
-      zkeyPath,
-    );
-
-    return { proof, publicSignals };
+    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
   } catch (error) {
     console.error("Failed to generate comment proof:", error);
     throw new Error(
@@ -770,12 +933,16 @@ export async function calculateNullifier(
   proposalId: string,
   chainId?: string,
 ): Promise<string> {
-  const { buildPoseidon } = await import("circomlibjs");
-  const poseidon = await buildPoseidon();
+  const poseidon = await getPoseidon();
 
   if (chainId !== undefined) {
     const hash = poseidon.F.toString(
-      poseidon([BigInt(secret), BigInt(daoId), BigInt(proposalId), BigInt(chainId)]),
+      poseidon([
+        BigInt(secret),
+        BigInt(daoId),
+        BigInt(proposalId),
+        BigInt(chainId),
+      ]),
     );
     return hash;
   }
@@ -916,10 +1083,27 @@ export async function verifyProofWithVersionedVK(
 ): Promise<boolean> {
   const vkEntry = await fetchVersionedVK(circuitId, version);
   try {
-    const result = await groth16.verify(vkEntry.verificationKey as never, publicSignals, proof);
+    const result = await groth16.verify(
+      vkEntry.verificationKey as never,
+      publicSignals,
+      proof,
+    );
     return result;
   } catch (e) {
     console.error("Versioned VK verification failed:", e);
     return false;
   }
 }
+
+// STARK Prover Stub
+export async function generateStarkProof(signals: any) {
+    // Prototype: Plonky2 based WASM prover logic goes here
+    return {
+        starkProof: {
+            proof_bytes: new Uint8Array(64),
+            public_inputs: new Uint8Array(32),
+        },
+        hybridCommitment: 'dummy-sha3-hash'
+    };
+}
+

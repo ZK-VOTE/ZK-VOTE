@@ -33,7 +33,8 @@
     "depths:gen": "node utils/gen_depth_circuits.js",
     "depths:check": "node utils/gen_depth_circuits.js --check",
     "depths:benchmark": "node utils/benchmark_depths.js",
-    "batch:fixture": "node utils/gen_batch_fixture.js"
+    "batch:fixture": "node utils/gen_batch_fixture.js",
+    "test:parity": "jest soroban_be_parity soroban_be_cli --verbose"
   },
   "dependencies": {
     "circomlib": "^2.0.5",

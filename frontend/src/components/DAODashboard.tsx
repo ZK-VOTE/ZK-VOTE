@@ -19,7 +19,7 @@ import {
   CardTitle,
   CardDescription,
 } from "./ui/Card";
-import { Key } from "lucide-react";
+import { Key, BarChart3 } from "lucide-react";
 import ProposalList from "./ProposalList";
 import ManageMembers from "./ManageMembers";
 import DAOInfoPanel from "./DAOInfoPanel";
@@ -27,6 +27,7 @@ import DAOSettings from "./DAOSettings";
 import DAOHeader, { type DAOTab, type DAOInfo } from "./DAOHeader";
 import RegistrationFlow from "./RegistrationFlow";
 import { ThresholdPanel } from "./ThresholdPanel";
+import { AnalyticsPanel } from "./AnalyticsPanel";
 
 interface DAODashboardProps {
   publicKey: string | null;
@@ -123,6 +124,10 @@ export default function DAODashboard({
       threshold: {
         title: `${daoName} - Threshold Encryption | ZKVote`,
         description: `Manage threshold encryption key setup and ceremonies for ${daoName} DAO.`,
+      },
+      analytics: {
+        title: `${daoName} - Analytics | ZKVote`,
+        description: `Privacy-preserving participation analytics for ${daoName} DAO — homomorphic tally aggregates with threshold decryption.`,
       },
     };
 
@@ -540,6 +545,24 @@ export default function DAODashboard({
               isConnected={!!publicKey}
               publicKey={publicKey}
             />
+          </CardContent>
+        </Card>
+      )}
+
+      {activeTab === "analytics" && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <BarChart3 className="w-5 h-5" />
+              Privacy-Preserving Analytics
+            </CardTitle>
+            <CardDescription>
+              Turnout and participation computed homomorphically over encrypted
+              tally aggregates — per-voter participation is never revealed.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <AnalyticsPanel daoId={daoId} isAdmin={dao.isAdmin} />
           </CardContent>
         </Card>
       )}

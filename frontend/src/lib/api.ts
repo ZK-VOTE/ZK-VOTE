@@ -1,7 +1,55 @@
 // API utilities with exponential backoff and relayer status tracking
 
+import type {
+  ContentEnvelope,
+  ContentType,
+  KeyEpoch,
+} from "./groupEncryption";
+
 const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
 const RELAYER_AUTH_TOKEN = import.meta.env.VITE_RELAYER_AUTH_TOKEN || "";
+
+// ============================================
+// CSRF TOKEN MANAGEMENT
+// ============================================
+
+/** In-memory CSRF token obtained from the relayer on initialization. */
+let csrfToken: string | null = null;
+
+/**
+ * Fetch a fresh CSRF token from the relayer and cache it for subsequent
+ * state-changing requests.  Should be called once on SPA startup (or
+ * lazily before the first write).  The token is returned in the
+ * X-CSRF-Token response header.
+ */
+export async function initCsrf(): Promise<void> {
+  try {
+    const url = `${RELAYER_URL}/csrf-token`;
+    const headers = new Headers();
+    if (RELAYER_AUTH_TOKEN) {
+      headers.set("X-Relayer-Auth", RELAYER_AUTH_TOKEN);
+    }
+    const response = await fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+    if (response.ok) {
+      const token = response.headers.get("X-CSRF-Token");
+      if (token) {
+        csrfToken = token;
+      }
+    }
+  } catch {
+    // Non-fatal — the first write will fail with a 403 and the UI can retry
+    console.warn("[csrf] Failed to initialise CSRF token");
+  }
+}
+
+/** Return the cached CSRF token (may be null if initCsrf has not been called). */
+export function getCsrfToken(): string | null {
+  return csrfToken;
+}
 
 // ============================================
 // ERROR TYPES
@@ -244,6 +292,12 @@ export async function relayerFetch(
         headers.set("X-Relayer-Auth", RELAYER_AUTH_TOKEN);
       }
 
+      // Add CSRF token for all state-changing requests (POST, PUT, DELETE, PATCH).
+      // The token is obtained from GET /csrf-token on initialisation.
+      if (isWrite && csrfToken) {
+        headers.set("X-CSRF-Token", csrfToken);
+      }
+
       const response = await fetch(url, {
         ...fetchOptions,
         headers,
@@ -470,6 +524,12 @@ export async function notifyEvent(
   }
 }
 
+export interface SponsoredFeeRequest {
+  sponsor?: "relayer" | "voter";
+  feePayer?: string;
+  feeBudgetStroops?: number;
+}
+
 export interface CommitVoteInput {
   daoId: number;
   proposalId: number;
@@ -511,4 +571,162 @@ export async function fetchRelayerPublicKey(): Promise<string> {
   }
   const data = await response.json();
   return data.publicKey;
+}
+
+// ============================================
+// E2E ENCRYPTED GOVERNANCE CONTENT (#324)
+// ============================================
+
+const ENCRYPTION_BASE = "/api/v1/encryption";
+
+export type { ContentEnvelope, ContentType, KeyEpoch };
+
+export interface WrappedGroupKey {
+  daoId: number;
+  epoch: number;
+  keyCommitment: string;
+  /** base64 blob only the addressed member can open. */
+  wrapped: string;
+}
+
+async function encryptionJson<T>(
+  path: string,
+  options: FetchOptions = {},
+): Promise<T> {
+  const response = await relayerFetch(path, options);
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new RelayerError(
+      parseApiError(data) || `Encryption request failed (${response.status})`,
+      response.status,
+      getApiErrorCode(data),
+    );
+  }
+  return response.json() as Promise<T>;
+}
+
+/**
+ * The DAO's current key epoch.
+ *
+ * Clients must read this before encrypting: writing under a stale epoch is
+ * rejected by the relay, because content sealed to a superseded key would be
+ * unreadable by the members who were just rotated in.
+ */
+export async function fetchKeyEpoch(daoId: number): Promise<KeyEpoch | null> {
+  const response = await relayerFetch(`${ENCRYPTION_BASE}/daos/${daoId}/epoch`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new RelayerError("Failed to fetch key epoch", response.status);
+  return response.json();
+}
+
+/**
+ * This member's sealed copy of the current group key.
+ *
+ * Returns `null` for a non-member: the relay holds no wrap for them and cannot
+ * synthesise one, so there is nothing to fall back to.
+ */
+export async function fetchWrappedGroupKey(
+  daoId: number,
+  memberId: string,
+): Promise<WrappedGroupKey | null> {
+  const response = await relayerFetch(
+    `${ENCRYPTION_BASE}/daos/${daoId}/members/${encodeURIComponent(memberId)}/key`,
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new RelayerError("Failed to fetch group key", response.status);
+  }
+  return response.json();
+}
+
+/**
+ * Publish a new key epoch after a membership change.
+ *
+ * `wraps` and `recoveryShares` must already be sealed on this device — there is
+ * no parameter here that could carry a raw group key.
+ */
+export async function publishKeyEpoch(
+  daoId: number,
+  epoch: {
+    threshold: number;
+    keyCommitment: string;
+    rotationReason:
+      | "genesis"
+      | "member_joined"
+      | "member_left"
+      | "member_revoked"
+      | "manual";
+    wraps: Array<{ memberId: string; wrapped: string }>;
+    recoveryShares?: Array<{ index: number; wrappedShare: string }>;
+  },
+): Promise<KeyEpoch> {
+  return encryptionJson(`${ENCRYPTION_BASE}/daos/${daoId}/epoch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ recoveryShares: [], ...epoch }),
+  });
+}
+
+/** Store an encrypted proposal or comment body. */
+export async function putEncryptedContent(
+  envelope: ContentEnvelope,
+): Promise<void> {
+  await encryptionJson(
+    `${ENCRYPTION_BASE}/daos/${envelope.daoId}/content/${envelope.contentType}/${encodeURIComponent(envelope.contentId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        v: envelope.v,
+        epoch: envelope.epoch,
+        nonce: envelope.nonce,
+        ciphertext: envelope.ciphertext,
+        tag: envelope.tag,
+      }),
+    },
+  );
+}
+
+export interface RedactedContent {
+  redacted: true;
+  redactedAt: string | null;
+  reason: string | null;
+}
+
+/**
+ * Fetch an encrypted body.
+ *
+ * Returns `null` when nothing is stored, and a redaction tombstone when the
+ * body was removed — callers should render "removed", not "failed to load".
+ */
+export async function fetchEncryptedContent(
+  daoId: number,
+  contentType: ContentType,
+  contentId: string,
+): Promise<ContentEnvelope | RedactedContent | null> {
+  const response = await relayerFetch(
+    `${ENCRYPTION_BASE}/daos/${daoId}/content/${contentType}/${encodeURIComponent(contentId)}`,
+  );
+
+  if (response.status === 404) return null;
+  if (response.status === 410) {
+    const data = await response.json().catch(() => ({}));
+    return {
+      redacted: true,
+      redactedAt: data.redactedAt ?? null,
+      reason: data.reason ?? null,
+    };
+  }
+  if (!response.ok) {
+    throw new RelayerError("Failed to fetch encrypted content", response.status);
+  }
+
+  return response.json();
+}
+
+/** True when a fetch result is a redaction tombstone rather than a body. */
+export function isRedacted(
+  content: ContentEnvelope | RedactedContent | null,
+): content is RedactedContent {
+  return content !== null && "redacted" in content;
 }

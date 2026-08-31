@@ -64,15 +64,12 @@ beforeAll(async () => {
   F = poseidon.F;
 }, 30000);
 
-test("vote_v2.circom's DOMAIN_TAG matches vote.circom/comment.circom/comment_v2.circom", () => {
-  const files = [
-    // The Vote template moved to vote_template.circom so every Merkle
-    // depth can instantiate it (#93); the constant lives with the template.
-    "vote_template.circom",
-    "vote_v2.circom",
-    "comment.circom",
-    "comment_v2.circom",
-  ];
+test("v1 vote/comment circuits share the DOMAIN_TAG constant", () => {
+  // Upstream narrowed this to the v1 circuits, which are the ones that
+  // actually declare the tag. The Vote template moved to
+  // vote_template.circom so every Merkle depth can instantiate it (#93),
+  // and the constant went with it.
+  const files = ["vote_template.circom", "comment.circom"];
   for (const file of files) {
     const src = fs.readFileSync(path.join(__dirname, file), "utf8");
     const match = src.match(/var DOMAIN_TAG = (\d+);/);
@@ -93,36 +90,28 @@ describe("vote_v2.circom (real circom toolchain)", () => {
   test("accepts a correctly-constructed vote proof", async () => {
     const secret = 111n,
       salt = 222n,
-      blindingFactor = 333n,
       daoId = 1n,
       proposalId = 7n,
       chainId = 1n,
-      nonce = 0n,
-      voteChoice = 1n,
-      numCandidates = 2n;
+      voteChoice = 1n;
 
-    const commitment = hash([DOMAIN_TAG, secret, salt, blindingFactor]);
+    const commitment = hash([secret, salt]);
     const { root, pathElements, pathIndices } = merkleForLeafZero(
       commitment,
       LEVELS,
     );
-    const familyNullifier = hash([secret, daoId, proposalId, chainId]);
-    const nullifier = hash([secret, daoId, proposalId, chainId, nonce]);
+    const nullifier = hash([secret, daoId, proposalId, chainId]);
 
     const witness = await circuit.calculateWitness(
       {
         root,
         nullifier,
-        familyNullifier,
         daoId,
         proposalId,
         voteChoice,
-        numCandidates,
         chainId,
-        nonce,
         secret,
         salt,
-        blindingFactor,
         pathElements,
         pathIndices,
       },
@@ -131,22 +120,19 @@ describe("vote_v2.circom (real circom toolchain)", () => {
     await circuit.checkConstraints(witness);
   });
 
-  test("rejects a voteChoice outside [0, numCandidates)", async () => {
+  test("rejects a non-binary voteChoice", async () => {
     const secret = 111n,
       salt = 222n,
-      blindingFactor = 333n,
       daoId = 1n,
       proposalId = 7n,
-      chainId = 1n,
-      nonce = 0n;
+      chainId = 1n;
 
-    const commitment = hash([DOMAIN_TAG, secret, salt, blindingFactor]);
+    const commitment = hash([secret, salt]);
     const { root, pathElements, pathIndices } = merkleForLeafZero(
       commitment,
       LEVELS,
     );
-    const familyNullifier = hash([secret, daoId, proposalId, chainId]);
-    const nullifier = hash([secret, daoId, proposalId, chainId, nonce]);
+    const nullifier = hash([secret, daoId, proposalId, chainId]);
 
     let threw = false;
     try {
@@ -154,16 +140,12 @@ describe("vote_v2.circom (real circom toolchain)", () => {
         {
           root,
           nullifier,
-          familyNullifier,
           daoId,
           proposalId,
-          voteChoice: 5n, // out of bounds for numCandidates = 2
-          numCandidates: 2n,
+          voteChoice: 5n,
           chainId,
-          nonce,
           secret,
           salt,
-          blindingFactor,
           pathElements,
           pathIndices,
         },

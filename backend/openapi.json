@@ -1,81 +1,94 @@
 {
-  "openapi": "3.1.0",
+  "openapi": "3.0.3",
   "info": {
-    "title": "ZK-VOTE Relayer API",
+    "title": "ZKVote Relayer API",
     "version": "1.0.0",
-    "description": "Backend relayer for anonymous voting on Stellar/Soroban. Generated from route definitions and Zod validation schemas — see backend/API.md for prose docs and GET /api-docs for interactive documentation."
+    "description": "Anonymous voting relayer with full audit trail and incident response"
   },
   "servers": [
     {
       "url": "http://localhost:3001",
-      "description": "Local development"
+      "description": "Local"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
     }
   ],
   "components": {
     "securitySchemes": {
-      "RelayerAuth": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      },
+      "relayerAuth": {
         "type": "apiKey",
         "in": "header",
-        "name": "X-Relayer-Auth",
-        "description": "Shared relayer auth token (also accepted as `Authorization: Bearer <token>`). There is currently one shared token per deployment, not per-user credentials."
+        "name": "X-Relayer-Auth"
       }
     },
     "schemas": {
-      "HealthResponse": {
+      "VoteRequest": {
         "type": "object",
+        "required": [
+          "daoId",
+          "proposalId",
+          "choice",
+          "nullifier",
+          "root",
+          "proof"
+        ],
         "properties": {
-          "status": {
-            "type": "string",
-            "example": "ok"
+          "daoId": {
+            "type": "integer"
           },
-          "rpc": {
+          "proposalId": {
+            "type": "integer"
+          },
+          "choice": {
+            "type": "boolean"
+          },
+          "nullifier": {
+            "type": "string",
+            "description": "BN254 field element hex < modulus (redacted in audit)"
+          },
+          "root": {
+            "type": "string",
+            "description": "Merkle root hex (redacted in audit)"
+          },
+          "proof": {
             "type": "object",
+            "description": "Groth16 proof (redacted in audit)",
             "properties": {
-              "ok": {
-                "type": "boolean"
+              "a": {
+                "type": "string"
+              },
+              "b": {
+                "type": "string"
+              },
+              "c": {
+                "type": "string"
               }
-            },
-            "required": [
-              "ok"
-            ]
+            }
           }
-        },
-        "required": [
-          "status",
-          "rpc"
-        ]
+        }
       },
-      "ReadyResponse": {
+      "AuditEntry": {
         "type": "object",
         "properties": {
-          "status": {
-            "type": "string",
-            "example": "ready"
-          }
-        },
-        "required": [
-          "status"
-        ]
-      },
-      "ErrorResponse": {
-        "type": "object",
-        "properties": {
-          "error": {
-            "type": "string",
-            "example": "Unauthorized"
-          }
-        },
-        "required": [
-          "error"
-        ]
-      },
-      "ConfigResponse": {
-        "type": "object",
-        "properties": {
-          "networkPassphrase": {
+          "id": {
             "type": "string"
           },
-          "rpcUrl": {
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "method": {
             "type": "string"
           },
           "ipfsEnabled": {
@@ -88,6 +101,51 @@
           "ipfsEnabled"
         ]
       },
+      "TxStatusResponse": {
+        "type": "object",
+        "properties": {
+          "hash": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "CONFIRMED",
+              "FAILED",
+              "EXPIRED",
+              "UNKNOWN"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "attempts": {
+            "type": "number"
+          },
+          "elapsedMs": {
+            "type": "number"
+          },
+          "error": {
+            "type": "string"
+          },
+          "enqueuedAt": {
+            "type": "string"
+          },
+          "confirmedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hash",
+          "state",
+          "attempts",
+          "elapsedMs"
+        ]
+      },
       "SuccessResponse": {
         "type": "object",
         "properties": {
@@ -95,162 +153,108 @@
             "type": "boolean",
             "example": true
           },
-          "txHash": {
+          "action": {
+            "type": "string"
+          },
+          "actor": {
             "type": "string",
-            "example": "a1b2c3...64hex"
+            "description": "Hashed actor identifier (PII redacted)"
+          },
+          "statusCode": {
+            "type": "integer"
+          },
+          "immutable": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
           }
-        },
-        "required": [
-          "success"
-        ]
+        }
       },
-      "PaginatedResponse": {
+      "RemediationAction": {
         "type": "object",
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": {}
-            }
-          },
-          "pagination": {
-            "type": "object",
-            "properties": {
-              "cursor": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "hasMore": {
-                "type": "boolean"
-              },
-              "total": {
-                "type": "number"
-              }
-            },
-            "required": [
-              "hasMore",
-              "total"
-            ]
-          }
-        },
         "required": [
-          "data",
-          "pagination"
-        ]
-      },
-      "DaosListResponse": {
-        "type": "object",
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": {}
-            }
-          },
-          "pagination": {
-            "type": "object",
-            "properties": {
-              "cursor": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "hasMore": {
-                "type": "boolean"
-              },
-              "total": {
-                "type": "number"
-              }
-            },
-            "required": [
-              "hasMore",
-              "total"
-            ]
-          },
-          "lastSync": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "cached": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "data",
-          "pagination",
-          "lastSync",
-          "cached"
-        ]
-      }
-    },
-    "parameters": {}
-  },
-  "paths": {
-    "/health": {
-      "get": {
-        "tags": [
-          "Health"
+          "action",
+          "target",
+          "reason",
+          "idempotencyKey"
         ],
-        "summary": "Basic health check and RPC pool status",
-        "description": "No rate limit.",
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
-                },
-                "example": {
-                  "status": "ok",
-                  "rpc": {
-                    "ok": true,
-                    "pool": {}
-                  },
-                  "db": {
-                    "totalEvents": 0,
-                    "daoCount": 0,
-                    "lastLedger": 0
-                  }
-                }
-              }
-            }
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "freeze_dao",
+              "unfreeze_dao",
+              "pause_voting",
+              "resume_voting",
+              "revoke_member",
+              "restore_member",
+              "emergency_pause",
+              "emergency_resume",
+              "rotate_vk",
+              "quarantine_proposal"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "description": "DAO or proposal identifier"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 5
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 8,
+            "description": "Replay protection - duplicate keys return 409"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
           }
         }
       }
     },
-    "/ready": {
+    "/tx/{hash}": {
       "get": {
         "tags": [
-          "Health"
+          "Transactions"
         ],
-        "summary": "Readiness check (verifies RPC connectivity)",
-        "description": "No rate limit.",
+        "summary": "Confirmation status for a transaction hash (polling fallback)",
+        "description": "Rate limit: queryLimiter.",
         "security": [],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "description": "Transaction hash",
+              "example": "a1b2c3...64hex"
+            },
+            "required": true,
+            "name": "hash",
+            "in": "path"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReadyResponse"
+                  "$ref": "#/components/schemas/TxStatusResponse"
                 },
                 "example": {
-                  "status": "ready"
+                  "hash": "a1b2c3...64hex",
+                  "state": "PENDING",
+                  "status": "NOT_FOUND",
+                  "attempts": 1,
+                  "elapsedMs": 2500
                 }
               }
             }
           },
-          "503": {
-            "description": "Error (HTTP 503)",
+          "400": {
+            "description": "Error (HTTP 400)",
             "content": {
               "application/json": {
                 "schema": {
@@ -262,45 +266,14 @@
         }
       }
     },
-    "/config": {
+    "/tx/stats": {
       "get": {
         "tags": [
-          "Health"
+          "Transactions"
         ],
-        "summary": "Public configuration for frontend clients",
-        "description": "No rate limit.",
+        "summary": "Confirmation queue and WebSocket hub diagnostics",
+        "description": "Rate limit: queryLimiter.",
         "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ConfigResponse"
-                },
-                "example": {
-                  "votingContract": "C...",
-                  "networkPassphrase": "Test SDF Network ; September 2015",
-                  "ipfsEnabled": true
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/db/stats": {
-      "get": {
-        "tags": [
-          "Health"
-        ],
-        "summary": "Database diagnostics (full detail requires auth)",
-        "description": "No rate limit.",
-        "security": [
-          {
-            "RelayerAuth": []
-          }
-        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -308,9 +281,17 @@
               "application/json": {
                 "schema": {},
                 "example": {
-                  "queries": {},
-                  "tables": [],
-                  "cache": {}
+                  "queue": {
+                    "running": true,
+                    "pending": 3,
+                    "cached": 5
+                  },
+                  "websocket": {
+                    "attached": true,
+                    "connectedClients": 2,
+                    "path": "/ws/confirmations",
+                    "enabled": true
+                  }
                 }
               }
             }
@@ -321,10 +302,10 @@
     "/vote": {
       "post": {
         "tags": [
-          "Voting"
+          "Membership"
         ],
-        "summary": "Submit an anonymous vote with a ZK proof",
-        "description": "Rate limit: voteLimiter.",
+        "summary": "Prepare a commitment registration transaction (per-member rate limited, #371)",
+        "description": "Rate limit: commitmentRegistrationLimiter.",
         "security": [
           {
             "RelayerAuth": []
@@ -340,71 +321,38 @@
                     "type": "integer",
                     "minimum": 0
                   },
-                  "proposalId": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "choice": {
-                    "type": "boolean"
-                  },
-                  "nullifier": {
+                  "commitment": {
                     "type": "string"
                   },
-                  "root": {
-                    "type": "string"
-                  },
-                  "proof": {
-                    "type": "object",
-                    "properties": {
-                      "a": {
-                        "type": "string"
-                      },
-                      "b": {
-                        "type": "string"
-                      },
-                      "c": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "a",
-                      "b",
-                      "c"
-                    ]
-                  },
-                  "nonce": {
-                    "type": "string"
-                  },
-                  "timestamp": {
-                    "type": "integer"
-                  },
-                  "walletAddress": {
-                    "type": "string"
-                  },
-                  "encryptedPayload": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "object",
-                        "additionalProperties": {}
-                      }
-                    ]
-                  },
-                  "voterPublicKey": {
+                  "caller": {
                     "type": "string",
                     "pattern": "^G[A-Z2-7]{55}$"
                   },
                   "voterSignature": {
                     "type": "string",
                     "minLength": 1
+                  },
+                  "sponsor": {
+                    "type": "string",
+                    "enum": [
+                      "relayer",
+                      "voter"
+                    ]
+                  },
+                  "feePayer": {
+                    "type": "string",
+                    "pattern": "^G[A-Z2-7]{55}$"
+                  },
+                  "feeBudgetStroops": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1000000
                   }
                 },
                 "required": [
                   "daoId",
-                  "proposalId",
-                  "choice"
+                  "commitment",
+                  "caller"
                 ]
               }
             }
@@ -415,13 +363,16 @@
             "description": "Success",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SuccessResponse"
-                },
+                "schema": {},
                 "example": {
                   "success": true,
-                  "txHash": "a1b2c3...64hex",
-                  "status": "SUCCESS"
+                  "prepared": true,
+                  "daoId": 0,
+                  "caller": "G...",
+                  "transactionXdr": "AAAA...",
+                  "authEntry": [
+                    "AAAAA..."
+                  ]
                 }
               }
             }
@@ -438,6 +389,26 @@
           },
           "401": {
             "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error (HTTP 403)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error (HTTP 409)",
             "content": {
               "application/json": {
                 "schema": {
@@ -488,445 +459,120 @@
           }
         }
       }
-    },
-    "/proposal/{daoId}/{proposalId}": {
-      "get": {
-        "tags": [
-          "Voting"
-        ],
-        "summary": "Get proposal vote tallies",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "description": "DAO identifier",
-              "example": "0"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "path"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "description": "Proposal identifier",
-              "example": "1"
-            },
-            "required": true,
-            "name": "proposalId",
-            "in": "path"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "daoId": 0,
-                  "proposalId": 1,
-                  "yesVotes": 12,
-                  "noVotes": 3
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/root/{daoId}": {
-      "get": {
-        "tags": [
-          "Voting"
-        ],
-        "summary": "Get the current membership merkle root for a DAO",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "description": "DAO identifier",
-              "example": "0"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "path"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "daoId": 0,
-                  "root": "0x..."
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/comment/anonymous": {
+    }
+  },
+  "paths": {
+    "/vote": {
       "post": {
-        "tags": [
-          "Comments"
-        ],
-        "summary": "Submit an anonymous comment with a ZK proof",
-        "description": "Rate limit: commentLimiter.",
+        "summary": "Submit anonymous vote (audited)",
         "security": [
           {
-            "RelayerAuth": []
+            "relayerAuth": []
           }
         ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "properties": {
-                  "daoId": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "proposalId": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "contentCid": {
-                    "type": "string"
-                  },
-                  "parentId": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "minimum": 0
-                  },
-                  "voteChoice": {
-                    "type": "boolean"
-                  },
-                  "nullifier": {
-                    "type": "string"
-                  },
-                  "root": {
-                    "type": "string"
-                  },
-                  "proof": {
-                    "type": "object",
-                    "properties": {
-                      "a": {
-                        "type": "string"
-                      },
-                      "b": {
-                        "type": "string"
-                      },
-                      "c": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "a",
-                      "b",
-                      "c"
-                    ]
-                  },
-                  "serverId": {
-                    "type": "string"
-                  },
-                  "workNonce": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "daoId",
-                  "proposalId",
-                  "contentCid",
-                  "voteChoice",
-                  "nullifier",
-                  "root",
-                  "proof"
-                ]
+                "$ref": "#/components/schemas/VoteRequest"
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SuccessResponse"
-                },
-                "example": {
-                  "success": true,
-                  "commentId": 42,
-                  "txHash": "a1b2c3...64hex"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error (HTTP 400)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            "description": "Vote submitted"
           },
           "401": {
-            "description": "Error (HTTP 401)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Error (HTTP 429)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error (HTTP 500)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Error (HTTP 503)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "504": {
-            "description": "Error (HTTP 504)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            "description": "Unauthorized"
           }
-        }
+        },
+        "x-audited": true,
+        "x-redacted-fields": [
+          "nullifier",
+          "root",
+          "proof"
+        ]
       }
     },
-    "/comment/challenge/{commitment}": {
-      "get": {
-        "tags": [
-          "Comments"
-        ],
-        "summary": "Get a proof-of-work challenge for a commitment (anti-spam)",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
-        "parameters": [
+    "/comment/anonymous": {
+      "post": {
+        "summary": "Anonymous comment (audited)",
+        "security": [
           {
-            "schema": {
-              "type": "string",
-              "description": "Commitment hash",
-              "example": "0x1234...64hex"
-            },
-            "required": true,
-            "name": "commitment",
-            "in": "path"
+            "relayerAuth": []
           }
         ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "serverId": "abc123",
-                  "difficulty": 20,
-                  "expiresAt": 1785200000000
-                }
-              }
-            }
-          }
-        }
+        "x-audited": true,
+        "x-redacted-fields": [
+          "nullifier",
+          "root",
+          "proof"
+        ]
       }
     },
-    "/comments/{daoId}/{proposalId}/nonce": {
-      "get": {
-        "tags": [
-          "Comments"
-        ],
-        "summary": "Get the next comment nonce for a commitment",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
-        "parameters": [
+    "/comment/edit": {
+      "post": {
+        "summary": "Edit comment (audited)",
+        "security": [
           {
-            "schema": {
-              "type": "string",
-              "description": "DAO identifier",
-              "example": "0"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "path"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "description": "Proposal identifier",
-              "example": "1"
-            },
-            "required": true,
-            "name": "proposalId",
-            "in": "path"
+            "relayerAuth": []
           }
         ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "nonce": 0
-                }
-              }
-            }
-          }
-        }
+        "x-audited": true
       }
     },
-    "/comments/{daoId}/{proposalId}": {
-      "get": {
-        "tags": [
-          "Comments"
-        ],
-        "summary": "List comments for a proposal (paginated)",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
-        "parameters": [
+    "/comment/delete": {
+      "post": {
+        "summary": "Delete comment (audited)",
+        "security": [
           {
-            "schema": {
-              "type": "string",
-              "description": "DAO identifier",
-              "example": "0"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "path"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "description": "Proposal identifier",
-              "example": "1"
-            },
-            "required": true,
-            "name": "proposalId",
-            "in": "path"
-          },
-          {
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 500,
-              "example": 100
-            },
-            "required": false,
-            "name": "limit",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "example": "eyJpIjoxMjN9"
-            },
-            "required": false,
-            "name": "cursor",
-            "in": "query"
+            "relayerAuth": []
           }
         ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PaginatedResponse"
-                },
-                "example": {
-                  "data": [],
-                  "pagination": {
-                    "hasMore": false,
-                    "total": 0
-                  }
-                }
-              }
-            }
-          }
-        }
+        "x-audited": true
       }
     },
-    "/comment/{daoId}/{proposalId}/{commentId}": {
-      "get": {
-        "tags": [
-          "Comments"
+    "/bridge/vote": {
+      "post": {
+        "summary": "Bridge vote (audited)",
+        "x-audited": true,
+        "x-redacted-fields": [
+          "nullifier",
+          "voteRoot",
+          "sbtRoot",
+          "proof"
+        ]
+      }
+    },
+    "/bridge/relay": {
+      "post": {
+        "summary": "Manual relay (audited)",
+        "security": [
+          {
+            "relayerAuth": []
+          }
         ],
-        "summary": "Get a single comment",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
-        "parameters": [
+        "x-audited": true
+      }
+    },
+    "/ipfs/image": {
+      "post": {
+        "summary": "Upload image (audited)",
+        "security": [
           {
-            "schema": {
-              "type": "string",
-              "description": "DAO identifier",
-              "example": "0"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "path"
-          },
+            "relayerAuth": []
+          }
+        ],
+        "x-audited": true
+      }
+    },
+    "/ipfs/metadata": {
+      "post": {
+        "summary": "Upload metadata (audited)",
+        "security": [
           {
-            "schema": {
-              "type": "string",
-              "description": "Proposal identifier",
-              "example": "1"
-            },
-            "required": true,
-            "name": "proposalId",
-            "in": "path"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "description": "Comment identifier",
-              "example": "42"
-            },
-            "required": true,
-            "name": "commentId",
-            "in": "path"
+            "relayerAuth": []
           }
         ],
         "responses": {
@@ -1316,7 +962,6 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 500,
-              "description": "Page size (default 100)",
               "example": 100
             },
             "required": false,
@@ -1325,19 +970,7 @@
           },
           {
             "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Rows to skip (default 0)",
-              "example": 0
-            },
-            "required": false,
-            "name": "offset",
-            "in": "query"
-          },
-          {
-            "schema": {
               "type": "string",
-              "description": "Opaque cursor from a previous pagination.cursor; alias for offset",
               "example": "100"
             },
             "required": false,
@@ -1361,26 +994,6 @@
                   },
                   "lastSync": null,
                   "cached": true
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error (HTTP 400)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error (HTTP 500)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2287,94 +1900,127 @@
         }
       }
     },
-    "/bridge/nullifier/{daoId}/{proposalId}/{nullifier}": {
-      "get": {
-        "tags": [
-          "Bridge"
+    "/daos/sync": {
+      "post": {
+        "summary": "Sync DAOs (audited)",
+        "security": [
+          {
+            "relayerAuth": []
+          }
         ],
-        "summary": "Check whether a nullifier has already been used",
-        "description": "Rate limit: queryLimiter.",
-        "security": [],
+        "x-audited": true
+      }
+    },
+    "/events": {
+      "post": {
+        "summary": "Manual event (audited)",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
+        "x-audited": true
+      }
+    },
+    "/events/notify": {
+      "post": {
+        "summary": "Notify event (audited)",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
+        "x-audited": true
+      }
+    },
+    "/remediation/action": {
+      "post": {
+        "summary": "Structured remediation action (append-only, authz, replay-safe)",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationAction"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Recorded"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "409": {
+            "description": "Duplicate idempotencyKey"
+          }
+        },
+        "x-audited": true,
+        "x-append-only": true,
+        "x-replay-safe": true
+      }
+    },
+    "/remediation/log": {
+      "get": {
+        "summary": "Query remediation log",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
         "parameters": [
           {
+            "name": "action",
+            "in": "query",
             "schema": {
               "type": "string",
               "description": "DAO identifier",
               "example": "0"
             },
             "required": true,
-            "name": "daoId",
+            "name": "dao",
             "in": "path"
           },
           {
+            "name": "target",
+            "in": "query",
             "schema": {
               "type": "string",
-              "description": "Proposal identifier",
-              "example": "1"
+              "enum": [
+                "vote",
+                "comment"
+              ],
+              "description": "Circuit type",
+              "example": "vote"
             },
             "required": true,
-            "name": "proposalId",
-            "in": "path"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "description": "Nullifier hash",
-              "example": "0x1234..."
-            },
-            "required": true,
-            "name": "nullifier",
+            "name": "type",
             "in": "path"
           }
         ],
         "responses": {
           "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "daoId": 0,
-                  "proposalId": 1,
-                  "nullifier": "0x1234...",
-                  "used": false
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error (HTTP 404)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error (HTTP 500)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            "description": "Log entries"
           }
         }
       }
     },
-    "/bridge/relay": {
+    "/randomness/seed": {
       "post": {
         "tags": [
-          "Bridge"
+          "Randomness"
         ],
-        "summary": "Manually trigger cross-chain event relay (admin only)",
+        "summary": "Seed the VDF computation for a DAO/proposal set (admin action)",
         "description": "No rate limit.",
         "security": [
           {
-            "RelayerAuth": []
+            "relayerAuth": []
           }
         ],
         "responses": {
@@ -2384,7 +2030,18 @@
               "application/json": {
                 "schema": {},
                 "example": {
-                  "success": true
+                  "success": true,
+                  "nonce": "deadbeef..."
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2412,33 +2069,142 @@
         }
       }
     },
-    "/circuits/{dao}/{type}/status": {
+    "/randomness/contribute": {
+      "post": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Submit a 32-byte random share from an independent authority",
+        "description": "No rate limit.",
+        "security": [
+          {
+            "RelayerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "success": true,
+                  "received": 1,
+                  "requiredShares": 3
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/finalize": {
+      "post": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Finalize the ordering once required shares are received",
+        "description": "No rate limit.",
+        "security": [
+          {
+            "RelayerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "success": true,
+                  "finalizedAt": 1722300000000
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/ordering/{daoId}": {
       "get": {
         "tags": [
-          "Circuits"
+          "Randomness"
         ],
-        "summary": "Get the active/available ZK circuit versions for a DAO",
+        "summary": "Get the finalized ordering for a DAO with verification data",
         "description": "Rate limit: queryLimiter.",
         "security": [],
         "parameters": [
           {
-            "schema": {
-              "type": "string"
-            },
-            "required": true,
-            "name": "dao",
-            "in": "path"
-          },
-          {
+            "name": "from",
+            "in": "query",
             "schema": {
               "type": "string",
-              "enum": [
-                "comment",
-                "vote"
-              ]
+              "description": "DAO identifier",
+              "example": "0"
             },
             "required": true,
-            "name": "type",
+            "name": "daoId",
             "in": "path"
           }
         ],
@@ -2450,14 +2216,98 @@
                 "schema": {},
                 "example": {
                   "daoId": 0,
-                  "circuitType": "Vote",
-                  "currentCircuit": "vote_v1",
-                  "availableCircuits": []
+                  "finalizedAt": 1722300000000,
+                  "ordering": []
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error (HTTP 404)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
           }
         }
+      }
+    },
+    "/randomness/verify/{daoId}": {
+      "get": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Verify a finalized ordering without re-running the VDF",
+        "description": "Rate limit: queryLimiter.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "description": "DAO identifier",
+              "example": "0"
+            },
+            "required": true,
+            "name": "daoId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "daoId": 0,
+                  "valid": true,
+                  "checks": {
+                    "vdfOutputValid": true,
+                    "replayNonceValid": true
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error (HTTP 404)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries"
+          }
+        },
+        "x-redacted": true
       }
     },
     "/admin/audit-log": {
@@ -2469,11 +2319,13 @@
         "description": "Rate limit: queryLimiter.",
         "security": [
           {
-            "RelayerAuth": []
+            "relayerAuth": []
           }
         ],
         "parameters": [
           {
+            "name": "format",
+            "in": "query",
             "schema": {
               "type": "string",
               "example": "50"
@@ -2562,97 +2414,26 @@
           }
         }
       }
-    },
-    "/admin/sbt-transfer-attempts": {
-      "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Review flagged membership-SBT transfer/approval attempts for a DAO (admin only)",
-        "description": "Rate limit: queryLimiter.",
-        "security": [
-          {
-            "RelayerAuth": []
-          }
-        ],
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "example": "1"
-            },
-            "required": true,
-            "name": "daoId",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "example": "50"
-            },
-            "required": false,
-            "name": "limit",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "example": "0"
-            },
-            "required": false,
-            "name": "offset",
-            "in": "query"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "daoId": 1,
-                  "attempts": [],
-                  "total": 0,
-                  "limit": 50,
-                  "offset": 0
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error (HTTP 400)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Error (HTTP 401)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error (HTTP 500)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
-  "webhooks": {}
+  "x-audit": {
+    "description": "All mutating routes are audited with PII redaction. 100% coverage via global auditMiddleware.",
+    "mutatingRoutes": [
+      "POST /vote",
+      "POST /comment/anonymous",
+      "POST /comment/edit",
+      "POST /comment/delete",
+      "POST /bridge/vote",
+      "POST /bridge/relay",
+      "POST /ipfs/image",
+      "POST /ipfs/metadata",
+      "POST /daos/sync",
+      "POST /events",
+      "POST /events/notify",
+      "POST /remediation/action"
+    ],
+    "redaction": "proof, nullifier, root, commitment, secret, token, password, jwt always redacted",
+    "immutable": "audit logs and remediation logs are append-only, no update/delete APIs",
+    "replaySafe": "remediation uses idempotencyKey; duplicates return 409"
+  }
 }

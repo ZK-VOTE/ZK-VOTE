@@ -43,7 +43,7 @@ The membership-tree contract maintains a FIFO history of the last 30 Merkle root
 **Guidance for DAOs:**
 - DAOs with frequent membership changes (>30 changes during a proposal's voting period) may strand some voters.
 - Consider proposal duration vs. expected membership change rate.
-- Frontend could warn when root age approaches eviction threshold.
+- Frontend should warn when root age approaches the eviction threshold and show the current anonymity set size to contextualize the risk.
 - For high-activity DAOs, consider shorter voting windows or coordinating membership changes.
 
 ## Fixed Mode Revocation Semantics (Intentional Behavior)
@@ -57,6 +57,8 @@ In **Fixed mode**, a proposal's eligible root is snapshotted at proposal creatio
 **Rationale**: This is intentional for voter privacy. If revoked members couldn't vote on already-open proposals, the admin could determine who has/hasn't voted by timing revocations. The Fixed mode snapshot provides a consistent eligibility boundary.
 
 **Contrast with Trailing Mode**: In Trailing mode, the contract also checks `min_root` (the root at which the member was added). This ensures revoked members cannot vote even on older proposals, because their `min_root` will be invalidated when they're removed. Trailing mode provides stronger revocation guarantees at the cost of some privacy (admin can influence eligibility mid-proposal by revoking members).
+
+**Frontend disclosure (issue #347)**: The frontend surfaces these revocation semantics to users — the vote-mode picker when creating a proposal, a revocation-semantics explainer in the vote dialog, and an eligibility preview on the proposal page — so the "documented per proposal" guidance above is reflected in the product UI.
 
 ## BN254 Public Signal Constraints
 
@@ -228,6 +230,69 @@ Admin guidance per DAO (documented for frontend tooltip):
 - `frontend/src/lib/zkproof.ts`: `generateClaimProof`, `calculateClaimNullifier`, `calculateVoteNullifier`.
 - `frontend/src/components/ClaimRewards.tsx` + `frontend/src/queries/claimQueries.ts` use `relayerFetch("/api/v1/claim", ...)`.
 
+## Privacy-Preserving Analytics (#306)
+
+Scope addition: on-chain homomorphic accumulation in `contracts/threshold-crypto`
+(`submit_analytic_contribution`, `analytics_aggregate`, `analytics_min_cohort`,
+`init_analytics`), backend service `backend/src/services/privacy-analytics.ts`
++ `backend/src/routes/analytics.ts`, migration `004_add_privacy_analytics`, and
+frontend `AnalyticsPanel` (`frontend/src/components/AnalyticsPanel.tsx`,
+`analyticsCrypto.ts`, `frontend/src/queries/analyticsQueries.ts`).
+
+**Goal**: compute turnout / participation aggregates (e.g. how many members
+contributed to a round) **without leaking which member contributed** to indexers or
+observers, and without revealing any single contribution.
+
+### Cryptographic design
+
+Analytics use an **ElGamal ciphertext over BN254 G1**. Each contributor submits
+`(c1, c2) = (r·G, m·G + r·Y)` where `m ∈ {0,1}` is their contributed value
+(1 = participated), `Y` is the DAO's joint public key, and `r` is fresh
+per submission.
+
+- **Homomorphic accumulation (off-chain, tested)**: contributions are summed via
+  point addition so the stored value is always the *sum*
+  `(Σ c1, Σ c2) = (R·G, (Σm)·G + R·Y)`. Any single intermediate sum is a valid
+  encryption of the running total, never a contributor's own ciphertext, so an
+  indexer reading the aggregate at any time learns nothing about any individual
+  `m_i`. See `homomorphicAdd` / `thresholdDecryptAggregate` in
+  `backend/src/services/privacy-analytics.ts`.
+- **On-chain register (tested, real host crypto)**: the threshold-crypto contract
+  holds the *aggregate only* and accumulates with the Soroban `bn254_g1_add` host
+  function. It never stores per-contributor plaintext. A contributor may submit at
+  most once per `(dao_id, round_id)`.
+- **Threshold decrypt of aggregate only**: there is no key enabling plaintext
+  recovery of any single contribution. Decryption recovers only `Σm` after enough
+  key shares combine, and only once the **privacy budget** is met.
+
+### Privacy budget (`min_cohort`)
+
+Before any aggregate may be decrypted, at least `minimum_cohort` contributions
+must be present (configured via `init_analytics`, checked in the contract's
+`analytics_aggregate` gate). This prevents an observer from decrypting an
+aggregate of one or two contributions and thereby singling out a voter. Counts
+(`analytics_count`) are public — they do not reveal identities.
+
+### Threat note
+
+- **Indexer/observer learns**: only `Σm` after cohort is met (and only via
+  threshold-decryption). Aggregate counts are public. No per-voter `m_i`.
+- **Cannot learn**: which contributor submitted what; the value of any single
+  contribution; the timely aggregate while below `min_cohort`.
+- **Contract admin**: can set/rotate the joint key and the cohort, but gains no
+  plaintext linkage to a member unless a full threshold of shares colludes.
+- **Threshold collusion**: the standard risk applies — if `t` of `n` share-holders
+  collude, they can decrypt the *aggregate*. This leaks only `Σm`, not per-voter
+  values, so the exposure is bounded to overall turnout.
+- **Double-counting**: prevented per contributor per round on-chain; off-chain the
+  service replaces a prior round's row on re-submission for the same DAO.
+- **Residual**: the ElGamal discrete-log lookup for `Σm` (solving `x` where
+  `x·G = Σm·G`) assumes `Σm` is small (bounded by cohort / DAO size), which holds
+  because contributions are single-bit; the scheme deliberately does not try to
+  hide the *total count* from a threshold decryptor, only from indexers without a
+  threshold. On-chain and off-chain homomorphic surfaces are independently tested
+  against the same BN254 primitives.
+
 ## Next Hardening Steps
 - Relay: structured logging with redaction; configurable log retention; coarser error responses; optional cover traffic/backoff to reduce correlation; explicit anti-censorship monitoring (missing votes vs submissions).
 - Contracts: coarse error codes to avoid fine-grained leakage; optional per-contract versioning + upgrade events; ensure membership/admin checks stay isolated.
@@ -313,6 +378,77 @@ See [`docs/post-quantum-evaluation.md`](docs/post-quantum-evaluation.md) and [`d
 - **Circuit constraint-count optimization** (tracked separately, #123): a
   multi-week circuit-engineering task independent of the security fixes
   above.
+
+## Relayer Address Binding (Issue #361)
+
+**Threat (from #167 deferred list)**: A malicious relayer could intercept
+a ZK proof and resubmit it through a different channel (different relayer or
+delayed resubmission) for strategic advantage. While the tally remains
+unaffected (votes are additive), voters may have preferences about:
+- Which relayer processes their vote (trust/latency)
+- Voting order (time-sensitive elections)
+- Proof reuse prevention (cross-relayer replay)
+
+**Mitigation (implemented in #361)**: Add `relayer_address` as the 7th public
+signal in the vote circuit (`vote.circom`) and 10th in the re-voting circuit
+(`vote_v2.circom`). The contract:
+
+1. **Extracts relayer address** from the transaction signer (`env.invoker()`)
+2. **Converts to field element** via SHA-256 hash: `relayer_signal = SHA256(address_xdr)`
+3. **Validates field membership** (must be < BN254 scalar field modulus r, non-zero)
+4. **Includes in public signals** passed to Groth16 verifier
+5. **Proof verification fails** if `relayer_address` in circuit ≠ `actual_relayer_submitting`
+
+**Security properties**:
+- **Proof binding**: A proof generated with `relayer_address=A` cannot be
+  resubmitted through relayer B; the pairing check will fail
+- **No nullifier pollution**: Nullifier remains deterministic per (voter, election),
+  unaffected by relayer change
+- **Election-scoped**: Each proof is bound to a specific relayer for a specific
+  election; not a global signature
+- **Frontend responsibility**: Frontend must pass correct relayer address when
+  generating proofs; incorrect address causes vote rejection
+
+**What this prevents**:
+- ✅ Cross-relayer proof reuse
+- ✅ Selective front-running via relayer switching
+- ✅ Proof harvesting and replay by malicious observer
+
+**What this does NOT prevent**:
+- ❌ Front-running within a single relayer (still possible)
+- ❌ Censorship (relayer can still drop votes)
+- ❌ Ordering attacks if coordinated with proposer
+- ❌ Nullifier censorship (relayer knows nullifier from proof)
+
+**Privacy impact**: Relayer address is now a public signal (visible on-chain in
+proof verification). Voters with different relayers will have different proofs.
+No new privacy leakage: relayer addresses are already known from transaction
+signing.
+
+**Backward compatibility**: This is a breaking change:
+- Old 6-signal proofs (without relayer_address) will fail verification with
+  new 7-signal verification keys
+- Clients must upgrade to new circuit version to generate compatible proofs
+- Old proofs are explicitly rejected by the new contract
+
+**Code changes**:
+- `circuits/vote.circom`: `signal input relayerAddress` added to template,
+  included in public signals list
+- `circuits/vote_v2.circom`: Same changes for re-voting circuit (10 signals total)
+- `contracts/voting/src/lib.rs`: 
+  - Constants: `NUM_PUBLIC_SIGNALS = 7`, `VOTE_CIRCUIT_IC_LEN = 8`
+  - Error codes: `InvalidRelayerAddress = 69`, `RelayerMismatch = 70`
+  - Helper: `address_to_u256()` converts address to field element
+  - Both `vote()` and `vote_bls381()` validate and include relayer signal
+- `frontend/src/lib/zkproof.ts`: Pass relayer address when generating proofs
+- `backend/src/services/stellar.ts`: Extract relayer from keypair, pass to frontend
+
+**Deployment impact**:
+- New verification keys must be generated (IC vector length: 7 → 8)
+- Groth16 trusted setup must be rerun (new circuit, new parameters)
+- KAT (Known Answer Test) must validate circuit and on-chain match
+- All clients must upgrade to new frontend/backend before voting
+
 ## Voter Deanonymization at Registration (Issue #122)
 
 **Threat**: during credential/registration flows where a voter submits an
@@ -361,3 +497,62 @@ larger change with its own migration and abuse-prevention design (e.g.
 preventing a single eligible voter from requesting many blind signatures)
 and is intentionally out of scope for this PR — see the PR description for
 the full list of deferred acceptance criteria.
+
+## Circuit-Registry Governed VK Upgrade with Timelock + Multi-Sig (Issue #297)
+
+**Threat**: DAO admin VK trust is a documented risk. A single admin key can
+rotate the verification key at will, potentially replacing it with a malicious
+VK that allows forged proofs or invalidates ongoing elections without notice.
+
+**Mitigation — Timelocked VK Proposals with Multi-Sig Quorum**:
+The `circuit-registry` contract now enforces a two-phase VK upgrade process
+that limits rogue VK swaps:
+
+1. **Proposal Phase**: Any authorized proposer (configurable per DAO) creates a
+   VK upgrade proposal specifying the new VK, new WASM hash, timelock duration,
+   and required approval quorum. The proposal is stored on-chain with status
+   `Pending`.
+
+2. **Approval Phase**: Multiple independent approvers (multi-sig) must each
+   submit `approve_vk_upgrade` transactions. The contract tracks approval
+   count. The proposal only becomes executable once `approvals >=
+   required_approvals`.
+
+3. **Timelock Phase**: After quorum is met, the proposal enters a mandatory
+   timelock period (`execute_after`). During this period, the proposal can be
+   cancelled by the proposer or governance. The timelock provides a safety
+   window for DAO members to review the change and for off-chain coordination.
+
+4. **Execution Phase**: After the timelock elapses and quorum is met, any
+   authorized executor can call `execute_vk_upgrade`. This atomically updates
+   the circuit's VK, WASM hash, and `registered_at` timestamp, and emits
+   `VkProposalExecutedEvent`.
+
+5. **Versioned VK History**: The voting contract maintains `VkByVersion`
+   mappings, preserving historical VKs. Proposals snapshotted before the
+   upgrade continue to verify against their pinned VK version, preventing
+   in-flight votes from being invalidated.
+
+6. **Stale Rejection**: The backend and frontend reject stale VK versions
+   (ZK-013), ensuring clients cannot accidentally use deprecated verification
+   keys.
+
+**Properties**:
+- No single admin can unilaterally rotate the VK.
+- DAO members have a timelock window to detect and respond to malicious
+  proposals.
+- Versioned VK storage ensures ongoing elections are not disrupted by
+  post-creation VK changes.
+- Frontend `CircuitUpgradePanel` displays pending VK proposals with timelock
+  countdown and approval progress.
+
+**Code alignment**:
+- `contracts/circuit-registry/src/lib.rs`: `propose_vk_upgrade`,
+  `approve_vk_upgrade`, `execute_vk_upgrade`, `cancel_vk_upgrade`,
+  `get_vk_proposal`, `get_dao_vk_proposal`, `VkProposal`/`VkProposalStatus`
+  types, and associated events.
+- `contracts/voting/src/lib.rs`: `get_pending_vk_proposal`,
+  `is_vk_proposal_ready`, `DaoVkProposal` storage key, `VkProposalStatus`
+  enum.
+- `backend/src/routes/circuits.ts`: REST endpoints for proposal lifecycle.
+- `frontend/src/components/CircuitUpgradePanel.tsx`: UI for pending proposals.

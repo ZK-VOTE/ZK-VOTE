@@ -21,7 +21,11 @@ import {
   type WeightedVoteProofInput,
   type BridgeProofInput,
 } from "./zkproof";
-import { getZKCredentials, generateDeterministicZKCredentials, storeZKCredentials } from "./zk";
+import {
+  getZKCredentials,
+  generateDeterministicZKCredentials,
+  storeZKCredentials,
+} from "./zk";
 import {
   getOfflineQueue,
   enqueueOfflineAction,
@@ -48,7 +52,11 @@ export {
   processOfflineQueue,
 };
 
-export { checkContractDrift, assertNoDrift, type DriftReport } from "./driftGuard";
+export {
+  checkContractDrift,
+  assertNoDrift,
+  type DriftReport,
+} from "./driftGuard";
 
 // ============================================
 // Central Client
@@ -71,18 +79,48 @@ export class ZkVoteClient {
     };
     if (publicKey) {
       const opts = { ...baseOpts, publicKey };
-      this.daoRegistry = new DaoRegistryClient({ ...opts, contractId: CONTRACTS.REGISTRY_ID });
-      this.membershipSbt = new MembershipSbtClient({ ...opts, contractId: CONTRACTS.SBT_ID });
-      this.membershipTree = new MembershipTreeClient({ ...opts, contractId: CONTRACTS.TREE_ID });
-      this.voting = new VotingClient({ ...opts, contractId: CONTRACTS.VOTING_ID });
-      this.comments = new CommentsClient({ ...opts, contractId: CONTRACTS.COMMENTS_ID });
+      this.daoRegistry = new DaoRegistryClient({
+        ...opts,
+        contractId: CONTRACTS.REGISTRY_ID,
+      });
+      this.membershipSbt = new MembershipSbtClient({
+        ...opts,
+        contractId: CONTRACTS.SBT_ID,
+      });
+      this.membershipTree = new MembershipTreeClient({
+        ...opts,
+        contractId: CONTRACTS.TREE_ID,
+      });
+      this.voting = new VotingClient({
+        ...opts,
+        contractId: CONTRACTS.VOTING_ID,
+      });
+      this.comments = new CommentsClient({
+        ...opts,
+        contractId: CONTRACTS.COMMENTS_ID,
+      });
     } else {
       // Read-only mode (no publicKey)
-      this.daoRegistry = new DaoRegistryClient({ ...baseOpts, contractId: CONTRACTS.REGISTRY_ID }) as unknown as DaoRegistryClient;
-      this.membershipSbt = new MembershipSbtClient({ ...baseOpts, contractId: CONTRACTS.SBT_ID }) as unknown as MembershipSbtClient;
-      this.membershipTree = new MembershipTreeClient({ ...baseOpts, contractId: CONTRACTS.TREE_ID }) as unknown as MembershipTreeClient;
-      this.voting = new VotingClient({ ...baseOpts, contractId: CONTRACTS.VOTING_ID }) as unknown as VotingClient;
-      this.comments = new CommentsClient({ ...baseOpts, contractId: CONTRACTS.COMMENTS_ID }) as unknown as CommentsClient;
+      this.daoRegistry = new DaoRegistryClient({
+        ...baseOpts,
+        contractId: CONTRACTS.REGISTRY_ID,
+      }) as unknown as DaoRegistryClient;
+      this.membershipSbt = new MembershipSbtClient({
+        ...baseOpts,
+        contractId: CONTRACTS.SBT_ID,
+      }) as unknown as MembershipSbtClient;
+      this.membershipTree = new MembershipTreeClient({
+        ...baseOpts,
+        contractId: CONTRACTS.TREE_ID,
+      }) as unknown as MembershipTreeClient;
+      this.voting = new VotingClient({
+        ...baseOpts,
+        contractId: CONTRACTS.VOTING_ID,
+      }) as unknown as VotingClient;
+      this.comments = new CommentsClient({
+        ...baseOpts,
+        contractId: CONTRACTS.COMMENTS_ID,
+      }) as unknown as CommentsClient;
     }
   }
 
@@ -94,7 +132,10 @@ export class ZkVoteClient {
     daoId: number;
     proposalId: number;
     choice: boolean;
-    kit: { signMessage: (msg: string) => Promise<{ signedMessage: string }>; signTransaction: (tx: string) => Promise<string> } | null;
+    kit: {
+      signMessage: (msg: string) => Promise<{ signedMessage: string }>;
+      signTransaction: (tx: string) => Promise<string>;
+    } | null;
     voteMode: "Fixed" | "Trailing";
     eligibleRoot: bigint;
     vkVersion?: number | null;
@@ -107,11 +148,18 @@ export class ZkVoteClient {
     // 2. VK version mismatch detection
     if (params.vkVersion != null) {
       try {
-        const cachedVK = await fetchVersionedVK("vote_v1", params.vkVersion).catch(() => null);
+        const cachedVK = await fetchVersionedVK(
+          "vote_v1",
+          params.vkVersion,
+        ).catch(() => null);
         const currentVer = cachedVK?.version ?? params.vkVersion;
         detectVKMismatch(params.vkVersion, currentVer);
       } catch (e) {
-        if ((e as Error).name === "VKMismatchError" || (e as Error).name === "StaleVKError") throw e;
+        if (
+          (e as Error).name === "VKMismatchError" ||
+          (e as Error).name === "StaleVKError"
+        )
+          throw e;
       }
     }
 
@@ -119,8 +167,12 @@ export class ZkVoteClient {
     let secret: string, salt: string, commitment: string, leafIndex: number;
     const cached = getZKCredentials(params.daoId, this.publicKey);
     if (!cached) {
-      if (!params.kit) throw new Error("No voting credentials — register first");
-      const creds = await generateDeterministicZKCredentials(params.kit as never, params.daoId);
+      if (!params.kit)
+        throw new Error("No voting credentials — register first");
+      const creds = await generateDeterministicZKCredentials(
+        params.kit as never,
+        params.daoId,
+      );
       const leafRes = await this.membershipTree.get_leaf_index({
         dao_id: BigInt(params.daoId),
         commitment: BigInt(creds.commitment),
@@ -142,7 +194,9 @@ export class ZkVoteClient {
     if (params.voteMode === "Fixed") {
       root = params.eligibleRoot;
     } else {
-      const cur = await this.membershipTree.current_root({ dao_id: BigInt(params.daoId) });
+      const cur = await this.membershipTree.current_root({
+        dao_id: BigInt(params.daoId),
+      });
       root = (cur as unknown as { result: bigint }).result;
     }
 
@@ -151,21 +205,42 @@ export class ZkVoteClient {
       dao_id: BigInt(params.daoId),
       leaf_index: leafIndex,
     });
-    const raw = (merkleRes as unknown as { result: [bigint[], number[]] }).result;
+    const raw = (merkleRes as unknown as { result: [bigint[], number[]] })
+      .result;
     const pathElements = raw[0].map((e: bigint) => e.toString());
     const pathIndices = raw[1].map((i: number) => Number(i));
 
     // 6. Nullifier
-    const nullifier = await calculateNullifier(secret, params.daoId.toString(), params.proposalId.toString());
+    const nullifier = await calculateNullifier(
+      secret,
+      params.daoId.toString(),
+      params.proposalId.toString(),
+    );
 
     // 7. Generate proof
     const wasmPath = "/circuits/vote.wasm";
     const zkeyPath = "/circuits/vote_final.zkey";
     const proofInput: VoteProofInput = {
-      secret, salt, root: root.toString(), nullifier, daoId: params.daoId.toString(), proposalId: params.proposalId.toString(), voteChoice: params.choice ? "1" : "0", commitment, pathElements, pathIndices,
+      secret,
+      salt,
+      root: root.toString(),
+      nullifier,
+      daoId: params.daoId.toString(),
+      proposalId: params.proposalId.toString(),
+      voteChoice: params.choice ? "1" : "0",
+      commitment,
+      pathElements,
+      pathIndices,
     };
-    const { proof } = await generateVoteProof(proofInput, wasmPath, zkeyPath);
+    const { proof, redundantProof } = await generateVoteProof(
+      proofInput,
+      wasmPath,
+      zkeyPath,
+    );
     const { proof_a, proof_b, proof_c } = formatProofForSoroban(proof);
+    const formattedRedundantProof = redundantProof
+      ? formatProofForSoroban(redundantProof)
+      : null;
 
     const toHexBE = (v: string | bigint): string => {
       const bi = typeof v === "string" ? BigInt(v) : v;
@@ -179,12 +254,25 @@ export class ZkVoteClient {
       nullifier: toHexBE(nullifier),
       root: toHexBE(root),
       proof: { a: proof_a, b: proof_b, c: proof_c },
+      ...(formattedRedundantProof
+        ? {
+            redundantProof: {
+              a: formattedRedundantProof.proof_a,
+              b: formattedRedundantProof.proof_b,
+              c: formattedRedundantProof.proof_c,
+            },
+          }
+        : {}),
     };
 
     // 8. Submit with offline queue fallback
     const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
     if (!isOnline) {
-      enqueueOfflineAction({ type: "vote", payload: payload as unknown as Record<string, unknown>, daoId: params.daoId });
+      enqueueOfflineAction({
+        type: "vote",
+        payload: payload as unknown as Record<string, unknown>,
+        daoId: params.daoId,
+      });
       return { txHash: "queued_offline", queued: true };
     }
 
@@ -201,9 +289,18 @@ export class ZkVoteClient {
       const data = await res.json();
       return { txHash: data.txHash };
     } catch (e) {
-      const stillOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
-      if ((e as Error).message.includes("fetch") || (e as Error).message.includes("Network") || !stillOnline) {
-        enqueueOfflineAction({ type: "vote", payload: payload as unknown as Record<string, unknown>, daoId: params.daoId });
+      const stillOnline =
+        typeof navigator !== "undefined" ? navigator.onLine : true;
+      if (
+        (e as Error).message.includes("fetch") ||
+        (e as Error).message.includes("Network") ||
+        !stillOnline
+      ) {
+        enqueueOfflineAction({
+          type: "vote",
+          payload: payload as unknown as Record<string, unknown>,
+          daoId: params.daoId,
+        });
         return { txHash: "queued_offline", queued: true };
       }
       throw e;
@@ -224,7 +321,9 @@ export class ZkVoteClient {
     return this.orchestrateVote(params as never);
   }
 
-  async orchestrateBridgeVote(input: BridgeProofInput): Promise<GeneratedProof> {
+  async orchestrateBridgeVote(
+    input: BridgeProofInput,
+  ): Promise<GeneratedProof> {
     return generateBridgeProof(input);
   }
 }

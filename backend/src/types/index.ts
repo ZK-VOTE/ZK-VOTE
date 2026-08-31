@@ -12,8 +12,41 @@ declare global {
   namespace Express {
     interface Request {
       ctx?: string; // Request context ID for logging
+      authToken?: unknown;
+      authClientId?: string;
+      authTokenId?: string;
     }
   }
+}
+
+export interface RelaySessionCapability {
+  daoId?: number;
+  actions?: string[];
+  nonce?: string;
+  issuedAt?: number;
+  expiresAt?: number;
+  scope?: string;
+}
+
+export interface RelaySession {
+  id: string;
+  clientId: string;
+  daoId?: number;
+  nonce: string;
+  issuedAt: number;
+  expiresAt: number;
+  capabilities: string[];
+  publicKey?: string;
+  signature: string;
+}
+
+export interface RelayMetadataEnvelope {
+  keyId: string;
+  daoId?: number;
+  kind: "verification-key" | "threshold" | "tally" | "relay-metadata";
+  ciphertext: string;
+  nonce: string;
+  createdAt: string;
 }
 
 // ============================================
@@ -98,6 +131,9 @@ export interface VoteRequest {
   proof: Groth16Proof;
   voterPublicKey?: string;
   voterSignature?: string;
+  sponsor?: "relayer" | "voter";
+  feePayer?: string;
+  feeBudgetStroops?: number;
 }
 
 // ============================================
@@ -248,10 +284,35 @@ export interface StructuredError {
   message: string;
   details?: unknown;
   requestId: string;
-  traceId?: string;
+  traceId: string;
   timestamp: string;
 }
 
 export interface ApiErrorResponse {
   error: StructuredError;
 }
+
+// ============================================
+// SCHEMA-INFERRED REQUEST TYPES
+// ============================================
+//
+// The canonical request types are derived from the shared Zod schemas in
+// validation/schemas.ts. They are re-exported here so `types` remains the
+// single import surface for request payloads across routes and tests.
+
+export type {
+  BridgeVoteRequest,
+  CreateTokenRequest,
+  TokenIdParams,
+  DidAttributeClaimRequest,
+  QvCalculateRequest,
+  QvTallyRequest,
+  NovaAggregateRequest,
+  ThresholdInitRequest,
+  ThresholdAuthorityRegisterRequest,
+  ThresholdFinalizeRequest,
+  ThresholdEncryptRequest,
+  ThresholdTallyComputeRequest,
+  ThresholdDecryptShareRequest,
+  ThresholdTallyDecryptRequest,
+} from "../validation/schemas.js";

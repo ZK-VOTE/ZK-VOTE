@@ -41,12 +41,32 @@ Environment Variables:
 - LOG_LEVEL: Minimum log level (default: info)
 - NODE_ENV: Environment (default: development)
 - SERVICE_NAME: Service name (default: relayer)
+- LOG_SAMPLE_RATE: Trace sampling rate in [0, 1] (default: 1). Requests are
+  sampled deterministically by trace ID, so an entire request (start, end,
+  and every nested log line) is either fully kept or fully dropped. Set to
+  e.g. 0.1 to keep 10% of high-volume traffic.
+
+## Correlation IDs
+
+Every HTTP request gets a correlation ID (`ctx`) and a W3C trace ID
+(`traceId`, propagated via the `traceparent` header). The request logging
+middleware runs the downstream chain inside an AsyncLocalStorage context, so
+**every** log call made by routes, services, or async work spawned from the
+request automatically carries the same `ctx` and `traceId` fields - no manual
+threading required.
+
+- Correlation context: `runWithContext({ ctx, traceId, path, method }, fn)`
+- Read active context: `getRequestContext()`
+- Sampling: `setLogSampleRate(rate)` / `getLogSampleRate()`
 
 ## Usage
 
 Basic Logging:
 import { logger } from "../services/logger.js";
 logger.info("user_vote_cast", { voter: stellarAddress, dao: daoId });
+
+Background jobs outside a request context log without correlation fields;
+pass `ctx`/`traceId` explicitly in meta when correlating to a prior request.
 
 Error Logging:
 try {

@@ -1,9 +1,19 @@
 /**
- * Structured Logger Service
- *
- * Provides structured JSON logging with sensitive field redaction.
+ * Structured Logger Service with PII Redaction
  */
-import type { LogLevel, LogMeta } from "../types/index.js";
+export type LogLevel = "debug" | "info" | "warn" | "error";
+export type LogMeta = Record<string, any>;
+export interface RedactionPolicy {
+    redactedFields: string[];
+    detailedLevels: LogLevel[];
+    showClientIp: "plain" | "hash" | "none";
+    showBodyKeysOnly: boolean;
+    stellarTruncateLength: number;
+}
+export declare function setRedactionPolicy(policy: Partial<RedactionPolicy>): void;
+export declare function getRedactionPolicy(): RedactionPolicy;
+export declare function truncateStellarAddress(address: string): string;
+export declare function redact(meta: LogMeta, level?: LogLevel): LogMeta;
 export interface Logger {
     log(level: LogLevel, event: string, meta?: LogMeta): void;
     debug(event: string, meta?: LogMeta): void;
@@ -11,21 +21,9 @@ export interface Logger {
     warn(event: string, meta?: LogMeta): void;
     error(event: string, meta?: LogMeta): void;
 }
-/**
- * Create a logger instance for a specific service
- */
 export declare function createLogger(service: string): Logger;
-/**
- * Generate a unique request ID
- */
 export declare function generateRequestId(): string;
-/**
- * Hash an IP address for privacy
- */
 export declare function hashIp(ip: string | undefined): string;
-/**
- * Simple log function compatible with existing code
- */
 export declare function log(level: LogLevel, event: string, meta?: LogMeta): void;
 export declare const logger: Logger;
 //# sourceMappingURL=logger.d.ts.map

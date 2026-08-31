@@ -52,6 +52,20 @@ usually caught automatically before it replaces the healthy instance — the
 above is for rolling back a release that *did* go live but is misbehaving
 in a way health checks don't catch (e.g. a business-logic regression).
 
+## Encrypted SQLite backups (Issue #359)
+
+When `BACKUP_ENCRYPTION_ENABLED=true`, the relayer's scheduled snapshots are
+AES-256-GCM encrypted before hitting disk / object storage
+(`docs/ENCRYPTED_BACKUPS.md`). Deploy notes:
+
+- Set `BACKUP_ENCRYPTION_KEY` via `fly secrets set` and rotate it with
+  `./scripts/rotate-backup-key.sh rotate`. The key ring
+  (`data/backup-keys/`) lives on the same `zkvote_data` volume as the DB, so
+  old snapshots stay decryptable across rotations; keep a copy of the ring
+  off-box too.
+- Migration `004_add_backup_key_metadata` (backup-key audit table) runs
+  automatically on boot like any other migration.
+
 ## Testing a deploy is actually zero-downtime
 
 Run a small load generator against `/health` (or any read endpoint) during

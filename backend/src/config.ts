@@ -63,6 +63,13 @@ const envSchema = z.object({
 
   RELAYER_AUTH_TOKEN: z.string().optional(),
   RELAYER_SECRET_KEY: z.string().optional(),
+  RELAYER_SIGNER_TYPE: z
+    .enum(["local", "aws_kms", "gcp_kms", "pkcs11"])
+    .default("local"),
+  RELAYER_PUBLIC_KEY: z.string().optional(),
+  KMS_KEY_ID: z.string().optional(),
+  KMS_REGION: z.string().optional(),
+  KMS_PROVIDER: z.string().optional(),
   AUTH_MASTER_KEY: z.string().optional(),
 
   TOKEN_ROTATION_ENABLED: z
@@ -100,6 +107,10 @@ const envSchema = z.object({
   VOTING_VK_VERSION: z.coerce.number().int().optional(),
 
   CORS_ORIGIN: z.string().optional(),
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+  OTEL_SERVICE_NAME: z.string().min(1).default("zkvote-relayer"),
+  OTEL_SDK_DISABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  OTEL_EXPORT_TIMEOUT_MS: z.coerce.number().int().positive().default(2000),
 
   LOG_CLIENT_IP: z.enum(["plain", "hash"]).optional(),
   LOG_REQUEST_BODY: z
@@ -110,6 +121,7 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+  LOG_SAMPLE_RATE: z.coerce.number().min(0).max(1).optional(),
   RELAYER_GENERIC_ERRORS: z
     .enum(["true", "false"])
     .default("false")
@@ -119,6 +131,19 @@ const envSchema = z.object({
     .default("true")
     .transform((v) => v !== "false"),
   HEALTHCHECK_PING: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+
+  // Logging Sampling
+  LOG_SAMPLING_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  LOG_SAMPLING_ERROR_RATE: z.coerce.number().min(0).max(1).default(1.0),
+  LOG_SAMPLING_SLOW_RATE: z.coerce.number().min(0).max(1).default(1.0),
+  LOG_SLOW_THRESHOLD_MS: z.coerce.number().int().positive().default(1000),
+  LOG_BODY_MAX_CHARS: z.coerce.number().int().positive().default(2000),
+
+  // Hot-Reload
+  HOT_RELOAD_ENABLED: z
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
@@ -158,6 +183,19 @@ const envSchema = z.object({
   COMMITMENT_RATE_LIMIT: z.coerce.number().int().positive().default(5),
   COMMITMENT_RATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
 
+  // #371: per-member commitment registration rate limit (relayer route).
+  // Mirrors the on-chain per-member cooldown in the membership-tree contract.
+  COMMITMENT_REGISTRATION_RATE_LIMIT: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(5),
+  COMMITMENT_REGISTRATION_RATE_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60000),
+
   FLAG_THRESHOLD: z.coerce.number().int().positive().default(3),
   FLAG_POW_DIFFICULTY: z.coerce.number().int().positive().default(10),
 
@@ -195,6 +233,19 @@ const envSchema = z.object({
   BACKUP_INTERVAL_MS: z.coerce.number().int().positive().default(86400000),
   BACKUP_S3_BUCKET: z.string().optional(),
   S3_BUCKET: z.string().optional(),
+  // Encrypted relay DB snapshots (#359)
+  BACKUP_ENCRYPTION_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  BACKUP_ENCRYPTION_AUTO_INIT: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  BACKUP_ENCRYPTION_KEY: z.string().optional(),
+  BACKUP_ENCRYPTION_KEY_FILE: z.string().optional(),
+  BACKUP_KEY_RING_DIR: z.string().optional(),
+  BACKUP_RETENTION_COUNT: z.coerce.number().int().positive().default(10),
   ARCHIVAL_AGE_DAYS: z.coerce.number().int().positive().default(90),
   ARCHIVAL_INTERVAL_MS: z.coerce.number().int().positive().default(86400000),
 
@@ -218,6 +269,12 @@ const envSchema = z.object({
     .positive()
     .default(60000),
   RELAYER_PUBLIC_KEY: z.string().default(""),
+  MAX_SPONSORED_FEE_STROOPS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(1_000_000)
+    .default(100000),
 
   CIRCUIT_BREAKER_RPC_FAILURE_THRESHOLD: z.coerce
     .number()
@@ -279,17 +336,59 @@ const envSchema = z.object({
   DB_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(50),
   DB_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(2000),
 
+  // Submit Queue (for bounded concurrency and backpressure)
+  SUBMIT_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
+  SUBMIT_QUEUE_ITEM_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(120000), // 2 minutes
+
+  // RPC Concurrency Limits
+  RPC_MAX_CONCURRENT_REQUESTS: z.coerce.number().int().positive().default(10),
+
+  // Cache TTLs (for memory bounding)
+  NULLIFIER_CACHE_TTL_MS: z.coerce.number().int().positive().default(600000), // 10 minutes
+  PROOF_CACHE_TTL_MS: z.coerce.number().int().positive().default(600000), // 10 minutes
+  MEMBERSHIP_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000), // 5 minutes
+  NULLIFIER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10000),
+  PROOF_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(5000),
+
   MAX_SEQUENCE_RETRY_ATTEMPTS: z.coerce.number().int().positive().default(1),
   VOTE_SUBMISSION_PENDING_TTL_MS: z.coerce
     .number()
     .int()
     .positive()
     .default(300000),
+  VOTE_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
 
   RELAYER_TEST_MODE: z
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  // Transaction confirmation queue (#172): confirmation polling is delegated
+  // to a single background worker that polls with exponential backoff + jitter.
+  CONFIRMATION_QUEUE_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  CONFIRMATION_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(2000),
+  CONFIRMATION_MAX_DELAY_MS: z.coerce.number().int().positive().default(30000),
+  CONFIRMATION_MAX_WAIT_MS: z.coerce.number().int().positive().default(60000),
+  CONFIRMATION_BACKOFF_FACTOR: z.coerce.number().min(1).default(2),
+  CONFIRMATION_JITTER_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  CONFIRMATION_RESULT_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
+
+  // WebSocket confirmation notifications (#172)
+  CONFIRMATION_WS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  CONFIRMATION_WS_PATH: z.string().default("/ws/confirmations"),
 });
 
 type EnvConfig = z.infer<typeof envSchema>;
@@ -352,6 +451,10 @@ export const config = {
 
   // Server
   port: validatedEnv.PORT,
+  otelExporterOtlpEndpoint: validatedEnv.OTEL_EXPORTER_OTLP_ENDPOINT,
+  otelServiceName: validatedEnv.OTEL_SERVICE_NAME,
+  otelSdkDisabled: validatedEnv.OTEL_SDK_DISABLED,
+  otelExportTimeoutMs: validatedEnv.OTEL_EXPORT_TIMEOUT_MS,
 
   // Clustering
   clusterEnabled: validatedEnv.CLUSTER_ENABLED,
@@ -381,6 +484,26 @@ export const config = {
   // Authentication (read from env as fallback; see getSecret() for dynamic retrieval)
   relayerAuthToken: validatedEnv.RELAYER_AUTH_TOKEN,
   relayerSecretKey: validatedEnv.RELAYER_SECRET_KEY,
+  relayerSignerType: validatedEnv.RELAYER_SIGNER_TYPE,
+  relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
+  kmsKeyId: validatedEnv.KMS_KEY_ID,
+  kmsRegion: validatedEnv.KMS_REGION,
+  kmsProvider: validatedEnv.KMS_PROVIDER,
+
+  // Decentralized relay network (MPC submitter + cover traffic)
+  decentralizedRelayEnabled: validatedEnv.DECENTRALIZED_RELAY_ENABLED,
+  mpcQuorumSize: validatedEnv.MPC_QUORUM_SIZE,
+  mpcRelayNodeUrls: validatedEnv.MPC_RELAY_NODE_URLS
+    ? validatedEnv.MPC_RELAY_NODE_URLS.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [],
+  coverTrafficEnabled: validatedEnv.COVER_TRAFFIC_ENABLED,
+  coverTrafficIntervalMs: validatedEnv.COVER_TRAFFIC_INTERVAL_MS,
+  coverTrafficBatchSize: validatedEnv.COVER_TRAFFIC_BATCH_SIZE,
+  missingVoteMonitorIntervalMs: validatedEnv.MISSING_VOTE_MONITOR_INTERVAL_MS,
+  missingVoteMonitorThreshold: validatedEnv.MISSING_VOTE_MONITOR_THRESHOLD,
+  anonymousSubmissionEnabled: validatedEnv.ANONYMOUS_SUBMISSION_ENABLED,
 
   // Master key for token management endpoints (REQUIRED - must be at least 32 chars)
   authMasterKey: validatedEnv.AUTH_MASTER_KEY,
@@ -402,22 +525,43 @@ export const config = {
   membershipSbtContractId: process.env.MEMBERSHIP_SBT_CONTRACT_ID,
   bridgeContractId: process.env.BRIDGE_CONTRACT_ID,
   circuitRegistryContractId: process.env.CIRCUIT_REGISTRY_CONTRACT_ID,
+  rewardsContractId: process.env.REWARDS_CONTRACT_ID,
 
   // VK Version
   staticVkVersion: validatedEnv.VOTING_VK_VERSION,
 
   // CORS
   corsOrigins: validatedEnv.CORS_ORIGIN
-    ? validatedEnv.CORS_ORIGIN.split(",").map((origin) => origin.trim())
-    : ("*" as const),
+    ? validatedEnv.CORS_ORIGIN.split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+    : (["*"] as string[]),
+  corsAllowedMethods: ["GET", "POST", "OPTIONS"] as string[],
+  corsAllowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-CSRF-Token",
+  ] as string[],
+  corsMaxAge: 3600,
 
   // Logging
   logClientIp: validatedEnv.LOG_CLIENT_IP,
   logRequestBody: validatedEnv.LOG_REQUEST_BODY,
   stripRequestBodies: validatedEnv.STRIP_REQUEST_BODIES,
+  logSampleRate: validatedEnv.LOG_SAMPLE_RATE,
   genericErrors: validatedEnv.RELAYER_GENERIC_ERRORS,
   healthExposeDetails: validatedEnv.HEALTH_EXPOSE_DETAILS,
   healthcheckPing: validatedEnv.HEALTHCHECK_PING,
+
+  // Logging Sampling
+  logSamplingRate: validatedEnv.LOG_SAMPLING_RATE,
+  logSamplingErrorRate: validatedEnv.LOG_SAMPLING_ERROR_RATE,
+  logSamplingSlowRate: validatedEnv.LOG_SAMPLING_SLOW_RATE,
+  logSlowThresholdMs: validatedEnv.LOG_SLOW_THRESHOLD_MS,
+  logBodyMaxChars: validatedEnv.LOG_BODY_MAX_CHARS,
+
+  // Hot-Reload
+  hotReloadEnabled: validatedEnv.HOT_RELOAD_ENABLED,
 
   // Event Indexer
   indexerEnabled: validatedEnv.INDEXER_ENABLED,
@@ -451,6 +595,12 @@ export const config = {
   commitmentRateLimit: validatedEnv.COMMITMENT_RATE_LIMIT,
   commitmentRateWindowMs: validatedEnv.COMMITMENT_RATE_WINDOW_MS,
 
+  // Anti-spam: per-member commitment registration rate limiting (#371)
+  commitmentRegistrationRateLimit:
+    validatedEnv.COMMITMENT_REGISTRATION_RATE_LIMIT,
+  commitmentRegistrationRateWindowMs:
+    validatedEnv.COMMITMENT_REGISTRATION_RATE_WINDOW_MS,
+
   // Anti-spam: community flagging
   flagThreshold: validatedEnv.FLAG_THRESHOLD,
   flagPowDifficulty: validatedEnv.FLAG_POW_DIFFICULTY,
@@ -472,6 +622,13 @@ export const config = {
   // Backup & Archival
   backupIntervalMs: validatedEnv.BACKUP_INTERVAL_MS,
   s3Bucket: validatedEnv.BACKUP_S3_BUCKET || validatedEnv.S3_BUCKET,
+  // Encrypted relay DB snapshots (#359)
+  backupEncryptionEnabled: validatedEnv.BACKUP_ENCRYPTION_ENABLED,
+  backupEncryptionAutoInit: validatedEnv.BACKUP_ENCRYPTION_AUTO_INIT,
+  backupEncryptionKey: validatedEnv.BACKUP_ENCRYPTION_KEY,
+  backupEncryptionKeyFile: validatedEnv.BACKUP_ENCRYPTION_KEY_FILE,
+  backupKeyRingDir: validatedEnv.BACKUP_KEY_RING_DIR,
+  backupRetentionCount: validatedEnv.BACKUP_RETENTION_COUNT,
   archivalAgeDays: validatedEnv.ARCHIVAL_AGE_DAYS,
   archivalIntervalMs: validatedEnv.ARCHIVAL_INTERVAL_MS,
 
@@ -486,6 +643,7 @@ export const config = {
   walletRateLimitMax: validatedEnv.WALLET_RATE_LIMIT_MAX,
   walletRateLimitWindowMs: validatedEnv.WALLET_RATE_LIMIT_WINDOW_MS,
   relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
+  maxSponsoredFeeStroops: validatedEnv.MAX_SPONSORED_FEE_STROOPS,
   // Circuit Breakers
   circuitBreakerRpcFailureThreshold:
     validatedEnv.CIRCUIT_BREAKER_RPC_FAILURE_THRESHOLD,
@@ -518,15 +676,70 @@ export const config = {
   dbRetryBaseDelayMs: validatedEnv.DB_RETRY_BASE_DELAY_MS,
   dbRetryMaxDelayMs: validatedEnv.DB_RETRY_MAX_DELAY_MS,
 
+  // Submit Queue
+  submitQueueMaxDepth: validatedEnv.SUBMIT_QUEUE_MAX_DEPTH,
+  submitQueueItemTimeoutMs: validatedEnv.SUBMIT_QUEUE_ITEM_TIMEOUT_MS,
+
+  // RPC Concurrency
+  rpcMaxConcurrentRequests: validatedEnv.RPC_MAX_CONCURRENT_REQUESTS,
+
+  // Cache TTLs
+  nullifierCacheTtlMs: validatedEnv.NULLIFIER_CACHE_TTL_MS,
+  proofCacheTtlMs: validatedEnv.PROOF_CACHE_TTL_MS,
+  membershipCacheTtlMs: validatedEnv.MEMBERSHIP_CACHE_TTL_MS,
+  nullifierCacheMaxEntries: validatedEnv.NULLIFIER_CACHE_MAX_ENTRIES,
+  proofCacheMaxEntries: validatedEnv.PROOF_CACHE_MAX_ENTRIES,
+
   // Sequence manager
   maxSequenceRetryAttempts: validatedEnv.MAX_SEQUENCE_RETRY_ATTEMPTS,
 
   // Vote submission idempotency
   voteSubmissionPendingTtlMs: validatedEnv.VOTE_SUBMISSION_PENDING_TTL_MS,
+  voteQueueMaxDepth: validatedEnv.VOTE_QUEUE_MAX_DEPTH,
 
   // Test mode
   testMode: validatedEnv.RELAYER_TEST_MODE,
+
+  // Transaction confirmation queue (#172)
+  confirmationQueueEnabled: validatedEnv.CONFIRMATION_QUEUE_ENABLED,
+  confirmationInitialDelayMs: validatedEnv.CONFIRMATION_INITIAL_DELAY_MS,
+  confirmationMaxDelayMs: validatedEnv.CONFIRMATION_MAX_DELAY_MS,
+  confirmationMaxWaitMs: validatedEnv.CONFIRMATION_MAX_WAIT_MS,
+  confirmationBackoffFactor: validatedEnv.CONFIRMATION_BACKOFF_FACTOR,
+  confirmationJitterEnabled: validatedEnv.CONFIRMATION_JITTER_ENABLED,
+  confirmationResultCacheTtlMs: validatedEnv.CONFIRMATION_RESULT_CACHE_TTL_MS,
+
+  // WebSocket confirmation notifications (#172)
+  confirmationWsEnabled: validatedEnv.CONFIRMATION_WS_ENABLED,
+  confirmationWsPath: validatedEnv.CONFIRMATION_WS_PATH,
 } as const;
+
+export const corsOptions = {
+  origin: (
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: boolean) => void,
+  ) => {
+    if (
+      !origin ||
+      config.corsOrigins.includes(origin) ||
+      config.corsOrigins.includes("*")
+    ) {
+      callback(null, true);
+      return;
+    }
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "cors_origin_rejected",
+        origin,
+      }),
+    );
+    callback(null, false);
+  },
+  methods: config.corsAllowedMethods,
+  allowedHeaders: config.corsAllowedHeaders,
+  maxAge: config.corsMaxAge,
+};
 
 // ============================================
 // SIZE LIMITS
@@ -562,21 +775,14 @@ export const ALLOWED_IMAGE_MIMES = [
 // BN254 CONSTANTS
 // ============================================
 
-// BN254 base field modulus (p) - the field the curve's coordinates live in.
-// Proof points are checked against this; circuit signals are not.
+// BN254 field modulus (p)
 export const BN254_MODULUS = BigInt(
-  "0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47",
+  "21888242871839275222246405745257275088548364400416034343698204186575808495617",
 );
 
-// BN254 scalar field modulus (r) - the group order, and the field every
-// circuit signal (nullifier, Merkle root, commitment) is an element of.
-//
-// This must stay byte-identical to `BN254_FR_MODULUS` in
-// contracts/zkvote-groth16/src/lib.rs, which is what the chain enforces:
-// a bound that is too small rejects legitimate votes, and one that is too
-// large lets a request through only to have the contract panic on it.
+// BN254 scalar field modulus (r)
 export const BN254_SCALAR_FIELD = BigInt(
-  "0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001",
+  "0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47",
 );
 
 // ============================================
@@ -592,12 +798,44 @@ export const BN254_SCALAR_FIELD = BigInt(
 export function validateEnv(): void {
   const errors: string[] = [];
 
+  const isProduction = config.NODE_ENV === "production";
+  if (isProduction) {
+    const corsOrigins = config.corsOrigins;
+    if (corsOrigins.length === 0 || corsOrigins.includes("*")) {
+      errors.push(
+        "CORS_ORIGIN must be set to explicit origins in production (no wildcards or regex)",
+      );
+    }
+    for (const origin of corsOrigins) {
+      if (origin === "*") continue;
+      if (origin.includes("*") || origin.includes("?") || /[\[\]{}()|]/.test(origin)) {
+        errors.push(
+          `CORS_ORIGIN contains wildcard or regex pattern: "${origin}"`,
+        );
+        continue;
+      }
+      try {
+        const parsed = new URL(origin);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          errors.push(`CORS_ORIGIN is not a valid origin: "${origin}"`);
+        }
+      } catch {
+        errors.push(`CORS_ORIGIN is not a valid origin: "${origin}"`);
+      }
+    }
+  }
+
   if (!config.votingContractId) errors.push("VOTING_CONTRACT_ID is required");
   if (!config.treeContractId) errors.push("TREE_CONTRACT_ID is required");
-  if (!config.commentsContractId)
+  // The comments contract is optional in test mode (many service tests boot
+  // without it); outside tests it gates the comment relay endpoints.
+  if (!config.commentsContractId && !config.testMode)
     errors.push("COMMENTS_CONTRACT_ID is required");
   if (!config.relayerSecretKey) errors.push("RELAYER_SECRET_KEY is required");
-  if (!config.authMasterKey) errors.push("AUTH_MASTER_KEY is required");
+  // AUTH_MASTER_KEY gates the token-management endpoints; it is optional in
+  // test mode so service tests can boot without a master key.
+  if (!config.authMasterKey && !config.testMode)
+    errors.push("AUTH_MASTER_KEY is required");
 
   if (config.votingContractId && !isValidContractId(config.votingContractId)) {
     errors.push(
@@ -611,24 +849,46 @@ export function validateEnv(): void {
     );
   }
 
+  // Report missing optional env vars so operators notice gaps. Critical keys
+  // abort startup; non-critical ones only warn in test mode.
+  const requiredKeys = [
+    "VOTING_CONTRACT_ID",
+    "TREE_CONTRACT_ID",
+    "COMMENTS_CONTRACT_ID",
+    "RELAYER_SECRET_KEY",
+    "RELAYER_AUTH_TOKEN",
+  ];
+  const missing = requiredKeys.filter((k) => !process.env[k]);
   const criticalKeys = ["VOTING_CONTRACT_ID", "TREE_CONTRACT_ID", "RELAYER_SECRET_KEY", "RELAYER_AUTH_TOKEN"];
-  const criticalMissing = missing.filter((k) => criticalKeys.includes(k));
-  const nonCriticalMissing = missing.filter((k) => !criticalKeys.includes(k));
+  const criticalMissing = missing.filter((k: string) => criticalKeys.includes(k));
+  const nonCriticalMissing = missing.filter((k: string) => !criticalKeys.includes(k));
 
   if (criticalMissing.length > 0) {
     console.error(
-      JSON.stringify({ level: "error", event: "missing_env", missing: criticalMissing }),
+      JSON.stringify({
+        level: "error",
+        event: "missing_env",
+        missing: criticalMissing,
+      }),
     );
   }
 
   if (nonCriticalMissing.length > 0) {
     if (config.testMode) {
       console.warn(
-        JSON.stringify({ level: "warn", event: "missing_optional_env_in_test_mode", missing: nonCriticalMissing }),
+        JSON.stringify({
+          level: "warn",
+          event: "missing_optional_env_in_test_mode",
+          missing: nonCriticalMissing,
+        }),
       );
     } else {
       console.error(
-        JSON.stringify({ level: "error", event: "missing_env", missing: nonCriticalMissing }),
+        JSON.stringify({
+          level: "error",
+          event: "missing_env",
+          missing: nonCriticalMissing,
+        }),
       );
       console.error("\nRun ./scripts/init-local.sh to generate backend/.env");
       process.exit(1);
@@ -684,16 +944,21 @@ export function validateEnv(): void {
     );
   }
 
-  if (config.commentsContractId && !isValidContractId(config.commentsContractId)) {
+  // In test mode, a missing OR placeholder comments contract is allowed
+  // (warned above, not fatal) so service tests can boot without one.
+  if (
+    config.commentsContractId &&
+    !isValidContractId(config.commentsContractId) &&
+    !config.testMode
+  ) {
     console.error(
       JSON.stringify({
         level: "error",
         event: "invalid_contract_id",
-        var: "REWARDS_CONTRACT_ID",
-        value: config.rewardsContractId,
+        var: "COMMENTS_CONTRACT_ID",
+        value: config.commentsContractId,
       }),
     );
     process.exit(1);
   }
-  // In test mode, missing comments contract is allowed (warned above, not fatal)
 }

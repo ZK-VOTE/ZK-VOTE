@@ -75,6 +75,74 @@ template MerkleTreeInclusionProof(levels) {
     root <== currentHash[levels];
 }
 
+// Post-Quantum SHA3-256 Merkle tree inclusion proof template
+//
+// Provides a dual-tree architecture alongside the classical Poseidon tree.
+// The SHA3-256 layer supplies quantum-resistant leaf privacy and nullifier
+// preimage resistance (THREAT_MODEL risk matrix). Leaf domain separation
+// mirrors the Poseidon tree: leafHash = SHA3-256(LEAF_DOMAIN, leaf), and
+// internal nodes hash left || right with SHA3-256.
+//
+// PRODUCTION NOTE: The Sha3Hasher component below is a structural placeholder.
+// Replace it with an optimized SHA3-256 circom implementation (e.g., Keccak-f
+// [1600] with multi-bit signal packing) before deployment. The interface is
+// stable and all callers (frontend, migration script, KAT) already use real
+// SHA3-256 off-chain.
+template Sha3MerkleTreeInclusionProof(levels) {
+    var LEAF_DOMAIN = 1;
+
+    signal input leaf;
+    signal input pathElements[levels];
+    signal input pathIndices[levels]; // 0 = left, 1 = right
+
+    signal output root;
+
+    component hashers[levels];
+    component selectors[levels];
+    component leafHasher = Sha3Hasher();
+
+    signal currentHash[levels + 1];
+
+    leafHasher.in[0] <== LEAF_DOMAIN;
+    leafHasher.in[1] <== leaf;
+    currentHash[0] <== leafHasher.out;
+
+    for (var i = 0; i < levels; i++) {
+        pathIndices[i] * (pathIndices[i] - 1) === 0;
+
+        selectors[i] = Selector();
+        selectors[i].in[0] <== currentHash[i];
+        selectors[i].in[1] <== pathElements[i];
+        selectors[i].s <== pathIndices[i];
+
+        hashers[i] = Sha3Hasher();
+        hashers[i].in[0] <== selectors[i].out[0];
+        hashers[i].in[1] <== selectors[i].out[1];
+        currentHash[i + 1] <== hashers[i].out;
+    }
+
+    root <== currentHash[levels];
+}
+
+// SHA3-256 hasher placeholder
+//
+// Production replacement: swap this template for a real SHA3-256 circom circuit.
+// Requirements:
+//   - input: 2 x BN254 field elements (left, right)
+//   - output: 1 x BN254 field element = SHA3-256(serialize(left) || serialize(right)) mod Fr
+//   - must match the frontend's crypto.subtle.digest("SHA3-256", ...) and
+//     the on-chain env.crypto().sha256() outputs when reduced to the field.
+template Sha3Hasher() {
+    signal input in[2];
+    signal output out;
+
+    // PLACEHOLDER: identity mapping. NOT CRYPTOGRAPHICALLY SECURE.
+    // This template exists so that dual-tree callers compile and the
+    // architecture is in place. Wire in a real SHA3-256 implementation
+    // before any production deployment.
+    out <== in[0] + in[1];
+}
+
 // Selector: swaps inputs based on selection bit
 // CONSTRAINT ANALYSIS:
 // - When s=0: out[0] = in[0], out[1] = in[1] (no swap)

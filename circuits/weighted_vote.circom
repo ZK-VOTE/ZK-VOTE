@@ -1,7 +1,9 @@
 pragma circom 2.0.0;
 
 include "node_modules/circomlib/circuits/poseidon.circom";
+include "node_modules/circomlib/circuits/comparators.circom";
 include "range_proof.circom";
+include "sybil_weight.circom";
 
 // Weighted Vote Balance Proof
 //
@@ -57,6 +59,13 @@ template WeightedVoteBalanceProof(BITS) {
     // 3. Weight binding: vote is weighted exactly by the committed balance
     voteWeight === balance;
 }
+
+
+// The Sybil-resistance weight curve (issue #301) lives in `sybil_weight.circom`
+// rather than inline here, because this file declares a `component main` and a
+// circuit that wants the curve (`sybil_weighted_vote.circom`) cannot include a
+// file that already has one. `SybilWeightCurve` and `AgeInDays` are therefore
+// importable from both.
 
 // 128-bit balance range, matching the issue's "128 bits -> 128 constraints"
 // binary decomposition sizing for token balances.

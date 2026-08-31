@@ -1,11 +1,35 @@
 #!/usr/bin/env node
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendConfigPath = path.resolve(__dirname, "../frontend/src/config/contracts.ts");
+const frontendRoot = path.resolve(__dirname, "../frontend");
+
+function walk(dir, exts, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (["node_modules", ".git", "dist", "build", ".cache"].includes(entry.name)) continue;
+      walk(path.join(dir, entry.name), exts, out);
+    } else if (exts.includes(path.extname(entry.name))) {
+      out.push(path.join(dir, entry.name));
+    }
+  }
+  return out;
+}
+
+function findLegacyRefs() {
+  const files = walk(frontendRoot, [".ts", ".tsx"]);
+  const hits = [];
+  for (const file of files) {
+    const content = fs.readFileSync(file, "utf-8");
+    if (content.includes("initializeContractClients")) {
+      hits.push(file);
+    }
+  }
+  return hits;
+}
 
 function parseContracts() {
   const content = fs.readFileSync(frontendConfigPath, "utf-8");
@@ -33,9 +57,9 @@ for (const [k, v] of Object.entries(contracts)) {
 }
 
 try {
-  const out = execSync('grep -r "initializeContractClients" frontend --include="*.ts" --include="*.tsx" || true', { encoding: "utf-8" });
-  if (out.trim()) {
-    console.error("❌ Legacy initializer still present:\n", out);
+  const legacyRefs = findLegacyRefs();
+  if (legacyRefs.length) {
+    console.error("❌ Legacy initializer still present:\n" + legacyRefs.join("\n"));
     mismatches.push("legacy_initializer");
   } else {
     console.log("✓ No legacy initializer found");
@@ -72,4 +96,22 @@ if (mismatches.length) {
 } else {
   console.log("\n✅ Drift guard PASSED — no drift");
   process.exit(0);
+}
+
+// Check NUM_PUBLIC_SIGNALS mismatch (IDL source-of-truth drift)
+try {
+  const votingLib = fs.readFileSync(path.resolve(__dirname, "../contracts/voting/src/lib.rs"), "utf-8");
+  const frontendTypes = fs.readFileSync(path.resolve(__dirname, "../frontend/src/types/index.ts"), "utf-8");
+  
+  const rustMatch = votingLib.match(/NUM_PUBLIC_SIGNALS:\s*u32\s*=\s*(\d+)/);
+  const tsMatch = frontendTypes.match(/NUM_PUBLIC_SIGNALS\s*=\s*(\d+)/);
+  
+  if (rustMatch && tsMatch) {
+    if (rustMatch[1] !== tsMatch[1]) {
+      console.error(`❌ Drift guard FAILED: NUM_PUBLIC_SIGNALS mismatch! Rust: ${rustMatch[1]}, TS: ${tsMatch[1]}`);
+      process.exit(1);
+    }
+  }
+} catch (e) {
+  console.error("Failed to check NUM_PUBLIC_SIGNALS drift", e);
 }

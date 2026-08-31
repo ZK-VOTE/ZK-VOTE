@@ -26,13 +26,21 @@ describe("Versioned VK cache", () => {
       json: () => Promise.resolve({ vk: mockVK, version: 1, hash: "hash1" }),
     } as unknown as Response);
 
-    const vk1 = await fetchVersionedVK("vote_v1", 1, fetchFn as unknown as typeof fetch);
+    const vk1 = await fetchVersionedVK(
+      "vote_v1",
+      1,
+      fetchFn as unknown as typeof fetch,
+    );
     expect(vk1.circuitId).toBe("vote_v1");
     expect(vk1.version).toBe(1);
     expect(fetchFn).toHaveBeenCalledTimes(1);
 
     // Second fetch should hit cache (no second network call)
-    const vk2 = await fetchVersionedVK("vote_v1", 1, fetchFn as unknown as typeof fetch);
+    const vk2 = await fetchVersionedVK(
+      "vote_v1",
+      1,
+      fetchFn as unknown as typeof fetch,
+    );
     expect(vk2.hash).toBe("hash1");
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
@@ -44,7 +52,9 @@ describe("Versioned VK cache", () => {
       text: () => Promise.resolve("stale"),
     } as unknown as Response);
 
-    await expect(fetchVersionedVK("vote_v1", 1, fetchFn as unknown as typeof fetch)).rejects.toThrow(StaleVKError);
+    await expect(
+      fetchVersionedVK("vote_v1", 1, fetchFn as unknown as typeof fetch),
+    ).rejects.toThrow(StaleVKError);
     expect(getCachedVK("vote_v1", 1)).toBeNull();
   });
 
@@ -73,7 +83,9 @@ describe("Versioned VK cache", () => {
     } as unknown as Response);
     await fetchVersionedVK("vote_v1", 1, fetchFn as unknown as typeof fetch);
     // Manually expire by manipulating fetchedAt
-    const entry = __vkCacheTestHelpers._memoryCache.get(__vkCacheTestHelpers._key("vote_v1", 1));
+    const entry = __vkCacheTestHelpers._memoryCache.get(
+      __vkCacheTestHelpers._key("vote_v1", 1),
+    );
     if (entry) entry.fetchedAt = Date.now() - VK_CACHE_TTL_MS - 1000;
     expect(getCachedVK("vote_v1", 1)).toBeNull();
   });

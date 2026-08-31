@@ -3,8 +3,7 @@ import assert from "node:assert/strict";
 
 process.env.RELAYER_TEST_MODE = "true";
 process.env.SOROBAN_RPC_URL = "http://localhost:8000/soroban/rpc";
-process.env.NETWORK_PASSPHRASE =
-  "Test SDF Future Network ; October 2022";
+process.env.NETWORK_PASSPHRASE = "Test SDF Future Network ; October 2022";
 
 const stellar = await import("../src/services/stellar.js");
 const { config } = await import("../src/config.js");
@@ -77,10 +76,7 @@ test("callWithTimeout rejects a stalled RPC call", async () => {
 
   try {
     await assert.rejects(
-      stellar.callWithTimeout(
-        () => new Promise(() => {}),
-        "stalled_call",
-      ),
+      stellar.callWithTimeout(() => new Promise(() => {}), "stalled_call"),
       /Timeout: stalled_call \(20ms\)/,
     );
   } finally {
@@ -176,35 +172,20 @@ test("u256 ScVal conversion round-trips padded hexadecimal values", () => {
   const scVal = stellar.u256ToScVal(input);
 
   assert.equal(scVal.switch().name, "scvU256");
-  assert.equal(
-    stellar.scValToU256Hex(scVal),
-    `0x${"1234".padStart(64, "0")}`,
-  );
+  assert.equal(stellar.scValToU256Hex(scVal), `0x${"1234".padStart(64, "0")}`);
 
   const zero = stellar.u256ToScVal("");
-  assert.equal(
-    stellar.scValToU256Hex(zero),
-    `0x${"0".repeat(64)}`,
-  );
+  assert.equal(stellar.scValToU256Hex(zero), `0x${"0".repeat(64)}`);
 });
 
 test("u256 ScVal conversion rejects malformed and out-of-range values", async () => {
   const StellarSdk = await import("@stellar/stellar-sdk");
 
-  assert.throws(
-    () => stellar.u256ToScVal("0xnot-hex"),
-    /non-hexadecimal/,
-  );
+  assert.throws(() => stellar.u256ToScVal("0xnot-hex"), /non-hexadecimal/);
 
-  assert.throws(
-    () => stellar.u256ToScVal("abc"),
-    /odd length/,
-  );
+  assert.throws(() => stellar.u256ToScVal("abc"), /odd length/);
 
-  assert.throws(
-    () => stellar.u256ToScVal("00".repeat(33)),
-    /too long/,
-  );
+  assert.throws(() => stellar.u256ToScVal("00".repeat(33)), /too long/);
 
   assert.throws(
     () => stellar.u256ToScVal("ff".repeat(32)),
@@ -212,34 +193,39 @@ test("u256 ScVal conversion rejects malformed and out-of-range values", async ()
   );
 
   assert.throws(
-    () =>
-      stellar.scValToU256Hex(
-        StellarSdk.xdr.ScVal.scvBool(true),
-      ),
+    () => stellar.scValToU256Hex(StellarSdk.xdr.ScVal.scvBool(true)),
     /Expected U256 ScVal/,
   );
 });
 
+test("validateSponsoredFeeRequest defaults to the relayer and caps abusive fee budgets", () => {
+  const defaulted = stellar.validateSponsoredFeeRequest({
+    voterPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" +"Q",
+    sponsor: "relayer",
+  });
+
+  assert.equal(defaulted.feePayer, config.relayerPublicKey || stellar.relayerKeypair.publicKey());
+  assert.equal(defaulted.feeBudgetStroops, 100000);
+
+  assert.throws(
+    () =>
+      stellar.validateSponsoredFeeRequest({
+        voterPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHFQ",
+        sponsor: "relayer",
+        feeBudgetStroops: 10_000_001,
+      }),
+    /fee budget/i,
+  );
+});
+
 test("hexToBytes pads values and rejects malformed inputs", () => {
-  assert.deepEqual(
-    stellar.hexToBytes("0x01", 4),
-    Buffer.from([0, 0, 0, 1]),
-  );
+  assert.deepEqual(stellar.hexToBytes("0x01", 4), Buffer.from([0, 0, 0, 1]));
 
-  assert.throws(
-    () => stellar.hexToBytes("xyz", 4),
-    /non-hexadecimal/,
-  );
+  assert.throws(() => stellar.hexToBytes("xyz", 4), /non-hexadecimal/);
 
-  assert.throws(
-    () => stellar.hexToBytes("abc", 4),
-    /odd length/,
-  );
+  assert.throws(() => stellar.hexToBytes("abc", 4), /odd length/);
 
-  assert.throws(
-    () => stellar.hexToBytes("0011223344", 4),
-    /too long/,
-  );
+  assert.throws(() => stellar.hexToBytes("0011223344", 4), /too long/);
 });
 
 test("proofToScVal converts valid Groth16 proof components", () => {
@@ -257,18 +243,26 @@ test("proofToScVal converts valid Groth16 proof components", () => {
 
   assert.equal(entries.length, 3);
   assert.deepEqual(
-    entries.map((entry) =>
-      Buffer.from(entry.val().bytes()).length
-    ),
+    entries.map((entry) => Buffer.from(entry.val().bytes()).length),
     [64, 128, 64],
   );
 });
 
-test("proofToScVal rejects incomplete and point-at-infinity proofs", () => {
-  assert.throws(
-    () => stellar.proofToScVal(null),
-    /must be an object/,
+test("canonicalProofFingerprint normalizes equivalent proof encoding", () => {
+  const proof = {
+    a: "01".padStart(128, "0"),
+    b: "02".padStart(256, "0"),
+    c: "03".padStart(128, "0"),
+  };
+
+  assert.equal(
+    stellar.canonicalProofFingerprint(proof),
+    stellar.canonicalProofFingerprint({ ...proof, a: `0x${proof.a}` }),
   );
+});
+
+test("proofToScVal rejects incomplete and point-at-infinity proofs", () => {
+  assert.throws(() => stellar.proofToScVal(null), /must be an object/);
 
   assert.throws(
     () =>

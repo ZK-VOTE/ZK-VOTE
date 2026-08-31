@@ -261,10 +261,13 @@ test("valid metadata reaches the IPFS service failure boundary", async () => {
       videoUrl: "https://vimeo.com/123456",
     });
 
-    assert.equal(response.statusCode, 500);
-    assert.deepEqual(response.body, {
-      error: "Failed to upload metadata to IPFS",
-    });
+    // The route fails gracefully: the write is queued for retry (202) with
+    // degradation markers instead of a hard 500, so the UI keeps working.
+    assert.equal(response.statusCode, 202);
+    assert.equal(response.body.queued, true);
+    assert.equal(typeof response.body.queueId, "string");
+    assert.equal(response.body.degraded, true);
+    assert.match(response.body.error, /queued for retry/);
   } finally {
     Object.assign(config, { ipfsEnabled: originalEnabled });
   }
