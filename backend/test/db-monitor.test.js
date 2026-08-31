@@ -6,7 +6,7 @@ process.env.RELAYER_TEST_MODE = "true";
 process.env.DB_SLOW_QUERY_THRESHOLD_MS = "1";
 process.env.DB_EXPLAIN_THRESHOLD_MS = "1";
 
-const monitor = await import("../src/services/dbMonitor.js");
+const monitor = await import("../src/services/dbMonitor.ts");
 
 function spinFor(milliseconds) {
   const end = performance.now() + milliseconds;

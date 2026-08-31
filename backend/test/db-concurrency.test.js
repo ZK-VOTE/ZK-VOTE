@@ -7,7 +7,7 @@ import path from "node:path";
 process.env.RELAYER_TEST_MODE = "true";
 
 const databaseService =
-  await import("../src/services/db.js");
+  await import("../src/services/db.ts");
 
 const tempDirectory = fs.mkdtempSync(
   path.join(os.tmpdir(), "zkvote-db-concurrency-"),
