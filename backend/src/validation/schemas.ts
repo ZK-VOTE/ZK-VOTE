@@ -385,6 +385,27 @@ export type MembershipRegisterRequest = z.infer<
 >;
 
 // ============================================
+// BLIND SIGNATURE REQUEST SCHEMA (#122)
+// ============================================
+
+export const blindSignRequestSchema = z.object({
+  daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+  blindedValue: z.string().refine(
+    (val) => {
+      const hex = val.startsWith("0x") ? val.slice(2) : val;
+      if (hex.length === 0 || hex.length > 512) return false;
+      return /^[0-9a-fA-F]+$/.test(hex);
+    },
+    { message: "blindedValue must be a valid hex string (max 512 chars)" },
+  ),
+  caller: z
+    .string()
+    .regex(/^G[A-Z2-7]{55}$/, "caller must be a valid Stellar address"),
+});
+
+export type BlindSignRequest = z.infer<typeof blindSignRequestSchema>;
+
+// ============================================
 // VOTE SCHEMA
 // ============================================
 
