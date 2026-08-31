@@ -378,6 +378,26 @@ export const claimLimiter = isTestMode
       keyGenerator: walletKeyGenerator,
     });
 
+/**
+ * Rate limiter for blind signature issuance (end-to-end RSA blind-signature
+ * credentials). Limit is intentionally strict to prevent signature farming:
+ * each voter should only need one blind signature per election/campaign.
+ * Keyed by wallet address so rate limit buckets are tied to a pseudonymous
+ * identity, never the raw IP.
+ */
+export const blindSignLimiter = isTestMode
+  ? noopMiddleware
+  : rateLimit({
+      windowMs: 60 * 1000, // 1 minute
+      max: 5,
+      message: {
+        error: "Too many blind signature requests, please try again later",
+      },
+      standardHeaders: true,
+      legacyHeaders: false,
+      keyGenerator: walletKeyGenerator,
+    });
+
 // ============================================
 // PER-MEMBER RATE LIMITING (#371)
 // ============================================
