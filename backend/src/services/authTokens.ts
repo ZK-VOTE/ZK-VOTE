@@ -474,6 +474,35 @@ export function logAuthAttempt(params: {
 }
 
 // ============================================
+// BLIND SIGNATURE CREDENTIAL ISSUANCE
+// ============================================
+
+export const CREDENTIAL_REQUEST_RATE_LIMIT = 3;
+export const CREDENTIAL_REQUEST_WINDOW_MS = 60 * 60 * 1000;
+export const CREDENTIAL_ISSUANCE_REQUEST_ACTION = "credential_issuance_requested";
+
+export function validateTokenForCredentialIssuance(rawToken: string): TokenValidationResult {
+  const result = validateToken(rawToken);
+  if (!result.valid || !result.token) return result;
+
+  const recent = getAuditEntries({
+    clientId: result.token.clientId,
+    action: CREDENTIAL_ISSUANCE_REQUEST_ACTION,
+    limit: CREDENTIAL_REQUEST_RATE_LIMIT + 1,
+  }).filter((e) => new Date(e.timestamp).getTime() >= Date.now() - CREDENTIAL_REQUEST_WINDOW_MS);
+
+  if (recent.length >= CREDENTIAL_REQUEST_RATE_LIMIT) {
+    return { valid: false, reason: "rate_limited", token: result.token };
+  }
+  return result;
+}
+
+/** Revokes a token after successful credential issuance to enforce one-credential-per-voter. */
+export function revokeTokenAfterCredentialIssuance(tokenId: string): boolean {
+  return revokeToken(tokenId, "credential-issuance");
+}
+
+// ============================================
 // MASTER KEY VALIDATION
 // ============================================
 
