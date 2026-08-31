@@ -96,6 +96,7 @@ import {
   initIndexerRoutes,
   bridgeRoutes,
   circuitRoutes,
+  thresholdRoutes,
 } from "./routes/index.js";
 import metricsRoutes from "./routes/metrics.js";
 
@@ -236,6 +237,7 @@ app.use(claimRoutes);
 app.use(indexerRoutes);
 app.use(bridgeRoutes);
 app.use(circuitRoutes);
+app.use(noStore, thresholdRoutes);
 // OpenAPI spec endpoints (public, no audit log pollution for the spec itself)
 app.get("/api-docs/openapi.json", (_req, res) => {
   res.json(buildOpenApiDocument());
@@ -544,6 +546,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           "/bridge/vote",
           "/bridge/nullifier/:daoId/:proposalId/:nullifier",
           "/bridge/relay",
+        ],
+        threshold: [
+          "/threshold/init",
+          "/threshold/authority/register",
+          "/threshold/dkg/finalize",
+          "/threshold/vote/encrypt",
+          "/threshold/tally/compute",
+          "/threshold/decrypt/share",
+          "/threshold/tally/decrypt",
+          "/threshold/state/:daoId/:proposalId",
+          "/threshold/status",
         ],
         ipfs: config.ipfsEnabled
           ? [

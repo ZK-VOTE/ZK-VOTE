@@ -59,6 +59,8 @@ class ProtocolState {
   private rounds: Map<string, DkgRound> = new Map();
   private encryptedVotes: Map<string, EncryptedVote[]> = new Map();
   private decryptionShares: Map<string, Map<number, string>> = new Map();
+  private tallyResults: Map<string, { tally: bigint; proof: string }> =
+    new Map();
 
   getRoundKey(daoId: number, proposalId: number): string {
     return `${daoId}:${proposalId}`;
@@ -136,6 +138,23 @@ class ProtocolState {
       authorityIndex: idx,
       shareHex: hex,
     }));
+  }
+
+  setTallyResult(
+    daoId: number,
+    proposalId: number,
+    tally: bigint,
+    proof: string,
+  ): void {
+    const key = this.getRoundKey(daoId, proposalId);
+    this.tallyResults.set(key, { tally, proof });
+  }
+
+  getTallyResult(
+    daoId: number,
+    proposalId: number,
+  ): { tally: bigint; proof: string } | undefined {
+    return this.tallyResults.get(this.getRoundKey(daoId, proposalId));
   }
 }
 
@@ -388,6 +407,7 @@ export async function computeFinalTally(
     tally: tally.toString(),
   });
 
+  state.setTallyResult(daoId, proposalId, tally, proof);
   emitEvent({ type: "tally_decrypted", tally: tally.toString() });
 
   return { tally, proof, combinedShare };
@@ -403,15 +423,17 @@ export function getProtocolState(
   encryptedVoteCount: number;
   decryptionShareCount: number;
   isTallyDecrypted: boolean;
+  decryptedTally: string | null;
 } {
   const round = state.getRound(daoId, proposalId);
   const shares = state.getDecryptionShares(daoId, proposalId);
-  const isDecrypted = round?.jointPublicKey ? true : false;
+  const tallyResult = state.getTallyResult(daoId, proposalId);
 
   return {
     dkgRound: round,
     encryptedVoteCount: state.getEncryptedVotes(daoId, proposalId).length,
     decryptionShareCount: shares.length,
-    isTallyDecrypted: isDecrypted,
+    isTallyDecrypted: !!tallyResult,
+    decryptedTally: tallyResult ? tallyResult.tally.toString() : null,
   };
 }

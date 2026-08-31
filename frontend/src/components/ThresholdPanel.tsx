@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { RELAYER_URL } from "../lib/api";
+import { relayerFetch, parseApiError } from "../lib/api";
 
 interface ThresholdPanelProps {
   daoId: number;
@@ -27,9 +27,31 @@ interface ProtocolState {
   encryptedVoteCount: number;
   decryptionShareCount: number;
   isTallyDecrypted: boolean;
+  decryptedTally: string | null;
+}
+
+interface EncryptedTally {
+  c1: { x: string; y: string };
+  c2: { x: string; y: string };
 }
 
 const BN254_VERIFIER_PREFIX = "did:stellar:";
+
+const STEP_ORDER = [
+  "idle",
+  "registration",
+  "commitment",
+  "completed",
+  "tally_computed",
+  "share_submitted",
+  "decrypted",
+] as const;
+
+type Step = (typeof STEP_ORDER)[number];
+
+function getStepIndex(step: Step): number {
+  return STEP_ORDER.indexOf(step);
+}
 
 export function ThresholdPanel({
   daoId,
@@ -50,11 +72,30 @@ export function ThresholdPanel({
     null,
   );
   const [loading, setLoading] = useState(false);
+  const [loadingAction, setLoadingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"setup" | "status" | "decrypt">(
     "setup",
   );
+  const [encryptedTally, setEncryptedTally] = useState<EncryptedTally | null>(
+    null,
+  );
+  const [decryptedTally, setDecryptedTally] = useState<string | null>(null);
+  const [decryptionProof, setDecryptionProof] = useState<string | null>(null);
+
+  const currentStep: Step = (() => {
+    if (protocolState?.isTallyDecrypted) return "decrypted";
+    if (encryptedTally) return "share_submitted";
+    if (dkgState.phase === "completed" && protocolState && protocolState.encryptedVoteCount > 0 && protocolState.decryptionShareCount > 0)
+      return "share_submitted";
+    if (dkgState.phase === "completed" && protocolState && protocolState.encryptedVoteCount > 0)
+      return "tally_computed";
+    if (dkgState.phase === "completed") return "completed";
+    if (dkgState.phase === "commitment") return "commitment";
+    if (dkgState.phase === "registration") return "registration";
+    return "idle";
+  })();
 
   const clearMessages = () => {
     setError(null);
@@ -71,19 +112,27 @@ export function ThresholdPanel({
     setError(null);
   };
 
-  // Initialize the threshold protocol
+  const withLoading = useCallback(
+    async (action: string, fn: () => Promise<void>) => {
+      clearMessages();
+      setLoading(true);
+      setLoadingAction(action);
+      try {
+        await fn();
+      } finally {
+        setLoading(false);
+        setLoadingAction(null);
+      }
+    },
+    [],
+  );
+
   const handleInitElection = useCallback(async () => {
     if (!publicKey) return;
-    clearMessages();
-    setLoading(true);
-
-    try {
-      const response = await fetch(`${RELAYER_URL}/threshold/init`, {
+    await withLoading("init", async () => {
+      const response = await relayerFetch("/threshold/init", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Relayer-Auth": import.meta.env.VITE_RELAYER_AUTH_TOKEN || "",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           daoId,
           proposalId,
@@ -92,85 +141,57 @@ export function ThresholdPanel({
           creator: publicKey,
         }),
       });
-
       const data = await response.json();
-      if (!data.success) throw new Error(data.error || "Initialization failed");
+      if (!data.success) throw new Error(parseApiError(data));
 
-      setDkgState((prev) => ({
-        ...prev,
-        phase: "registration",
-      }));
-
+      setDkgState((prev) => ({ ...prev, phase: "registration" }));
       showSuccess("Threshold decryption initialized successfully");
-    } catch (err) {
-      showError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }, [daoId, proposalId, dkgState.thresholdN, dkgState.thresholdT, publicKey]);
+    });
+  }, [
+    daoId,
+    proposalId,
+    dkgState.thresholdN,
+    dkgState.thresholdT,
+    publicKey,
+    withLoading,
+  ]);
 
-  // Register as an authority
   const handleRegisterAuthority = useCallback(async () => {
     if (!publicKey || !authorityName.trim()) return;
-    clearMessages();
-    setLoading(true);
-
     const verifierId = `${BN254_VERIFIER_PREFIX}${publicKey.slice(0, 16)}`;
-
-    try {
-      const response = await fetch(
-        `${RELAYER_URL}/threshold/authority/register`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Relayer-Auth": import.meta.env.VITE_RELAYER_AUTH_TOKEN || "",
-          },
-          body: JSON.stringify({
-            daoId,
-            proposalId,
-            authorityAddress: publicKey,
-            authorityName: authorityName.trim(),
-            verifierId,
-          }),
-        },
-      );
-
+    await withLoading("register", async () => {
+      const response = await relayerFetch("/threshold/authority/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          daoId,
+          proposalId,
+          authorityAddress: publicKey,
+          authorityName: authorityName.trim(),
+          verifierId,
+        }),
+      });
       const data = await response.json();
-      if (!data.success) throw new Error(data.error || "Registration failed");
+      if (!data.success) throw new Error(parseApiError(data));
 
       setAuthorities((prev) => [
         ...prev,
         { address: publicKey, name: authorityName.trim(), verifierId },
       ]);
-
       setAuthorityName("");
       showSuccess("Registered as tally authority");
-    } catch (err) {
-      showError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }, [daoId, proposalId, publicKey, authorityName]);
+    });
+  }, [daoId, proposalId, publicKey, authorityName, withLoading]);
 
-  // Finalize DKG
   const handleFinalizeDKG = useCallback(async () => {
-    clearMessages();
-    setLoading(true);
-
-    try {
-      const response = await fetch(`${RELAYER_URL}/threshold/dkg/finalize`, {
+    await withLoading("finalize", async () => {
+      const response = await relayerFetch("/threshold/dkg/finalize", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Relayer-Auth": import.meta.env.VITE_RELAYER_AUTH_TOKEN || "",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ daoId, proposalId }),
       });
-
       const data = await response.json();
-      if (!data.success)
-        throw new Error(data.error || "DKG finalization failed");
+      if (!data.success) throw new Error(parseApiError(data));
 
       setDkgState((prev) => ({
         ...prev,
@@ -178,31 +199,81 @@ export function ThresholdPanel({
         jointPublicKey: data.jointPublicKey,
         authorityCount: data.authoritiesCount,
       }));
-
       showSuccess("DKG completed. Joint public key established.");
-    } catch (err) {
-      showError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }, [daoId, proposalId]);
+    });
+  }, [daoId, proposalId, withLoading]);
 
-  // Refresh protocol state
+  const handleComputeTally = useCallback(async () => {
+    await withLoading("compute_tally", async () => {
+      const response = await relayerFetch("/threshold/tally/compute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ daoId, proposalId }),
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(parseApiError(data));
+
+      setEncryptedTally(data.encryptedTally);
+      showSuccess("Encrypted tally computed successfully");
+    });
+  }, [daoId, proposalId, withLoading]);
+
+  const handleSubmitDecryptionShare = useCallback(async () => {
+    if (!publicKey || !encryptedTally) return;
+    await withLoading("submit_share", async () => {
+      const response = await relayerFetch("/threshold/decrypt/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          daoId,
+          proposalId,
+          authorityAddress: publicKey,
+          privateKeyShare: "0x0",
+          encryptedTally,
+        }),
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(parseApiError(data));
+
+      showSuccess("Decryption share submitted successfully");
+    });
+  }, [daoId, proposalId, publicKey, encryptedTally, withLoading]);
+
+  const handleDecryptTally = useCallback(async () => {
+    if (!encryptedTally) return;
+    await withLoading("decrypt_tally", async () => {
+      const response = await relayerFetch("/threshold/tally/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ daoId, proposalId, encryptedTally }),
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(parseApiError(data));
+
+      setDecryptedTally(data.tally);
+      setDecryptionProof(data.proof);
+      showSuccess(`Tally decrypted: ${data.tally} votes`);
+    });
+  }, [daoId, proposalId, encryptedTally, withLoading]);
+
   const refreshState = useCallback(async () => {
     try {
-      const response = await fetch(
-        `${RELAYER_URL}/threshold/state/${daoId}/${proposalId}`,
+      const response = await relayerFetch(
+        `/threshold/state/${daoId}/${proposalId}`,
+        { method: "GET" },
       );
       const data = await response.json();
       if (data.success) {
         setProtocolState(data.state);
+        if (data.state.decryptedTally) {
+          setDecryptedTally(data.state.decryptedTally);
+        }
       }
     } catch {
       // Silent fail for polling
     }
   }, [daoId, proposalId]);
 
-  // Poll for state updates
   useEffect(() => {
     if (!isConnected) return;
     const interval = setInterval(refreshState, 5000);
@@ -216,6 +287,10 @@ export function ThresholdPanel({
       </div>
     );
   }
+
+  const votingOpen = protocolState ? protocolState.encryptedVoteCount > 0 : false;
+  const shareCount = protocolState?.decryptionShareCount ?? 0;
+  const tallyComputed = encryptedTally !== null || (protocolState?.encryptedVoteCount ?? 0) > 0;
 
   return (
     <div className="space-y-6">
@@ -241,6 +316,49 @@ export function ThresholdPanel({
         </span>
       </div>
 
+      {/* Progress Steps */}
+      {dkgState.phase !== "idle" && (
+        <div className="flex items-center gap-1 text-xs">
+          {[
+            { key: "registration", label: "Register" },
+            { key: "completed", label: "DKG" },
+            { key: "tally_computed", label: "Tally" },
+            { key: "share_submitted", label: "Shares" },
+            { key: "decrypted", label: "Decrypt" },
+          ].map(({ key, label }, i) => {
+            const stepIdx = getStepIndex(key as Step);
+            const currentIdx = getStepIndex(currentStep);
+            const isComplete = currentIdx > stepIdx;
+            const isCurrent = currentIdx === stepIdx;
+            return (
+              <div key={key} className="flex items-center">
+                {i > 0 && (
+                  <div
+                    className={`w-4 h-px ${isComplete ? "bg-green-500" : "bg-gray-300 dark:bg-gray-600"}`}
+                  />
+                )}
+                <div
+                  className={`flex items-center gap-1 px-2 py-1 rounded ${
+                    isComplete
+                      ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                      : isCurrent
+                        ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400 font-medium"
+                        : "text-muted-foreground"
+                  }`}
+                >
+                  {isComplete && (
+                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                    </svg>
+                  )}
+                  {label}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Tab Navigation */}
       <div className="flex gap-2 border-b border-border/40 pb-2">
         {(["setup", "status", "decrypt"] as const).map((tab) => (
@@ -264,20 +382,25 @@ export function ThresholdPanel({
 
       {/* Error/Success Messages */}
       {error && (
-        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 rounded-lg text-sm">
-          {error}
+        <div className="p-3 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 rounded-lg text-sm flex items-start gap-2">
+          <svg className="w-4 h-4 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+            <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+          </svg>
+          <span>{error}</span>
         </div>
       )}
       {success && (
-        <div className="p-3 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 rounded-lg text-sm">
-          {success}
+        <div className="p-3 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 rounded-lg text-sm flex items-start gap-2">
+          <svg className="w-4 h-4 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+          </svg>
+          <span>{success}</span>
         </div>
       )}
 
       {/* Setup Tab */}
       {activeTab === "setup" && (
         <div className="space-y-6">
-          {/* Initialize */}
           {dkgState.phase === "idle" && (
             <div className="p-4 border border-border/40 rounded-lg space-y-4">
               <h4 className="font-medium">Initialize Threshold Decryption</h4>
@@ -332,12 +455,13 @@ export function ThresholdPanel({
                 disabled={loading}
                 className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm"
               >
-                {loading ? "Initializing..." : "Initialize Election"}
+                {loading && loadingAction === "init"
+                  ? "Initializing..."
+                  : "Initialize Election"}
               </button>
             </div>
           )}
 
-          {/* Authority Registration */}
           {(dkgState.phase === "registration" ||
             dkgState.phase === "commitment") && (
             <div className="p-4 border border-border/40 rounded-lg space-y-4">
@@ -360,7 +484,9 @@ export function ThresholdPanel({
                 disabled={loading || !authorityName.trim()}
                 className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm"
               >
-                {loading ? "Registering..." : "Register"}
+                {loading && loadingAction === "register"
+                  ? "Registering..."
+                  : "Register"}
               </button>
 
               {authorities.length > 0 && (
@@ -390,13 +516,14 @@ export function ThresholdPanel({
                   disabled={loading}
                   className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 text-sm"
                 >
-                  {loading ? "Finalizing..." : "Finalize DKG"}
+                  {loading && loadingAction === "finalize"
+                    ? "Finalizing..."
+                    : "Finalize DKG"}
                 </button>
               )}
             </div>
           )}
 
-          {/* DKG Complete */}
           {dkgState.phase === "completed" && (
             <div className="p-4 border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/10 rounded-lg">
               <h4 className="font-medium text-green-700 dark:text-green-400">
@@ -471,27 +598,124 @@ export function ThresholdPanel({
             </p>
 
             {dkgState.phase === "completed" ? (
-              <div className="space-y-3">
-                <div className="p-3 bg-blue-50 dark:bg-blue-900/10 rounded text-sm">
-                  <p className="font-medium text-blue-700 dark:text-blue-400">
-                    Ready for Decryption
+              <div className="space-y-4">
+                {/* Step 1: Compute Tally */}
+                <div
+                  className={`p-3 rounded text-sm ${
+                    encryptedTally
+                      ? "bg-green-50 dark:bg-green-900/10 border border-green-200 dark:border-green-800"
+                      : "bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-800"
+                  }`}
+                >
+                  <p
+                    className={`font-medium ${encryptedTally ? "text-green-700 dark:text-green-400" : "text-blue-700 dark:text-blue-400"}`}
+                  >
+                    {encryptedTally
+                      ? "Encrypted Tally Computed"
+                      : "Step 1: Compute Encrypted Tally"}
                   </p>
                   <p className="text-muted-foreground mt-1">
-                    The DKG is complete. Once voting ends, the encrypted tally
-                    will be computed and authorities will be able to submit
-                    decryption shares.
+                    {encryptedTally
+                      ? "The encrypted tally is ready for decryption share submission."
+                      : "Compute the homomorphic encrypted tally from all encrypted votes."}
                   </p>
                 </div>
 
-                <button
-                  onClick={() =>
-                    showSuccess("Decryption share submitted (simulated)")
-                  }
-                  disabled={loading}
-                  className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm"
-                >
-                  Submit Decryption Share
-                </button>
+                {!encryptedTally && (
+                  <button
+                    onClick={handleComputeTally}
+                    disabled={loading}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm"
+                  >
+                    {loading && loadingAction === "compute_tally"
+                      ? "Computing..."
+                      : "Compute Encrypted Tally"}
+                  </button>
+                )}
+
+                {/* Step 2: Submit Decryption Share */}
+                {encryptedTally && !protocolState?.isTallyDecrypted && (
+                  <>
+                    <div className="p-3 bg-purple-50 dark:bg-purple-900/10 border border-purple-200 dark:border-purple-800 rounded text-sm">
+                      <p className="font-medium text-purple-700 dark:text-purple-400">
+                        Step 2: Submit Decryption Share
+                      </p>
+                      <p className="text-muted-foreground mt-1">
+                        Submit your authority's decryption share. At least{" "}
+                        {dkgState.thresholdT} shares are needed to decrypt.
+                      </p>
+                      <p className="text-muted-foreground mt-1">
+                        Shares submitted: {shareCount} / {dkgState.thresholdN}
+                      </p>
+                    </div>
+
+                    <button
+                      onClick={handleSubmitDecryptionShare}
+                      disabled={loading}
+                      className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 text-sm"
+                    >
+                      {loading && loadingAction === "submit_share"
+                        ? "Submitting..."
+                        : "Submit Decryption Share"}
+                    </button>
+                  </>
+                )}
+
+                {/* Step 3: Decrypt Tally */}
+                {encryptedTally &&
+                  !protocolState?.isTallyDecrypted &&
+                  shareCount >= dkgState.thresholdT && (
+                    <>
+                      <div className="p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800 rounded text-sm">
+                        <p className="font-medium text-amber-700 dark:text-amber-400">
+                          Step 3: Decrypt Final Tally
+                        </p>
+                        <p className="text-muted-foreground mt-1">
+                          Sufficient shares have been submitted. You can now
+                          combine shares and decrypt the tally.
+                        </p>
+                      </div>
+
+                      <button
+                        onClick={handleDecryptTally}
+                        disabled={loading}
+                        className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-50 text-sm"
+                      >
+                        {loading && loadingAction === "decrypt_tally"
+                          ? "Decrypting..."
+                          : "Decrypt Final Tally"}
+                      </button>
+                    </>
+                  )}
+
+                {/* Final Result */}
+                {protocolState?.isTallyDecrypted && decryptedTally && (
+                  <div className="p-4 bg-green-50 dark:bg-green-900/10 border border-green-200 dark:border-green-800 rounded-lg">
+                    <h5 className="font-medium text-green-700 dark:text-green-400">
+                      Tally Decrypted
+                    </h5>
+                    <div className="mt-2 text-3xl font-bold text-green-800 dark:text-green-300">
+                      {decryptedTally} votes
+                    </div>
+                    {decryptionProof && (
+                      <p className="text-xs font-mono mt-2 text-muted-foreground break-all">
+                        ZK Proof: {decryptionProof.slice(0, 48)}...
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Waiting for votes */}
+                {!encryptedTally &&
+                  protocolState &&
+                  protocolState.encryptedVoteCount === 0 && (
+                    <div className="p-3 bg-yellow-50 dark:bg-yellow-900/10 rounded text-sm">
+                      <p className="text-yellow-700 dark:text-yellow-400">
+                        Waiting for encrypted votes before tally can be
+                        computed.
+                      </p>
+                    </div>
+                  )}
               </div>
             ) : (
               <div className="p-3 bg-yellow-50 dark:bg-yellow-900/10 rounded text-sm">
