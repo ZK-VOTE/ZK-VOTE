@@ -26,7 +26,10 @@
     "checksums": "sha256sum build/vote.r1cs build/vote_js/vote.wasm build/verification_key.json build/verification_key_soroban.json > checksums.sha256",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "test:coverage": "jest --coverage",
+    "poseidon:audit": "node utils/poseidon_param_audit.js",
+    "poseidon:audit:all": "node utils/poseidon_param_audit.js --all",
+    "poseidon:golden": "node utils/gen_poseidon_golden.js"
   },
   "dependencies": {
     "circomlib": "^2.0.5",
