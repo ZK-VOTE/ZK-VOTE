@@ -88,8 +88,14 @@ import {
   initIndexerRoutes,
   bridgeRoutes,
   circuitRoutes,
+  authRoutes,
+  quadraticRoutes,
   metricsRoutes,
   remediationRoutes,
+  novaRoutes,
+  adminRoutes,
+  thresholdRoutes,
+  randomnessRoutes,
 } from "./routes/index.js";
 
 // ============================================
@@ -183,10 +189,49 @@ app.use(metricsMiddleware);
 app.use(degradationContext);
 
 // Security: CORS configuration
-const corsOrigins = config.corsOrigins === "*" ? "*" : config.corsOrigins;
+function parseCorsOrigins(value: string): string[] {
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins);
+const isProduction = process.env.NODE_ENV === "production";
+
+if (allowedCorsOrigins.length === 0) {
+  throw new Error("CORS_ORIGIN must specify at least one origin");
+}
+
+if (isProduction && allowedCorsOrigins.includes("*")) {
+  throw new Error(
+    "CORS_ORIGIN must not be '*' in production; configure exact origins",
+  );
+}
+
+for (const origin of allowedCorsOrigins) {
+  if (origin !== "*" && /[*?]/.test(origin)) {
+    throw new Error(
+      "CORS_ORIGIN origins must be exact URLs, not wildcard patterns",
+    );
+  }
+}
+
+const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
+
 const corsOptions: cors.CorsOptions = {
-  origin: corsOrigins,
-  methods: ["GET", "POST"],
+  origin: (origin, callback) => {
+    if (!origin || allowAllCors || allowedCorsOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    log("warn", "cors_origin_rejected", {
+      origin,
+      allowedOrigins: allowedCorsOrigins,
+    });
+    callback(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
     "Authorization",
@@ -201,7 +246,8 @@ const corsOptions: cors.CorsOptions = {
     "X-Service-Degraded",
     "X-Service-Status",
   ],
-  maxAge: 86400, // 24 hours
+  maxAge: 3600,
+  credentials: !allowAllCors,
 };
 app.use(cors(corsOptions));
 
@@ -257,7 +303,64 @@ app.use(claimRoutes);
 app.use(indexerRoutes);
 app.use(bridgeRoutes);
 app.use(circuitRoutes);
-app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(openApiSpec));
+app.use(authRoutes);
+app.use(quadraticRoutes);
+app.use("/api/v1/nova", novaRoutes);
+app.use(noStore, adminRoutes);
+app.use(noStore, thresholdRoutes);
+app.use(noStore, randomnessRoutes);
+
+// ============================================
+// API VERSIONING (#139)
+// ============================================
+// URL-based versioning: mount the same routers under /api/v1 in addition to
+// the existing unversioned paths, so existing clients keep working while new
+// clients can opt into the explicit, cache-friendly versioned path. A
+// response header also advertises which version served the request.
+//
+// Deliberately out of scope for this pass (see PR body): deprecation/Sunset
+// headers for the unversioned routes, a version-lifecycle policy doc, and
+// updating the frontend to call /api/v1.
+app.use((_req, res, next) => {
+  res.setHeader("API-Version", "v1");
+  next();
+});
+
+const v1Router = express.Router();
+v1Router.use(metricsRoutes);
+v1Router.use(healthRoutes);
+v1Router.use(remediationRoutes);
+v1Router.use(noStore, votingRoutes);
+v1Router.use(daoRoutes);
+v1Router.use(ipfsRoutes);
+v1Router.use(commentsRoutes);
+v1Router.use(indexerRoutes);
+v1Router.use(bridgeRoutes);
+v1Router.use(circuitRoutes);
+v1Router.use(quadraticRoutes);
+v1Router.use(noStore, adminRoutes);
+v1Router.use(noStore, thresholdRoutes);
+v1Router.use(noStore, randomnessRoutes);
+app.use("/api/v1", v1Router);
+
+// OpenAPI spec + interactive docs
+const openApiDocument = buildOpenApiDocument();
+app.get("/api-docs/openapi.json", (_req, res) => res.json(openApiDocument));
+app.use(
+  "/api-docs",
+  // helmet's default CSP blocks the inline scripts/styles Swagger UI's
+  // bundled assets need; relax it for this documentation-only route.
+  (
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) => {
+    res.removeHeader("Content-Security-Policy");
+    next();
+  },
+  swaggerUi.serve,
+  swaggerUi.setup(openApiDocument),
+);
 
 // Global error handler (must be last)
 app.use(errorHandler);

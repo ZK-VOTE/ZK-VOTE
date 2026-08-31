@@ -35,6 +35,52 @@ if (process.env.NODE_ENV === "production" && isTestMode) {
   process.exit(1);
 }
 
+// CORS hardening: exact-match allowlist; no wildcards in production.
+const corsOriginList = String(config.corsOrigins || "*")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (process.env.NODE_ENV === "production" && corsOriginList.includes("*")) {
+  console.error("[fatal] CORS_ORIGIN='*' is forbidden when NODE_ENV=production");
+  process.exit(1);
+}
+
+/**
+ * Strict CORS options for the `cors` middleware.
+ * Validates against an exact list, restricts methods/headers, caches preflight.
+ */
+export const corsOptions = {
+  origin(
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: unknown) => void,
+  ): void {
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
+    if (corsOriginList.includes("*") && process.env.NODE_ENV !== "production") {
+      callback(null, true);
+      return;
+    }
+    if (corsOriginList.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    log("warn", "cors_origin_rejected", { origin });
+    callback(new Error(`Origin "${origin}" is not allowed by CORS`));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Wallet-Address",
+    "X-CSRF-Token",
+  ],
+  credentials: true,
+  maxAge: 3600,
+};
+
 /**
  * No-op middleware for test mode - skips rate limiting
  */

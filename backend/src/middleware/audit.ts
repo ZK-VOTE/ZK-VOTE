@@ -15,6 +15,63 @@ import crypto from "crypto";
 import { hashIp } from "../services/logger.js";
 
 // ============================================
+// CORS HARDENING
+// ============================================
+
+export const CORS_ALLOWED_METHODS: string[] = ["GET", "POST", "OPTIONS"];
+export const CORS_ALLOWED_HEADERS: string[] = [
+  "Content-Type",
+  "Authorization",
+  "x-relayer-auth",
+  "x-relayer-token",
+];
+export const CORS_MAX_AGE = 3600;
+
+export function parseCorsOrigins(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+}
+
+export function isCorsOriginAllowed(origin: string | undefined, allowedOrigins: string[]): boolean {
+  return typeof origin === "string" && allowedOrigins.includes(origin);
+}
+
+export function createCorsOptions(rawOrigins: string | undefined) {
+  const allowedOrigins = parseCorsOrigins(rawOrigins);
+
+  if (process.env.NODE_ENV === "production" && allowedOrigins.includes("*")) {
+    throw new Error("CORS origin '*' is not allowed in production");
+  }
+
+  for (const origin of allowedOrigins) {
+    if (origin.includes("*") || origin.includes("?")) {
+      throw new Error(`CORS origin must be an exact origin: ${origin}`);
+    }
+  }
+
+  return {
+    origin: (
+      origin: string | undefined,
+      callback: (error: Error | null, allow?: boolean) => void,
+    ) => {
+      if (!origin || isCorsOriginAllowed(origin, allowedOrigins)) {
+        callback(null, true);
+        return;
+      }
+      console.warn(JSON.stringify({ level: "warn", event: "cors_rejected", origin }));
+      callback(null, false);
+    },
+    methods: CORS_ALLOWED_METHODS,
+    allowedHeaders: CORS_ALLOWED_HEADERS,
+    credentials: true,
+    maxAge: CORS_MAX_AGE,
+  };
+}
+
+// ============================================
 // REDACTION - PII protection
 // ============================================
 

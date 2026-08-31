@@ -528,8 +528,17 @@ export const config = {
 
   // CORS
   corsOrigins: validatedEnv.CORS_ORIGIN
-    ? validatedEnv.CORS_ORIGIN.split(",").map((origin) => origin.trim())
-    : ("*" as const),
+    ? validatedEnv.CORS_ORIGIN.split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+    : (["*"] as string[]),
+  corsAllowedMethods: ["GET", "POST", "OPTIONS"] as string[],
+  corsAllowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-CSRF-Token",
+  ] as string[],
+  corsMaxAge: 3600,
 
   // Logging
   logClientIp: validatedEnv.LOG_CLIENT_IP,
@@ -688,6 +697,33 @@ export const config = {
   testMode: validatedEnv.RELAYER_TEST_MODE,
 } as const;
 
+export const corsOptions = {
+  origin: (
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: boolean) => void,
+  ) => {
+    if (
+      !origin ||
+      config.corsOrigins.includes(origin) ||
+      config.corsOrigins.includes("*")
+    ) {
+      callback(null, true);
+      return;
+    }
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "cors_origin_rejected",
+        origin,
+      }),
+    );
+    callback(null, false);
+  },
+  methods: config.corsAllowedMethods,
+  allowedHeaders: config.corsAllowedHeaders,
+  maxAge: config.corsMaxAge,
+};
+
 // ============================================
 // SIZE LIMITS
 // ============================================
@@ -746,16 +782,36 @@ export function validateEnv(): void {
   const errors: string[] = [];
   const missing: string[] = [];
 
-  if (!config.votingContractId) {
-    missing.push("VOTING_CONTRACT_ID");
-    errors.push("VOTING_CONTRACT_ID is required");
+  const isProduction = config.NODE_ENV === "production";
+  if (isProduction) {
+    const corsOrigins = config.corsOrigins;
+    if (corsOrigins.length === 0 || corsOrigins.includes("*")) {
+      errors.push(
+        "CORS_ORIGIN must be set to explicit origins in production (no wildcards or regex)",
+      );
+    }
+    for (const origin of corsOrigins) {
+      if (origin === "*") continue;
+      if (origin.includes("*") || origin.includes("?") || /[\[\]{}()|]/.test(origin)) {
+        errors.push(
+          `CORS_ORIGIN contains wildcard or regex pattern: "${origin}"`,
+        );
+        continue;
+      }
+      try {
+        const parsed = new URL(origin);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          errors.push(`CORS_ORIGIN is not a valid origin: "${origin}"`);
+        }
+      } catch {
+        errors.push(`CORS_ORIGIN is not a valid origin: "${origin}"`);
+      }
+    }
   }
-  if (!config.treeContractId) {
-    missing.push("TREE_CONTRACT_ID");
-    errors.push("TREE_CONTRACT_ID is required");
-  }
-  if (!config.commentsContractId) {
-    missing.push("COMMENTS_CONTRACT_ID");
+
+  if (!config.votingContractId) errors.push("VOTING_CONTRACT_ID is required");
+  if (!config.treeContractId) errors.push("TREE_CONTRACT_ID is required");
+  if (!config.commentsContractId)
     errors.push("COMMENTS_CONTRACT_ID is required");
   }
   if (!config.relayerSecretKey) {
