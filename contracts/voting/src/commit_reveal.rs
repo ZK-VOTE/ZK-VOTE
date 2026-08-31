@@ -44,6 +44,7 @@
 
 use soroban_sdk::{contractimpl, panic_with_error, Address, Bytes, BytesN, Env, U256};
 
+use crate::PathContext;
 use crate::{
     CommitRevealConfig, CommitRevealConfiguredEvent, DataKey, Proof, ProposalInfo, ProposalState,
     VerificationKey, VoteCommittedEvent, VoteRevealedEvent, Voting, VotingArgs, VotingClient,
@@ -251,8 +252,8 @@ impl Voting {
         Self::require_not_paused(&env);
         Self::set_reentrancy_lock(&env);
 
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
+        Self::assert_in_field(&env, PathContext::Anonymous, &root);
         if nullifier == U256::from_u32(&env, 0) {
             panic_with_error!(&env, VotingError::InvalidNullifier);
         }
@@ -392,7 +393,7 @@ impl Voting {
         Self::require_not_paused(&env);
         Self::set_reentrancy_lock(&env);
 
-        Self::assert_in_field(&env, &nullifier);
+        Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
 
         if blinding.len() < MIN_BLINDING_LEN {
             panic_with_error!(&env, VotingError::VoteCommitmentMismatch);

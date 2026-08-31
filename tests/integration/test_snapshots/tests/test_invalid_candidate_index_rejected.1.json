@@ -2123,6 +2123,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "merkle_depth"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "merkle_root_set_at"
                     },
                     "val": "void"
@@ -2613,6 +2621,14 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "stor_ver"
+                      },
+                      "val": {
+                        "u32": 1
                       }
                     },
                     {

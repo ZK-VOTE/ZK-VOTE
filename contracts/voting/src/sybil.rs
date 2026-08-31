@@ -40,6 +40,7 @@
 
 use soroban_sdk::{contractimpl, panic_with_error, Address, Env, U256};
 
+use crate::PathContext;
 use crate::{
     DataKey, ElectionConfig, Proof, ProposalInfo, ProposalState, SybilWeightCapSetEvent,
     VerificationKey, Voting, VotingArgs, VotingClient, VotingError, WeightedTally,
@@ -151,7 +152,7 @@ impl Voting {
         Self::require_not_paused(&env);
         admin.require_auth();
         Self::assert_admin(&env, dao_id, &admin);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, PathContext::Anonymous, &root);
 
         let key = DataKey::AttestationRoot(dao_id, proposal_id);
         env.storage().persistent().set(&key, &root);
@@ -210,9 +211,9 @@ impl Voting {
         Self::require_not_paused(&env);
         Self::set_reentrancy_lock(&env);
 
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
-        Self::assert_in_field(&env, &attestation_commitment);
+        Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
+        Self::assert_in_field(&env, PathContext::Anonymous, &root);
+        Self::assert_in_field(&env, PathContext::Anonymous, &attestation_commitment);
 
         if nullifier == U256::from_u32(&env, 0) {
             panic_with_error!(&env, VotingError::InvalidNullifier);
@@ -278,6 +279,8 @@ impl Voting {
                 twab_window: 0,
                 candidate_seed: None,
                 num_candidates: 0,
+                // 0 = the default circuit; this election declares no depth (#93).
+                merkle_depth: 0,
                 vdf_output: None,
                 vdf_delay: 0,
                 max_revotes: 0,

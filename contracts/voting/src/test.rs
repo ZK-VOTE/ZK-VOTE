@@ -4085,3 +4085,355 @@ fn test_registry_upgrade_hook_rejects_version_mismatch_before_wasm_update() {
 
     voting_client.apply_upgrade_from_registry(&wasm_hash, &1u32, &3u32, &1u32, &migration_payload);
 }
+
+// =========================================================================
+// Batched voting (#90) and Merkle depth flexibility (#93)
+//
+// Proof verification is stubbed under `cfg(test)` (see zkvote-groth16), so
+// these cover the contract-side rules around the verifier: batch shape,
+// nullifier bookkeeping, tallying, and which verification key an election
+// resolves to. The cryptography itself is covered against real proofs by
+// `zkvote-groth16/tests/batch_verification.rs`.
+// =========================================================================
+
+/// A DAO with one active Fixed-mode proposal, ready to receive votes.
+fn setup_batch_election() -> (Env, VotingClient<'static>, Address, u64, U256) {
+    let (env, voting_id, tree_id, sbt_id, registry_id, admin) = setup_env_with_registry();
+    let registry = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let sbt = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let voting = VotingClient::new(&env, &voting_id);
+
+    let root = U256::from_u32(&env, 12345);
+    registry.set_admin(&1u64, &admin);
+    sbt.set_member(&1u64, &admin, &true);
+    tree.set_root(&1u64, &root);
+    voting.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let proposal_id = voting.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Batched election"),
+        &String::from_str(&env, ""),
+        &(env.ledger().timestamp() + 3600),
+        &admin,
+        &VoteMode::Fixed,
+    );
+
+    (env, voting, admin, proposal_id, root)
+}
+
+fn batch_vote(env: &Env, choice: bool, nullifier: u32, root: &U256) -> BatchVote {
+    BatchVote {
+        vote_choice: choice,
+        nullifier: U256::from_u32(env, nullifier),
+        root: root.clone(),
+        proof: create_all_zero_proof(env),
+    }
+}
+
+#[test]
+fn test_cast_votes_records_every_vote_in_the_batch() {
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 101, &root),
+        batch_vote(&env, true, 102, &root),
+        batch_vote(&env, false, 103, &root),
+    ];
+
+    assert_eq!(voting.cast_votes(&1u64, &proposal_id, &votes), 3);
+
+    let (yes, no) = voting.get_results(&1u64, &proposal_id);
+    assert_eq!((yes, no), (2, 1));
+
+    for nullifier in [101u32, 102, 103] {
+        assert!(voting.is_nullifier_used(&1u64, &proposal_id, &U256::from_u32(&env, nullifier)));
+    }
+}
+
+#[test]
+fn test_cast_votes_tally_matches_individual_votes() {
+    // A batch must land the same tally as the same votes cast one at a time.
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+
+    voting.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 201),
+        &root,
+        &create_all_zero_proof(&env),
+    );
+    voting.vote(
+        &1u64,
+        &proposal_id,
+        &false,
+        &U256::from_u32(&env, 202),
+        &root,
+        &create_all_zero_proof(&env),
+    );
+    let (single_yes, single_no) = voting.get_results(&1u64, &proposal_id);
+
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 203, &root),
+        batch_vote(&env, false, 204, &root),
+    ];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+
+    let (yes, no) = voting.get_results(&1u64, &proposal_id);
+    assert_eq!((single_yes, single_no), (1, 1));
+    assert_eq!((yes, no), (2, 2));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #72)")]
+fn test_cast_votes_rejects_an_empty_batch() {
+    let (env, voting, _admin, proposal_id, _root) = setup_batch_election();
+    let empty: soroban_sdk::Vec<BatchVote> = soroban_sdk::Vec::new(&env);
+    voting.cast_votes(&1u64, &proposal_id, &empty);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #72)")]
+fn test_cast_votes_rejects_an_oversized_batch() {
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    let mut votes = soroban_sdk::Vec::new(&env);
+    for i in 0..(MAX_VOTE_BATCH + 1) {
+        votes.push_back(batch_vote(&env, true, 1000 + i, &root));
+    }
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #73)")]
+fn test_cast_votes_rejects_a_duplicate_nullifier_inside_the_batch() {
+    // The storage check only sees committed state, so a batch carrying the
+    // same nullifier twice would otherwise double-vote in one transaction.
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 301, &root),
+        batch_vote(&env, false, 301, &root),
+    ];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_cast_votes_rejects_an_already_used_nullifier() {
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    voting.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 401),
+        &root,
+        &create_all_zero_proof(&env),
+    );
+
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 402, &root),
+        batch_vote(&env, true, 401, &root),
+    ];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_cast_votes_rejects_a_zero_nullifier() {
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    let votes = soroban_sdk::vec![&env, batch_vote(&env, true, 0, &root)];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_cast_votes_rejects_a_wrong_root_in_fixed_mode() {
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    let wrong = U256::from_u32(&env, 999_999);
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 501, &root),
+        batch_vote(&env, true, 502, &wrong),
+    ];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+fn test_cast_votes_leaves_no_nullifier_burned_when_the_batch_fails() {
+    // An honest voter grouped with a bad one must be able to retry: a failed
+    // batch reverts, so their nullifier must still be unused afterwards.
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    let wrong = U256::from_u32(&env, 999_999);
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 601, &root),
+        batch_vote(&env, true, 602, &wrong),
+    ];
+
+    assert!(voting.try_cast_votes(&1u64, &proposal_id, &votes).is_err());
+    assert!(!voting.is_nullifier_used(&1u64, &proposal_id, &U256::from_u32(&env, 601)));
+
+    // ... and the honest vote still goes through on its own.
+    let retry = soroban_sdk::vec![&env, batch_vote(&env, true, 601, &root)];
+    assert_eq!(voting.cast_votes(&1u64, &proposal_id, &retry), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #68)")]
+fn test_cast_votes_enforces_the_candidate_bound() {
+    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    // One candidate means only index 0 is valid, so a "yes" (index 1) is out of range.
+    voting.set_election_config(&1u64, &proposal_id, &0i128, &0u64, &1u32);
+
+    let votes = soroban_sdk::vec![&env, batch_vote(&env, true, 701, &root)];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_cast_votes_rejects_a_closed_proposal() {
+    let (env, voting, admin, proposal_id, root) = setup_batch_election();
+    voting.close_proposal(&1u64, &proposal_id, &admin);
+
+    let votes = soroban_sdk::vec![&env, batch_vote(&env, true, 801, &root)];
+    voting.cast_votes(&1u64, &proposal_id, &votes);
+}
+
+#[test]
+fn test_merkle_depth_defaults_to_the_default_circuit() {
+    let (_env, voting, _admin, proposal_id, _root) = setup_batch_election();
+    assert_eq!(voting.get_merkle_depth(&1u64, &proposal_id), 0);
+}
+
+#[test]
+fn test_set_vk_for_depth_round_trips() {
+    let (env, voting, admin, _proposal_id, _root) = setup_batch_election();
+    assert!(voting.get_vk_for_depth(&1u64, &10u32).is_none());
+
+    let vk = create_dummy_vk(&env);
+    voting.set_vk_for_depth(&1u64, &10u32, &vk, &admin);
+    assert!(voting.get_vk_for_depth(&1u64, &10u32).is_some());
+    // Registering one depth must not register any other.
+    assert!(voting.get_vk_for_depth(&1u64, &15u32).is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #71)")]
+fn test_set_vk_for_depth_rejects_depth_zero() {
+    let (env, voting, admin, _proposal_id, _root) = setup_batch_election();
+    voting.set_vk_for_depth(&1u64, &0u32, &create_dummy_vk(&env), &admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #71)")]
+fn test_set_vk_for_depth_rejects_depth_above_the_maximum() {
+    let (env, voting, admin, _proposal_id, _root) = setup_batch_election();
+    voting.set_vk_for_depth(
+        &1u64,
+        &(MAX_MERKLE_DEPTH + 1),
+        &create_dummy_vk(&env),
+        &admin,
+    );
+}
+
+#[test]
+fn test_election_can_declare_a_merkle_depth() {
+    let (env, voting, admin, proposal_id, root) = setup_batch_election();
+    voting.set_vk_for_depth(&1u64, &10u32, &create_dummy_vk(&env), &admin);
+    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &10u32);
+
+    assert_eq!(voting.get_merkle_depth(&1u64, &proposal_id), 10);
+    let config = voting.get_election_config(&1u64, &proposal_id).unwrap();
+    assert_eq!(config.merkle_depth, 10);
+    assert_eq!(config.num_candidates, 2);
+
+    // Voting still works: the election just resolves the depth key instead of
+    // the version-pinned default one.
+    voting.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 901),
+        &root,
+        &create_all_zero_proof(&env),
+    );
+    assert_eq!(voting.get_results(&1u64, &proposal_id).0, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #71)")]
+fn test_election_cannot_declare_a_depth_without_a_registered_key() {
+    let (_env, voting, _admin, proposal_id, _root) = setup_batch_election();
+    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &15u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #71)")]
+fn test_election_rejects_a_depth_above_the_maximum() {
+    let (_env, voting, _admin, proposal_id, _root) = setup_batch_election();
+    voting.set_election_config_with_depth(
+        &1u64,
+        &proposal_id,
+        &0i128,
+        &0u64,
+        &2u32,
+        &(MAX_MERKLE_DEPTH + 1),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_replacing_a_depth_key_mid_election_is_rejected() {
+    // Same protection the version-pinned default key has: an in-flight vote
+    // must not silently start verifying against a different key.
+    let (env, voting, admin, proposal_id, root) = setup_batch_election();
+    voting.set_vk_for_depth(&1u64, &10u32, &create_dummy_vk(&env), &admin);
+    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &10u32);
+
+    let mut replacement = create_dummy_vk(&env);
+    replacement.alpha = BytesN::from_array(&env, &[0u8; 64]);
+    voting.set_vk_for_depth(&1u64, &10u32, &replacement, &admin);
+
+    voting.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 902),
+        &root,
+        &create_all_zero_proof(&env),
+    );
+}
+
+#[test]
+fn test_set_election_config_preserves_a_declared_depth() {
+    // The plain setter must not silently reset the depth an election declared.
+    let (env, voting, admin, proposal_id, _root) = setup_batch_election();
+    voting.set_vk_for_depth(&1u64, &20u32, &create_dummy_vk(&env), &admin);
+    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &20u32);
+
+    voting.set_election_config(&1u64, &proposal_id, &5i128, &10u64, &3u32);
+
+    let config = voting.get_election_config(&1u64, &proposal_id).unwrap();
+    assert_eq!(config.merkle_depth, 20);
+    assert_eq!(config.num_candidates, 3);
+    assert_eq!(config.min_balance, 5);
+}
+
+#[test]
+fn test_cast_votes_uses_the_depth_key_when_one_is_declared() {
+    let (env, voting, admin, proposal_id, root) = setup_batch_election();
+    voting.set_vk_for_depth(&1u64, &15u32, &create_dummy_vk(&env), &admin);
+    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &15u32);
+
+    let votes = soroban_sdk::vec![
+        &env,
+        batch_vote(&env, true, 1001, &root),
+        batch_vote(&env, false, 1002, &root),
+    ];
+    assert_eq!(voting.cast_votes(&1u64, &proposal_id, &votes), 2);
+    assert_eq!(voting.get_results(&1u64, &proposal_id), (1, 1));
+}

@@ -747,6 +747,8 @@ export const corsOptions = {
 
 export const LIMITS = {
   MAX_IMAGE_SIZE: 5 * 1024 * 1024, // 5MB
+  MAX_IMAGE_DIMENSION: 4096, // 4096×4096 pixels
+  MAX_UPLOAD_MEMORY_LIMIT: 8 * 1024 * 1024, // 8MB memory buffer
   MAX_METADATA_SIZE: 100 * 1024, // 100KB
   MAX_PROPOSAL_BODY: 100_000, // 100KB text
   MAX_COMMENT_BODY: 10_000, // 10KB text
@@ -763,13 +765,18 @@ export const ALLOWED_IMAGE_MIMES = [
   "image/png",
   "image/gif",
   "image/webp",
-  "image/svg+xml",
-  "image/heic",
-  "image/heif",
-  "image/avif",
-  "image/bmp",
-  "image/tiff",
 ] as const;
+
+// Upload hardening options for the /ipfs/image Multer pipeline.
+export const IMAGE_UPLOAD_SECURITY = {
+  ENFORCE_MAGIC_BYTES: true,
+  MAX_DIMENSION: LIMITS.MAX_IMAGE_DIMENSION,
+  MEMORY_LIMIT: LIMITS.MAX_UPLOAD_MEMORY_LIMIT,
+  STRIP_METADATA: true,
+  REJECT_POLYGLOTS: true,
+  MALWARE_SCAN_ENABLED: true,
+  AUDIT_LOG_ENABLED: true,
+} as const;
 
 // ============================================
 // BN254 CONSTANTS
@@ -797,7 +804,6 @@ export const BN254_SCALAR_FIELD = BigInt(
  */
 export function validateEnv(): void {
   const errors: string[] = [];
-  const missing: string[] = [];
 
   const isProduction = config.NODE_ENV === "production";
   if (isProduction) {
@@ -861,9 +867,6 @@ export function validateEnv(): void {
   ];
   const missing = requiredKeys.filter((k) => !process.env[k]);
   const criticalKeys = ["VOTING_CONTRACT_ID", "TREE_CONTRACT_ID", "RELAYER_SECRET_KEY", "RELAYER_AUTH_TOKEN"];
-  const missing: string[] = [
-    ...errors.map((e) => e.split(" ")[0]).filter((k) => typeof k === "string"),
-  ];
   const criticalMissing = missing.filter((k: string) => criticalKeys.includes(k));
   const nonCriticalMissing = missing.filter((k: string) => !criticalKeys.includes(k));
 

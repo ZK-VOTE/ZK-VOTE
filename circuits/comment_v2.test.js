@@ -118,7 +118,8 @@ beforeAll(async () => {
 
 describe("comment_v2.circom signal parity", () => {
   test("DOMAIN_TAG is the exact same constant across v1 vote/comment circuits", () => {
-    const files = ["vote.circom", "comment.circom"];
+    // See vote_v2.test.js: the tag lives in vote_template.circom since #93.
+    const files = ["vote_template.circom", "comment.circom"];
     for (const file of files) {
       const src = fs.readFileSync(path.join(__dirname, file), "utf8");
       const match = src.match(/var DOMAIN_TAG = (\d+);/);

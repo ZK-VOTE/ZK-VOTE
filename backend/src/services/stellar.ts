@@ -983,6 +983,40 @@ export function proofToScVal(proof: Groth16Proof): StellarSdk.xdr.ScVal {
 }
 
 /**
+ * Encodes one entry of the voting contract's `cast_votes` batch (#90).
+ *
+ * A `#[contracttype]` struct crosses the boundary as an `ScMap` whose keys are
+ * the field symbols in sorted order — the host rejects a map that is not
+ * sorted — so the entries below are ordered `nullifier`, `proof`, `root`,
+ * `vote_choice` to match `BatchVote`, not the order the fields are declared in.
+ */
+export function batchVoteToScVal(vote: {
+  choice: boolean;
+  nullifier: string;
+  root: string;
+  proof: Groth16Proof;
+}): StellarSdk.xdr.ScVal {
+  return StellarSdk.xdr.ScVal.scvMap([
+    new StellarSdk.xdr.ScMapEntry({
+      key: StellarSdk.xdr.ScVal.scvSymbol("nullifier"),
+      val: u256ToScVal(vote.nullifier),
+    }),
+    new StellarSdk.xdr.ScMapEntry({
+      key: StellarSdk.xdr.ScVal.scvSymbol("proof"),
+      val: proofToScVal(vote.proof),
+    }),
+    new StellarSdk.xdr.ScMapEntry({
+      key: StellarSdk.xdr.ScVal.scvSymbol("root"),
+      val: u256ToScVal(vote.root),
+    }),
+    new StellarSdk.xdr.ScMapEntry({
+      key: StellarSdk.xdr.ScVal.scvSymbol("vote_choice"),
+      val: StellarSdk.xdr.ScVal.scvBool(vote.choice),
+    }),
+  ]);
+}
+
+/**
  * Get relayer account from server
  */
 export async function getRelayerAccount(): Promise<StellarSdk.Account> {

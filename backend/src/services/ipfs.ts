@@ -8,6 +8,8 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { fileTypeFromBuffer } from "file-type";
+import sharp from "sharp";
 import { PinataSDK } from "pinata";
 import * as pinManager from "./ipfs-pin-manager.js";
 import { getMonitorStatus, type MonitorStatus } from "./ipfs-monitor.js";
@@ -102,6 +104,9 @@ const PUBLIC_GATEWAYS = [
 // Content size limits (DoS protection)
 export const MAX_JSON_SIZE = 1024 * 1024; // 1MB for JSON metadata
 export const MAX_RAW_SIZE = 10 * 1024 * 1024; // 10MB for raw content (images)
+export const MAX_IMAGE_UPLOAD_BYTES = MAX_RAW_SIZE; // 10MB Multer memory limit per upload
+export const MAX_IMAGE_DIMENSION = 4096;
+const MAX_IMAGE_PIXELS = MAX_IMAGE_DIMENSION * MAX_IMAGE_DIMENSION;
 
 // Metadata schema validation
 export const PROPOSAL_METADATA_SCHEMA: MetadataSchema = {
@@ -626,6 +631,115 @@ export async function pinJSON(
   };
 }
 
+// ============================================
+// UPLOAD SECURITY HARDENING
+// ============================================
+
+const ALLOWED_IMAGE_MIME_SET = new Set<string>(config.ALLOWED_IMAGE_MIMES);
+
+const MALWARE_SIGNATURES: Array<{ name: string; pattern: RegExp }> = [
+  { name: "eicar", pattern: /X5O!P%@AP\[4\\PZX54\(P\^\)7CC\)7\}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H\+H\*/i },
+  { name: "zip", pattern: /PK\x03\x04/ },
+  { name: "rar", pattern: /Rar!\x1A\x07/ },
+  { name: "sevenzip", pattern: /7z\xBC\xAF\x27\x1C/ },
+  { name: "pdf", pattern: /%PDF/ },
+  { name: "javascript", pattern: /<script[\s>]/i },
+  { name: "svg", pattern: /<svg[\s>]/i },
+  { name: "php", pattern: /<\?php/i },
+];
+
+function scanBufferForMalware(buffer: Buffer): void {
+  const haystack = buffer.toString("latin1");
+  for (const signature of MALWARE_SIGNATURES) {
+    if (signature.pattern.test(haystack)) {
+      log("warn", "upload_malware_blocked", {
+        signature: signature.name,
+        size: buffer.length,
+      });
+      throw new Error(
+        `Upload blocked by malware/polyglot signature: ${signature.name}`,
+      );
+    }
+  }
+}
+
+export async function validateAndSanitizeImage(
+  buffer: Buffer,
+  claimedMime: string,
+  uploader = "anonymous",
+): Promise<Buffer> {
+  if (buffer.length === 0) {
+    throw new Error("Uploaded file is empty");
+  }
+
+  if (buffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+    throw new Error(
+      `Uploaded image exceeds maximum size of ${MAX_IMAGE_UPLOAD_BYTES} bytes`,
+    );
+  }
+
+  const detected = await fileTypeFromBuffer(buffer);
+  const detectedMime = detected?.mime;
+  if (!detectedMime) {
+    throw new Error("Unable to detect file magic bytes");
+  }
+  if (detectedMime !== claimedMime) {
+    throw new Error(
+      `Image MIME mismatch: claimed ${claimedMime}, detected ${detectedMime}`,
+    );
+  }
+  if (!ALLOWED_IMAGE_MIME_SET.has(detectedMime)) {
+    throw new Error(`Image MIME type not allowed: ${detectedMime}`);
+  }
+  if (
+    detectedMime === "image/svg+xml" ||
+    /<svg[\s>]|<script[\s>]|<\?xml/i.test(
+      buffer.subarray(0, 2048).toString("latin1"),
+    )
+  ) {
+    throw new Error("SVG/XML and script-bearing image uploads are not allowed");
+  }
+
+  scanBufferForMalware(buffer);
+
+  const metadata = await sharp(buffer, {
+    animated: detectedMime === "image/gif",
+    limitInputPixels: MAX_IMAGE_PIXELS,
+    failOn: "error",
+  }).metadata();
+
+  if (
+    metadata.width === undefined ||
+    metadata.height === undefined ||
+    metadata.width <= 0 ||
+    metadata.height <= 0
+  ) {
+    throw new Error("Unable to determine image dimensions");
+  }
+  if (
+    metadata.width > MAX_IMAGE_DIMENSION ||
+    metadata.height > MAX_IMAGE_DIMENSION
+  ) {
+    throw new Error(
+      `Image dimensions ${metadata.width}x${metadata.height} exceed maximum ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}`,
+    );
+  }
+
+  const sanitizedBuffer = await sharp(buffer, {
+    animated: detectedMime === "image/gif",
+    limitInputPixels: MAX_IMAGE_PIXELS,
+    failOn: "error",
+  })
+    .rotate()
+    .toBuffer();
+
+  if (sanitizedBuffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+    throw new Error("Sanitized image exceeds upload size limit");
+  }
+
+  return sanitizedBuffer;
+}
+
 /**
  * Pin a file (image) to public IPFS (SDK v2.x)
  */
@@ -633,15 +747,27 @@ export async function pinFile(
   buffer: Buffer,
   filename: string,
   mimeType: string,
+  uploader = "anonymous",
 ): Promise<PinResult> {
   if (!pinata) {
     throw new Error("Pinata client not initialized");
   }
 
+  // Validate and sanitize the upload before it is backed up or pinned.
+  const safeBuffer = await validateAndSanitizeImage(buffer, mimeType, uploader);
+  const sha256 = crypto.createHash("sha256").update(safeBuffer).digest("hex");
+  log("info", "ipfs_upload_audit", {
+    filename,
+    size: safeBuffer.length,
+    mimeType,
+    uploader,
+    sha256,
+  });
+
   // 1. Backup to local disk before uploading (recovery safety net)
   let backupPath: string | undefined;
   try {
-    backupPath = pinManager.backupFile(buffer, filename);
+    backupPath = pinManager.backupFile(safeBuffer, filename);
   } catch (err) {
     log("warn", "local_backup_failed", {
       filename,
@@ -652,7 +778,7 @@ export async function pinFile(
   // 2. Upload to Pinata (primary)
   // Create a File object from the buffer
   // Cast buffer to BlobPart to satisfy strict TypeScript checks
-  const file = new File([buffer as unknown as BlobPart], filename, {
+  const file = new File([safeBuffer as unknown as BlobPart], filename, {
     type: mimeType,
   });
 
@@ -664,7 +790,7 @@ export async function pinFile(
     }),
   );
 
-  const sizeBytes = result.size || buffer.length;
+  const sizeBytes = result.size || safeBuffer.length;
 
   // 3. Register in pin tracker
   try {

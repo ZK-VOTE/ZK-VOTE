@@ -27,6 +27,7 @@ use soroban_sdk::{
     contractimpl, panic_with_error, symbol_short, Address, Env, IntoVal, String, Vec, U256,
 };
 
+use crate::PathContext;
 use crate::{
     CurveId, DataKey, Proof, ProposalInfo, ProposalState, QvBallot, QvTallyEvent, QvVoteEvent,
     VerificationKey, VoteMode, Voting, VotingArgs, VotingClient, VotingError, MAX_CID_LEN,
@@ -251,9 +252,9 @@ impl Voting {
         Self::bump_instance(&env);
 
         // Field-bounds validation on all field-element public signals.
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
-        Self::assert_in_field(&env, &allocations_hash);
+        Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
+        Self::assert_in_field(&env, PathContext::Anonymous, &root);
+        Self::assert_in_field(&env, PathContext::Anonymous, &allocations_hash);
 
         if nullifier == U256::from_u32(&env, 0) {
             panic_with_error!(&env, VotingError::InvalidNullifier);
