@@ -19,7 +19,9 @@ import {
   getZKCredentials,
   storeZKCredentials,
 } from "../lib/zk";
-import { CheckCircle, XCircle, Loader2, X } from "lucide-react";
+import { submissionQueue } from "../store/submissionQueue";
+import { processEntry } from "../lib/queueProcessor";
+import { CheckCircle, XCircle, AlertTriangle, Loader2, X, WifiOff } from "lucide-react";
 import { useReceipts } from "../hooks/useReceipts";
 import VoteModeExplainer from "./ui/VoteModeExplainer";
 
@@ -35,7 +37,7 @@ interface VoteModalProps {
   onComplete: () => void;
 }
 
-type VoteStep = "select" | "generating" | "submitting" | "success" | "error";
+type VoteStep = "select" | "generating" | "submitting" | "success" | "queued" | "error";
 
 export default function VoteModal({
   proposalId,
@@ -51,7 +53,7 @@ export default function VoteModal({
   const [step, setStep] = useState<VoteStep>("select");
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
-  const [panicMode, setPanicMode] = useState(false);
+  const [isOfflineQueued, setIsOfflineQueued] = useState(false);
   const { addReceipt } = useReceipts();
   const { setOptimisticVote, clearPendingVote } = useOptimisticVote();
 
@@ -223,7 +225,7 @@ export default function VoteModal({
         console.log("Proof input ready, generating proof...");
       }
 
-      const { proof, publicSignals } = await generateVoteProof(
+      const { proof, publicSignals, redundantProof } = await generateVoteProof(
         proofInput,
         wasm,
         zkey,
@@ -250,10 +252,13 @@ export default function VoteModal({
       // Step 5: Format proof for Soroban
       setProgress("Formatting proof...");
       const { proof_a, proof_b, proof_c } = formatProofForSoroban(proof);
+      const formattedRedundantProof = redundantProof
+        ? formatProofForSoroban(redundantProof)
+        : null;
 
-      // Step 6: Submit vote through anonymous relay
+      // Step 6: Build the vote payload
       setStep("submitting");
-      setProgress("Submitting anonymous vote through relay...");
+      setProgress("Preparing vote submission...");
 
       // Convert U256 to big-endian hex (U256 values use big-endian, unlike BN254 curve points which use little-endian)
       const toHexBE = (value: string | bigint): string => {
@@ -272,6 +277,15 @@ export default function VoteModal({
           b: proof_b,
           c: proof_c,
         },
+        ...(formattedRedundantProof
+          ? {
+              redundantProof: {
+                a: formattedRedundantProof.proof_a,
+                b: formattedRedundantProof.proof_b,
+                c: formattedRedundantProof.proof_c,
+              },
+            }
+          : {}),
         timestamp: Date.now(),
       };
 
@@ -287,7 +301,14 @@ export default function VoteModal({
           networkDetails?.networkPassphrase ||
           "Public Global Stellar Network ; September 2015";
 
-        const payloadToSign = JSON.stringify(votePayload);
+        const payloadToSign = JSON.stringify({
+          daoId: Number(daoId),
+          proposalId: Number(proposalId),
+          choice,
+          nullifier: toHexBE(nullifier),
+          root: toHexBE(root),
+          timestamp: Date.now(),
+        });
         voterSignature = await signVotePayload(
           payloadToSign,
           publicKey,
@@ -304,77 +325,99 @@ export default function VoteModal({
         // Continue without signature - backend will still accept it with relayer auth token
       }
 
-      const requestBody = JSON.stringify({
-        ...votePayload,
+      const votePayload = {
+        daoId: Number(daoId),
+        proposalId: Number(proposalId),
+        choice: choice,
+        nullifier: toHexBE(nullifier),
+        root: toHexBE(root),
+        proof: {
+          a: proof_a,
+          b: proof_b,
+          c: proof_c,
+        },
+        timestamp: Date.now(),
         voterPublicKey: publicKey,
         voterSignature,
-      });
+      };
 
-      // Optimistic update
+      // Step 7: Deduplication check — if this nullifier is already in the
+      // queue as submitted or conflict, surface that to the user.
+      const existingEntry = submissionQueue.getState().entries[votePayload.nullifier];
+      if (existingEntry) {
+        if (existingEntry.status === "submitted") {
+          // Already successfully submitted — idempotent success
+          setStep("success");
+          onComplete();
+          return;
+        }
+        if (existingEntry.status === "conflict") {
+          // Already recorded as a conflict
+          setStep("error");
+          setError(
+            existingEntry.conflictDetail ||
+              "You have already voted on this proposal.",
+          );
+          return;
+        }
+      }
+
+      // Optimistic update — show success UI before the network round-trip
       const revertOptimisticUpdate = setOptimisticVote(
         daoId,
         proposalId,
         choice,
       );
 
-      // Close the modal immediately to show optimistic UI state
+      // Step 8: Enqueue the vote (persists to localStorage for offline resilience)
+      setProgress("Queuing vote submission...");
+      const entry = submissionQueue.enqueue(votePayload);
+
+      // If we're offline, show the queued state and return
+      const isCurrentlyOffline = !navigator.onLine;
+      if (isCurrentlyOffline) {
+        setIsOfflineQueued(true);
+        setStep("queued");
+        onComplete();
+        return;
+      }
+
+      // Step 9: Attempt immediate submission via queue processor
+      setProgress("Submitting anonymous vote through relay...");
       setStep("success");
       onComplete();
 
-      // Submit to relay server asynchronously in background
-      relayerFetch("/vote", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: requestBody,
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            const errorData = await response.json();
-            const errorMsg = parseApiError(errorData);
-            const errorCode = getApiErrorCode(errorData);
+      // Submit in background via the queue processor
+      processEntry(entry)
+        .then(() => {
+          // Read final state from the queue
+          const finalEntry = submissionQueue.getState().entries[votePayload.nullifier];
+          if (!finalEntry) return;
 
-            // Detect double-vote error
-            if (
-              errorCode === ErrorCode.VOTE_ALREADY_CAST ||
-              errorMsg.includes("already voted") ||
-              errorMsg.includes("UnreachableCodeReached")
-            ) {
-              alert(
-                "You have already voted on this proposal. Each member can only vote once per proposal.",
-              );
-            } else {
-              alert(errorMsg);
+          if (finalEntry.status === "submitted") {
+            if (finalEntry.txHash) {
+              addReceipt({
+                txHash: finalEntry.txHash,
+                nullifier: votePayload.nullifier,
+                timestamp: Date.now(),
+                daoId: Number(daoId),
+                proposalId: Number(proposalId),
+              });
             }
+            clearPendingVote(daoId, proposalId);
+          } else if (finalEntry.status === "conflict") {
+            // Conflict: this nullifier was already used.
+            // The SubmissionQueueBanner will surface the conflict notification.
             revertOptimisticUpdate();
-            return;
+          } else if (finalEntry.status === "failed") {
+            // Permanent failure
+            revertOptimisticUpdate();
           }
-
-          const result = await response.json();
-          if (import.meta.env.DEV)
-            console.log("Vote submitted successfully:", result);
-
-          // Save receipt
-          if (result.txHash) {
-            addReceipt({
-              txHash: result.txHash,
-              nullifier: toHexBE(nullifier),
-              timestamp: Date.now(),
-              daoId: Number(daoId),
-              proposalId: Number(proposalId),
-            });
-          }
-
-          clearPendingVote(daoId, proposalId);
+          // For "pending" (retryable): leave optimistic update in place,
+          // the queue processor will retry automatically.
         })
-        .catch((err) => {
-          console.error("Vote submission background failure:", err);
-          alert(
-            "Background vote submission failed: " +
-              (err instanceof Error ? err.message : "Network error"),
-          );
-          revertOptimisticUpdate();
+        .catch(() => {
+          // processEntry never throws — errors are recorded in the queue entry
         });
     } catch (err) {
       setStep("error");
@@ -577,6 +620,40 @@ export default function VoteModal({
                   Your anonymous vote has been recorded on the blockchain.
                 </p>
               </div>
+              <Button onClick={onClose} className="w-full min-h-[48px] mt-4">
+                Done
+              </Button>
+            </div>
+          )}
+
+          {step === "queued" && (
+            <div
+              className="py-8 flex flex-col items-center text-center space-y-4"
+              aria-live="assertive"
+              aria-atomic="true"
+            >
+              <div className="h-16 w-16 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center mb-2">
+                <WifiOff
+                  className="h-8 w-8 text-blue-600 dark:text-blue-400"
+                  aria-hidden="true"
+                />
+              </div>
+              <div className="space-y-1">
+                <h3 className="font-bold text-xl">Vote Queued</h3>
+                <p className="text-sm text-muted-foreground">
+                  {isOfflineQueued
+                    ? "You appear to be offline. Your vote has been saved and will be submitted automatically when you reconnect."
+                    : "Your vote has been queued and will be submitted shortly."}
+                </p>
+              </div>
+              <Alert className="text-xs text-left">
+                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  Do not cast this vote again — it will be submitted
+                  automatically. A status notification will appear if any issue
+                  occurs.
+                </span>
+              </Alert>
               <Button onClick={onClose} className="w-full min-h-[48px] mt-4">
                 Done
               </Button>

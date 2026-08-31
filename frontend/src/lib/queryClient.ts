@@ -73,4 +73,11 @@ export const queryKeys = {
       ["claim", "status", daoId, proposalId, claimNullifier] as const,
     treasury: (daoId: number) => ["claim", "treasury", daoId] as const,
   },
+
+  // Privacy-preserving analytics (#306)
+  analytics: {
+    all: ["analytics"] as const,
+    state: (daoId: number) => ["analytics", "state", daoId] as const,
+    budget: (daoId: number) => ["analytics", "budget", daoId] as const,
+  },
 } as const;

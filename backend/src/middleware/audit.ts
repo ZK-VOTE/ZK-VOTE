@@ -15,6 +15,63 @@ import crypto from "crypto";
 import { hashIp } from "../services/logger.js";
 
 // ============================================
+// CORS HARDENING
+// ============================================
+
+export const CORS_ALLOWED_METHODS: string[] = ["GET", "POST", "OPTIONS"];
+export const CORS_ALLOWED_HEADERS: string[] = [
+  "Content-Type",
+  "Authorization",
+  "x-relayer-auth",
+  "x-relayer-token",
+];
+export const CORS_MAX_AGE = 3600;
+
+export function parseCorsOrigins(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+}
+
+export function isCorsOriginAllowed(origin: string | undefined, allowedOrigins: string[]): boolean {
+  return typeof origin === "string" && allowedOrigins.includes(origin);
+}
+
+export function createCorsOptions(rawOrigins: string | undefined) {
+  const allowedOrigins = parseCorsOrigins(rawOrigins);
+
+  if (process.env.NODE_ENV === "production" && allowedOrigins.includes("*")) {
+    throw new Error("CORS origin '*' is not allowed in production");
+  }
+
+  for (const origin of allowedOrigins) {
+    if (origin.includes("*") || origin.includes("?")) {
+      throw new Error(`CORS origin must be an exact origin: ${origin}`);
+    }
+  }
+
+  return {
+    origin: (
+      origin: string | undefined,
+      callback: (error: Error | null, allow?: boolean) => void,
+    ) => {
+      if (!origin || isCorsOriginAllowed(origin, allowedOrigins)) {
+        callback(null, true);
+        return;
+      }
+      console.warn(JSON.stringify({ level: "warn", event: "cors_rejected", origin }));
+      callback(null, false);
+    },
+    methods: CORS_ALLOWED_METHODS,
+    allowedHeaders: CORS_ALLOWED_HEADERS,
+    credentials: true,
+    maxAge: CORS_MAX_AGE,
+  };
+}
+
+// ============================================
 // REDACTION - PII protection
 // ============================================
 
@@ -92,7 +149,11 @@ export function redactPii(obj: unknown, seen = new WeakSet<object>()): unknown {
 
     if (ALWAYS_REDACT.has(lower) || lower === "proof") {
       // Proof object itself or sensitive field - redact entire value
-      if (key.toLowerCase() === "proof" && typeof value === "object" && value !== null) {
+      if (
+        key.toLowerCase() === "proof" &&
+        typeof value === "object" &&
+        value !== null
+      ) {
         output[key] = REDACTED;
       } else {
         // For primitives or nested sensitive fields
@@ -162,7 +223,8 @@ const idempotencyKeys = new Set<string>();
  * - Never store raw address or secret
  */
 export function deriveActor(req: Request): string {
-  const authHeader = (req.headers["x-relayer-auth"] || req.headers["authorization"]) as string | undefined;
+  const authHeader = (req.headers["x-relayer-auth"] ||
+    req.headers["authorization"]) as string | undefined;
   let token: string | undefined;
   if (authHeader) {
     token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
@@ -177,6 +239,7 @@ export function deriveActor(req: Request): string {
 function inferAction(path: string, method: string): string {
   if (!path) return `${method}:unknown`;
   // Normalize path for action naming
+  if (path.includes("/tally") || path.includes("verify_tally_proof")) return "tally_verify";
   if (path.includes("/vote") || path === "/vote") return "vote";
   if (path.includes("/comment")) return "comment";
   if (path.includes("/bridge")) return "bridge";
@@ -192,9 +255,14 @@ function inferAction(path: string, method: string): string {
 /**
  * Append-only insert. Returns entry. Never allows mutation.
  */
-export function appendAudit(entry: Omit<AuditEntry, "id" | "timestamp" | "immutable"> & Partial<Pick<AuditEntry, "id" | "timestamp">>): AuditEntry {
+export function appendAudit(
+  entry: Omit<AuditEntry, "id" | "timestamp" | "immutable"> &
+    Partial<Pick<AuditEntry, "id" | "timestamp">>,
+): AuditEntry {
   const full: AuditEntry = {
-    id: entry.id || `${Date.now()}-${++auditCounter}-${crypto.randomBytes(4).toString("hex")}`,
+    id:
+      entry.id ||
+      `${Date.now()}-${++auditCounter}-${crypto.randomBytes(4).toString("hex")}`,
     timestamp: entry.timestamp || new Date().toISOString(),
     requestId: entry.requestId || crypto.randomBytes(6).toString("hex"),
     method: entry.method,
@@ -202,7 +270,10 @@ export function appendAudit(entry: Omit<AuditEntry, "id" | "timestamp" | "immuta
     action: entry.action || inferAction(entry.path, entry.method),
     actor: entry.actor,
     actorIpHash: entry.actorIpHash,
-    requestBody: entry.requestBody !== undefined ? redactBody(entry.requestBody) : undefined,
+    requestBody:
+      entry.requestBody !== undefined
+        ? redactBody(entry.requestBody)
+        : undefined,
     query: entry.query ? (redactPii(entry.query) as unknown) : undefined,
     params: entry.params ? (redactPii(entry.params) as unknown) : undefined,
     statusCode: entry.statusCode,
@@ -242,7 +313,9 @@ export function queryAuditLogs(q: AuditQuery): { entries: AuditEntry[]; total: n
   let filtered = auditEntries;
 
   if (q.action) {
-    filtered = filtered.filter((e) => e.action === q.action || e.action.includes(q.action!));
+    filtered = filtered.filter(
+      (e) => e.action === q.action || e.action.includes(q.action!),
+    );
   }
   if (q.actor) {
     filtered = filtered.filter((e) => e.actor === q.actor);
@@ -281,7 +354,7 @@ export function exportAuditLogs(format: "json" | "csv" = "json"): string {
     const rows = auditEntries.map((e) =>
       [e.id, e.timestamp, e.requestId, e.method, e.path, e.action, e.actor, e.statusCode ?? "", e.durationMs ?? ""]
         .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-        .join(",")
+        .join(","),
     );
     return [header, ...rows].join("\n");
   }
@@ -317,13 +390,49 @@ export function clearIdempotencyKeys(): void {
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
+ * Build audit-logging middleware for a named action.
+ *
+ * Compatibility layer for the pre-rewrite `auditLog(action)` API used by
+ * route handlers that want a per-action audit entry on a specific route
+ * (e.g. `/daos/sync`) in addition to the global mutating-route audit.
+ */
+export function auditLog(action: string) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    res.on("finish", () => {
+      try {
+        appendAudit({
+          requestId: (req as any).ctx || crypto.randomBytes(6).toString("hex"),
+          method: req.method,
+          path: req.path,
+          action,
+          actor: deriveActor(req),
+          actorIpHash: hashIp(req.ip),
+          requestBody: req.body ? (redactBody(req.body) as unknown) : undefined,
+          query: req.query ? (redactPii({ ...req.query }) as unknown) : undefined,
+          params: req.params ? (redactPii({ ...req.params }) as unknown) : undefined,
+          statusCode: res.statusCode,
+          userAgent: (req.headers["user-agent"] as string) || undefined,
+        });
+      } catch {
+        // Never block the request on audit failure.
+      }
+    });
+    next();
+  };
+}
+
+/**
  * Audit middleware - should be mounted early but after body parsing.
  * Audits every mutating request (POST/PUT/PATCH/DELETE).
  * - Captures redacted body, actor, timing
  * - Appends immutable entry on response finish
  * - Never blocks request on audit failure
  */
-export function auditMiddleware(req: Request, res: Response, next: NextFunction): void {
+export function auditMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
   // Only audit mutating methods; but also allow explicit opt-in via header for testing
   const shouldAudit = MUTATING_METHODS.has(req.method);
   if (!shouldAudit) {
@@ -363,7 +472,9 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
     } catch (_e) {
       // Never fail request due to audit error; log warning if possible
       // eslint-disable-next-line no-console
-      console.warn(JSON.stringify({ level: "warn", event: "audit_append_failed" }));
+      console.warn(
+        JSON.stringify({ level: "warn", event: "audit_append_failed" }),
+      );
     }
   });
 
@@ -412,7 +523,7 @@ export function auditLog(action: string) {
 export function auditAction(
   req: Request,
   action: string,
-  extra?: { body?: unknown; statusCode?: number }
+  extra?: { body?: unknown; statusCode?: number },
 ): AuditEntry {
   const actor = deriveActor(req);
   return appendAudit({
@@ -422,10 +533,22 @@ export function auditAction(
     action,
     actor,
     actorIpHash: hashIp(req.ip),
-    requestBody: extra?.body !== undefined ? redactBody(extra.body) : req.body ? redactBody(req.body) : undefined,
+    requestBody:
+      extra?.body !== undefined
+        ? redactBody(extra.body)
+        : req.body
+          ? redactBody(req.body)
+          : undefined,
     query: req.query ? (redactPii({ ...req.query }) as unknown) : undefined,
     params: req.params ? (redactPii({ ...req.params }) as unknown) : undefined,
     statusCode: extra?.statusCode,
     userAgent: (req.headers["user-agent"] as string) || undefined,
   });
+}
+
+export function auditLog(action: string) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    auditAction(req, action);
+    next();
+  };
 }

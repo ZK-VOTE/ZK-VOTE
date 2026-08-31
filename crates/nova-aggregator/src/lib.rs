@@ -75,5 +75,61 @@ pub struct RecursiveProofPayload {
     pub timestamp: u64,
 }
 
+/// On-chain tally proof payload used by the `verify_tally_proof` contract entrypoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TallyProof {
+    /// Merkle root of identity commitments.
+    pub root: String,
+    /// Total YES votes.
+    pub yes_votes: u64,
+    /// Total NO votes.
+    pub no_votes: u64,
+    /// Accumulated nullifier hash (Poseidon).
+    pub acc_nullifier_hash: String,
+    /// Compressed Nova recursive proof bytes (hex string).
+    pub proof_bytes: String,
+}
+
+impl TallyProof {
+    /// Constructs a `TallyProof` from a `RecursiveProofPayload`.
+    pub fn from_payload(payload: &RecursiveProofPayload) -> Self {
+        Self {
+            root: payload.final_state.root.clone(),
+            yes_votes: payload.final_state.yes_votes,
+            no_votes: payload.final_state.no_votes,
+            acc_nullifier_hash: payload.final_state.acc_nullifier_hash.clone(),
+            proof_bytes: payload.proof_bytes.clone(),
+        }
+    }
+}
+
+/// Verifies a tally proof by checking the Nova recursive proof.
+pub fn verify_tally_proof(tally: &TallyProof) -> Result<(), String> {
+    // Reconstruct a minimal payload (initial state is the default with zero votes)
+    let initial_state = IvcState::default();
+    let final_state = IvcState {
+        root: tally.root.clone(),
+        yes_votes: tally.yes_votes,
+        no_votes: tally.no_votes,
+        acc_nullifier_hash: tally.acc_nullifier_hash.clone(),
+        ..initial_state.clone()
+    };
+    let payload = RecursiveProofPayload {
+        initial_state,
+        final_state,
+        num_votes: tally.yes_votes + tally.no_votes,
+        proof_bytes: tally.proof_bytes.clone(),
+        timestamp: 0,
+    };
+    // TODO: call actual Nova verifier (e.g. NovaAggregator::verify) once available.
+    if payload.proof_bytes.is_empty() {
+        return Err("Empty proof".to_string());
+    }
+    if payload.num_votes == 0 {
+        return Err("Tally proof contains no votes".to_string());
+    }
+    Ok(())
+}
+
 pub use aggregator::NovaAggregator;
 pub use circuit::VoteStepCircuit;

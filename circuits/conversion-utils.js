@@ -98,11 +98,116 @@ function reverseHexBytes(hex) {
     return bytes.reverse().join('');
 }
 
+// ---------------------------------------------------------------------------
+// Reverse conversions (Soroban big-endian -> snarkjs decimal) so round-trip
+// parity tests can decode a Soroban byte string back to the exact snarkjs
+// field elements it was produced from.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a 32-byte (64-hex-char) big-endian hex string back to a BigInt.
+ *
+ * @param {string} hex - 64-character hex string
+ * @returns {bigint} Parsed value
+ */
+function beHexToBigInt(hex) {
+    if (typeof hex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+        throw new Error(`beHexToBigInt: expected 64 hex chars, got ${JSON.stringify(hex)}`);
+    }
+    return BigInt('0x' + hex);
+}
+
+/**
+ * Decode a Soroban-format G1 point (64 bytes: be32(X) || be32(Y)) back to
+ * snarkjs format: [x, y, "1"] as decimal strings.
+ *
+ * @param {string} hex - 128-hex-char (64-byte) Soroban G1 encoding
+ * @returns {Array<string>} snarkjs G1 point [x, y, "1"]
+ */
+function sorobanG1ToSnarkjs(hex) {
+    if (typeof hex !== 'string' || hex.length !== 128) {
+        throw new Error(`sorobanG1ToSnarkjs: expected 128 hex chars, got ${JSON.stringify(hex)}`);
+    }
+    const x = beHexToBigInt(hex.slice(0, 64));
+    const y = beHexToBigInt(hex.slice(64, 128));
+    return [x.toString(), y.toString(), '1'];
+}
+
+/**
+ * Decode a Soroban-format G2 point (128 bytes:
+ * be32(X.c1) || be32(X.c0) || be32(Y.c1) || be32(Y.c0)) back to snarkjs
+ * format: [[x.c0, x.c1], [y.c0, y.c1], ["1", "0"]] as decimal strings.
+ *
+ * @param {string} hex - 256-hex-char (128-byte) Soroban G2 encoding
+ * @returns {Array<Array<string>>} snarkjs G2 point
+ */
+function sorobanG2ToSnarkjs(hex) {
+    if (typeof hex !== 'string' || hex.length !== 256) {
+        throw new Error(`sorobanG2ToSnarkjs: expected 256 hex chars, got ${JSON.stringify(hex)}`);
+    }
+    const x_c1 = beHexToBigInt(hex.slice(0, 64));   // imaginary (first, per CAP-74)
+    const x_c0 = beHexToBigInt(hex.slice(64, 128)); // real
+    const y_c1 = beHexToBigInt(hex.slice(128, 192));
+    const y_c0 = beHexToBigInt(hex.slice(192, 256));
+
+    // snarkjs order is [c0, c1]; the "1" / "0" z-coordinate is restored too.
+    return [
+        [x_c0.toString(), x_c1.toString()],
+        [y_c0.toString(), y_c1.toString()],
+        ['1', '0']
+    ];
+}
+
+/**
+ * Reverse of `convertProofToSoroban`: decode a Soroban BE proof object
+ * ({a, b, c} hex strings) back into the snarkjs proof shape
+ * {pi_a, pi_b, pi_c}.
+ *
+ * @param {Object} sorobanProof - {a: string, b: string, c: string}
+ * @returns {Object} snarkjs proof {pi_a, pi_b, pi_c}
+ */
+function sorobanProofToSnarkjs(sorobanProof) {
+    if (!sorobanProof || typeof sorobanProof !== 'object') {
+        throw new Error('sorobanProofToSnarkjs: expected a proof object');
+    }
+    return {
+        pi_a: sorobanG1ToSnarkjs(sorobanProof.a),
+        pi_b: sorobanG2ToSnarkjs(sorobanProof.b),
+        pi_c: sorobanG1ToSnarkjs(sorobanProof.c)
+    };
+}
+
+/**
+ * Reverse of `convertVKeyToSoroban`: decode a Soroban BE verification key
+ * ({alpha, beta, gamma, delta, ic} hex strings) back into the snarkjs vkey
+ * shape {vk_alpha_1, vk_beta_2, vk_gamma_2, vk_delta_2, IC}.
+ *
+ * @param {Object} sorobanVK - {alpha, beta, gamma, delta, ic: string[]}
+ * @returns {Object} snarkjs verification key
+ */
+function sorobanVKeyToSnarkjs(sorobanVK) {
+    if (!sorobanVK || typeof sorobanVK !== 'object' || !Array.isArray(sorobanVK.ic)) {
+        throw new Error('sorobanVKeyToSnarkjs: expected {alpha, beta, gamma, delta, ic}');
+    }
+    return {
+        vk_alpha_1: sorobanG1ToSnarkjs(sorobanVK.alpha),
+        vk_beta_2: sorobanG2ToSnarkjs(sorobanVK.beta),
+        vk_gamma_2: sorobanG2ToSnarkjs(sorobanVK.gamma),
+        vk_delta_2: sorobanG2ToSnarkjs(sorobanVK.delta),
+        IC: sorobanVK.ic.map(point => sorobanG1ToSnarkjs(point))
+    };
+}
+
 module.exports = {
     toBE32ByteHex,
     convertG1Point,
     convertG2Point,
     convertProofToSoroban,
     convertVKeyToSoroban,
-    reverseHexBytes
+    reverseHexBytes,
+    beHexToBigInt,
+    sorobanG1ToSnarkjs,
+    sorobanG2ToSnarkjs,
+    sorobanProofToSnarkjs,
+    sorobanVKeyToSnarkjs
 };

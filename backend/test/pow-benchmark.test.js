@@ -239,6 +239,14 @@ test("spam resistance: flag spam prevention", async () => {
 
   initDb();
 
+  // anti-spam is DI-migrated (#358) — wire it with the real singletons the
+  // same way the composition root does (kysely is lazy over getDb()).
+  const { getDb } = await import("../src/services/db.js");
+  const { kysely } = await import("../src/services/kysely.js");
+  const { logger } = await import("../src/services/logger.js");
+  const { initAntiSpam } = await import("../src/services/anti-spam.js");
+  initAntiSpam({ getDb, kysely, logger });
+
   const daoId = 1;
   const proposalId = 1;
   const threshold = 3;

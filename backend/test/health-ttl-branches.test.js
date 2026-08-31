@@ -32,6 +32,21 @@ const { default: healthRouter, initHealthRoutes } =
 const { initDb, closeDb } = await import("../src/services/db.js");
 const ttlChecker = await import("../src/services/ttl-checker.js");
 
+// Wire the DI-migrated ttl-checker (#358): it no longer reads the config/db
+// module singletons directly, so tests must perform the same wiring the
+// composition root does at boot, using the real singletons.
+ttlChecker.initTtlChecker({
+  server: (await import("../src/services/stellar.js")).server,
+  ttlGracePeriodMs: config.ttlGracePeriodMs,
+  ttlRenewalThresholdMs: config.ttlRenewalThresholdMs,
+  testMode: config.testMode,
+  getTTLTracking: (await import("../src/services/db.js")).getTTLTracking,
+  upsertTTLTracking: (await import("../src/services/db.js")).upsertTTLTracking,
+  log: (await import("../src/services/logger.js")).logger.log.bind(
+    (await import("../src/services/logger.js")).logger,
+  ),
+});
+
 const originalConfig = {
   healthcheckPing: config.healthcheckPing,
   healthExposeDetails: config.healthExposeDetails,

@@ -2,9 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import ClaimRewards from "./ClaimRewards";
 
-// Mock contracts
-vi.mock("../lib/contracts", () => ({
-  initializeContractClients: vi.fn(() => ({
+// Mock contract clients via unified client
+vi.mock("../lib/client", () => ({
+  getZkVoteClient: vi.fn(() => ({
     membershipTree: {
       get_leaf_index: vi.fn().mockResolvedValue({ result: 0 }),
       current_root: vi.fn().mockResolvedValue({ result: BigInt("12345") }),
@@ -140,8 +140,8 @@ describe("ClaimRewards — Vote-to-Earn integration (real relayer path)", () => 
   });
 
   it("shows error when user has not voted (gate on is_nullifier_used)", async () => {
-    const { initializeContractClients } = await import("../lib/contracts");
-    (initializeContractClients as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+    const { getZkVoteClient } = await import("../lib/client");
+    (getZkVoteClient as ReturnType<typeof vi.fn>).mockReturnValueOnce(
       {
         membershipTree: {
           get_leaf_index: vi.fn().mockResolvedValue({ result: 0 }),

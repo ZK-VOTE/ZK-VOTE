@@ -90,11 +90,11 @@ impl VoteStepCircuit {
             return Err(CircuitError::InvalidMerklePath);
         }
 
-        // 4. Verify nullifier derivation
+        // 4. Verify nullifier derivation — reject any nullifier that doesn't exactly match
         let expected_nullifier =
             Self::compute_nullifier(&witness.secret, witness.dao_id, witness.proposal_id);
-        if witness.nullifier != expected_nullifier && !witness.nullifier.is_empty() {
-            // Allow matching if explicit nullifier supplied
+        if witness.nullifier != expected_nullifier {
+            return Err(CircuitError::InvalidNullifier);
         }
 
         // 5. Update Poseidon nullifier accumulator
@@ -154,6 +154,56 @@ mod tests {
         assert_ne!(
             next_state.acc_nullifier_hash,
             initial_state.acc_nullifier_hash
+        );
+    }
+
+    #[test]
+    fn test_mismatched_nullifier_rejected() {
+        let state = IvcState {
+            step_count: 0,
+            root: "0x1234".to_string(),
+            yes_votes: 0,
+            no_votes: 0,
+            acc_nullifier_hash: "0x0".to_string(),
+        };
+        let witness = VoteWitness {
+            secret: "secret123".to_string(),
+            salt: "salt456".to_string(),
+            path_elements: vec![],
+            path_indices: vec![],
+            vote_choice: 1,
+            nullifier: "wrong_nullifier".to_string(),
+            dao_id: 1,
+            proposal_id: 100,
+        };
+        assert_eq!(
+            VoteStepCircuit::step(&state, &witness),
+            Err(CircuitError::InvalidNullifier)
+        );
+    }
+
+    #[test]
+    fn test_empty_nullifier_rejected() {
+        let state = IvcState {
+            step_count: 0,
+            root: "0x1234".to_string(),
+            yes_votes: 0,
+            no_votes: 0,
+            acc_nullifier_hash: "0x0".to_string(),
+        };
+        let witness = VoteWitness {
+            secret: "secret123".to_string(),
+            salt: "salt456".to_string(),
+            path_elements: vec![],
+            path_indices: vec![],
+            vote_choice: 1,
+            nullifier: "".to_string(),
+            dao_id: 1,
+            proposal_id: 100,
+        };
+        assert_eq!(
+            VoteStepCircuit::step(&state, &witness),
+            Err(CircuitError::InvalidNullifier)
         );
     }
 }

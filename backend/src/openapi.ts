@@ -1,5 +1,5 @@
 /**
- * OpenAPI 3.1 Specification Builder
+ * OpenAPI 3.1 Specification for ZKVote Backend (Task #339)
  *
  * Builds the API's OpenAPI document from the same Zod schemas used to
  * validate requests at runtime (validation/schemas.ts and a couple of
@@ -54,13 +54,6 @@ export const successResponseSchema = z
  * against it — the same pattern the issue's `zod-to-openapi` suggestion is
  * about, applied to responses instead of just requests.
  */
-export const healthResponseSchema = z
-  .object({
-    status: z.string().openapi({ example: "ok" }),
-    rpc: z.object({ ok: z.boolean() }).passthrough(),
-  })
-  .passthrough()
-  .openapi("HealthResponse");
 
 export const readyResponseSchema = z
   .object({ status: z.string().openapi({ example: "ready" }) })
@@ -879,8 +872,17 @@ export const openApiSpec = {
       post: {
         summary: "Submit anonymous vote (audited)",
         security: [{ relayerAuth: [] }],
-        requestBody: { content: { "application/json": { schema: { $ref: "#/components/schemas/VoteRequest" } } } },
-        responses: { "200": { description: "Vote submitted" }, "401": { description: "Unauthorized" } },
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/VoteRequest" },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "Vote submitted" },
+          "401": { description: "Unauthorized" },
+        },
         "x-audited": true,
         "x-redacted-fields": ["nullifier", "root", "proof"],
       },
@@ -958,10 +960,21 @@ export const openApiSpec = {
     },
     "/remediation/action": {
       post: {
-        summary: "Structured remediation action (append-only, authz, replay-safe)",
+        summary:
+          "Structured remediation action (append-only, authz, replay-safe)",
         security: [{ relayerAuth: [] }],
-        requestBody: { content: { "application/json": { schema: { $ref: "#/components/schemas/RemediationAction" } } } },
-        responses: { "201": { description: "Recorded" }, "409": { description: "Duplicate idempotencyKey" }, "401": { description: "Unauthorized" } },
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/RemediationAction" },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "Recorded" },
+          "409": { description: "Duplicate idempotencyKey" },
+          "401": { description: "Unauthorized" },
+        },
         "x-audited": true,
         "x-append-only": true,
         "x-replay-safe": true,
@@ -971,7 +984,12 @@ export const openApiSpec = {
       get: {
         summary: "Query remediation log",
         security: [{ relayerAuth: [] }],
-        parameters: [{ name: "action", in: "query", schema: { type: "string" } }, { name: "target", in: "query", schema: { type: "string" } }, { name: "limit", in: "query", schema: { type: "integer" } }, { name: "offset", in: "query", schema: { type: "integer" } }],
+        parameters: [
+          { name: "action", in: "query", schema: { type: "string" } },
+          { name: "target", in: "query", schema: { type: "string" } },
+          { name: "limit", in: "query", schema: { type: "integer" } },
+          { name: "offset", in: "query", schema: { type: "integer" } },
+        ],
         responses: { "200": { description: "Log entries" } },
       },
     },
@@ -979,7 +997,23 @@ export const openApiSpec = {
       get: {
         summary: "Query audit logs (redacted, authz)",
         security: [{ relayerAuth: [] }],
-        parameters: [{ name: "action", in: "query", schema: { type: "string" } }, { name: "actor", in: "query", schema: { type: "string" } }, { name: "method", in: "query", schema: { type: "string" } }, { name: "from", in: "query", schema: { type: "string", format: "date-time" } }, { name: "to", in: "query", schema: { type: "string", format: "date-time" } }, { name: "limit", in: "query", schema: { type: "integer" } }, { name: "offset", in: "query", schema: { type: "integer" } }],
+        parameters: [
+          { name: "action", in: "query", schema: { type: "string" } },
+          { name: "actor", in: "query", schema: { type: "string" } },
+          { name: "method", in: "query", schema: { type: "string" } },
+          {
+            name: "from",
+            in: "query",
+            schema: { type: "string", format: "date-time" },
+          },
+          {
+            name: "to",
+            in: "query",
+            schema: { type: "string", format: "date-time" },
+          },
+          { name: "limit", in: "query", schema: { type: "integer" } },
+          { name: "offset", in: "query", schema: { type: "integer" } },
+        ],
         responses: { "200": { description: "Audit entries" } },
         "x-redacted": true,
       },
@@ -988,7 +1022,13 @@ export const openApiSpec = {
       get: {
         summary: "Export audit logs (json/csv)",
         security: [{ relayerAuth: [] }],
-        parameters: [{ name: "format", in: "query", schema: { type: "string", enum: ["json", "csv"] } }],
+        parameters: [
+          {
+            name: "format",
+            in: "query",
+            schema: { type: "string", enum: ["json", "csv"] },
+          },
+        ],
         responses: { "200": { description: "Exported logs" } },
       },
     },
@@ -1001,7 +1041,8 @@ export const openApiSpec = {
     },
   },
   "x-audit": {
-    description: "All mutating routes are audited with PII redaction. 100% coverage via global auditMiddleware.",
+    description:
+      "All mutating routes are audited with PII redaction. 100% coverage via global auditMiddleware.",
     mutatingRoutes: [
       "POST /vote",
       "POST /comment/anonymous",
@@ -1016,10 +1057,24 @@ export const openApiSpec = {
       "POST /events/notify",
       "POST /remediation/action",
     ],
-    redaction: "proof, nullifier, root, commitment, secret, token, password, jwt always redacted",
-    immutable: "audit logs and remediation logs are append-only, no update/delete APIs",
+    redaction:
+      "proof, nullifier, root, commitment, secret, token, password, jwt always redacted",
+    immutable:
+      "audit logs and remediation logs are append-only, no update/delete APIs",
     replaySafe: "remediation uses idempotencyKey; duplicates return 409",
   },
 } as const;
+
+export const ENDPOINTS = Object.entries(openApiSpec.paths).flatMap(
+  ([path, operations]) =>
+    Object.keys(operations).map((method) => ({
+      method,
+      path,
+    })),
+);
+
+export function buildOpenApiDocument(): typeof openApiSpec {
+  return openApiSpec;
+}
 
 export default openApiSpec;

@@ -26,7 +26,8 @@
     "checksums": "sha256sum build/vote.r1cs build/vote_js/vote.wasm build/verification_key.json build/verification_key_soroban.json > checksums.sha256",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "test:coverage": "jest --coverage",
+    "test:parity": "jest soroban_be_parity soroban_be_cli --verbose"
   },
   "dependencies": {
     "circomlib": "^2.0.5",

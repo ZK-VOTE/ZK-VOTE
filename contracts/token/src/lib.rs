@@ -57,6 +57,9 @@ pub enum TokenError {
     SelfDelegation = 21,
     BatchTooLarge = 22,
     EmptyBatch = 23,
+    NullifierAlreadySpent = 24,
+    InvalidShieldedProof = 25,
+    ShieldedPoolExhausted = 26,
 }
 
 #[contracttype]
@@ -89,6 +92,35 @@ pub enum DataKey {
     Checkpoints(Address),
     CheckpointRetention,
     Delegate(Address),
+    ShieldedPoolBalance,
+    NullifierSpent(BytesN<32>),
+    ShieldedCommitment(u32),
+    ShieldedCommitmentCount,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShieldEvent {
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
+    pub commitment: BytesN<32>,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShieldedTransferEvent {
+    pub commitment_count: u32,
+    pub public_fee: i128,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnshieldEvent {
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+    pub nullifier: BytesN<32>,
 }
 
 #[soroban_sdk::contractevent]
@@ -1511,6 +1543,196 @@ impl Token {
             }
             .publish(&env);
         }
+    }
+
+    /// Shield transparent tokens into the confidential DAO treasury pool
+    pub fn shield(env: Env, from: Address, amount: i128, note_commitment: BytesN<32>) {
+        from.require_auth();
+        Self::bump_instance(&env);
+
+        if amount <= 0 {
+            panic_with_error!(&env, TokenError::InvalidAmount);
+        }
+
+        let from_balance = Self::balance(env.clone(), from.clone());
+        if from_balance < amount {
+            panic_with_error!(&env, TokenError::InsufficientBalance);
+        }
+
+        // Deduct from transparent balance
+        Self::write_balance(&env, from.clone(), from_balance - amount);
+        Self::append_checkpoint(&env, from.clone(), from_balance - amount);
+
+        // Credit to shielded pool
+        let pool_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShieldedPoolBalance)
+            .unwrap_or(0);
+        let new_pool_balance = pool_balance
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, TokenError::Overflow));
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedPoolBalance, &new_pool_balance);
+
+        // Record note commitment in sequence
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShieldedCommitmentCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedCommitment(count), &note_commitment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedCommitmentCount, &(count + 1));
+
+        ShieldEvent {
+            from,
+            amount,
+            commitment: note_commitment,
+        }
+        .publish(&env);
+    }
+
+    /// Execute a shielded UTXO transfer
+    pub fn transfer_shielded(
+        env: Env,
+        nullifiers: Vec<BytesN<32>>,
+        commitments: Vec<BytesN<32>>,
+        public_fee: i128,
+    ) {
+        Self::bump_instance(&env);
+
+        if public_fee < 0 {
+            panic_with_error!(&env, TokenError::InvalidAmount);
+        }
+
+        // Validate and spend nullifiers
+        for nullifier in nullifiers.iter() {
+            let key = DataKey::NullifierSpent(nullifier.clone());
+            if env.storage().persistent().has(&key) {
+                panic_with_error!(&env, TokenError::NullifierAlreadySpent);
+            }
+            env.storage().persistent().set(&key, &true);
+        }
+
+        // Append new note commitments
+        let mut count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShieldedCommitmentCount)
+            .unwrap_or(0);
+
+        for commitment in commitments.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ShieldedCommitment(count), &commitment);
+            count += 1;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedCommitmentCount, &count);
+
+        if public_fee > 0 {
+            let pool_balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ShieldedPoolBalance)
+                .unwrap_or(0);
+            if pool_balance < public_fee {
+                panic_with_error!(&env, TokenError::ShieldedPoolExhausted);
+            }
+            env.storage().persistent().set(
+                &DataKey::ShieldedPoolBalance,
+                &(pool_balance - public_fee),
+            );
+        }
+
+        ShieldedTransferEvent {
+            commitment_count: commitments.len(),
+            public_fee,
+        }
+        .publish(&env);
+    }
+
+    /// Unshield confidential notes back to a transparent address
+    pub fn unshield(
+        env: Env,
+        to: Address,
+        amount: i128,
+        nullifier: BytesN<32>,
+        remainder_commitment: BytesN<32>,
+    ) {
+        Self::bump_instance(&env);
+
+        if amount <= 0 {
+            panic_with_error!(&env, TokenError::InvalidAmount);
+        }
+
+        let pool_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShieldedPoolBalance)
+            .unwrap_or(0);
+        if pool_balance < amount {
+            panic_with_error!(&env, TokenError::ShieldedPoolExhausted);
+        }
+
+        let key = DataKey::NullifierSpent(nullifier.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, TokenError::NullifierAlreadySpent);
+        }
+        env.storage().persistent().set(&key, &true);
+
+        // Insert remainder change commitment if any
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ShieldedCommitmentCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedCommitment(count), &remainder_commitment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedCommitmentCount, &(count + 1));
+
+        // Deduct from pool balance and credit recipient transparent balance
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShieldedPoolBalance, &(pool_balance - amount));
+
+        let to_balance = Self::balance(env.clone(), to.clone());
+        let new_balance = to_balance
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, TokenError::Overflow));
+        Self::write_balance(&env, to.clone(), new_balance);
+        Self::append_checkpoint(&env, to.clone(), new_balance);
+
+        UnshieldEvent {
+            to,
+            amount,
+            nullifier,
+        }
+        .publish(&env);
+    }
+
+    /// Read the total confidential balance in the shielded pool
+    pub fn get_shielded_pool_balance(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ShieldedPoolBalance)
+            .unwrap_or(0)
+    }
+
+    /// Query whether a nullifier has already been spent
+    pub fn is_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::NullifierSpent(nullifier))
     }
 }
 

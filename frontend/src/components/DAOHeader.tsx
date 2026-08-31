@@ -23,6 +23,7 @@ import {
   Globe,
   ChevronDown,
   ChevronUp,
+  BarChart3,
 } from "lucide-react";
 
 // Custom social icons
@@ -50,7 +51,8 @@ export type DAOTab =
   | "members"
   | "create-proposal"
   | "settings"
-  | "threshold";
+  | "threshold"
+  | "analytics";
 
 export interface DAOInfo {
   id: number;
@@ -337,6 +339,17 @@ function NavButtons({
         >
           <Lock className="w-4 h-4" />
           Tally Auth
+        </Button>
+      )}
+      {dao.isAdmin && (
+        <Button
+          variant={activeTab === "analytics" ? "secondary" : "outline"}
+          size="sm"
+          onClick={() => navigateToTab("analytics")}
+          className="gap-2"
+        >
+          <BarChart3 className="w-4 h-4" />
+          Analytics
         </Button>
       )}
     </>

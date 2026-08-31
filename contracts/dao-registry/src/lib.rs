@@ -2,11 +2,11 @@
 #![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, IntoVal, String, Symbol,
+    Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 const DAO_COUNT: Symbol = symbol_short!("dao_cnt");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
 // TTL management: bump on every interaction to keep contract alive
@@ -28,6 +28,16 @@ pub enum RegistryError {
     UpgradeAlreadyExecuted = 8,
     UpgradeInvalidWindow = 9,
     UpgradePayloadTooLarge = 10,
+    // Role and multisig errors
+    InvalidRole = 11,
+    NotMultisigAdmin = 12,
+    InsufficientSignatures = 13,
+    ProposalNotFound = 14,
+    ProposalAlreadyExecuted = 15,
+    InvalidSignature = 16,
+    DuplicateSigner = 17,
+    InvalidThreshold = 18,
+    SignerNotFound = 19,
 }
 
 // Size limit to prevent DoS attacks
@@ -51,6 +61,56 @@ pub struct DaoInfo {
 }
 
 pub use zkvote_groth16::VerificationKey;
+
+// ============================================
+// ROLE MODEL
+// ============================================
+
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum DaoRole {
+    Admin = 0,
+    Member = 1,
+    Auditor = 2,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MemberRole {
+    pub member: Address,
+    pub role: DaoRole,
+    pub assigned_at: u64,
+}
+
+// ============================================
+// MULTISIG MODEL
+// ============================================
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MultisigConfig {
+    pub dao_id: u64,
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MultisigProposal {
+    pub dao_id: u64,
+    pub proposal_id: u64,
+    pub title: String,
+    pub description: String,
+    pub action_type: String, // "TransferAdmin", "SetRole", "UpdateMultisig", etc
+    pub action_data: Bytes,
+    pub proposer: Address,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub signatures: Vec<Address>,
+    pub executed: bool,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -80,6 +140,70 @@ pub struct ContractUpgradeProposal {
     pub expires_at: u64,
     pub executed: bool,
     pub rolled_back: bool,
+}
+
+// ============================================
+// EVENTS
+// ============================================
+
+// Role and Multisig Events
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleAssignedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub member: Address,
+    pub role: u32, // 0=Admin, 1=Member, 2=Auditor
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleRevokedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub member: Address,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultisigConfiguredEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub signer_count: u32,
+    pub threshold: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultisigProposalCreatedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub action_type: String,
+    pub expires_at: u64,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultisigProposalSignedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub signer: Address,
+    pub signature_count: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultisigProposalExecutedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub action_type: String,
 }
 
 // Typed Events
@@ -177,6 +301,355 @@ impl DaoRegistry {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
+
+    // ============================================
+    // ROLE MANAGEMENT
+    // ============================================
+
+    /// Assign a role to a DAO member (admin only)
+    pub fn assign_role(env: Env, dao_id: u64, member: Address, role: u32, admin: Address) {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        // Validate DAO exists and caller is admin
+        Self::require_dao_admin(&env, dao_id, &admin);
+
+        // Validate role
+        if role > 2 {
+            panic_with_error!(&env, RegistryError::InvalidRole);
+        }
+
+        let role_enum = match role {
+            0 => DaoRole::Admin,
+            1 => DaoRole::Member,
+            2 => DaoRole::Auditor,
+            _ => panic_with_error!(&env, RegistryError::InvalidRole),
+        };
+
+        let key = Self::member_role_key(dao_id, &member);
+        let member_role = MemberRole {
+            member: member.clone(),
+            role: role_enum,
+            assigned_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&key, &member_role);
+        Self::bump_persistent(&env, &key);
+
+        RoleAssignedEvent {
+            dao_id,
+            member,
+            role,
+        }
+        .publish(&env);
+    }
+
+    /// Get member role in a DAO
+    pub fn get_member_role(env: Env, dao_id: u64, member: Address) -> Option<u32> {
+        Self::bump_instance(&env);
+
+        let key = Self::member_role_key(dao_id, &member);
+        if let Some(member_role) = env.storage().persistent().get::<_, MemberRole>(&key) {
+            Self::bump_persistent(&env, &key);
+            let role_val = match member_role.role {
+                DaoRole::Admin => 0,
+                DaoRole::Member => 1,
+                DaoRole::Auditor => 2,
+            };
+            return Some(role_val);
+        }
+        None
+    }
+
+    /// Revoke member role (admin only)
+    pub fn revoke_role(env: Env, dao_id: u64, member: Address, admin: Address) {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        // Validate DAO exists and caller is admin
+        Self::require_dao_admin(&env, dao_id, &admin);
+
+        let key = Self::member_role_key(dao_id, &member);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+
+            RoleRevokedEvent { dao_id, member }.publish(&env);
+        }
+    }
+
+    // ============================================
+    // MULTISIG MANAGEMENT
+    // ============================================
+
+    /// Initialize multisig for a DAO (admin only)
+    pub fn init_multisig(
+        env: Env,
+        dao_id: u64,
+        signers: Vec<Address>,
+        threshold: u32,
+        admin: Address,
+    ) {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        // Validate DAO exists and caller is admin
+        Self::require_dao_admin(&env, dao_id, &admin);
+
+        // Validate threshold
+        if threshold == 0 || threshold > signers.len() as u32 {
+            panic_with_error!(&env, RegistryError::InvalidThreshold);
+        }
+
+        // Check for duplicate signers
+        for i in 0..signers.len() {
+            for j in (i + 1)..signers.len() {
+                if signers.get_unchecked(i) == signers.get_unchecked(j) {
+                    panic_with_error!(&env, RegistryError::DuplicateSigner);
+                }
+            }
+        }
+
+        let config = MultisigConfig {
+            dao_id,
+            signers,
+            threshold,
+            created_at: env.ledger().timestamp(),
+        };
+
+        let key = Self::multisig_config_key(dao_id);
+        env.storage().persistent().set(&key, &config);
+        Self::bump_persistent(&env, &key);
+
+        MultisigConfiguredEvent {
+            dao_id,
+            signer_count: config.signers.len() as u32,
+            threshold,
+        }
+        .publish(&env);
+    }
+
+    /// Get multisig configuration for a DAO
+    pub fn get_multisig(env: Env, dao_id: u64) -> Option<MultisigConfig> {
+        Self::bump_instance(&env);
+
+        let key = Self::multisig_config_key(dao_id);
+        if let Some(config) = env.storage().persistent().get::<_, MultisigConfig>(&key) {
+            Self::bump_persistent(&env, &key);
+            return Some(config);
+        }
+        None
+    }
+
+    /// Create a multisig proposal (any signer can propose)
+    pub fn create_multisig_proposal(
+        env: Env,
+        dao_id: u64,
+        title: String,
+        description: String,
+        action_type: String,
+        action_data: Bytes,
+        proposer: Address,
+    ) -> u64 {
+        Self::bump_instance(&env);
+        proposer.require_auth();
+
+        // Verify DAO exists
+        if !Self::dao_exists(env.clone(), dao_id) {
+            panic_with_error!(&env, RegistryError::DaoNotFound);
+        }
+
+        // Get multisig config
+        let key = Self::multisig_config_key(dao_id);
+        let config: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotMultisigAdmin));
+
+        // Verify proposer is a signer
+        let mut is_signer = false;
+        for signer in config.signers.iter() {
+            if signer == proposer {
+                is_signer = true;
+                break;
+            }
+        }
+        if !is_signer {
+            panic_with_error!(&env, RegistryError::NotMultisigAdmin);
+        }
+
+        let proposal_id = Self::next_multisig_proposal_id(&env);
+        let now = env.ledger().timestamp();
+        let expires_at = now + 7 * 24 * 60 * 60; // 7 days
+
+        let mut signatures = Vec::new(&env);
+        signatures.push_back(proposer.clone());
+
+        let proposal = MultisigProposal {
+            dao_id,
+            proposal_id,
+            title: title.clone(),
+            description: description.clone(),
+            action_type: action_type.clone(),
+            action_data,
+            proposer: proposer.clone(),
+            created_at: now,
+            expires_at,
+            signatures,
+            executed: false,
+        };
+
+        let proposal_key = Self::multisig_proposal_key(dao_id, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        MultisigProposalCreatedEvent {
+            dao_id,
+            proposal_id,
+            proposer,
+            action_type,
+            expires_at,
+        }
+        .publish(&env);
+
+        proposal_id
+    }
+
+    /// Sign a multisig proposal (must be a signer)
+    pub fn sign_multisig_proposal(env: Env, dao_id: u64, proposal_id: u64, signer: Address) {
+        Self::bump_instance(&env);
+        signer.require_auth();
+
+        let proposal_key = Self::multisig_proposal_key(dao_id, proposal_id);
+        let mut proposal: MultisigProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProposalNotFound));
+
+        // Check if already executed
+        if proposal.executed {
+            panic_with_error!(&env, RegistryError::ProposalAlreadyExecuted);
+        }
+
+        // Check if expired
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic_with_error!(&env, RegistryError::UpgradeExpired);
+        }
+
+        // Verify signer is authorized
+        let config_key = Self::multisig_config_key(dao_id);
+        let config: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotMultisigAdmin));
+
+        let mut is_authorized = false;
+        for authorized_signer in config.signers.iter() {
+            if authorized_signer == signer {
+                is_authorized = true;
+                break;
+            }
+        }
+        if !is_authorized {
+            panic_with_error!(&env, RegistryError::InvalidSignature);
+        }
+
+        // Check if already signed
+        for sig in proposal.signatures.iter() {
+            if sig == signer {
+                panic_with_error!(&env, RegistryError::DuplicateSigner);
+            }
+        }
+
+        proposal.signatures.push_back(signer.clone());
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        MultisigProposalSignedEvent {
+            dao_id,
+            proposal_id,
+            signer,
+            signature_count: proposal.signatures.len() as u32,
+        }
+        .publish(&env);
+    }
+
+    /// Get a multisig proposal
+    pub fn get_multisig_proposal(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<MultisigProposal> {
+        Self::bump_instance(&env);
+
+        let proposal_key = Self::multisig_proposal_key(dao_id, proposal_id);
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, MultisigProposal>(&proposal_key)
+        {
+            Self::bump_persistent(&env, &proposal_key);
+            return Some(proposal);
+        }
+        None
+    }
+
+    /// Execute a multisig proposal (when threshold met)
+    pub fn execute_multisig_proposal(env: Env, dao_id: u64, proposal_id: u64, executor: Address) {
+        Self::bump_instance(&env);
+        executor.require_auth();
+
+        let proposal_key = Self::multisig_proposal_key(dao_id, proposal_id);
+        let mut proposal: MultisigProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProposalNotFound));
+
+        // Check if already executed
+        if proposal.executed {
+            panic_with_error!(&env, RegistryError::ProposalAlreadyExecuted);
+        }
+
+        // Get multisig config
+        let config_key = Self::multisig_config_key(dao_id);
+        let config: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotMultisigAdmin));
+
+        // Verify executor is a signer
+        let mut is_signer = false;
+        for signer in config.signers.iter() {
+            if signer == executor {
+                is_signer = true;
+                break;
+            }
+        }
+        if !is_signer {
+            panic_with_error!(&env, RegistryError::InvalidSignature);
+        }
+
+        // Check threshold met
+        if (proposal.signatures.len() as u32) < config.threshold {
+            panic_with_error!(&env, RegistryError::InsufficientSignatures);
+        }
+
+        // Mark as executed
+        proposal.executed = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        MultisigProposalExecutedEvent {
+            dao_id,
+            proposal_id,
+            action_type: proposal.action_type,
+        }
+        .publish(&env);
     }
 
     /// Create a new DAO (permissionless).
@@ -641,6 +1114,18 @@ impl DaoRegistry {
         (symbol_short!("dao"), dao_id)
     }
 
+    fn member_role_key(dao_id: u64, member: &Address) -> (Symbol, u64, Address) {
+        (symbol_short!("mrole"), dao_id, member.clone())
+    }
+
+    fn multisig_config_key(dao_id: u64) -> (Symbol, u64) {
+        (symbol_short!("msig_cfg"), dao_id)
+    }
+
+    fn multisig_proposal_key(dao_id: u64, proposal_id: u64) -> (Symbol, u64, u64) {
+        (symbol_short!("msig_prp"), dao_id, proposal_id)
+    }
+
     fn circuit_upgrade_key(dao_id: u64, proposal_id: u64) -> (Symbol, u64, u64) {
         (symbol_short!("c_upgrade"), dao_id, proposal_id)
     }
@@ -651,6 +1136,14 @@ impl DaoRegistry {
 
     fn next_upgrade_proposal_id(env: &Env) -> u64 {
         let key = symbol_short!("c_upg_cnt");
+        let count: u64 = env.storage().instance().get(&key).unwrap_or(0);
+        let new_id = count + 1;
+        env.storage().instance().set(&key, &new_id);
+        new_id
+    }
+
+    fn next_multisig_proposal_id(env: &Env) -> u64 {
+        let key = symbol_short!("msig_cnt");
         let count: u64 = env.storage().instance().get(&key).unwrap_or(0);
         let new_id = count + 1;
         env.storage().instance().set(&key, &new_id);

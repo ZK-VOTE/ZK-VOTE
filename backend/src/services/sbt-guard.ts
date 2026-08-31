@@ -16,11 +16,53 @@
  */
 
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config, isValidContractId } from "../config.js";
-import { server } from "./stellar.js";
-import { log } from "./logger.js";
-import * as dbService from "./db.js";
-import { markDegraded, markHealthy } from "./service-health.js";
+import { isValidContractId } from "../config.js";
+import type { RpcServerPort, LoggerPort } from "./interfaces.js";
+import type { EventInput } from "./db.js";
+
+/**
+ * Dependencies of the SBT transfer-watch service, injected explicitly via
+ * `initSbtGuard` (called by the composition root) so this module never
+ * imports the `stellar.js`/`db.js`/`service-health.js` module singletons
+ * to get what it needs (#358).
+ */
+export interface SbtGuardDeps {
+  /** Active RPC server (pool-backed proxy in production). */
+  server: RpcServerPort;
+  /** Config: relayer test mode (disables the background watch loop). */
+  testMode: boolean;
+  /** Config: membership SBT contract ID (watch target). */
+  membershipSbtContractId?: string;
+  /** Config: default poll interval (ms). */
+  sbtTransferWatchIntervalMs: number;
+  /** Config: admin alert webhook URL (optional). */
+  adminAlertWebhookUrl?: string;
+  /** Event persistence (events table, DAO-partitioned). */
+  addEvent(event: EventInput): boolean;
+  /** Health reporting for the watch loop. */
+  health: {
+    markHealthy(service: "sbt_transfer_watch"): void;
+    markDegraded(service: "sbt_transfer_watch", reason?: string): void;
+  };
+  /** Structured logger (called as `deps.log(level, event, meta)`). */
+  log: LoggerPort["log"];
+}
+
+let sbtDeps: SbtGuardDeps | null = null;
+
+/** Explicitly wire the SBT guard's dependencies (composition root only). */
+export function initSbtGuard(d: SbtGuardDeps): void {
+  sbtDeps = d;
+}
+
+/** Internal accessor — throws if the composition root has not wired deps. */
+function deps(): SbtGuardDeps {
+  if (!sbtDeps) {
+    throw new Error("sbt-guard: initSbtGuard() must be called before use");
+  }
+  return sbtDeps;
+}
+
 
 /** The three SEP-41-shaped entrypoints the contract stubs out and always rejects. */
 export const SBT_GUARDED_FUNCTIONS: ReadonlySet<string> = new Set([
@@ -72,7 +114,7 @@ export function extractInvokedFunctionNames(
       names.push(invocation.functionName().toString());
     }
   } catch (err) {
-    log("debug", "sbt_guard_envelope_parse_failed", {
+    deps().log("debug", "sbt_guard_envelope_parse_failed", {
       error: (err as Error).message,
     });
     return [];
@@ -127,7 +169,7 @@ export function extractDaoId(
       return null;
     }
   } catch (err) {
-    log("debug", "sbt_guard_dao_id_decode_failed", {
+    deps().log("debug", "sbt_guard_dao_id_decode_failed", {
       error: (err as Error).message,
     });
   }
@@ -149,12 +191,13 @@ export function isTransferAttempt(functionNames: string[]): boolean {
 export async function alertAdmin(
   payload: Record<string, unknown>,
 ): Promise<void> {
-  log("error", "sbt_transfer_attempt_detected", payload);
+  deps().log("error", "sbt_transfer_attempt_detected", payload);
 
-  if (!config.adminAlertWebhookUrl) return;
+  const webhookUrl = deps().adminAlertWebhookUrl;
+  if (!webhookUrl) return;
 
   try {
-    const res = await fetch(config.adminAlertWebhookUrl, {
+    const res = await fetch(webhookUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ event: "sbt_transfer_attempt", ...payload }),
@@ -162,10 +205,10 @@ export async function alertAdmin(
     if (!res.ok) {
       throw new Error(`webhook responded ${res.status}`);
     }
-    markHealthy("sbt_transfer_watch");
+    deps().health.markHealthy("sbt_transfer_watch");
   } catch (err) {
-    markDegraded("sbt_transfer_watch", (err as Error).message);
-    log("warn", "sbt_alert_webhook_failed", {
+    deps().health.markDegraded("sbt_transfer_watch", (err as Error).message);
+    deps().log("warn", "sbt_alert_webhook_failed", {
       error: (err as Error).message,
     });
   }
@@ -190,7 +233,7 @@ export function recordTransferAttempt(
   // never executes far enough to validate it), so an out-of-range value must
   // not be allowed to throw out of the poll loop.
   try {
-    return dbService.addEvent({
+    return deps().addEvent({
       daoId: attempt.daoId,
       type: "sbt_transfer_attempt",
       data: {
@@ -202,7 +245,7 @@ export function recordTransferAttempt(
       verified: true,
     });
   } catch (err) {
-    log("debug", "sbt_guard_record_failed", {
+    deps().log("debug", "sbt_guard_record_failed", {
       daoId: attempt.daoId,
       error: (err as Error).message,
     });
@@ -210,7 +253,7 @@ export function recordTransferAttempt(
   }
 }
 
-/** Minimal shape this module needs from a `server.getTransactions()` entry. */
+/** Minimal shape this module needs from a `deps().server.getTransactions()` entry. */
 export interface TransactionLike {
   envelopeXdr: StellarSdk.xdr.TransactionEnvelope;
   txHash: string;
@@ -260,15 +303,15 @@ export async function checkForTransferAttempts(): Promise<{
   checked: number;
   flagged: number;
 }> {
-  if (config.testMode) return { checked: 0, flagged: 0 };
+  if (deps().testMode) return { checked: 0, flagged: 0 };
 
-  const contractId = config.membershipSbtContractId;
+  const contractId = deps().membershipSbtContractId;
   if (!contractId || !isValidContractId(contractId)) {
     return { checked: 0, flagged: 0 };
   }
 
   try {
-    const rpcServer = server as StellarSdk.rpc.Server;
+    const rpcServer = deps().server as StellarSdk.rpc.Server;
     const request = cursor
       ? { pagination: { cursor, limit: 50 } }
       : { startLedger: 0, pagination: { limit: 50 } };
@@ -293,11 +336,11 @@ export async function checkForTransferAttempts(): Promise<{
     }
 
     cursor = response.cursor;
-    markHealthy("sbt_transfer_watch");
+    deps().health.markHealthy("sbt_transfer_watch");
     return { checked: response.transactions.length, flagged };
   } catch (err) {
-    markDegraded("sbt_transfer_watch", (err as Error).message);
-    log("error", "sbt_transfer_watch_check_failed", {
+    deps().health.markDegraded("sbt_transfer_watch", (err as Error).message);
+    deps().log("error", "sbt_transfer_watch_check_failed", {
       error: (err as Error).message,
     });
     return { checked: 0, flagged: 0 };
@@ -305,22 +348,22 @@ export async function checkForTransferAttempts(): Promise<{
 }
 
 export function startSbtTransferWatch(intervalMs?: number): void {
-  if (config.testMode) return;
+  if (deps().testMode) return;
 
-  const interval = intervalMs ?? config.sbtTransferWatchIntervalMs;
+  const interval = intervalMs ?? deps().sbtTransferWatchIntervalMs;
 
   void checkForTransferAttempts();
   watchTimerId = setInterval(() => {
     void checkForTransferAttempts();
   }, interval);
 
-  log("info", "sbt_transfer_watch_started", { intervalMs: interval });
+  deps().log("info", "sbt_transfer_watch_started", { intervalMs: interval });
 }
 
 export function stopSbtTransferWatch(): void {
   if (watchTimerId) {
     clearInterval(watchTimerId);
     watchTimerId = null;
-    log("info", "sbt_transfer_watch_stopped");
+    deps().log("info", "sbt_transfer_watch_stopped");
   }
 }

@@ -16,8 +16,8 @@
     "typecheck": "tsc --noEmit",
     "format:check": "prettier --check \"src/**/*.ts\"",
     "format": "prettier --write \"src/**/*.ts\"",
-    "test": "RELAYER_TEST_MODE=true tsx --test --test-force-exit --test-concurrency=1 'test/*.test.js' 'test/*.test.ts' 'tests/*.test.ts'",
-    "test:coverage": "RELAYER_TEST_MODE=true node --import tsx --test --test-force-exit --test-concurrency=1 --experimental-test-coverage --test-coverage-include='src/**/*.ts' --test-coverage-exclude='test/**' --test-coverage-lines=80 'test/*.test.js' 'test/*.test.ts' 'tests/*.test.ts'",
+    "test": "RELAYER_TEST_MODE=true tsx --test --test-force-exit --test-concurrency=1 'test/*.test.js' 'test/*.test.ts' 'test/di/*.test.ts' 'tests/*.test.ts'",
+    "test:coverage": "RELAYER_TEST_MODE=true node --import tsx --test --test-force-exit --test-concurrency=1 --experimental-test-coverage --test-coverage-include='src/**/*.ts' --test-coverage-exclude='test/**' --test-coverage-lines=80 'test/*.test.js' 'test/*.test.ts' 'test/di/*.test.ts' 'tests/*.test.ts'",
     "validate-profiles": "tsx scripts/validate-profiles.ts",
     "audit:check": "npm audit --audit-level=high",
     "sbom:generate": "node ./scripts/generate-sbom.mjs",
@@ -25,6 +25,8 @@
     "migrate:down": "tsx src/services/migrate.ts down",
     "migrate:status": "tsx src/services/migrate.ts status",
     "migrate:dry-run": "tsx src/services/migrate.ts dry-run",
+    "migrate:parity": "tsx src/services/migrate.ts parity",
+    "db:benchmark": "tsx scripts/db-benchmark.ts",
     "token:create": "tsx src/token-manager.ts create",
     "token:list": "tsx src/token-manager.ts list",
     "token:revoke": "tsx src/token-manager.ts revoke",
@@ -40,6 +42,8 @@
     "docs:generate": "RELAYER_TEST_MODE=true tsx scripts/generate-openapi.ts && npm run docs:types",
     "docs:check": "RELAYER_TEST_MODE=true tsx scripts/generate-openapi.ts --check",
     "docs:types": "openapi-typescript openapi.json -o src/generated/api-types.ts",
+    "config:generate": "tsx scripts/generate-env-example.ts",
+    "config:check": "tsx scripts/generate-env-example.ts --check 2>&1 || (echo \"\n.env.example is out of sync! Run: npm run config:generate\" && exit 1)",
     "db:generate-types": "kysely-codegen --dialect sqlite --url data/zkvote.db --out-file src/generated/db-types.ts"
   },
   "keywords": [

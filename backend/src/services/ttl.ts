@@ -1,25 +1,122 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config, isValidContractId } from "../config.js";
-import {
-  server,
-  relayerKeypair,
-  callWithTimeout,
-  withSequenceLock,
-  waitForTransaction,
-} from "./stellar.js";
-import { log } from "./logger.js";
-import * as dbService from "./db.js";
-import {
-  queryInstanceTTLWithFallback,
-  queryPersistentTTLWithFallback,
-  needsRenewal,
-  isInGracePeriod,
-  formatRemaining,
-} from "./ttl-checker.js";
-import { markDegraded, markHealthy } from "./service-health.js";
+import { isValidContractId } from "../config.js";
+import type { RpcServerPort, LoggerPort } from "./interfaces.js";
+import type { TTLInfo } from "./ttl-checker.js";
+import type { TTLTrackingEntry } from "./db.js";
+
+/**
+ * Database surface needed by the TTL renewal service (#358). Structurally
+ * typed so unit tests can inject an in-memory fake.
+ */
+export interface TtlDbPort {
+  getAllCachedDaos(): Array<{ id: number }>;
+  upsertTTLTracking(entry: TTLTrackingEntry): void;
+  createTTLCostLog(cycleId: string, cycleStart: string): number;
+  updateTTLCostLog(
+    id: number,
+    fields: Partial<{
+      cycleEnd: string;
+      entriesRenewed: number;
+      entriesSkipped: number;
+      txCount: number;
+      totalFeeXlm: number;
+      status: string;
+    }>,
+  ): void;
+}
+
+/** TTL introspection surface (the subset of `ttl-checker.ts` used here). */
+export interface TtlCheckerPort {
+  queryInstanceTTLWithFallback(
+    contractId: string,
+    entryId: string,
+  ): Promise<TTLInfo>;
+  queryPersistentTTLWithFallback(
+    contractId: string,
+    daoId: number,
+    method: string,
+    entryId: string,
+  ): Promise<TTLInfo>;
+  needsRenewal(info: TTLInfo): boolean;
+  isInGracePeriod(info: TTLInfo): boolean;
+  formatRemaining(info: TTLInfo): string;
+}
+
+/** Health-reporting surface (subset of `service-health.ts`). */
+export interface TtlHealthPort {
+  markHealthy(service: "ttl_renewal"): void;
+  markDegraded(service: "ttl_renewal", reason?: string): void;
+}
+
+/**
+ * Dependencies of the TTL renewal service, injected explicitly via
+ * `initTtlService` (called by the composition root) so this module never
+ * imports the `stellar.js`/`db.js`/`service-health.js` module singletons
+ * to get what it needs (#358).
+ */
+export interface TtlServiceDeps {
+  /** Active RPC server (pool-backed proxy in production). */
+  server: RpcServerPort;
+  /** Relayer keypair used to sign renewal transactions. */
+  relayerKeypair: { publicKey(): string } & Partial<StellarSdk.Keypair>;
+  /** Run `fn` with a timeout, labelled for logs/metrics. */
+  callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
+  /** Serialize transaction submissions against the relayer account. */
+  withSequenceLock<T>(fn: () => Promise<T>): Promise<T>;
+  /** Wait for an on-chain transaction to settle. */
+  waitForTransaction(
+    hash: string,
+    timeoutSeconds?: number,
+  ): Promise<{ status: string }>;
+  /** Config: relayer test mode (disables the background renewal loop). */
+  testMode: boolean;
+  /** Config: Stellar network passphrase. */
+  networkPassphrase: string;
+  /** Config: max fee (stroops) for TTL renewal transactions. */
+  ttlMaxFee: string;
+  /** Config: whether on-chain TTL checks run before renewal. */
+  ttlCheckEnabled: boolean;
+  /** Config: whether per-cycle cost logging is persisted. */
+  ttlCostTrackingEnabled: boolean;
+  /** Config: renewal batch size. */
+  ttlBatchSize: number;
+  /** Config: default renewal interval (ms). */
+  ttlRenewalIntervalMs: number;
+  /** Contract IDs by config key (same keys as `CONTRACT_META.envKey`). */
+  contractIds: {
+    votingContractId?: string;
+    treeContractId?: string;
+    commentsContractId?: string;
+    daoRegistryContractId?: string;
+    membershipSbtContractId?: string;
+  };
+  /** Cached-DAO reads + TTL tracking/cost-log persistence. */
+  db: TtlDbPort;
+  /** On-chain TTL introspection. */
+  checker: TtlCheckerPort;
+  /** Health reporting for the renewal loop. */
+  health: TtlHealthPort;
+  /** Structured logger (called as `deps.log(level, event, meta)`). */
+  log: LoggerPort["log"];
+}
+
+let ttlDeps: TtlServiceDeps | null = null;
+
+/** Explicitly wire the TTL service's dependencies (composition root only). */
+export function initTtlService(d: TtlServiceDeps): void {
+  ttlDeps = d;
+}
+
+/** Internal accessor — throws if the composition root has not wired deps. */
+function deps(): TtlServiceDeps {
+  if (!ttlDeps) {
+    throw new Error("ttl: initTtlService() must be called before use");
+  }
+  return ttlDeps;
+}
 
 const CONTRACT_META: Array<{
-  envKey: keyof typeof config;
+  envKey: keyof TtlServiceDeps["contractIds"];
   method: string;
   label: string;
 }> = [
@@ -35,7 +132,7 @@ const CONTRACT_META: Array<{
 ];
 
 const DAO_METHODS: Array<{
-  envKey: keyof typeof config;
+  envKey: keyof TtlServiceDeps["contractIds"];
   method: string;
   label: string;
 }> = [
@@ -62,6 +159,8 @@ interface SubmitCallResult {
 
 let renewalTimerId: ReturnType<typeof setInterval> | null = null;
 
+const NULLIFIER_GRACE_SECONDS = 72 * 60 * 60;
+
 function getContractId(envKey: keyof typeof config): string | null {
   const val = config[envKey];
   if (typeof val === "string" && isValidContractId(val)) return val;
@@ -74,22 +173,22 @@ async function submitCall(
   args: StellarSdk.xdr.ScVal[] = [],
 ): Promise<SubmitCallResult> {
   try {
-    return await withSequenceLock(async () => {
-      const rpcServer = server as StellarSdk.rpc.Server;
+    return await deps().withSequenceLock(async () => {
+      const rpcServer = deps().server as StellarSdk.rpc.Server;
       const sourceAccount = await rpcServer.getAccount(
-        relayerKeypair.publicKey(),
+        deps().relayerKeypair.publicKey(),
       );
       const contract = new StellarSdk.Contract(contractId);
 
       const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
-        fee: config.ttlMaxFee,
-        networkPassphrase: config.networkPassphrase,
+        fee: deps().ttlMaxFee,
+        networkPassphrase: deps().networkPassphrase,
       })
         .addOperation(contract.call(method, ...args))
         .setTimeout(30)
         .build();
 
-      const simResult = await callWithTimeout(
+      const simResult = await deps().callWithTimeout(
         () => rpcServer.simulateTransaction(tx),
         `ttl_sim_${method}`,
       );
@@ -101,9 +200,9 @@ async function submitCall(
       const prepared = StellarSdk.rpc
         .assembleTransaction(tx, simResult)
         .build();
-      prepared.sign(relayerKeypair as StellarSdk.Keypair);
+      prepared.sign(deps().relayerKeypair as StellarSdk.Keypair);
 
-      const sendResult = await callWithTimeout(
+      const sendResult = await deps().callWithTimeout(
         () => rpcServer.sendTransaction(prepared),
         `ttl_send_${method}`,
       );
@@ -112,7 +211,7 @@ async function submitCall(
         return { success: false, error: "send_error" };
       }
 
-      await waitForTransaction(sendResult.hash, 15);
+      await deps().waitForTransaction(sendResult.hash, 15);
 
       let feeXlm: number | undefined;
       try {
@@ -137,7 +236,7 @@ let ttlSubmitter: TTLSubmitter = submitCall;
  * Replace only the transaction-submission boundary in test mode.
  */
 export function setTTLSubmitterForTests(submitter: TTLSubmitter | null): void {
-  if (!config.testMode) {
+  if (!deps().testMode) {
     throw new Error("TTL submitter overrides are only available in test mode");
   }
 
@@ -159,13 +258,12 @@ function makeDaoIdScVal(daoId: number): StellarSdk.xdr.ScVal {
   return StellarSdk.nativeToScVal(daoId, { type: "u64" });
 }
 
-async function hasActiveProposals(
+async function getProposalEndTime(
   contractId: string,
   daoId: number,
-): Promise<boolean> {
+  proposalId: number,
+): Promise<number | null> {
   try {
-    if (config.testMode) return true;
-
     const rpcServer = server as StellarSdk.rpc.Server;
     const sourceAccount = await rpcServer.getAccount(
       relayerKeypair.publicKey(),
@@ -176,11 +274,56 @@ async function hasActiveProposals(
       fee: "100",
       networkPassphrase: config.networkPassphrase,
     })
-      .addOperation(contract.call("proposal_count", makeDaoIdScVal(daoId)))
+      .addOperation(
+        contract.call(
+          "get_proposal_end_time",
+          makeDaoIdScVal(daoId),
+          StellarSdk.nativeToScVal(proposalId, { type: "u64" }),
+        ),
+      )
       .setTimeout(30)
       .build();
 
     const simResult = await callWithTimeout(
+      () => rpcServer.simulateTransaction(tx),
+      "ttl_get_proposal_end_time",
+    );
+
+    if (
+      !StellarSdk.rpc.Api.isSimulationSuccess(simResult) ||
+      !simResult.result?.retval
+    ) {
+      return null;
+    }
+    const endTime = Number(StellarSdk.scValToNative(simResult.result.retval));
+    return endTime === 0 ? null : endTime;
+  } catch {
+    return null;
+  }
+}
+
+async function hasActiveProposals(
+  contractId: string,
+  daoId: number,
+): Promise<boolean> {
+  try {
+    if (deps().testMode) return true;
+
+    const rpcServer = deps().server as StellarSdk.rpc.Server;
+    const sourceAccount = await rpcServer.getAccount(
+      deps().relayerKeypair.publicKey(),
+    );
+    const contract = new StellarSdk.Contract(contractId);
+
+    const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+      fee: "100",
+      networkPassphrase: deps().networkPassphrase,
+    })
+      .addOperation(contract.call("proposal_count", makeDaoIdScVal(daoId)))
+      .setTimeout(30)
+      .build();
+
+    const simResult = await deps().callWithTimeout(
       () => rpcServer.simulateTransaction(tx),
       "ttl_check_proposal_count",
     );
@@ -193,7 +336,21 @@ async function hasActiveProposals(
     }
 
     const count = Number(StellarSdk.scValToNative(simResult.result.retval));
-    return count > 0;
+    if (count === 0) return false;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const recentLookback = Math.min(count, 5);
+    for (let offset = 0; offset < recentLookback; offset++) {
+      const pid = count - offset;
+      const endTime = await getProposalEndTime(contractId, daoId, pid);
+      if (endTime === null) {
+        return true;
+      }
+      if (endTime + NULLIFIER_GRACE_SECONDS >= nowSec) {
+        return true;
+      }
+    }
+    return false;
   } catch {
     return true;
   }
@@ -212,9 +369,9 @@ async function collectEntries(): Promise<{
 
     const entryId = buildEntryId(contractId, undefined, meta.method);
 
-    if (config.ttlCheckEnabled) {
-      const info = await queryInstanceTTLWithFallback(contractId, entryId);
-      if (isInGracePeriod(info)) {
+    if (deps().ttlCheckEnabled) {
+      const info = await deps().checker.queryInstanceTTLWithFallback(contractId, entryId);
+      if (deps().checker.isInGracePeriod(info)) {
         graceEntries.push({
           entryId,
           contractId,
@@ -222,15 +379,15 @@ async function collectEntries(): Promise<{
           args: [],
           label: `${meta.label}_instance`,
         });
-        log("warn", "ttl_grace_period_entry", {
+        deps().log("warn", "ttl_grace_period_entry", {
           entry: meta.label,
-          remaining: formatRemaining(info),
+          remaining: deps().checker.formatRemaining(info),
         });
       }
-      if (!needsRenewal(info)) {
-        log("info", "ttl_skip_healthy_instance", {
+      if (!deps().checker.needsRenewal(info)) {
+        deps().log("info", "ttl_skip_healthy_instance", {
           entry: meta.label,
-          remaining: formatRemaining(info),
+          remaining: deps().checker.formatRemaining(info),
         });
         continue;
       }
@@ -245,7 +402,7 @@ async function collectEntries(): Promise<{
     });
   }
 
-  const daos = dbService.getAllCachedDaos();
+  const daos = deps().db.getAllCachedDaos();
 
   for (const dao of daos) {
     let hasActive = true;
@@ -261,7 +418,7 @@ async function collectEntries(): Promise<{
       const entryId = buildEntryId(contractId, dao.id, daoMethod.method);
 
       if (!hasActive && daoMethod.envKey === "votingContractId") {
-        log("info", "ttl_skip_inactive_dao", {
+        deps().log("info", "ttl_skip_inactive_dao", {
           dao: dao.id,
           method: daoMethod.label,
           reason: "no active proposals",
@@ -269,14 +426,14 @@ async function collectEntries(): Promise<{
         continue;
       }
 
-      if (config.ttlCheckEnabled) {
-        const info = await queryPersistentTTLWithFallback(
+      if (deps().ttlCheckEnabled) {
+        const info = await deps().checker.queryPersistentTTLWithFallback(
           contractId,
           dao.id,
           daoMethod.method,
           entryId,
         );
-        if (isInGracePeriod(info)) {
+        if (deps().checker.isInGracePeriod(info)) {
           graceEntries.push({
             entryId,
             contractId,
@@ -285,12 +442,12 @@ async function collectEntries(): Promise<{
             daoId: dao.id,
             label: `${daoMethod.label}_dao${dao.id}`,
           });
-          log("warn", "ttl_grace_period_entry", {
+          deps().log("warn", "ttl_grace_period_entry", {
             entry: entryId,
-            remaining: formatRemaining(info),
+            remaining: deps().checker.formatRemaining(info),
           });
         }
-        if (!needsRenewal(info)) {
+        if (!deps().checker.needsRenewal(info)) {
           continue;
         }
       }
@@ -339,7 +496,7 @@ async function executeBatch(batch: RenewalEntry[]): Promise<{
       totalFee += result.feeXlm ?? 0;
       txCount++;
 
-      dbService.upsertTTLTracking({
+      deps().db.upsertTTLTracking({
         entryId: entry.entryId,
         contractId: entry.contractId,
         daoId: entry.daoId ?? null,
@@ -350,7 +507,7 @@ async function executeBatch(batch: RenewalEntry[]): Promise<{
       });
     } else {
       failCount++;
-      log("warn", "ttl_batch_entry_failed", {
+      deps().log("warn", "ttl_batch_entry_failed", {
         entry: entry.label,
         error: result.error,
       });
@@ -361,24 +518,24 @@ async function executeBatch(batch: RenewalEntry[]): Promise<{
 }
 
 async function renewAllTTLs(): Promise<void> {
-  log("info", "ttl_renewal_started");
+  deps().log("info", "ttl_renewal_started");
   const startTime = Date.now();
   const cycleId = new Date().toISOString();
   let costLogId: number | null = null;
 
-  if (config.ttlCostTrackingEnabled) {
-    costLogId = dbService.createTTLCostLog(cycleId, cycleId);
+  if (deps().ttlCostTrackingEnabled) {
+    costLogId = deps().db.createTTLCostLog(cycleId, cycleId);
   }
 
   const { entries, graceEntries } = await collectEntries();
 
   if (entries.length === 0 && graceEntries.length === 0) {
-    log("info", "ttl_renewal_all_healthy", {
+    deps().log("info", "ttl_renewal_all_healthy", {
       message:
         "All entries have sufficient remaining TTL. Skipping renewal cycle.",
     });
     if (costLogId !== null) {
-      dbService.updateTTLCostLog(costLogId, {
+      deps().db.updateTTLCostLog(costLogId, {
         cycleEnd: new Date().toISOString(),
         entriesRenewed: 0,
         entriesSkipped: 0,
@@ -390,7 +547,7 @@ async function renewAllTTLs(): Promise<void> {
     return;
   }
 
-  const batchSize = config.ttlBatchSize;
+  const batchSize = deps().ttlBatchSize;
   const batches: RenewalEntry[][] = [];
   for (let i = 0; i < entries.length; i += batchSize) {
     batches.push(entries.slice(i, i + batchSize));
@@ -403,7 +560,7 @@ async function renewAllTTLs(): Promise<void> {
 
   for (let b = 0; b < batches.length; b++) {
     const batch = batches[b];
-    log("info", "ttl_batch_executing", {
+    deps().log("info", "ttl_batch_executing", {
       batch: b + 1,
       of: batches.length,
       size: batch.length,
@@ -419,7 +576,7 @@ async function renewAllTTLs(): Promise<void> {
   const durationMs = Date.now() - startTime;
   const skipped = entries.length - totalSuccess - totalFail;
 
-  log("info", "ttl_renewal_completed", {
+  deps().log("info", "ttl_renewal_completed", {
     totalEntries: entries.length,
     successCount: totalSuccess,
     failCount: totalFail,
@@ -430,7 +587,7 @@ async function renewAllTTLs(): Promise<void> {
   });
 
   if (graceEntries.length > 0) {
-    log("warn", "ttl_grace_period_alerts", {
+    deps().log("warn", "ttl_grace_period_alerts", {
       count: graceEntries.length,
       entries: graceEntries.map((e) => e.label),
       message:
@@ -439,7 +596,7 @@ async function renewAllTTLs(): Promise<void> {
   }
 
   if (costLogId !== null) {
-    dbService.updateTTLCostLog(costLogId, {
+    deps().db.updateTTLCostLog(costLogId, {
       cycleEnd: new Date().toISOString(),
       entriesRenewed: totalSuccess,
       entriesSkipped: skipped,
@@ -451,39 +608,39 @@ async function renewAllTTLs(): Promise<void> {
 }
 
 export function startTTLRenewal(intervalMs?: number): void {
-  if (config.testMode) return;
+  if (deps().testMode) return;
 
-  const interval = intervalMs ?? config.ttlRenewalIntervalMs;
+  const interval = intervalMs ?? deps().ttlRenewalIntervalMs;
 
   renewAllTTLs()
-    .then(() => markHealthy("ttl_renewal"))
+    .then(() => deps().health.markHealthy("ttl_renewal"))
     .catch((err) => {
-      markDegraded("ttl_renewal", (err as Error).message);
-      log("error", "ttl_renewal_initial_failed", {
+      deps().health.markDegraded("ttl_renewal", (err as Error).message);
+      deps().log("error", "ttl_renewal_initial_failed", {
         error: (err as Error).message,
       });
     });
 
   renewalTimerId = setInterval(() => {
     renewAllTTLs()
-      .then(() => markHealthy("ttl_renewal"))
+      .then(() => deps().health.markHealthy("ttl_renewal"))
       .catch((err) => {
-        markDegraded("ttl_renewal", (err as Error).message);
-        log("error", "ttl_renewal_periodic_failed", {
+        deps().health.markDegraded("ttl_renewal", (err as Error).message);
+        deps().log("error", "ttl_renewal_periodic_failed", {
           error: (err as Error).message,
         });
       });
   }, interval);
 
   const intervalDays = (interval / (24 * 60 * 60 * 1000)).toFixed(1);
-  log("info", "ttl_renewal_service_started", { intervalDays });
+  deps().log("info", "ttl_renewal_service_started", { intervalDays });
 }
 
 export function stopTTLRenewal(): void {
   if (renewalTimerId) {
     clearInterval(renewalTimerId);
     renewalTimerId = null;
-    log("info", "ttl_renewal_service_stopped");
+    deps().log("info", "ttl_renewal_service_stopped");
   }
 }
 

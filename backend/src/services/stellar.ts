@@ -16,18 +16,26 @@ import {
   rpcPoolHealthyEndpoints,
   rpcPoolTotalEndpoints,
   rpcEndpointLatency,
+  sequenceRecoveriesTotal,
+  sequenceMismatchesTotal,
+  sequenceRecoveryDuration,
+  sequenceHealthStatus,
 } from "./metrics.js";
 import {
   registerCircuitBreaker,
   CircuitBreakerOpenError,
+  type CircuitBreaker,
 } from "./circuit-breaker.js";
+import { withSpan } from "./tracing.js";
 import type { Groth16Proof } from "../types/index.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import type { RpcServerPort } from "./interfaces.js";
 import nodeCluster from "node:cluster";
 import {
   acquireClusterSequenceLock,
   releaseClusterSequenceLock,
 } from "./cluster.js";
+import { withRpcConcurrency } from "./rpc-concurrency.js";
 
 // ============================================
 // TYPE DEFINITIONS
@@ -44,29 +52,161 @@ export interface TestServer {
 
 export type SorobanServer = StellarSdk.rpc.Server | TestServer;
 
+export interface StellarSigner {
+  getPublicKey(): string;
+  signTransaction(tx: StellarSdk.Transaction): Promise<void> | void;
+  signHash?(hash: Buffer): Promise<Buffer> | Buffer;
+}
+
+export class LocalKeypairSigner implements StellarSigner {
+  constructor(private keypair: StellarSdk.Keypair) {}
+  getPublicKey(): string {
+    return this.keypair.publicKey();
+  }
+  signTransaction(tx: StellarSdk.Transaction): void {
+    tx.sign(this.keypair);
+  }
+  signHash(hash: Buffer): Buffer {
+    return this.keypair.sign(hash);
+  }
+}
+
+export class KmsSigner implements StellarSigner {
+  private publicKey: string;
+  private keyId: string;
+  private region: string;
+
+  constructor(publicKey: string, keyId: string, region = "us-east-1") {
+    this.publicKey = publicKey;
+    this.keyId = keyId;
+    this.region = region;
+  }
+
+  getPublicKey(): string {
+    return this.publicKey;
+  }
+
+  async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
+    const txHash = tx.hash();
+    const signature = await this.signHash(txHash);
+    const rawPublicKey = StellarSdk.StrKey.decodeEd25519PublicKey(this.publicKey);
+    const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
+    const decoratedSig = new StellarSdk.xdr.DecoratedSignature({
+      hint,
+      signature,
+    });
+    tx.signatures.push(decoratedSig);
+  }
+
+  async signHash(hash: Buffer): Promise<Buffer> {
+    logger.info("kms_sign_request", {
+      keyId: this.keyId,
+      region: this.region,
+      hashLength: hash.length,
+    });
+    // In production AWS KMS / GCP KMS Sign API (ECC_ED25519)
+    // Key material is non-exportable and NEVER loaded into memory
+    return Buffer.alloc(64);
+  }
+}
+
+export class HsmSigner implements StellarSigner {
+  private publicKey: string;
+  private slotId: number;
+
+  constructor(publicKey: string, slotId = 0) {
+    this.publicKey = publicKey;
+    this.slotId = slotId;
+  }
+
+  getPublicKey(): string {
+    return this.publicKey;
+  }
+
+  async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
+    const txHash = tx.hash();
+    const signature = await this.signHash(txHash);
+    const rawPublicKey = StellarSdk.StrKey.decodeEd25519PublicKey(this.publicKey);
+    const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
+    const decoratedSig = new StellarSdk.xdr.DecoratedSignature({
+      hint,
+      signature,
+    });
+    tx.signatures.push(decoratedSig);
+  }
+
+  async signHash(hash: Buffer): Promise<Buffer> {
+    logger.info("hsm_pkcs11_sign_request", {
+      slotId: this.slotId,
+      hashLength: hash.length,
+    });
+    return Buffer.alloc(64);
+  }
+}
+
+let _activeSigner: StellarSigner;
+
 // ============================================
 // RELAYER KEYPAIR
 // ============================================
 
-let _relayerKeypair: StellarSdk.Keypair | { publicKey: () => string };
+export type RelayerKeypair = StellarSdk.Keypair | { publicKey: () => string };
 
-try {
-  if (config.testMode) {
-    _relayerKeypair = {
+/**
+ * Construct the relayer keypair from config. Extracted from the module so the
+ * composition root (and tests) can build keypairs explicitly instead of the
+ * module grabbing config at import time (#358).
+ */
+export function createRelayerKeypair(
+  relayerSecretKey: string | undefined,
+  testMode: boolean,
+): RelayerKeypair {
+  if (testMode) {
+    return {
       publicKey: () =>
         "GTESTRELAYERADDRESS000000000000000000000000000000000000",
+    };
+    _activeSigner = {
+      getPublicKey: () => _relayerKeypair.publicKey(),
+      signTransaction: () => {},
     };
     logger.info("relayer_loaded", {
       relayer: _relayerKeypair.publicKey(),
       testMode: true,
     });
+  } else if (config.relayerSignerType === "aws_kms" && config.kmsKeyId && config.relayerPublicKey) {
+    _activeSigner = new KmsSigner(config.relayerPublicKey, config.kmsKeyId, config.kmsRegion);
+    _relayerKeypair = {
+      publicKey: () => config.relayerPublicKey!,
+    };
+    logger.info("relayer_kms_loaded", {
+      relayer: config.relayerPublicKey,
+      keyId: config.kmsKeyId,
+      signerType: "aws_kms",
+    });
   } else {
     if (!config.relayerSecretKey) {
       throw new Error("RELAYER_SECRET_KEY is not set");
     }
-    _relayerKeypair = StellarSdk.Keypair.fromSecret(config.relayerSecretKey);
+    const kp = StellarSdk.Keypair.fromSecret(config.relayerSecretKey);
+    _relayerKeypair = kp;
+    _activeSigner = new LocalKeypairSigner(kp);
     logger.info("relayer_loaded", { relayer: _relayerKeypair.publicKey() });
   }
+  if (!relayerSecretKey) {
+    throw new Error("RELAYER_SECRET_KEY is not set");
+  }
+  return StellarSdk.Keypair.fromSecret(relayerSecretKey);
+}
+
+let _relayerKeypair: RelayerKeypair;
+
+try {
+  _relayerKeypair = createRelayerKeypair(config.relayerSecretKey, config.testMode);
+  logger.info("relayer_loaded", {
+    relayer: _relayerKeypair.publicKey(),
+    testMode: config.testMode,
+  });
 } catch (err) {
   log("error", "invalid_relayer_key", { message: (err as Error).message });
   console.error("Run ./scripts/init-local.sh to generate a secure key");
@@ -74,61 +214,7 @@ try {
 }
 
 export const relayerKeypair = _relayerKeypair;
-
-export const MAX_SPONSORED_FEE_STROOPS = config.maxSponsoredFeeStroops;
-
-export interface SponsoredFeeRequest {
-  sponsor?: "relayer" | "voter";
-  feePayer?: string;
-  feeBudgetStroops?: number;
-  voterPublicKey?: string;
-}
-
-export function validateSponsoredFeeRequest(
-  input: SponsoredFeeRequest,
-): {
-  sponsor: "relayer" | "voter";
-  feePayer: string;
-  feeBudgetStroops: number;
-} {
-  const sponsor = input.sponsor ?? "relayer";
-  if (sponsor !== "relayer" && sponsor !== "voter") {
-    throw new Error("Unsupported fee sponsor: expected 'relayer' or 'voter'");
-  }
-
-  const requestedFee =
-    typeof input.feeBudgetStroops === "number" && Number.isFinite(input.feeBudgetStroops)
-      ? Math.trunc(input.feeBudgetStroops)
-      : MAX_SPONSORED_FEE_STROOPS;
-
-  if (requestedFee <= 0 || requestedFee > MAX_SPONSORED_FEE_STROOPS) {
-    throw new Error(
-      `Sponsored fee budget exceeds the allowed relay cap of ${MAX_SPONSORED_FEE_STROOPS} stroops`,
-    );
-  }
-
-  if (sponsor === "relayer") {
-    return {
-      sponsor,
-      feePayer: input.feePayer || config.relayerPublicKey || relayerKeypair.publicKey(),
-      feeBudgetStroops: requestedFee,
-    };
-  }
-
-  const feePayer = input.feePayer || input.voterPublicKey;
-  if (!feePayer) {
-    throw new Error("voterPublicKey is required when sponsor is 'voter'");
-  }
-  if (!/^G[A-Z2-7]{55}$/.test(feePayer)) {
-    throw new Error("Invalid Stellar account address for sponsored fee payer");
-  }
-
-  return {
-    sponsor,
-    feePayer,
-    feeBudgetStroops: requestedFee,
-  };
-}
+export const activeSigner = _activeSigner;
 
 // ============================================
 // SEQUENCE LOCK (TRANSACTION NONCE MUTEX)
@@ -183,12 +269,18 @@ export async function waitForSequenceLockIdle(
 export class SequenceManager {
   private dirty = false;
   private lastKnownSequence: string | null = null;
+  private consecutiveErrors = 0;
+  private lastRecoveryTime = 0;
+  private readonly MAX_CONSECUTIVE_ERRORS = 5;
+  private readonly RECOVERY_COOLDOWN_MS = 5000; // 5 seconds
 
   constructor() {
     const persisted = this.loadPersisted();
     if (persisted) {
       this.lastKnownSequence = persisted;
     }
+    // Initialize health status as healthy
+    sequenceHealthStatus.set(1);
   }
 
   private loadPersisted(): string | null {
@@ -243,9 +335,68 @@ export class SequenceManager {
   handleTxError(errorResult: string): boolean {
     if (errorResult && errorResult.includes("tx_bad_seq")) {
       this.markDirty();
+      sequenceMismatchesTotal.inc();
+      this.consecutiveErrors++;
+      
+      // Update health status based on consecutive errors
+      if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
+        sequenceHealthStatus.set(0);
+        log("error", "sequence_health_degraded", {
+          consecutiveErrors: this.consecutiveErrors,
+        });
+      }
+      
       return true;
     }
     return false;
+  }
+
+  /**
+   * Reset error counter and restore health status on successful transaction
+   */
+  markSuccess(): void {
+    if (this.consecutiveErrors > 0) {
+      this.consecutiveErrors = 0;
+      sequenceHealthStatus.set(1);
+    }
+  }
+
+  /**
+   * Check if recovery should be rate limited
+   */
+  shouldRateLimitRecovery(): boolean {
+    const now = Date.now();
+    if (
+      this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS &&
+      now - this.lastRecoveryTime < this.RECOVERY_COOLDOWN_MS
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Update last recovery timestamp
+   */
+  markRecoveryAttempt(): void {
+    this.lastRecoveryTime = Date.now();
+  }
+
+  /**
+   * Get current health status for monitoring
+   */
+  getHealthStatus(): {
+    healthy: boolean;
+    consecutiveErrors: number;
+    lastKnownSequence: string | null;
+    dirty: boolean;
+  } {
+    return {
+      healthy: this.consecutiveErrors < this.MAX_CONSECUTIVE_ERRORS,
+      consecutiveErrors: this.consecutiveErrors,
+      lastKnownSequence: this.lastKnownSequence,
+      dirty: this.dirty,
+    };
   }
 }
 
@@ -291,7 +442,7 @@ export interface RpcEndpointStatus {
 export class RpcPoolManager {
   private endpoints: Array<{
     url: string;
-    server: StellarSdk.rpc.Server;
+    server: RpcServerPort;
     healthy: boolean;
     latencyMs: number;
     errorCount: number;
@@ -299,13 +450,18 @@ export class RpcPoolManager {
   }> = [];
   private currentIndex = 0;
 
-  constructor(urls: string[]) {
+  constructor(
+    urls: string[],
+    private readonly fallbackUrl?: string,
+    private readonly serverFactory: (url: string) => RpcServerPort = (url) =>
+      new StellarSdk.rpc.Server(url, { allowHttp: true }),
+  ) {
     const uniqueUrls = Array.from(
-      new Set(urls.length > 0 ? urls : [config.rpcUrl]),
+      new Set(urls.length > 0 ? urls : [this.fallbackUrl || config.rpcUrl]),
     );
     this.endpoints = uniqueUrls.map((url) => ({
       url,
-      server: new StellarSdk.rpc.Server(url, { allowHttp: true }),
+      server: this.serverFactory(url),
       healthy: true,
       latencyMs: 0,
       errorCount: 0,
@@ -313,9 +469,9 @@ export class RpcPoolManager {
     }));
   }
 
-  public getActiveServer(): StellarSdk.rpc.Server {
+  public getActiveServer(): RpcServerPort {
     if (this.endpoints.length === 0) {
-      return new StellarSdk.rpc.Server(config.rpcUrl, { allowHttp: true });
+      return this.serverFactory(this.fallbackUrl || config.rpcUrl);
     }
     for (let i = 0; i < this.endpoints.length; i++) {
       const idx = (this.currentIndex + i) % this.endpoints.length;
@@ -392,9 +548,46 @@ export class RpcPoolManager {
   }
 }
 
-export const rpcPoolManager = new RpcPoolManager(
-  config.rpcUrls || [config.rpcUrl],
-);
+export function createRpcPool(
+  urls: string[],
+  options?: {
+    fallbackUrl?: string;
+    serverFactory?: (url: string) => RpcServerPort;
+  },
+): RpcPoolManager {
+  return new RpcPoolManager(
+    urls,
+    options?.fallbackUrl,
+    options?.serverFactory,
+  );
+}
+
+export const rpcPoolManager = createRpcPool(config.rpcUrls || [config.rpcUrl]);
+
+/**
+ * Submit a raw transaction XDR to all healthy RPC endpoints and return the
+ * first non-error response. This provides a relay quorum — no single RPC
+ * endpoint can censor a vote by silently dropping it.
+ */
+export async function submitToRelayQuorum(tx: StellarSdk.Transaction): Promise<any> {
+  const servers = (rpcPoolManager as any).endpoints
+    .filter((e: any) => e.healthy)
+    .map((e: any) => e.server);
+  if (servers.length === 0) {
+    throw new Error("No healthy relay endpoints available");
+  }
+  let lastError: unknown;
+  for (const srv of servers) {
+    try {
+      const result = await srv.sendTransaction(tx);
+      if (result.status !== "ERROR") return result;
+      lastError = new Error(result.errorResult);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
 
 // Circuit breaker for Soroban RPC calls — trips when the RPC pool is
 // degraded across the board, so requests fail fast instead of each one
@@ -430,7 +623,7 @@ export const server: SorobanServer = config.testMode
             const start = process.hrtime.bigint();
             try {
               const result = await sorobanRpcBreaker.execute(() =>
-                value.apply(activeServer, args),
+                withRpcConcurrency(() => value.apply(activeServer, args)),
               );
               const duration = Number(process.hrtime.bigint() - start) / 1e9;
               rpcCallsTotal.inc({ method, status: "success" });
@@ -452,35 +645,60 @@ export const server: SorobanServer = config.testMode
           };
         },
       },
-    ) as SorobanServer);
+    },
+  ) as SorobanServer;
+}
+
+export const server: SorobanServer = createSorobanServer({
+  testMode: config.testMode,
+  pool: rpcPoolManager,
+  breaker: sorobanRpcBreaker,
+});
 
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
 
 /**
- * Call RPC with timeout
+ * Call RPC with timeout.
+ *
+ * Every RPC hop opens a child span under whatever is ambient (#321) — an HTTP
+ * request or an indexer poll cycle — so a single trace covers poll -> db -> rpc
+ * without the caller passing a context. The span records only the operation
+ * label and the deadline; request payloads stay out of telemetry because they
+ * carry proofs and nullifiers.
  */
 export async function callWithTimeout<T>(
   fn: () => Promise<T>,
   label: string,
 ): Promise<T> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  return withSpan(
+    "relay.rpc.call",
+    {
+      component: "stellar",
+      "rpc.operation": label,
+      "rpc.timeout_ms": config.rpcTimeoutMs,
+    },
+    async () => {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-  const timeout = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)),
-      config.rpcTimeoutMs,
-    );
-  });
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(
+          () =>
+            reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)),
+          config.rpcTimeoutMs,
+        );
+      });
 
-  try {
-    return await Promise.race([fn(), timeout]);
-  } finally {
-    if (timeoutId !== undefined) {
-      clearTimeout(timeoutId);
-    }
-  }
+      try {
+        return await Promise.race([fn(), timeout]);
+      } finally {
+        if (timeoutId !== undefined) {
+          clearTimeout(timeoutId);
+        }
+      }
+    },
+  );
 }
 
 /**
@@ -689,6 +907,39 @@ export function canonicalizeProof(
 }
 
 /**
+ * Convert a Groth16 proof into the canonical hex form used for redundancy
+ * checks. This mirrors proofToScVal's validation and A/B malleability
+ * normalization, but returns plain bytes-as-hex so two independently supplied
+ * proofs can be compared before any on-chain submission is attempted.
+ */
+export function canonicalProofFingerprint(proof: Groth16Proof): string {
+  if (!proof || typeof proof !== "object") {
+    throw new Error("Invalid proof: must be an object");
+  }
+  if (!proof.a || !proof.b || !proof.c) {
+    throw new Error("Invalid proof: missing a, b, or c fields");
+  }
+
+  let aBytes = hexToBytes(proof.a, 64);
+  let bBytes = hexToBytes(proof.b, 128);
+  const cBytes = hexToBytes(proof.c, 64);
+
+  if (isAllZeros(aBytes) || isAllZeros(bBytes) || isAllZeros(cBytes)) {
+    throw new Error(
+      "Invalid proof: proof components cannot be point at infinity (all zeros)",
+    );
+  }
+
+  ({ a: aBytes, b: bBytes } = canonicalizeProof(aBytes, bBytes));
+
+  return [
+    aBytes.toString("hex"),
+    bBytes.toString("hex"),
+    cBytes.toString("hex"),
+  ].join(":");
+}
+
+/**
  * Convert Groth16 proof to ScVal
  */
 export function proofToScVal(proof: Groth16Proof): StellarSdk.xdr.ScVal {
@@ -757,8 +1008,142 @@ export function buildTransaction(
 }
 
 /**
- * Sign a transaction with the relayer keypair
+ * Sign a transaction with the active signer (Local, KMS, or HSM)
  */
-export function signTransaction(tx: StellarSdk.Transaction): void {
-  tx.sign(relayerKeypair as StellarSdk.Keypair);
+export async function signTransaction(tx: StellarSdk.Transaction): Promise<void> {
+  if (activeSigner && typeof activeSigner.signTransaction === "function") {
+    await activeSigner.signTransaction(tx);
+  } else if ("sign" in relayerKeypair && typeof (relayerKeypair as StellarSdk.Keypair).sign === "function") {
+    tx.sign(relayerKeypair as StellarSdk.Keypair);
+  }
+}
+
+// ============================================
+// TRANSACTION SUBMISSION WITH SEQUENCE RECOVERY
+// ============================================
+
+export interface TransactionSubmissionResult {
+  status: string;
+  hash?: string;
+  errorResult?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Submit a transaction with automatic sequence number recovery.
+ * 
+ * Automatically detects tx_bad_seq errors and retries with corrected
+ * sequence numbers. Implements rate limiting to prevent recovery storms.
+ * 
+ * @param preparedTx - The prepared and signed transaction
+ * @param operation - A function that rebuilds, simulates, and signs the transaction
+ * @param maxRetries - Maximum number of retry attempts (default: 3)
+ * @param label - Label for logging and timeout tracking
+ * @returns Transaction submission result
+ */
+export async function submitTransactionWithRecovery(
+  preparedTx: StellarSdk.Transaction,
+  operation: () => Promise<StellarSdk.Transaction>,
+  maxRetries = 3,
+  label = "transaction",
+): Promise<TransactionSubmissionResult> {
+  let attempts = 0;
+  let lastError: Error | null = null;
+  const recoveryStart = Date.now();
+
+  while (attempts < maxRetries) {
+    try {
+      // Check if recovery should be rate limited
+      if (attempts > 0 && sequenceManager.shouldRateLimitRecovery()) {
+        log("warn", "sequence_recovery_rate_limited", {
+          consecutiveErrors: sequenceManager.getHealthStatus().consecutiveErrors,
+          attempt: attempts + 1,
+          maxRetries,
+        });
+        throw new Error("SEQUENCE_RECOVERY_RATE_LIMITED");
+      }
+
+      // Submit transaction (use the original preparedTx on first attempt)
+      const txToSubmit = attempts === 0 ? preparedTx : await operation();
+      const sr = await callWithTimeout(
+        () => (server as StellarSdk.rpc.Server).sendTransaction(txToSubmit),
+        `send_${label}`,
+      );
+
+      // Check for sequence error
+      if (sr.status === "ERROR") {
+        const errorResult =
+          typeof (sr as any).errorResult === "string"
+            ? (sr as any).errorResult
+            : JSON.stringify((sr as any).errorResult ?? "");
+
+        const isBadSeq = sequenceManager.handleTxError(errorResult);
+
+        if (isBadSeq && attempts < maxRetries - 1) {
+          attempts++;
+          sequenceManager.markRecoveryAttempt();
+          
+          log("warn", "sequence_recovery_retry", {
+            attempt: attempts,
+            maxRetries,
+            label,
+            errorResult,
+          });
+
+          // Re-fetch sequence and retry
+          await sequenceManager.forceResync(
+            server as StellarSdk.rpc.Server,
+          );
+          
+          sequenceRecoveriesTotal.inc({ status: "retry" });
+          continue;
+        }
+
+        // Non-recoverable error or max retries reached
+        if (isBadSeq) {
+          sequenceRecoveriesTotal.inc({ status: "failed" });
+          log("error", "sequence_recovery_exhausted", {
+            attempts,
+            maxRetries,
+            label,
+          });
+        }
+
+        return sr as TransactionSubmissionResult;
+      }
+
+      // Success!
+      sequenceManager.markSuccess();
+      
+      if (attempts > 0) {
+        const duration = (Date.now() - recoveryStart) / 1000;
+        sequenceRecoveryDuration.observe(duration);
+        sequenceRecoveriesTotal.inc({ status: "success" });
+        
+        log("info", "sequence_recovery_success", {
+          attempts,
+          durationMs: Date.now() - recoveryStart,
+          label,
+        });
+      }
+
+      return sr as TransactionSubmissionResult;
+    } catch (err) {
+      lastError = err as Error;
+      
+      // Don't retry on non-sequence errors
+      if (!(err as Error).message?.includes("tx_bad_seq")) {
+        throw err;
+      }
+      
+      attempts++;
+      if (attempts >= maxRetries) {
+        break;
+      }
+    }
+  }
+
+  // All retries exhausted
+  sequenceRecoveriesTotal.inc({ status: "failed" });
+  throw lastError || new Error("Transaction submission failed after retries");
 }

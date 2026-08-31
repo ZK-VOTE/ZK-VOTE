@@ -15,8 +15,9 @@ include "merkle_tree.circom";
 // 1. Voter knows secret & salt that hash to a commitment (leaf) in the Merkle tree
 // 2. Nullifier is correctly derived from secret, daoId, and proposalId (domain-separated)
 // 3. Vote choice (candidate index) is within [0, numCandidates)
+// 4. Proof is bound to a specific relayer address (prevents cross-relayer proof reuse)
 //
-// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates]
+// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]
 // Private signals: secret, salt, blindingFactor, pathElements, pathIndices
 //
 // PRIVACY: Commitment is NOT exposed publicly. Votes are fully unlinkable across proposals.
@@ -26,6 +27,11 @@ include "merkle_tree.circom";
 // the same candidate bound that the election was configured with. Without this binding,
 // a prover could supply a proof valid under one numCandidates value while the contract
 // tallies using a different (potentially larger) count.
+//
+// RELAYER BINDING: relayerAddress binds the proof to a specific relayer, preventing
+// front-running attacks where a malicious intermediary could resubmit proofs through
+// different relayers or delay submissions strategically. The contract verifies this
+// signal matches the actual relayer submitting the transaction.
 template Vote(levels) {
     var DOMAIN_TAG = 19666041591797403834655481403982443037438503980743793537655983658411276515161;
 
@@ -36,6 +42,7 @@ template Vote(levels) {
     signal input proposalId;        // Which proposal this vote is for
     signal input voteChoice;        // Candidate index the voter selected
     signal input numCandidates;     // Total number of candidates (set by election config)
+    signal input relayerAddress;    // Relayer address binding proof to specific relayer (anti-front-running)
 
     // Private inputs
     signal input secret;            // Voter's secret (like password)
@@ -91,8 +98,8 @@ template Vote(levels) {
 }
 
 // Default tree depth of 18 (supports ~262K members)
-// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
+// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress] - 7 signals
 // Commitment is computed internally from secret+salt (private)
-component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates]} = Vote(18);
+component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]} = Vote(18);
 
 

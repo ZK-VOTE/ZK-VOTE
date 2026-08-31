@@ -17,6 +17,23 @@ import {
   type ExclusionProof,
 } from "../src/services/exclusion-proof.js";
 
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+import { buildAppServices } from "../src/composition-root.js";
+buildAppServices();
+
+// The revocation-tracking tests persist through the wired db deps, so make
+// sure the schema (including member_revocations) exists before they run.
+import fs from "node:fs";
+import path from "node:path";
+import { initDb } from "../src/services/db.js";
+const dataDir = path.resolve("data");
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+initDb(path.join(dataDir, "zkvote.db"));
+
 const TEST_TREE_CONTRACT = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
 const TEST_DAO_ID = 1n;
 

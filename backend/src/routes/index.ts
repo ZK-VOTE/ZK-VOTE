@@ -5,6 +5,7 @@
  */
 
 export { default as healthRoutes, initHealthRoutes } from "./health.js";
+export { default as analyticsRoutes } from "./analytics.js";
 export { default as votingRoutes } from "./voting.js";
 export { default as daoRoutes } from "./daos.js";
 export { default as ipfsRoutes } from "./ipfs.js";

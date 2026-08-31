@@ -1,14 +1,16 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    BytesN, Env, String, Symbol,
+    Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
-use zkvote_groth16::VerificationKey;
+use zkvote_groth16::{verify, VerificationKey};
 
 const VERSION: u32 = 1;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 const GOVERNANCE: Symbol = symbol_short!("gov");
+const ADMINS: Symbol = symbol_short!("admins");
+const VK_PROPOSAL_COUNTER: Symbol = symbol_short!("vk_prop_cnt");
 
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
 const INSTANCE_TTL_EXTEND: u32 = 535_680;
@@ -26,6 +28,15 @@ pub enum RegistryError {
     MigrationAlreadyExists = 6,
     MigrationDeadlinePassed = 7,
     CircuitExpired = 8,
+    VkProposalNotFound = 9,
+    VkProposalAlreadyExecuted = 10,
+    VkProposalTimelockNotElapsed = 11,
+    VkProposalQuorumNotMet = 12,
+    VkProposalAlreadyApproved = 13,
+    VkProposalNotActive = 14,
+    VkProposalInvalidQuorum = 15,
+    VkProposalAlreadyCancelled = 16,
+    NotAdmin = 17,
 }
 
 #[contracttype]
@@ -33,6 +44,7 @@ pub enum RegistryError {
 pub enum CircuitType {
     Vote,
     Comment,
+    Tally,
 }
 
 #[contracttype]
@@ -66,10 +78,39 @@ pub struct CircuitVKMap {
 }
 
 #[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VkProposalStatus {
+    Pending,
+    Approved,
+    Executed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VkProposal {
+    pub id: u32,
+    pub circuit_id: String,
+    pub circuit_type: CircuitType,
+    pub new_vk: VerificationKey,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execute_after: u64,
+    pub required_approvals: u32,
+    pub approvals: u32,
+    pub status: VkProposalStatus,
+    pub dao_id: Option<u64>,
+}
+
+#[contracttype]
 pub enum DataKey {
     Circuit(String, CircuitType),
     DaoMigration(u64),
     DaoCurrentCircuit(u64, CircuitType),
+    VkProposal(u32),
+    VkProposalCounter,
+    DaoVkProposal(u64),
 }
 
 #[soroban_sdk::contractevent]
@@ -98,6 +139,45 @@ pub struct CircuitUpgradedEvent {
     pub dao_id: u64,
     pub circuit_type: CircuitType,
     pub to_circuit_id: String,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VkProposalCreatedEvent {
+    #[topic]
+    pub proposal_id: u32,
+    pub circuit_id: String,
+    pub circuit_type: CircuitType,
+    pub proposed_by: Address,
+    pub execute_after: u64,
+    pub required_approvals: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VkProposalApprovedEvent {
+    #[topic]
+    pub proposal_id: u32,
+    pub approver: Address,
+    pub current_approvals: u32,
+    pub required_approvals: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VkProposalExecutedEvent {
+    #[topic]
+    pub proposal_id: u32,
+    pub circuit_id: String,
+    pub circuit_type: CircuitType,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VkProposalCancelledEvent {
+    #[topic]
+    pub proposal_id: u32,
+    pub cancelled_by: Address,
 }
 
 #[contract]
@@ -199,6 +279,17 @@ impl CircuitRegistry {
             vk: circuit.vk,
             num_public_signals: circuit.num_public_signals,
         }
+    }
+
+    pub fn verify_tally_proof(
+        env: Env,
+        dao_id: u64,
+        proof: Bytes,
+        public_inputs: Vec<BytesN<32>>,
+    ) -> bool {
+        let circuit_id = Self::get_dao_current_circuit(env.clone(), dao_id, CircuitType::Tally);
+        let vk_map = Self::get_vk(env.clone(), circuit_id, CircuitType::Tally);
+        verify(&env, &vk_map.vk, &proof, &public_inputs)
     }
 
     pub fn migrate_dao(
@@ -344,6 +435,209 @@ impl CircuitRegistry {
             .persistent()
             .set(&current_key, &circuit_id.clone());
         Self::bump_persistent(&env, &current_key);
+    }
+
+    pub fn propose_vk_upgrade(
+        env: Env,
+        circuit_id: String,
+        circuit_type: CircuitType,
+        new_vk: VerificationKey,
+        new_wasm_hash: BytesN<32>,
+        timelock_duration: u64,
+        required_approvals: u32,
+        dao_id: Option<u64>,
+        proposer: Address,
+    ) -> u32 {
+        Self::bump_instance(&env);
+        proposer.require_auth();
+
+        let circuit_key = DataKey::Circuit(circuit_id.clone(), circuit_type);
+        if !env.storage().persistent().has(&circuit_key) {
+            panic_with_error!(&env, RegistryError::CircuitNotFound);
+        }
+
+        if required_approvals == 0 {
+            panic_with_error!(&env, RegistryError::VkProposalInvalidQuorum);
+        }
+
+        let now = env.ledger().timestamp();
+        let execute_after = now.saturating_add(timelock_duration);
+
+        let counter_key = DataKey::VkProposalCounter;
+        let proposal_id: u32 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0u32)
+            .saturating_add(1);
+        env.storage().instance().set(&counter_key, &proposal_id);
+
+        let proposal = VkProposal {
+            id: proposal_id,
+            circuit_id: circuit_id.clone(),
+            circuit_type,
+            new_vk,
+            new_wasm_hash,
+            proposed_by: proposer.clone(),
+            proposed_at: now,
+            execute_after,
+            required_approvals,
+            approvals: 0,
+            status: VkProposalStatus::Pending,
+            dao_id,
+        };
+
+        let proposal_key = DataKey::VkProposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        if let Some(did) = dao_id {
+            let dao_proposal_key = DataKey::DaoVkProposal(did);
+            env.storage().persistent().set(&dao_proposal_key, &proposal_id);
+            Self::bump_persistent(&env, &dao_proposal_key);
+        }
+
+        VkProposalCreatedEvent {
+            proposal_id,
+            circuit_id: circuit_id.clone(),
+            circuit_type,
+            proposed_by: proposer,
+            execute_after,
+            required_approvals,
+        }
+        .publish(&env);
+
+        proposal_id
+    }
+
+    pub fn approve_vk_upgrade(env: Env, proposal_id: u32, approver: Address) {
+        Self::bump_instance(&env);
+        approver.require_auth();
+
+        let proposal_key = DataKey::VkProposal(proposal_id);
+        let mut proposal: VkProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VkProposalNotFound));
+
+        if proposal.status != VkProposalStatus::Pending {
+            panic_with_error!(&env, RegistryError::VkProposalNotActive);
+        }
+
+        proposal.approvals = proposal.approvals.saturating_add(1);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        VkProposalApprovedEvent {
+            proposal_id,
+            approver,
+            current_approvals: proposal.approvals,
+            required_approvals: proposal.required_approvals,
+        }
+        .publish(&env);
+    }
+
+    pub fn execute_vk_upgrade(env: Env, proposal_id: u32, executor: Address) {
+        Self::bump_instance(&env);
+        executor.require_auth();
+
+        let proposal_key = DataKey::VkProposal(proposal_id);
+        let mut proposal: VkProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VkProposalNotFound));
+
+        if proposal.status != VkProposalStatus::Pending {
+            panic_with_error!(&env, RegistryError::VkProposalNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.execute_after {
+            panic_with_error!(&env, RegistryError::VkProposalTimelockNotElapsed);
+        }
+
+        if proposal.approvals < proposal.required_approvals {
+            panic_with_error!(&env, RegistryError::VkProposalQuorumNotMet);
+        }
+
+        proposal.status = VkProposalStatus::Executed;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        let circuit_key = DataKey::Circuit(proposal.circuit_id.clone(), proposal.circuit_type);
+        let mut circuit: CircuitInfo = env
+            .storage()
+            .persistent()
+            .get(&circuit_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+
+        circuit.vk = proposal.new_vk.clone();
+        circuit.wasm_hash = proposal.new_wasm_hash;
+        circuit.registered_at = now;
+        env.storage().persistent().set(&circuit_key, &circuit);
+        Self::bump_persistent(&env, &circuit_key);
+
+        VkProposalExecutedEvent {
+            proposal_id,
+            circuit_id: proposal.circuit_id.clone(),
+            circuit_type: proposal.circuit_type,
+        }
+        .publish(&env);
+    }
+
+    pub fn cancel_vk_upgrade(env: Env, proposal_id: u32, canceller: Address) {
+        Self::bump_instance(&env);
+        canceller.require_auth();
+
+        let proposal_key = DataKey::VkProposal(proposal_id);
+        let mut proposal: VkProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VkProposalNotFound));
+
+        if proposal.status != VkProposalStatus::Pending {
+            panic_with_error!(&env, RegistryError::VkProposalNotActive);
+        }
+
+        if proposal.proposed_by != canceller {
+            let governance: Address = env.storage().instance().get(&GOVERNANCE).unwrap();
+            if governance != canceller {
+                panic_with_error!(&env, RegistryError::NotGovernance);
+            }
+        }
+
+        proposal.status = VkProposalStatus::Cancelled;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent(&env, &proposal_key);
+
+        VkProposalCancelledEvent {
+            proposal_id,
+            cancelled_by: canceller,
+        }
+        .publish(&env);
+    }
+
+    pub fn get_vk_proposal(env: Env, proposal_id: u32) -> VkProposal {
+        Self::bump_instance(&env);
+        let proposal_key = DataKey::VkProposal(proposal_id);
+        env.storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VkProposalNotFound))
+    }
+
+    pub fn get_dao_vk_proposal(env: Env, dao_id: u64) -> Option<VkProposal> {
+        Self::bump_instance(&env);
+        let dao_proposal_key = DataKey::DaoVkProposal(dao_id);
+        if !env.storage().persistent().has(&dao_proposal_key) {
+            return None;
+        }
+        let proposal_id: u32 = env.storage().persistent().get(&dao_proposal_key).unwrap();
+        let proposal_key = DataKey::VkProposal(proposal_id);
+        env.storage().persistent().get(&proposal_key)
     }
 
     pub fn version(env: Env) -> u32 {

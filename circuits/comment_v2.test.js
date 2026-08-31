@@ -72,13 +72,12 @@ function merkleForLeafZero(leaf, levels) {
 function buildCommentV2Input(overrides = {}) {
   const secret = 111n;
   const salt = 222n;
-  const blindingFactor = 333n;
   const daoId = 1n;
   const proposalId = 7n;
   const commentNonce = 0n;
   const parentCommentId = 0n;
 
-  const commitment = hash([DOMAIN_TAG, secret, salt, blindingFactor]);
+  const commitment = hash([secret, salt]);
   const { root, pathElements, pathIndices } = merkleForLeafZero(
     commitment,
     LEVELS,
@@ -95,7 +94,6 @@ function buildCommentV2Input(overrides = {}) {
     parentCommentId,
     secret,
     salt,
-    blindingFactor,
     pathElements,
     pathIndices,
     ...overrides,
@@ -118,9 +116,9 @@ beforeAll(async () => {
   F = poseidon.F;
 });
 
-describe("comment_v2.circom domain-tag / signal parity with vote_v2.circom", () => {
-  test("DOMAIN_TAG is the exact same constant across vote/vote_v2/comment/comment_v2", () => {
-    const files = ["vote.circom", "vote_v2.circom", "comment.circom", "comment_v2.circom"];
+describe("comment_v2.circom signal parity", () => {
+  test("DOMAIN_TAG is the exact same constant across v1 vote/comment circuits", () => {
+    const files = ["vote.circom", "comment.circom"];
     for (const file of files) {
       const src = fs.readFileSync(path.join(__dirname, file), "utf8");
       const match = src.match(/var DOMAIN_TAG = (\d+);/);
@@ -173,11 +171,10 @@ describe("comment_v2.circom (real circom toolchain)", () => {
   test("accepts a non-zero commentNonce for a second comment by the same commenter", async () => {
     const secret = 111n,
       salt = 222n,
-      blindingFactor = 333n,
       daoId = 1n,
       proposalId = 7n,
       commentNonce = 1n;
-    const commitment = hash([DOMAIN_TAG, secret, salt, blindingFactor]);
+    const commitment = hash([secret, salt]);
     const { root, pathElements, pathIndices } = merkleForLeafZero(
       commitment,
       LEVELS,
@@ -195,7 +192,6 @@ describe("comment_v2.circom (real circom toolchain)", () => {
         parentCommentId: 0n,
         secret,
         salt,
-        blindingFactor,
         pathElements,
         pathIndices,
       },
@@ -204,7 +200,7 @@ describe("comment_v2.circom (real circom toolchain)", () => {
     await circuit.checkConstraints(witness);
   });
 
-  test("rejects a commitment that doesn't match Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)", async () => {
+  test("rejects a commitment that doesn't match Poseidon(secret, salt)", async () => {
     const input = buildCommentV2Input({ commitment: 999999n });
     await expectInvalid(circuit, input);
   });
@@ -226,9 +222,7 @@ describe("comment_v2.circom (real circom toolchain)", () => {
   });
 
   test("commitment computed from a different secret does not satisfy the same proof", async () => {
-    // Using the wrong secret changes both the commitment (so it no longer
-    // matches the public `commitment` input) and the nullifier -- this
-    // pins that the two are cryptographically bound to the same identity.
+    // Using the wrong secret changes both the commitment and the nullifier.
     const wrongSecret = 999n;
     const input = buildCommentV2Input();
     input.secret = wrongSecret;

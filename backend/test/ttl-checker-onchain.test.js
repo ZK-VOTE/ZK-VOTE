@@ -20,6 +20,12 @@ import os from "node:os";
 import path from "node:path";
 import * as StellarSdk from "@stellar/stellar-sdk";
 
+// Wire refactored services for tests: since #358 services receive their
+// dependencies via init*() instead of importing module globals, tests must
+// perform the same wiring the production composition root does at boot.
+import { buildAppServices } from "../src/composition-root.js";
+buildAppServices();
+
 process.env.RELAYER_TEST_MODE = "true";
 process.env.VOTING_CONTRACT_ID = "C".padEnd(56, "A");
 process.env.TREE_CONTRACT_ID = "C".padEnd(56, "B");
@@ -39,6 +45,7 @@ function withRealRpc(getLedgerEntries) {
   const originalTestMode = config.testMode;
   const originalMethod = server.getLedgerEntries;
   config.testMode = false;
+  buildAppServices();
   server.getLedgerEntries = getLedgerEntries;
   return () => {
     config.testMode = originalTestMode;

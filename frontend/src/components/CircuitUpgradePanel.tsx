@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
-import { AlertCircle, CheckCircle, Clock, RefreshCw } from "lucide-react";
+import { AlertCircle, CheckCircle, Clock, RefreshCw, Shield } from "lucide-react";
 import { useState } from "react";
-import type { CircuitStatusResponse } from "../types/index";
+import type { CircuitStatusResponse, VkProposal } from "../types/index";
 import { relayerFetch } from "../lib/api";
 
 interface CircuitUpgradePanelProps {
@@ -63,6 +63,53 @@ function MigrationTimeline({
             Overlap window active — both circuits accepted
           </p>
         )}
+      </div>
+    </div>
+  );
+}
+
+function PendingVkProposal({
+  proposal,
+}: {
+  proposal: VkProposal;
+}) {
+  const executeDate = new Date(proposal.executeAfter * 1000);
+  const [now] = useState(() => Date.now());
+  const remaining = Math.max(0, executeDate.getTime() - now);
+  const hoursRemaining = Math.ceil(remaining / (1000 * 60 * 60));
+  const quorumMet = proposal.approvals >= proposal.requiredApprovals;
+  const approvalPercent = Math.min(
+    100,
+    Math.round((proposal.approvals / proposal.requiredApprovals) * 100),
+  );
+
+  return (
+    <div className="border border-blue-300 bg-blue-50 rounded-lg p-4 mt-4">
+      <h4 className="text-sm font-semibold text-blue-800 flex items-center gap-2">
+        <Shield className="w-4 h-4" />
+        Pending VK Upgrade
+      </h4>
+      <div className="mt-2 text-sm text-blue-700 space-y-1">
+        <p>
+          Circuit: <span className="font-mono">{proposal.circuitId}</span>
+        </p>
+        <p>
+          Execute after: {executeDate.toLocaleString()} (
+          {hoursRemaining > 0 ? `${hoursRemaining}h remaining` : "Ready"})
+        </p>
+        <div className="w-full bg-blue-200 rounded-full h-2 mt-2">
+          <div
+            className={`h-2 rounded-full ${quorumMet ? "bg-green-500" : "bg-blue-500"}`}
+            style={{ width: `${approvalPercent}%` }}
+          />
+        </div>
+        <p>
+          Approvals: {proposal.approvals} / {proposal.requiredApprovals}
+          {quorumMet && " (quorum met)"}
+        </p>
+        <p className="text-xs text-blue-600">
+          Status: {proposal.status}
+        </p>
       </div>
     </div>
   );
@@ -165,6 +212,9 @@ export default function CircuitUpgradePanel({
         )}
 
         {data.migration && <MigrationTimeline migration={data.migration} />}
+        {data.pendingVkProposal && (
+          <PendingVkProposal proposal={data.pendingVkProposal} />
+        )}
       </div>
     </div>
   );

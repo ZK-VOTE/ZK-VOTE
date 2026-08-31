@@ -50,7 +50,8 @@ export type DataKey =
   | { tag: "RevokedAt"; values: readonly [u64, u256] }
   | { tag: "ReinstatedAt"; values: readonly [u64, u256] }
   | { tag: "NodeHash"; values: readonly [u64, u32, u32] }
-  | { tag: "MinValidRootIdx"; values: readonly [u64] };
+  | { tag: "MinValidRootIdx"; values: readonly [u64] }
+  | { tag: "LastRegistrationAt"; values: readonly [u64, string] };
 
 export const TreeError = {
   1: { message: "NotAdmin" },
@@ -68,6 +69,8 @@ export const TreeError = {
   13: { message: "RootNotFound" },
   14: { message: "AlreadyInitialized" },
   15: { message: "MemberNotRevoked" },
+  16: { message: "CommitmentAlreadyUsed" },
+  17: { message: "RateLimited" },
 };
 
 export interface Client {

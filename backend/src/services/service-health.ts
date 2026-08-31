@@ -33,6 +33,7 @@ export type ServiceName =
   | "comments"
   | "indexer"
   | "dao_sync"
+  | "membership_sync"
   | "ttl_renewal"
   | "sbt_transfer_watch";
 
@@ -97,6 +98,10 @@ const SERVICE_META: Record<
   sbt_transfer_watch: {
     tier: "background",
     description: "Membership SBT transfer-attempt monitor",
+  },
+  membership_sync: {
+    tier: "background",
+    description: "Membership sync from SBT contract",
   },
 };
 

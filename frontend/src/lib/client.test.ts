@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { getZkVoteClient, __clearClientCache, checkContractDrift } from "./client";
+import {
+  getZkVoteClient,
+  __clearClientCache,
+  checkContractDrift,
+} from "./client";
 import { getOfflineQueue, enqueueOfflineAction } from "./offlineQueue";
 
 describe("ZkVoteClient - unified SDK", () => {
@@ -30,7 +34,11 @@ describe("ZkVoteClient - unified SDK", () => {
   });
 
   it("offline queue enqueue and retrieval", () => {
-    const entry = enqueueOfflineAction({ type: "vote", payload: { daoId: 1 }, daoId: 1 });
+    const entry = enqueueOfflineAction({
+      type: "vote",
+      payload: { daoId: 1 },
+      daoId: 1,
+    });
     expect(entry.id).toBeDefined();
     const q = getOfflineQueue();
     expect(q.length).toBe(1);
@@ -43,7 +51,9 @@ describe("ZkVoteClient - unified SDK", () => {
   });
 
   it("drift guard detects mismatch", async () => {
-    const report = await checkContractDrift({ REGISTRY_ID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" } as unknown as Record<string, string>);
+    const report = await checkContractDrift({
+      REGISTRY_ID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    } as unknown as Record<string, string>);
     expect(report.driftDetected).toBe(true);
   });
 });

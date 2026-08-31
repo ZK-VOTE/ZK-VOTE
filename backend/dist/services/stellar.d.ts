@@ -30,7 +30,56 @@ export type SorobanServer = StellarSdk.rpc.Server | TestServer;
 export declare const relayerKeypair: StellarSdk.Keypair | {
     publicKey: () => string;
 };
+export declare function getPendingSequenceLockOps(): number;
+/**
+ * Wait until all in-flight withSequenceLock operations drain, or until
+ * timeoutMs elapses. Resolves true if drained cleanly, false on timeout
+ * with work still outstanding.
+ */
+export declare function waitForSequenceLockIdle(timeoutMs: number): Promise<boolean>;
+/**
+ * Manages the relayer account's sequence number with dirty-flag recovery.
+ *
+ * When an RPC error leaves the local sequence unknown, `markDirty()` forces a
+ * fresh `getAccount` call before the next submission instead of building on a
+ * potentially stale number. The last known sequence is persisted to the SQLite
+ * metadata table so a process crash doesn't lose it.
+ */
+export declare class SequenceManager {
+    private dirty;
+    private lastKnownSequence;
+    constructor();
+    private loadPersisted;
+    private persist;
+    markDirty(): void;
+    forceResync(sorobanServer: StellarSdk.rpc.Server): Promise<void>;
+    getAccount(sorobanServer: StellarSdk.rpc.Server): Promise<StellarSdk.Account>;
+    handleTxError(errorResult: string): boolean;
+}
+export declare const sequenceManager: SequenceManager;
 export declare function withSequenceLock<T>(fn: () => Promise<T>): Promise<T>;
+export interface RpcEndpointStatus {
+    url: string;
+    healthy: boolean;
+    latencyMs: number;
+    errorCount: number;
+    lastChecked: string;
+}
+export declare class RpcPoolManager {
+    private endpoints;
+    private currentIndex;
+    constructor(urls: string[]);
+    getActiveServer(): StellarSdk.rpc.Server;
+    checkHealth(): Promise<RpcEndpointStatus[]>;
+    getMetrics(): {
+        totalEndpoints: number;
+        healthyEndpoints: number;
+        activeUrl: string;
+        endpoints: RpcEndpointStatus[];
+    };
+}
+export declare const rpcPoolManager: RpcPoolManager;
+export declare const sorobanRpcBreaker: import("./circuit-breaker.js").CircuitBreaker;
 export declare const server: SorobanServer;
 /**
  * Call RPC with timeout
@@ -72,6 +121,25 @@ export declare function scValToU256Hex(scVal: StellarSdk.xdr.ScVal): string;
  * Convert hex string to byte array
  */
 export declare function hexToBytes(hex: string, expectedLength: number): Buffer;
+/**
+ * Canonicalizes a Groth16 proof's (A, B) pair (#167).
+ *
+ * Groth16 proofs are malleable: given a valid (A, B, C), the point (-A, -B, C)
+ * also satisfies the pairing check, since e(-A, -B) = e(A, B). If any
+ * downstream logic keys off proof bytes (e.g. deduplicating relayer retries,
+ * or an event-notify flow indexing by proof hash), the two representations
+ * look like distinct submissions even though they prove the same statement.
+ *
+ * This picks a single canonical representative by requiring A's Y-coordinate
+ * to lie in the lower half of the BN254 base field (Fq); if it doesn't, both
+ * A and B are negated (C is untouched — C is not part of the malleable pair).
+ * `aBytes`/`bBytes` are the raw 64/128-byte G1/G2 encodings (X||Y for G1;
+ * X_c1||X_c0||Y_c1||Y_c0 for G2, per the Groth16Proof type's format).
+ */
+export declare function canonicalizeProof(aBytes: Buffer, bBytes: Buffer): {
+    a: Buffer;
+    b: Buffer;
+};
 /**
  * Convert Groth16 proof to ScVal
  */

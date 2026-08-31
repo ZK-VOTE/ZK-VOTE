@@ -19,9 +19,13 @@ import {
   getCachedDaoCount,
 } from "../services/db.js";
 import { getBackupStatus } from "../services/backup.js";
+import { getLogMetrics } from "../middleware/logging.js";
 import { getWalHealth } from "../services/walResilience.js";
 
-import { rpcPoolManager } from "../services/stellar.js";
+import { checkRotationHealth, getSecretBackend } from "../services/secrets/index.js";
+import { getWalHealth } from "../services/walResilience.js";
+
+import { rpcPoolManager, sequenceManager } from "../services/stellar.js";
 import { getAllCircuitBreakerMetrics } from "../services/circuit-breaker.js";
 import { getMemorySnapshot } from "../services/memory-monitor.js";
 import {
@@ -30,6 +34,7 @@ import {
   markHealthy,
   markUnavailable,
 } from "../services/service-health.js";
+import { getSupervisor } from "../services/supervisor.js";
 import v8 from "node:v8";
 import fs from "node:fs";
 import os from "node:os";
@@ -324,6 +329,29 @@ router.get("/ready", async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /services
+ * Supervisor status for all background services (admin only)
+ * Exposes per-service health, failure counts, and restart history
+ */
+router.get("/services", async (req: Request, res: Response) => {
+  if (config.healthExposeDetails) {
+    const token = extractAuthToken(req);
+    if (token !== config.relayerAuthToken) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
+  try {
+    const supervisor = getSupervisor();
+    const status = supervisor.getStatus();
+    res.json(status);
+  } catch (err) {
+    log("error", "supervisor_status_failed", { error: (err as Error).message });
+    res.status(500).json({ error: "Failed to get supervisor status" });
+  }
+});
+
+/**
  * GET /config
  * Returns public configuration (for frontend)
  */
@@ -338,6 +366,31 @@ router.get("/config", (_req: Request, res: Response) => {
     rpcUrl: config.rpcUrl,
     ipfsEnabled: config.ipfsEnabled,
     pinataGateway: config.pinataGateway,
+  });
+});
+
+/**
+ * GET /log/metrics
+ * Log volume and sampling metrics (admin only)
+ */
+router.get("/log/metrics", async (req: Request, res: Response) => {
+  if (config.healthExposeDetails) {
+    const token = extractAuthToken(req);
+    if (token !== config.relayerAuthToken) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
+  res.json({
+    metrics: getLogMetrics(),
+    config: {
+      samplingRate: config.logSamplingRate,
+      errorRate: config.logSamplingErrorRate,
+      slowRate: config.logSamplingSlowRate,
+      slowThresholdMs: config.logSlowThresholdMs,
+      bodyMaxChars: config.logBodyMaxChars,
+      logRequestBody: config.logRequestBody,
+    },
   });
 });
 
@@ -543,6 +596,19 @@ router.get("/relay-test", async (req: Request, res: Response) => {
       },
     };
 
+    // Test 6: Sequence Number Health
+    const sequenceHealth = sequenceManager.getHealthStatus();
+    results.tests = {
+      ...(results.tests as Record<string, unknown>),
+      sequence_number: {
+        passed: sequenceHealth.healthy,
+        message: sequenceHealth.healthy
+          ? "Sequence number tracking is healthy"
+          : `Sequence tracking degraded: ${sequenceHealth.consecutiveErrors} consecutive errors`,
+        ...sequenceHealth,
+      },
+    };
+
     // Overall result
     const allTests = Object.values(
       results.tests as Record<string, { passed: boolean }>,
@@ -581,6 +647,44 @@ router.get("/relay-test", async (req: Request, res: Response) => {
       },
       tests: results.tests,
     });
+  }
+});
+
+/**
+ * GET /sequence/health
+ * Sequence number health check endpoint
+ * Returns detailed status of the relayer sequence number tracking
+ */
+router.get("/sequence/health", async (req: Request, res: Response) => {
+  try {
+    const health = sequenceManager.getHealthStatus();
+    const statusCode = health.healthy ? 200 : 503;
+
+    const response = {
+      timestamp: new Date().toISOString(),
+      healthy: health.healthy,
+      consecutiveErrors: health.consecutiveErrors,
+      dirty: health.dirty,
+    };
+
+    // Include detailed info if authenticated
+    if (config.healthExposeDetails) {
+      const token = extractAuthToken(req);
+      if (token === config.relayerAuthToken) {
+        Object.assign(response, {
+          lastKnownSequence: health.lastKnownSequence,
+        });
+      }
+    }
+
+    return res.status(statusCode).json(response);
+  } catch (err) {
+    log("error", "sequence_health_check_failed", {
+      error: (err as Error).message,
+    });
+    return res
+      .status(500)
+      .json({ error: "Failed to check sequence health" });
   }
 });
 

@@ -22,6 +22,7 @@ import {
   profileEventQueries,
 } from "./dbMonitor.js";
 import { migrateUp } from "./migrate.js";
+import { assertBackendConfigured } from "./dbDialect.js";
 import { kysely } from "./kysely.js";
 import { sql } from "kysely";
 import {
@@ -1061,7 +1062,12 @@ function getAllPartitionDaoIds(database: DatabaseType): number[] {
  * @returns The write connection (backward compatible with prior callers).
  */
 export function initDb(dbPath?: string): DatabaseType {
-  const dbFile = dbPath ?? activeDbFile ?? DB_FILE;
+  // Fail fast on a misconfigured backend (issue #305) before any handle is
+  // opened, so DB_BACKEND=postgres without DATABASE_URL is a boot error rather
+  // than a silent fallback to the embedded SQLite file.
+  assertBackendConfigured();
+
+  const dbFile = dbPath ?? DB_FILE;
 
   // Reuse open handles for the same file
   if (writeDb && activeDbFile === dbFile) {
@@ -1194,6 +1200,16 @@ export function initDb(dbPath?: string): DatabaseType {
       PRIMARY KEY (comment_id, dao_id, proposal_id)
     );
 
+    CREATE TABLE IF NOT EXISTS member_revocations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      commitment TEXT NOT NULL,
+      dao_id INTEGER NOT NULL,
+      revoked_at INTEGER NOT NULL,
+      reinstated_at INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(commitment, dao_id)
+    );
+
     CREATE TABLE IF NOT EXISTS ttl_tracking (
       entry_id TEXT PRIMARY KEY,
       contract_id TEXT NOT NULL,
@@ -1238,6 +1254,23 @@ export function initDb(dbPath?: string): DatabaseType {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_vote_submissions_nullifier ON vote_submissions(nullifier_hash);
+
+    CREATE TABLE IF NOT EXISTS vote_jobs (
+      id TEXT PRIMARY KEY,
+      nullifier_hash TEXT NOT NULL,
+      dao_id INTEGER NOT NULL,
+      proposal_id INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      tx_hash TEXT,
+      error_message TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_vote_jobs_status ON vote_jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_vote_jobs_nullifier ON vote_jobs(nullifier_hash);
 
     -- Auth tokens table: stores hashed authentication tokens with expiration and metadata
     CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -2463,6 +2496,21 @@ export interface VoteSubmissionRow {
   updated_at: number;
 }
 
+export interface VoteJobRow {
+  id: string;
+  nullifier_hash: string;
+  dao_id: number;
+  proposal_id: number;
+  payload: string;
+  status: "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "DEAD_LETTER";
+  attempts: number;
+  max_attempts: number;
+  tx_hash: string | null;
+  error_message: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 /**
  * Look up an existing vote submission by nullifier hash.
  */
@@ -2529,6 +2577,85 @@ export function cleanupExpiredVoteSubmissions(ttlMs: number): number {
     )
     .run(cutoff);
   return result.changes;
+}
+
+export function createVoteJob(
+  jobId: string,
+  nullifierHash: string,
+  daoId: number,
+  proposalId: number,
+  payload: string,
+): VoteJobRow {
+  const database = getWriteDb();
+  const now = Date.now();
+  database
+    .prepare(
+      `INSERT INTO vote_jobs (id, nullifier_hash, dao_id, proposal_id, payload, status, attempts, max_attempts, tx_hash, error_message, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'QUEUED', 0, 3, NULL, NULL, ?, ?)`,
+    )
+    .run(jobId, nullifierHash, daoId, proposalId, payload, now, now);
+
+  return (
+    getVoteJobById(jobId) ?? {
+      id: jobId,
+      nullifier_hash: nullifierHash,
+      dao_id: daoId,
+      proposal_id: proposalId,
+      payload,
+      status: "QUEUED",
+      attempts: 0,
+      max_attempts: 3,
+      tx_hash: null,
+      error_message: null,
+      created_at: now,
+      updated_at: now,
+    }
+  );
+}
+
+export function getVoteJobById(jobId: string): VoteJobRow | null {
+  const database = getReadDb();
+  const row = database
+    .prepare("SELECT * FROM vote_jobs WHERE id = ?")
+    .get(jobId) as VoteJobRow | undefined;
+  return row ?? null;
+}
+
+export function updateVoteJobStatus(
+  jobId: string,
+  status: VoteJobRow["status"],
+  update: {
+    txHash?: string;
+    errorMessage?: string;
+    attempts?: number;
+  } = {},
+): VoteJobRow | null {
+  const database = getWriteDb();
+  const now = Date.now();
+  const existing = getVoteJobById(jobId);
+  const currentAttempts = update.attempts ?? existing?.attempts ?? 0;
+  const txHash = update.txHash ?? existing?.tx_hash ?? null;
+  const errorMessage = update.errorMessage ?? existing?.error_message ?? null;
+
+  database
+    .prepare(
+      `UPDATE vote_jobs
+       SET status = ?, attempts = ?, tx_hash = ?, error_message = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(status, currentAttempts, txHash, errorMessage, now, jobId);
+
+  return getVoteJobById(jobId);
+}
+
+export function getVoteQueueDepth(): number {
+  const database = getReadDb();
+  const row = database
+    .prepare(
+      "SELECT COUNT(*) AS count FROM vote_jobs WHERE status IN ('QUEUED', 'PROCESSING')",
+    )
+    .get() as { count: number } | undefined;
+  return row?.count ?? 0;
 }
 
 // ============================================
@@ -3875,6 +4002,9 @@ export function storeVoteReceipt(
 ): void {
   const database = getWriteDb();
   try {
+    database
+      .prepare("INSERT OR IGNORE INTO daos (id, name, creator) VALUES (?, ?, ?)")
+      .run(daoId, `DAO ${daoId}`, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     database
       .prepare(
         `INSERT INTO vote_receipts (nullifier, tx_hash, proposal_id, dao_id, status)

@@ -1,85 +1,67 @@
-/** Lightweight W3C-compatible tracing for one complete indexer cycle. */
+/**
+ * Indexer-facing view of the shared relay tracing pipeline (#321).
+ *
+ * The indexer used to own a private span implementation. It now delegates to
+ * `services/tracing.ts` so a poll cycle, the database writes it drives and the
+ * Soroban RPC calls underneath all land in one trace with a single exporter
+ * registry. The original surface is kept intact for existing call sites.
+ */
 
-import { randomBytes } from "node:crypto";
+import {
+  registerSpanExporter,
+  clearSpanExporters,
+  withSpan,
+  type ExportedSpan,
+  type SpanAttributes,
+  type SpanContext,
+  type SpanExporter,
+} from "./tracing.js";
 
-export type SpanAttributes = Record<string, boolean | number | string>;
+export type { SpanAttributes };
 
-export interface IndexerSpanContext {
-  traceId: string;
-  spanId: string;
-  traceFlags: "01";
-}
+/** @deprecated Use `SpanContext` from `services/tracing.js`. */
+export type IndexerSpanContext = SpanContext;
 
-export interface ExportedIndexerSpan extends IndexerSpanContext {
-  name: string;
-  parentSpanId?: string;
-  traceparent: string;
-  startedAt: string;
-  durationMs: number;
-  status: "ok" | "error";
-  attributes: SpanAttributes;
-  error?: string;
-}
+/** @deprecated Use `ExportedSpan` from `services/tracing.js`. */
+export type ExportedIndexerSpan = ExportedSpan;
 
-export interface IndexerSpanExporter {
-  export(span: ExportedIndexerSpan): Promise<void> | void;
-}
+/** @deprecated Use `SpanExporter` from `services/tracing.js`. */
+export type IndexerSpanExporter = SpanExporter;
 
-const noopExporter: IndexerSpanExporter = { export: () => undefined };
-let activeExporter: IndexerSpanExporter = noopExporter;
+let disposeCurrent: (() => void) | null = null;
 
+/**
+ * Install a single indexer exporter, replacing any previous one.
+ *
+ * Retained for compatibility with the indexer's original one-exporter model.
+ * New code should call `registerSpanExporter` directly, which composes.
+ */
 export function setIndexerSpanExporter(
   exporter: IndexerSpanExporter | null,
 ): void {
-  activeExporter = exporter ?? noopExporter;
+  disposeCurrent?.();
+  disposeCurrent = null;
+  if (exporter) disposeCurrent = registerSpanExporter(exporter);
 }
 
-function randomHex(bytes: number): string {
-  return randomBytes(bytes).toString("hex");
+/** Remove every exporter, including ones registered outside this module. */
+export function resetIndexerSpanExporters(): void {
+  disposeCurrent = null;
+  clearSpanExporters();
 }
 
-async function exportSpan(span: ExportedIndexerSpan): Promise<void> {
-  try {
-    await activeExporter.export(span);
-  } catch {
-    // Telemetry must never make the indexer fail or replay a ledger range.
-  }
-}
-
+/**
+ * Open a span for one step of an indexer cycle.
+ *
+ * `parent` is explicit here — the indexer builds its span tree from a root
+ * cycle span it holds directly — but a `null` parent still inherits any
+ * ambient context, so a poll triggered from an HTTP request joins that trace.
+ */
 export async function withIndexerSpan<T>(
   name: string,
   parent: IndexerSpanContext | null,
   attributes: SpanAttributes,
   operation: (context: IndexerSpanContext) => Promise<T> | T,
 ): Promise<T> {
-  const context: IndexerSpanContext = {
-    traceId: parent?.traceId ?? randomHex(16),
-    spanId: randomHex(8),
-    traceFlags: "01",
-  };
-  const startedAt = new Date();
-  const startedNs = process.hrtime.bigint();
-  let status: ExportedIndexerSpan["status"] = "ok";
-  let errorMessage: string | undefined;
-
-  try {
-    return await operation(context);
-  } catch (error) {
-    status = "error";
-    errorMessage = error instanceof Error ? error.message : String(error);
-    throw error;
-  } finally {
-    const durationMs = Number(process.hrtime.bigint() - startedNs) / 1_000_000;
-    await exportSpan({
-      ...context,
-      name,
-      parentSpanId: parent?.spanId,
-      traceparent: `00-${context.traceId}-${context.spanId}-${context.traceFlags}`,
-      startedAt: startedAt.toISOString(),
-      durationMs,
-      status,
-      attributes,
-      ...(errorMessage ? { error: errorMessage } : {}),
-    });
-  }
+  return withSpan(name, attributes, operation, parent ? { parent } : {});
 }

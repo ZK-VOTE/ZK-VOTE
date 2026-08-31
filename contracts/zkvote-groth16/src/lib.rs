@@ -31,6 +31,49 @@ pub enum Groth16Error {
     /// ZKV1 serialized proof has an unknown version byte, unknown curve id,
     /// or does not match the expected total byte length.
     InvalidProofFormat = 33,
+
+    /// ── Coarse error codes (100–106) ──────────────────────────────────
+    /// Production anonymous paths collapse fine-grained variants into one
+    /// of these stable categories. Admin / test contexts continue to use
+    /// the original variants above so that tooling retains debugging
+    /// fidelity.  Numeric codes are intentionally placed above the
+    /// existing fine-grained range to avoid collisions with deployed
+    /// contract discriminants.
+    InvalidInput = 100,
+    EligibilityFailed = 101,
+    ProofInvalid = 102,
+    AlreadySubmitted = 103,
+    WindowClosed = 104,
+    InsufficientFunds = 105,
+    ConfigError = 106,
+}
+
+/// Whether the caller is an authorized admin/configuration path (retains
+/// fine-grained errors) or an anonymous user submission path (must use
+/// coarse collapsed codes so a relayer cannot probe internal state).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PathContext {
+    Admin,
+    Anonymous,
+}
+
+impl Groth16Error {
+    /// Collapse fine-grained `Groth16Error` discriminants into the coarse
+    /// set (codes 100–106) when the caller is an anonymous-submission
+    /// path.  Returns the error unchanged on [`PathContext::Admin`] so
+    /// admin tooling and unit tests retain full diagnostic fidelity.
+    pub fn to_coarse(&self, ctx: PathContext) -> Groth16Error {
+        match ctx {
+            PathContext::Admin => *self,
+            PathContext::Anonymous => match self {
+                Groth16Error::SignalNotInField
+                | Groth16Error::InvalidNullifier => Groth16Error::InvalidInput,
+                Groth16Error::IcLengthMismatch
+                | Groth16Error::InvalidProofFormat => Groth16Error::ProofInvalid,
+                other => *other,
+            },
+        }
+    }
 }
 
 #[contracttype]
@@ -197,6 +240,37 @@ pub fn validate_nullifier(env: &Env, nullifier: &U256) -> Result<(), Groth16Erro
     assert_in_field(env, nullifier)
 }
 
+
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut result = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
+pub fn is_identity_bn254_g1(bytes: &BytesN<64>) -> bool {
+    let zeros = [0u8; 64];
+    constant_time_eq(&bytes.to_array(), &zeros)
+}
+
+pub fn is_identity_bn254_g2(bytes: &BytesN<128>) -> bool {
+    let zeros = [0u8; 128];
+    constant_time_eq(&bytes.to_array(), &zeros)
+}
+
+pub fn is_identity_bls381_g1(bytes: &BytesN<96>) -> bool {
+    let mut id = [0u8; 96];
+    id[0] = 0xc0;
+    constant_time_eq(&bytes.to_array(), &id)
+}
+
+pub fn is_identity_bls381_g2(bytes: &BytesN<192>) -> bool {
+    let mut id = [0u8; 192];
+    id[0] = 0xc0;
+    constant_time_eq(&bytes.to_array(), &id)
+}
+
 #[cfg(not(any(test, feature = "testutils")))]
 fn verify_groth16_impl<C: Groth16Curve>(
     env: &Env,
@@ -207,6 +281,13 @@ fn verify_groth16_impl<C: Groth16Curve>(
     if pub_signals.len() + 1 != vk.ic.len() {
         return false;
     }
+
+    // Prevent invalid-curve/subgroup and timing attacks by explicitly rejecting identity points
+    // in constant-time before performing any pairing operations.
+    if is_identity_bn254_g1(&proof.a) || is_identity_bn254_g2(&proof.b) || is_identity_bn254_g1(&proof.c) {
+        return false;
+    }
+
 
     let vk_x = compute_vk_x::<C>(env, vk, pub_signals);
 
@@ -282,6 +363,13 @@ fn verify_groth16_impl_bls381(
     if pub_signals.len() + 1 != vk.ic.len() {
         return false;
     }
+
+    // Prevent invalid-curve/subgroup and timing attacks by explicitly rejecting identity points
+    // in constant-time before performing any pairing operations.
+    if is_identity_bls381_g1(&proof.a) || is_identity_bls381_g2(&proof.b) || is_identity_bls381_g1(&proof.c) {
+        return false;
+    }
+
 
     let vk_x = compute_vk_x_impl_bls381(env, vk, pub_signals);
 
@@ -504,7 +592,90 @@ mod tests {
         );
     }
 
+    // ── Coarse error code mapping tests ─────────────────────────────────
+
     #[test]
+    fn coarse_admin_preserves_specific_codes() {
+        let cases = [
+            Groth16Error::IcLengthMismatch,
+            Groth16Error::SignalNotInField,
+            Groth16Error::InvalidNullifier,
+            Groth16Error::InvalidProofFormat,
+            Groth16Error::ProofInvalid,
+            Groth16Error::InvalidInput,
+        ];
+        for c in &cases {
+            assert_eq!(c.to_coarse(PathContext::Admin), *c);
+        }
+    }
+
+    #[test]
+    fn coarse_anon_collapses_input_errors() {
+        assert_eq!(
+            Groth16Error::SignalNotInField.to_coarse(PathContext::Anonymous),
+            Groth16Error::InvalidInput
+        );
+        assert_eq!(
+            Groth16Error::InvalidNullifier.to_coarse(PathContext::Anonymous),
+            Groth16Error::InvalidInput
+        );
+    }
+
+    #[test]
+    fn coarse_anon_collapses_proof_errors() {
+        assert_eq!(
+            Groth16Error::IcLengthMismatch.to_coarse(PathContext::Anonymous),
+            Groth16Error::ProofInvalid
+        );
+        assert_eq!(
+            Groth16Error::InvalidProofFormat.to_coarse(PathContext::Anonymous),
+            Groth16Error::ProofInvalid
+        );
+    }
+
+    #[test]
+    fn coarse_anon_passthroughs() {
+        assert_eq!(
+            Groth16Error::ProofInvalid.to_coarse(PathContext::Anonymous),
+            Groth16Error::ProofInvalid
+        );
+        assert_eq!(
+            Groth16Error::InvalidInput.to_coarse(PathContext::Anonymous),
+            Groth16Error::InvalidInput
+        );
+    }
+
+    #[test]
+
+    #[test]
+    fn test_timing_identity_rejection() {
+        let env = Env::default();
+        let vk = VerificationKey {
+            alpha: BytesN::from_array(&env, &[0u8; 64]),
+            beta: BytesN::from_array(&env, &[0u8; 128]),
+            gamma: BytesN::from_array(&env, &[0u8; 128]),
+            delta: BytesN::from_array(&env, &[0u8; 128]),
+            ic: soroban_sdk::vec![&env, BytesN::from_array(&env, &[0u8; 64])],
+        };
+        let mut proof = Proof {
+            a: BytesN::from_array(&env, &[0u8; 64]), // Identity point
+            b: BytesN::from_array(&env, &[0u8; 128]),
+            c: BytesN::from_array(&env, &[0u8; 64]),
+        };
+        let signals = soroban_sdk::vec![&env];
+        
+        // This should quickly return false without trying to parse or pair
+        // (if not rejected, the host function would panic or take longer)
+        // Note: verify_groth16 returns true in test mode normally, but here we can check the constant time func
+        assert!(is_identity_bn254_g1(&proof.a));
+        
+        // Modify a to not be identity
+        let mut a_bytes = [0u8; 64];
+        a_bytes[0] = 1;
+        proof.a = BytesN::from_array(&env, &a_bytes);
+        assert!(!is_identity_bn254_g1(&proof.a));
+    }
+
     fn test_bls381_verify_groth16_ic_mismatch() {
         let env = Env::default();
         let vk = VerificationKeyBls381 {

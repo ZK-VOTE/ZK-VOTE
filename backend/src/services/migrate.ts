@@ -610,6 +610,73 @@ export function printMigrationStatus(database: DatabaseType): void {
 // ============================================
 
 /**
+ * Postgres arm of the migration CLI (issue #305).
+ *
+ * Kept separate from the SQLite arm rather than merged into it: the SQLite path
+ * is synchronous and load-bearing at relay boot, and it must not grow an async
+ * seam just so a second backend can share the switch statement.
+ */
+async function runPostgresCli(command: string, args: string[]): Promise<void> {
+  const { config } = await import("../config.js");
+  const { createPgPool } = await import("./dbDialect.js");
+  const { migrateUpPg, migrateDownPg, getAppliedMigrationsPg } = await import(
+    "./migratePg.js"
+  );
+
+  if (!config.databaseUrl) {
+    throw new Error("DB_BACKEND=postgres requires DATABASE_URL to be set.");
+  }
+  const pool = await createPgPool({ connectionString: config.databaseUrl });
+  const exec = pool as unknown as import("./migratePg.js").SqlExecutor;
+
+  const print = (results: MigrationResult[]): void => {
+    for (const r of results) {
+      console.info(
+        `  ${r.success ? "✓" : "✗"} ${r.direction} ${r.id}: ${r.durationMs.toFixed(0)}ms${r.error ? ` — ${r.error}` : ""}`,
+      );
+    }
+  };
+
+  try {
+    switch (command) {
+      case "up": {
+        const target = args[1] === "--target" ? args[2] : undefined;
+        const results = await migrateUpPg(exec, { target });
+        if (results.length === 0) console.info("Already at latest migration.");
+        else print(results);
+        break;
+      }
+      case "down": {
+        const allFlag = args.includes("--all") || args.includes("-a");
+        const results = await migrateDownPg(exec, {
+          target: allFlag ? "000" : undefined,
+        });
+        if (results.length === 0) console.info("Nothing to roll back.");
+        else print(results);
+        break;
+      }
+      case "dry-run": {
+        console.info("\n=== DRY RUN — No changes will be made ===\n");
+        const results = await migrateUpPg(exec, { dryRun: true });
+        if (results.length === 0) console.info("No pending migrations to apply.");
+        break;
+      }
+      case "status":
+      default: {
+        const applied = await getAppliedMigrationsPg(exec);
+        console.info(`\n${applied.length} migrations applied (postgres):`);
+        for (const a of applied) {
+          console.info(`  ✓ ${a.id} @ ${a.applied_at}`);
+        }
+        break;
+      }
+    }
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
  * Run migrations from the command line.
  * Usage: node dist/services/migrate.js <command> [options]
  *
@@ -619,10 +686,49 @@ export function printMigrationStatus(database: DatabaseType): void {
  *   down --all  Rollback all migrations
  *   status      Show migration status
  *   dry-run     Show what would be applied without running
+ *   parity      Report SQLite/Postgres migration parity (issue #305)
+ *
+ * The backend is chosen by DB_BACKEND (sqlite | postgres). On `postgres` the
+ * commands are routed to the async runner in `migratePg.ts`, which reads
+ * `migrations/postgres/` and uses a Postgres advisory lock.
  */
 async function cli(): Promise<void> {
   const args = process.argv.slice(2);
   const command = args[0] || "status";
+
+  const { resolveDbBackend } = await import("./dbDialect.js");
+  const backend = resolveDbBackend();
+
+  if (command === "parity") {
+    const { checkMigrationParity } = await import("./migratePg.js");
+    const report = checkMigrationParity();
+    console.info("\nMigration parity (sqlite ↔ postgres):");
+    console.info("-".repeat(70));
+    for (const e of report.entries) {
+      const mark = e.matched && e.bothHaveDown ? "✓" : "✗";
+      console.info(
+        `  ${mark} ${e.id.padEnd(5)} sqlite=${String(e.sqliteName).padEnd(32)} postgres=${e.postgresName}`,
+      );
+    }
+    console.info("-".repeat(70));
+    if (report.inParity) {
+      console.info("Migration sets are in parity.");
+    } else {
+      console.error("Parity drift detected:", {
+        missingInPostgres: report.missingInPostgres,
+        missingInSqlite: report.missingInSqlite,
+        nameMismatches: report.nameMismatches,
+        missingDown: report.missingDown,
+      });
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (backend !== "sqlite") {
+    await runPostgresCli(command, args);
+    return;
+  }
 
   // Initialize a temporary database connection
   const { default: Database } = await import("better-sqlite3");
