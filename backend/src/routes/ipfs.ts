@@ -4,8 +4,10 @@
  * Handles IPFS uploads (images, metadata) and content retrieval.
  */
 
+import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
+import sharp from "sharp";
 
 import { config, LIMITS, ALLOWED_IMAGE_MIMES } from "../config.js";
 import { log } from "../services/logger.js";
@@ -61,11 +63,202 @@ router.use(["/ipfs/:cid", "/ipfs/image/:cid"], (req, res, next) => {
 // MULTER CONFIGURATION (FILE UPLOADS)
 // ============================================
 
+const MAX_IMAGE_DIMENSION = 4096;
+
+const ALLOWED_IMAGE_MIME_SET = new Set<string>(ALLOWED_IMAGE_MIMES);
+
+const FORBIDDEN_IMAGE_MIMES = new Set<string>([
+  "image/svg+xml",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+  "text/html",
+  "application/xhtml+xml",
+  "application/xml",
+  "text/xml",
+  "application/javascript",
+  "text/javascript",
+]);
+
+const MIME_ALIASES: Record<string, string> = {
+  "image/jpg": "image/jpeg",
+  "image/pjpeg": "image/jpeg",
+  "image/x-png": "image/png",
+  "image/x-gif": "image/gif",
+  "image/x-webp": "image/webp",
+};
+
+function normalizeMimeType(mime: string | undefined): string | null {
+  if (!mime) return null;
+  const normalized = mime.toLowerCase().split(";")[0].trim();
+  return MIME_ALIASES[normalized] ?? normalized;
+}
+
+function isAllowedImageMime(mime: string | undefined): boolean {
+  const normalized = normalizeMimeType(mime);
+  return (
+    normalized !== null &&
+    ALLOWED_IMAGE_MIME_SET.has(normalized) &&
+    !FORBIDDEN_IMAGE_MIMES.has(normalized)
+  );
+}
+
+function scanFileForThreats(file: {
+  buffer: Buffer;
+  originalname: string;
+}): string[] {
+  const threats: string[] = [];
+  const lower = file.buffer.toString("latin1").toLowerCase();
+
+  const patterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /<script[\s>]/i, label: "script_tag" },
+    { pattern: /javascript:/i, label: "javascript_protocol" },
+    { pattern: /vbscript:/i, label: "vbscript_protocol" },
+    { pattern: /<svg[\s>]/i, label: "svg_xss" },
+    { pattern: /<html[\s>]/i, label: "html_payload" },
+    { pattern: /<\?php/i, label: "php_payload" },
+    { pattern: /<\?xml/i, label: "xml_payload" },
+    { pattern: /<!doctype\s+html/i, label: "html_doctype" },
+    { pattern: /on(error|load)\s*=/i, label: "event_handler" },
+    { pattern: /data:\s*text\/html/i, label: "data_html" },
+  ];
+
+  for (const { pattern, label } of patterns) {
+    if (pattern.test(lower)) {
+      threats.push(label);
+    }
+  }
+
+  const archiveSignatures: Array<{ bytes: number[]; label: string }> = [
+    { bytes: [0x50, 0x4b, 0x03, 0x04], label: "zip_polyglot" },
+    { bytes: [0x52, 0x61, 0x72, 0x21], label: "rar_polyglot" },
+    { bytes: [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c], label: "7z_polyglot" },
+    { bytes: [0x25, 0x50, 0x44, 0x46], label: "pdf_polyglot" },
+  ];
+
+  for (const { bytes, label } of archiveSignatures) {
+    if (file.buffer.includes(Buffer.from(bytes))) {
+      threats.push(label);
+    }
+  }
+
+  if (
+    /\.(html?|svg|php|phtml|jsp|asp|aspx|sh|js|mjs|xml)$/i.test(
+      file.originalname,
+    )
+  ) {
+    threats.push("dangerous_extension");
+  }
+
+  return threats;
+}
+
+interface ProcessedImage {
+  buffer: Buffer;
+  mimeType: string;
+  width: number;
+  height: number;
+  hash: string;
+}
+
+function invalidUpload(message: string, code: string): Error & { code: string } {
+  const err = new Error(message) as Error & { code: string };
+  err.code = code;
+  return err;
+}
+
+async function processImageUpload(file: {
+  buffer: Buffer;
+  mimetype: string;
+  originalname: string;
+  size: number;
+}): Promise<ProcessedImage> {
+  const declaredMime = normalizeMimeType(file.mimetype);
+  if (!declaredMime || !isAllowedImageMime(declaredMime)) {
+    throw invalidUpload(
+      `Unsupported file type: ${file.mimetype || "unknown"}. Allowed: JPEG, PNG, GIF, WebP, AVIF, HEIC.`,
+      "INVALID_FILE_TYPE",
+    );
+  }
+
+  const detectedMime = detectMimeType(file.buffer);
+  if (!detectedMime || !isAllowedImageMime(detectedMime)) {
+    throw invalidUpload(
+      `File content is not a supported image (detected: ${detectedMime || "unknown"}).`,
+      "INVALID_FILE_TYPE",
+    );
+  }
+
+  if (detectedMime !== declaredMime) {
+    throw invalidUpload(
+      `File content (${detectedMime}) does not match declared MIME type (${declaredMime}).`,
+      "MIME_MISMATCH",
+    );
+  }
+
+  const threats = scanFileForThreats(file);
+  if (threats.length > 0) {
+    throw invalidUpload(
+      `Upload rejected as potentially malicious (${threats.join(", ")}).`,
+      "MALICIOUS_CONTENT",
+    );
+  }
+
+  let metadata;
+  try {
+    metadata = await sharp(file.buffer, { failOn: "error" }).metadata();
+  } catch {
+    throw invalidUpload("Unable to read image metadata.", "INVALID_IMAGE");
+  }
+
+  if (
+    !metadata.width ||
+    !metadata.height ||
+    metadata.width > MAX_IMAGE_DIMENSION ||
+    metadata.height > MAX_IMAGE_DIMENSION
+  ) {
+    throw invalidUpload(
+      `Image dimensions exceed maximum allowed ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}.`,
+      "IMAGE_DIMENSIONS_EXCEEDED",
+    );
+  }
+
+  let sanitizedBuffer: Buffer;
+  try {
+    sanitizedBuffer = await sharp(file.buffer, { failOn: "error" })
+      .rotate()
+      .withMetadata(false)
+      .toBuffer();
+  } catch {
+    throw invalidUpload("Image sanitization failed.", "IMAGE_SANITIZATION_FAILED");
+  }
+
+  const sanitizedThreats = scanFileForThreats({
+    buffer: sanitizedBuffer,
+    originalname: file.originalname,
+  });
+  if (sanitizedThreats.length > 0) {
+    throw invalidUpload(
+      `Sanitized image still contains threats (${sanitizedThreats.join(", ")}).`,
+      "MALICIOUS_CONTENT",
+    );
+  }
+
+  return {
+    buffer: sanitizedBuffer,
+    mimeType: detectedMime,
+    width: metadata.width,
+    height: metadata.height,
+    hash: createHash("sha256").update(file.buffer).digest("hex"),
+  };
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: LIMITS.MAX_IMAGE_SIZE,
     files: 1,
+    fields: 0,
+    parts: 1,
   },
   fileFilter: (_req, file, cb) => {
     log("info", "upload_file_filter", {
@@ -73,10 +266,7 @@ const upload = multer({
       originalname: file.originalname,
     });
 
-    if (
-      ALLOWED_IMAGE_MIMES.includes(file.mimetype as any) ||
-      file.mimetype?.startsWith("image/")
-    ) {
+    if (isAllowedImageMime(file.mimetype)) {
       cb(null, true);
     } else {
       const err = new Error(
@@ -239,31 +429,64 @@ router.post(
     }
 
     try {
+      const uploader =
+        (req as any).user?.address ??
+        (req as any).user?.id ??
+        (req as any).auth?.sub ??
+        "authenticated";
+
+      const processed = await processImageUpload(req.file);
+
       log("info", "ipfs_upload_image", {
         filename: req.file.originalname,
-        size: req.file.size,
-        mimetype: req.file.mimetype,
+        originalSize: req.file.size,
+        size: processed.buffer.length,
+        mimetype: processed.mimeType,
+        width: processed.width,
+        height: processed.height,
+        hash: processed.hash,
+        uploader,
       });
 
       const result = await ipfsService.pinFile(
-        req.file.buffer,
+        processed.buffer,
         req.file.originalname,
-        req.file.mimetype,
+        processed.mimeType,
       );
 
-      log("info", "ipfs_upload_success", { cid: result.cid, type: "image" });
+      log("info", "ipfs_upload_success", {
+        cid: result.cid,
+        type: "image",
+        hash: processed.hash,
+        uploader,
+      });
 
       res.json({
         cid: result.cid,
         size: result.size,
+        originalSize: req.file.size,
         filename: req.file.originalname,
-        mimeType: req.file.mimetype,
+        mimeType: processed.mimeType,
       });
     } catch (err) {
       log("error", "ipfs_upload_failed", {
         error: (err as Error).message,
+        code: (err as any).code,
         type: "image",
       });
+      if (
+        (err as any).code &&
+        [
+          "INVALID_FILE_TYPE",
+          "MIME_MISMATCH",
+          "MALICIOUS_CONTENT",
+          "INVALID_IMAGE",
+          "IMAGE_DIMENSIONS_EXCEEDED",
+          "IMAGE_SANITIZATION_FAILED",
+        ].includes((err as any).code)
+      ) {
+        return res.status(400).json({ error: (err as Error).message });
+      }
       res.status(500).json({ error: "Failed to upload image to IPFS" });
     }
   }) as AsyncHandler,
