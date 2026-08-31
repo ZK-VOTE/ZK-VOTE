@@ -66,7 +66,9 @@ beforeAll(async () => {
 
 test("vote_v2.circom's DOMAIN_TAG matches vote.circom/comment.circom/comment_v2.circom", () => {
   const files = [
-    "vote.circom",
+    // The Vote template moved to vote_template.circom so every Merkle
+    // depth can instantiate it (#93); the constant lives with the template.
+    "vote_template.circom",
     "vote_v2.circom",
     "comment.circom",
     "comment_v2.circom",

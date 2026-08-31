@@ -120,7 +120,14 @@ beforeAll(async () => {
 
 describe("comment_v2.circom domain-tag / signal parity with vote_v2.circom", () => {
   test("DOMAIN_TAG is the exact same constant across vote/vote_v2/comment/comment_v2", () => {
-    const files = ["vote.circom", "vote_v2.circom", "comment.circom", "comment_v2.circom"];
+    // The Vote template moved to vote_template.circom so every Merkle depth
+    // can instantiate it (#93); the constant lives with the template.
+    const files = [
+      "vote_template.circom",
+      "vote_v2.circom",
+      "comment.circom",
+      "comment_v2.circom",
+    ];
     for (const file of files) {
       const src = fs.readFileSync(path.join(__dirname, file), "utf8");
       const match = src.match(/var DOMAIN_TAG = (\d+);/);
