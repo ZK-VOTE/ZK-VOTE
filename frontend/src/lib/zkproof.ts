@@ -106,6 +106,14 @@ async function proveWithSnarkjs(
   wasmPath: string | Uint8Array,
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
+  // Off the main thread where the platform allows it (#92): a multi-second
+  // BigInt proof on the main thread blocks rendering, which hands any script
+  // on the page a timing trace via frame pacing alone. Timing masking is
+  // applied by the caller, so this path does not pad.
+  if (workerAvailable()) {
+    const r = await proveInWorker(input, wasmPath, zkeyPath);
+    return { proof: r.proof, publicSignals: r.publicSignals } as GeneratedProof;
+  }
   const { groth16 } = await import("snarkjs");
   const { proof, publicSignals } = await groth16.fullProve(
     input as CircuitSignals,
@@ -642,26 +650,34 @@ export async function generateVoteProof(
       };
     }
 
-    if (USE_RUST_PROVER) {
-      try {
-        const primary = await proveWithRust(circuitInput, wasmPath, zkeyPath);
+    // Mask the timing of the whole prover selection, not of a single prover
+    // (#92). snarkjs is variable-time, so duration correlates with the secret
+    // and candidate choice in the witness — and *which* prover ran, or whether
+    // the Rust one failed and fell back to snarkjs, is itself readable from
+    // the clock. One masking boundary here covers every path; the individual
+    // provers deliberately do not pad, so the padding cannot compound.
+    return withMaskedTiming(async () => {
+      if (USE_RUST_PROVER) {
         try {
-          const secondary = await proveWithSnarkjs(
-            circuitInput,
-            wasmPath,
-            zkeyPath,
-          );
-          return { ...primary, redundantProof: secondary.proof };
+          const primary = await proveWithRust(circuitInput, wasmPath, zkeyPath);
+          try {
+            const secondary = await proveWithSnarkjs(
+              circuitInput,
+              wasmPath,
+              zkeyPath,
+            );
+            return { ...primary, redundantProof: secondary.proof };
+          } catch (e) {
+            console.warn("Secondary snarkjs vote prover failed.", e);
+            return primary;
+          }
         } catch (e) {
-          console.warn("Secondary snarkjs vote prover failed.", e);
-          return primary;
+          console.warn("Rust vote prover failed; falling back to snarkjs.", e);
         }
-      } catch (e) {
-        console.warn("Rust vote prover failed; falling back to snarkjs.", e);
       }
-    }
 
-    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
+      return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
+    });
   } catch (error) {
     console.error("Failed to generate vote proof:", error);
     throw new Error(
