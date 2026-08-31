@@ -27,7 +27,11 @@ import {
   getAuditEntries,
   listTokensForClient,
 } from "../services/authTokens.js";
-import { buildDidAttributeProofSeed } from "../services/blindSignature.js";
+import {
+  buildDidAttributeProofSeed,
+  getBlindSignaturePublicKey,
+  issueBlindSignature,
+} from "../services/blindSignature.js";
 import type { AsyncHandler } from "../types/index.js";
 import {
   createTokenSchema,
@@ -41,6 +45,24 @@ import {
 } from "../validation/schemas.js";
 
 const router = Router();
+
+const blindSignatureIssuedForClient = new Set<string>();
+const blindSignatureAttempts = new Map<string, number[]>();
+
+function isBlindSignatureRateLimited(key: string): boolean {
+  const now = Date.now();
+  const windowMs = 60_000;
+  const maxAttempts = 5;
+  const recent = (blindSignatureAttempts.get(key) ?? []).filter(
+    (timestamp) => now - timestamp < windowMs,
+  );
+  if (recent.length >= maxAttempts) {
+    return true;
+  }
+  recent.push(now);
+  blindSignatureAttempts.set(key, recent);
+  return false;
+}
 
 // ============================================
 // TOKEN MANAGEMENT ENDPOINTS
@@ -403,5 +425,84 @@ router.get("/auth/config", masterKeyGuard, (_req: Request, res: Response) => {
     },
   });
 });
+
+/**
+ * GET /auth/blind-signature/public-key - Get the RSA public key used for blind signing
+ */
+router.get(
+  "/auth/blind-signature/public-key",
+  (async (_req: Request, res: Response) => {
+    try {
+      const publicKey = await getBlindSignaturePublicKey();
+      return res.json({
+        success: true,
+        publicKey,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: (err as Error).message,
+      });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /auth/blind-signature/sign - Issue a blind signature on a blinded value.
+ * Requires: AUTH_MASTER_KEY
+ */
+router.post(
+  "/auth/blind-signature/sign",
+  bodyLimit("100kb"),
+  masterKeyGuard,
+  (async (req: Request, res: Response) => {
+    const { clientId, blindedValue } = req.body as {
+      clientId?: unknown;
+      blindedValue?: unknown;
+    };
+
+    if (typeof clientId !== "string" || typeof blindedValue !== "string") {
+      return res.status(400).json({
+        success: false,
+        error: "clientId and blindedValue are required",
+      });
+    }
+
+    if (isBlindSignatureRateLimited(req.ip ?? "unknown")) {
+      return res.status(429).json({
+        success: false,
+        error: "Blind signature rate limit exceeded",
+      });
+    }
+
+    if (blindSignatureIssuedForClient.has(clientId)) {
+      return res.status(409).json({
+        success: false,
+        error: "A blind signature has already been issued for this voter",
+      });
+    }
+
+    try {
+      const blindSignature = await issueBlindSignature({ clientId, blindedValue });
+      blindSignatureIssuedForClient.add(clientId);
+
+      log("info", "blind_signature_issued", { clientId });
+
+      return res.status(201).json({
+        success: true,
+        blindSignature,
+      });
+    } catch (err) {
+      log("error", "blind_signature_issue_failed", {
+        error: (err as Error).message,
+        clientId,
+      });
+      return res.status(400).json({
+        success: false,
+        error: (err as Error).message,
+      });
+    }
+  }) as AsyncHandler,
+);
 
 export default router;
