@@ -54,6 +54,7 @@ flowchart LR
 - [zk-voting-protocol.md](zk-voting-protocol.md) — anti-flash-loan voting mechanism
 - [recursive-proof-architecture.md](recursive-proof-architecture.md) — Nova/SuperNova recursive proof composition ($O(1)$ on-chain verification at scale)
 - [vdf-randomness.md](vdf-randomness.md) — verifiable delay function for election randomness
+- [merkle-depth-and-batched-voting.md](merkle-depth-and-batched-voting.md) — per-election Merkle depth selection and batched vote submission
 - [bn254-edge-case-findings.md](bn254-edge-case-findings.md) — BN254 Groth16 edge-case findings
 - [adr-0001-bn254-groth16-validation-boundary.md](adr-0001-bn254-groth16-validation-boundary.md) — ADR: BN254 Groth16 validation boundary
 - [trusted-setup-ceremony.md](trusted-setup-ceremony.md) — multi-party trusted setup ceremony
