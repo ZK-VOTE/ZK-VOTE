@@ -84,6 +84,9 @@ const bn254FieldAnon = z.string().refine(
  * Soroban host's job at proof-verification time (see module comment above).
  */
 function coordinatesInFieldRange(paddedHex: string, count: number): boolean {
+  // Non-hex input (e.g. a malformed proof from a client) must fail validation
+  // cleanly instead of throwing a SyntaxError out of BigInt() (#172).
+  if (!/^[0-9a-fA-F]+$/.test(paddedHex)) return false;
   const coordHexLen = paddedHex.length / count;
   for (let i = 0; i < count; i++) {
     const coordHex = paddedHex.slice(i * coordHexLen, (i + 1) * coordHexLen);
@@ -628,12 +631,33 @@ export const eventsQuerySchema = cursorPaginationSchema.extend({
 export const daosQuerySchema = limitOffsetPaginationSchema
   .extend({
     user: stellarAddress.optional(),
+    /** Free-text search against DAO name (case-insensitive substring match) */
+    search: z.string().min(1).max(100).optional(),
+    /** Filter by membership type: open | closed */
+    membershipType: z.enum(["open", "closed"]).optional(),
     cursor: z.coerce.number().int().min(0).optional(),
   })
   .transform(({ cursor, offset, ...rest }) => ({
     ...rest,
     offset: cursor ?? offset,
   }));
+
+// ============================================
+// PROPOSAL SEARCH / FILTER SCHEMA (issue #377)
+// ============================================
+
+/**
+ * Query-string schema for the GET /proposals/:daoId endpoint.
+ *
+ * - `status`  : filter by proposal lifecycle state (active / closed / all)
+ * - `search`  : free-text substring match on proposal title stored in event data
+ * - `limit`   : page size (1 – 500, default 100)
+ * - `offset`  : zero-based page start
+ */
+export const proposalsQuerySchema = limitOffsetPaginationSchema.extend({
+  status: z.enum(["active", "closed", "all"]).default("all"),
+  search: z.string().min(1).max(100).optional(),
+});
 
 export const commentCountQuerySchema = limitOffsetPaginationSchema.extend({
   types: z

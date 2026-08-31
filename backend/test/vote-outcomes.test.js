@@ -30,7 +30,8 @@ const {
   initDb,
   closeDb,
   getTransactionLog,
-  recordTransactionLog,
+  insertVoteSubmission,
+  updateVoteSubmission,
 } = await import("../src/services/db.js");
 
 function votePayload(nullifier) {
@@ -43,7 +44,7 @@ function votePayload(nullifier) {
     proof: {
       a: "11".repeat(64),
       b: "22".repeat(128),
-      c: "33".repeat(64),
+      c: "0f".repeat(64),
     },
   };
 }
@@ -88,10 +89,14 @@ test("POST /vote records failed confirmation and prevents replay", async (t) => 
   assert.equal(failedTransaction.status, "FAILED");
 
   const replayNullifier = "04".padStart(64, "0");
-  recordTransactionLog(
+  // Idempotency lives in the vote_submissions table: a nullifier already
+  // recorded as confirmed must be answered from the stored tx hash without
+  // ever reaching the on-chain executor.
+  insertVoteSubmission(replayNullifier);
+  updateVoteSubmission(
     replayNullifier,
+    "confirmed",
     "vote_existing_tx_001",
-    "PENDING",
   );
 
   let executorCalls = 0;
@@ -116,11 +121,9 @@ test("POST /vote records failed confirmation and prevents replay", async (t) => 
     .send(votePayload(replayNullifier));
 
   assert.equal(replayResponse.statusCode, 200);
-  assert.deepEqual(replayResponse.body, {
-    success: true,
-    txHash: "vote_existing_tx_001",
-    status: "PENDING",
-    replayed: true,
-  });
+  assert.equal(replayResponse.body.success, true);
+  assert.equal(replayResponse.body.txHash, "vote_existing_tx_001");
+  assert.equal(replayResponse.body.status, "SUCCESS");
+  assert.equal(replayResponse.body.replayed, true);
   assert.equal(executorCalls, 0);
 });

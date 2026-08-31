@@ -1,3 +1,4 @@
+import { describe, it, before } from "node:test";
 import { expect } from "chai";
 import { kysely } from "../src/services/kysely.js";
 import { sql } from "kysely";
@@ -16,7 +17,7 @@ describe("Kysely Query Builder", () => {
       .where("key", "=", "lastLedger")
       .compile();
 
-    expect(query.sql).to.include("SELECT * FROM `metadata` WHERE `key` = ?");
+    expect(query.sql).to.include('select * from "metadata" where "key" = ?');
     expect(query.parameters).to.deep.equal(["lastLedger"]);
   });
 
@@ -29,8 +30,8 @@ describe("Kysely Query Builder", () => {
       )
       .compile();
 
-    expect(query.sql).to.include("INSERT INTO `metadata` (`key`, `value`) VALUES (?, ?)");
-    expect(query.sql).to.include("ON CONFLICT (`key`) DO UPDATE SET `value` = ?");
+    expect(query.sql).to.include('insert into "metadata" ("key", "value") values (?, ?)');
+    expect(query.sql).to.include('on conflict ("key") do update set "value" = ?');
     expect(query.parameters).to.deep.equal(["test", "123", "123"]);
   });
 
@@ -49,7 +50,7 @@ describe("Kysely Query Builder", () => {
     
     const compiled = query.compile();
 
-    expect(compiled.sql).to.include("SELECT * FROM events_123 as `events` WHERE `type` in (?, ?) AND `verified` = ?");
+    expect(compiled.sql).to.include('select * from events_123 as "events" where "type" in (?, ?) and "verified" = ?');
     expect(compiled.parameters).to.deep.equal(["vote", "comment", 1]);
   });
 });

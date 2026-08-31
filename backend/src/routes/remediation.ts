@@ -14,13 +14,18 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { authGuard, queryLimiter } from "../middleware/index.js";
+import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import {
-  getRemediationHistory,
-  getMTTRStats,
-} from "../services/remediation.js";
-import { validateQuery } from "../middleware/index.js";
-import { remediationHistoryQuerySchema } from "../validation/schemas.js";
+  appendAudit,
+  isIdempotencyKeyUsed,
+  markIdempotencyKey,
+  deriveActor,
+  redactPii,
+} from "../middleware/audit.js";
+import { hashIp } from "../services/logger.js";
+import { log } from "../services/logger.js";
+import type { AsyncHandler } from "../types/index.js";
+import crypto from "crypto";
 
 const router = Router();
 
@@ -138,10 +143,7 @@ function validateRemediationBody(body: any): {
  * POST /remediation/action - Submit structured remediation action
  * Requires auth (authz), append-only, replay-safe
  */
-router.post("/remediation/action", authGuard, (async (
-  req: Request,
-  res: Response,
-) => {
+router.post("/remediation/action", bodyLimit("100kb"), authGuard, (async (req: Request, res: Response) => {
   const validation = validateRemediationBody(req.body);
   if (!validation.valid) {
     return res.status(400).json({ error: validation.error });
@@ -252,91 +254,71 @@ router.post("/remediation/action", authGuard, (async (
  * GET /remediation/log - Query remediation audit trail
  * Requires auth, supports filters: action, target, from, to, limit, offset
  */
-router.get(
-  "/remediation/log",
-  authGuard,
-  queryLimiter,
-  (req: Request, res: Response) => {
-    const { action, target, from, to, limit, offset } = req.query;
-    let filtered = [...remediationLog];
+router.get("/remediation/log", authGuard, queryLimiter, (req: Request, res: Response) => {
+  const { action, target, from, to, limit, offset } = req.query;
+  let filtered = [...remediationLog];
 
-    if (action) filtered = filtered.filter((r) => r.action === String(action));
-    if (target) filtered = filtered.filter((r) => r.target === String(target));
-    if (from) {
-      const fromTs = new Date(String(from)).getTime();
-      if (!isNaN(fromTs))
-        filtered = filtered.filter(
-          (r) => new Date(r.timestamp).getTime() >= fromTs,
-        );
-    }
-    if (to) {
-      const toTs = new Date(String(to)).getTime();
-      if (!isNaN(toTs))
-        filtered = filtered.filter(
-          (r) => new Date(r.timestamp).getTime() <= toTs,
-        );
-    }
+  if (action) filtered = filtered.filter((r) => r.action === String(action));
+  if (target) filtered = filtered.filter((r) => r.target === String(target));
+  if (from) {
+    const fromTs = new Date(String(from)).getTime();
+    if (!isNaN(fromTs)) filtered = filtered.filter((r) => new Date(r.timestamp).getTime() >= fromTs);
+  }
+  if (to) {
+    const toTs = new Date(String(to)).getTime();
+    if (!isNaN(toTs)) filtered = filtered.filter((r) => new Date(r.timestamp).getTime() <= toTs);
+  }
 
-    const total = filtered.length;
-    const off = Math.max(0, parseInt(String(offset || "0"), 10) || 0);
-    const lim = Math.min(
-      Math.max(1, parseInt(String(limit || "50"), 10) || 50),
-      100,
-    );
+  const total = filtered.length;
+  const off = Math.max(0, parseInt(String(offset || "0"), 10) || 0);
+  const lim = Math.min(Math.max(1, parseInt(String(limit || "50"), 10) || 50), 100);
 
-    const entries = filtered.slice(off, off + lim);
-    // Return redacted view - idempotencyKey always redacted
-    const sanitized = entries.map((e) => ({
-      id: e.id,
-      timestamp: e.timestamp,
-      action: e.action,
-      target: e.target,
-      reason: e.reason,
-      actor: e.actor,
-      actorIpHash: e.actorIpHash,
-      metadata: e.metadata,
-      txHash: e.txHash,
-      immutable: true,
-      idempotencyKey: "[REDACTED]",
-    }));
+  const entries = filtered.slice(off, off + lim);
+  // Return redacted view - idempotencyKey always redacted
+  const sanitized = entries.map((e) => ({
+    id: e.id,
+    timestamp: e.timestamp,
+    action: e.action,
+    target: e.target,
+    reason: e.reason,
+    actor: e.actor,
+    actorIpHash: e.actorIpHash,
+    metadata: e.metadata,
+    txHash: e.txHash,
+    immutable: true,
+    idempotencyKey: "[REDACTED]",
+  }));
 
-    res.json({ entries: sanitized, total, limit: lim, offset: off });
-  },
-);
+  res.json({ entries: sanitized, total, limit: lim, offset: off });
+});
 
 /**
  * GET /remediation/:id - Get single remediation record by id
  */
-router.get(
-  "/remediation/:id",
-  authGuard,
-  queryLimiter,
-  (req: Request, res: Response) => {
-    const { id } = req.params;
-    const rec = getRemediationById(id);
-    if (!rec)
-      return res.status(404).json({ error: "Remediation record not found" });
-    res.json({
-      id: rec.id,
-      timestamp: rec.timestamp,
-      action: rec.action,
-      target: rec.target,
-      reason: rec.reason,
-      actor: rec.actor,
-      actorIpHash: rec.actorIpHash,
-      metadata: rec.metadata,
-      txHash: rec.txHash,
-      immutable: true,
-      idempotencyKey: "[REDACTED]",
-    });
-  },
-);
+router.get("/remediation/:id", authGuard, queryLimiter, (req: Request, res: Response) => {
+  const { id } = req.params;
+  const rec = getRemediationById(id);
+  if (!rec) return res.status(404).json({ error: "Remediation record not found" });
+  res.json({
+    id: rec.id,
+    timestamp: rec.timestamp,
+    action: rec.action,
+    target: rec.target,
+    reason: rec.reason,
+    actor: rec.actor,
+    actorIpHash: rec.actorIpHash,
+    metadata: rec.metadata,
+    txHash: rec.txHash,
+    immutable: true,
+    idempotencyKey: "[REDACTED]",
+  });
+});
 
 /**
  * POST /remediation/verify - Verify remediation log integrity (immutable check)
  * Returns hash chain to prove append-only
  */
-router.post("/remediation/verify", authGuard, (req: Request, res: Response) => {
+router.post("/remediation/verify", bodyLimit("100kb"), authGuard, (req: Request, res: Response) => {
   // Compute simple hash chain of remediation log to prove no tampering
   let prevHash = "0".repeat(64);
   const chain: Array<{ id: string; hash: string; prevHash: string }> = [];

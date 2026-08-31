@@ -15,7 +15,7 @@ import {
   getVkProposal,
   getDaoVkProposal,
 } from "../services/circuit-registry.js";
-import { queryLimiter, authGuard } from "../middleware/index.js";
+import { bodyLimit, queryLimiter } from "../middleware/index.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();
@@ -32,7 +32,16 @@ router.get("/circuits/:dao/:type/status", queryLimiter, (async (
     return res.status(400).json({ error: "Invalid dao ID" });
   }
 
-  const circuitType = type === "comment" ? "Comment" : "Vote";
+  // Circuit type is a strict enum (vote | comment) — anything else is a
+  // client error rather than silently defaulting to the vote circuit.
+  // Comparison is case-insensitive so existing capitalized callers keep
+  // working.
+  const normalizedType = type.toLowerCase();
+  if (normalizedType !== "vote" && normalizedType !== "comment") {
+    return res.status(400).json({ error: "Invalid circuit type" });
+  }
+
+  const circuitType = normalizedType === "comment" ? "Comment" : "Vote";
 
   try {
     log("info", "circuit_status_request", { daoId, circuitType });
@@ -168,7 +177,7 @@ router.get("/circuits/vk/:circuitId", queryLimiter, (async (
 }) as AsyncHandler);
 
 // Mismatch detection endpoint for client preflight
-router.post("/circuits/verify-version", queryLimiter, (async (
+router.post("/circuits/verify-version", bodyLimit("5kb"), queryLimiter, (async (
   req: Request,
   res: Response,
 ) => {

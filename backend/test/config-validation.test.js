@@ -29,17 +29,18 @@ test("config: arrays and lists parse correctly", () => {
 
 test("validateEnv: detects missing required VOTING_CONTRACT_ID", () => {
   const originalValue = process.env.VOTING_CONTRACT_ID;
+  const originalExit = process.exit;
   delete process.env.VOTING_CONTRACT_ID;
 
   try {
-    assert.throws(
-      () => validateEnv(),
-      (err) => {
-        assert(err.message.includes("required") || process.exitCode === 1);
-        return true;
-      },
-    );
+    // validateEnv() hard-exits on missing required vars; capture that as an
+    // exception so the assertion runs instead of killing the test runner.
+    process.exit = (code) => {
+      throw new Error(`process.exit(${code}) called`);
+    };
+    assert.throws(() => validateEnv(), /process\.exit\(1\)/);
   } finally {
+    process.exit = originalExit;
     if (originalValue) process.env.VOTING_CONTRACT_ID = originalValue;
   }
 });

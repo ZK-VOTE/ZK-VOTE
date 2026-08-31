@@ -7,15 +7,15 @@ import {
   upsertDao,
 } from "../src/services/db.js";
 
-function ensureDao(daoId) {
+// vote_receipts.dao_id references daos(id); seed the DAOs these tests insert
+// against so the FK constraint holds regardless of shared database state.
+for (const id of [1, 2, 42, 43]) {
   upsertDao({
-    id: daoId,
-    name: `DAO ${daoId}`,
-    creator: "GTEST",
+    id,
+    name: `test-dao-${id}`,
+    creator: "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN",
     membership_open: true,
     members_can_propose: true,
-    metadata_cid: null,
-    member_count: 0,
   });
 }
 

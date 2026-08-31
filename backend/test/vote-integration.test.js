@@ -27,6 +27,7 @@ const {
   initDb,
   closeDb,
   getTransactionLog,
+  upsertDao,
 } = await import("../src/services/db.js");
 
 before(() => {
@@ -37,15 +38,21 @@ before(() => {
   initDb(dbPath);
 });
 
-after(() => {
-  closeDb();
-  fs.rmSync(tempDir, { recursive: true, force: true });
-});
+  // vote_receipts.dao_id references daos(id); seed the DAO so the receipt
+  // insert on confirmation doesn't trip the FK constraint.
+  upsertDao({
+    id: 7,
+    name: "DAO 7",
+    creator: "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN",
+    membership_open: true,
+    members_can_propose: true,
+  });
 
-afterEach(() => {
-  setVoteExecutorForTests(null);
-  setTallyVerifierForTests(null);
-});
+  t.after(() => {
+    setVoteExecutorForTests(null);
+    closeDb();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
 
 test("POST /vote completes a successful vote flow", async () => {
   let capturedInput;
@@ -76,9 +83,9 @@ test("POST /vote completes a successful vote flow", async () => {
       nullifier,
       root,
       proof: {
-        a:"11".repeat(64),
-        b:"22".repeat(128),
-        c:"33".repeat(64),
+        a: "11".repeat(64),
+        b: "22".repeat(128),
+        c: "0f".repeat(64),
       },
     });
 

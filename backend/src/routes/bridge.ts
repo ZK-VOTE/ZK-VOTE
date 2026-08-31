@@ -23,17 +23,8 @@ import {
   u256ToScVal,
 } from "../services/stellar.js";
 
-import {
-  authGuard,
-  queryLimiter,
-  validateBody,
-  validateParams,
-  bodyLimit,
-} from "../middleware/index.js";
-import {
-  nullifierParamsSchema,
-  bridgeVoteSchema,
-} from "../validation/schemas.js";
+import { authGuard, queryLimiter, validateBody } from "../middleware/index.js";
+import { bridgeVoteSchema } from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();

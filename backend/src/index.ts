@@ -44,6 +44,20 @@ import {
   stopMonitor as stopPinMonitor,
 } from "./services/ipfs-monitor.js";
 import {
+  server,
+  relayerKeypair,
+  getPendingSequenceLockOps,
+  waitForSequenceLockIdle,
+} from "./services/stellar.js";
+import {
+  startConfirmationWorker,
+  stopConfirmationWorker,
+} from "./services/confirmation-queue.js";
+import {
+  attachConfirmationHub,
+  closeConfirmationHub,
+} from "./services/confirmation-hub.js";
+import {
   startDaoSync,
   stopDaoSync,
   startMembershipSync,
@@ -66,13 +80,16 @@ import {
   stopMemoryMonitor,
 } from "./services/memory-monitor.js";
 
+// Middleware
 import {
   csrfGuard,
+  csrfTokenMiddleware,
   requestLogger,
   errorHandler,
   auditMiddleware,
-  metricsMiddleware,
+  graduatedSlowDown,
   degradationContext,
+  metricsMiddleware,
 } from "./middleware/index.js";
 
 import {
@@ -88,6 +105,7 @@ import {
   initIndexerRoutes,
   bridgeRoutes,
   circuitRoutes,
+  transactionRoutes,
   authRoutes,
   quadraticRoutes,
   metricsRoutes,
@@ -95,8 +113,11 @@ import {
   novaRoutes,
   adminRoutes,
   thresholdRoutes,
+  auditRoutes,
   randomnessRoutes,
 } from "./routes/index.js";
+import { registerShutdownHandler } from "./routes/admin.js";
+import openApiSpec from "./openapi.js";
 
 // ============================================
 // ENVIRONMENT VALIDATION
@@ -261,6 +282,10 @@ app.use(requestLogger);
 // Graduated throttling (delays before a client is hard rate-limited)
 app.use(graduatedSlowDown);
 
+// Audit middleware - must be after body parsing and requestLogger, before routes
+// Audits every mutating route (POST/PUT/PATCH/DELETE) with PII redaction, append-only
+app.use(auditMiddleware);
+
 // CSRF token generation for safe methods (GET, HEAD, OPTIONS)
 app.use(csrfTokenMiddleware);
 
@@ -303,11 +328,13 @@ app.use(claimRoutes);
 app.use(indexerRoutes);
 app.use(bridgeRoutes);
 app.use(circuitRoutes);
+app.use(transactionRoutes);
 app.use(authRoutes);
 app.use(quadraticRoutes);
 app.use("/api/v1/nova", novaRoutes);
 app.use(noStore, adminRoutes);
 app.use(noStore, thresholdRoutes);
+app.use(auditRoutes);
 app.use(noStore, randomnessRoutes);
 
 // ============================================
@@ -327,24 +354,33 @@ app.use((_req, res, next) => {
 });
 
 const v1Router = express.Router();
-v1Router.use(metricsRoutes);
-v1Router.use(healthRoutes);
-v1Router.use(remediationRoutes);
-v1Router.use(noStore, votingRoutes);
-v1Router.use(daoRoutes);
-v1Router.use(ipfsRoutes);
-v1Router.use(commentsRoutes);
-v1Router.use(indexerRoutes);
-v1Router.use(bridgeRoutes);
-v1Router.use(circuitRoutes);
-v1Router.use(quadraticRoutes);
-v1Router.use(noStore, adminRoutes);
-v1Router.use(noStore, thresholdRoutes);
-v1Router.use(noStore, randomnessRoutes);
+
+function mountV1(): void {
+  v1Router.use(metricsRoutes);
+  v1Router.use(healthRoutes);
+  v1Router.use(remediationRoutes);
+  v1Router.use(noStore, votingRoutes);
+  v1Router.use(daoRoutes);
+  v1Router.use(ipfsRoutes);
+  v1Router.use(commentsRoutes);
+  v1Router.use(claimRoutes);
+  v1Router.use(indexerRoutes);
+  v1Router.use(bridgeRoutes);
+  v1Router.use(circuitRoutes);
+  v1Router.use(transactionRoutes);
+  v1Router.use(quadraticRoutes);
+  v1Router.use(noStore, adminRoutes);
+  v1Router.use(noStore, thresholdRoutes);
+  v1Router.use(auditRoutes);
+  v1Router.use(noStore, randomnessRoutes);
+}
+
+mountV1();
 app.use("/api/v1", v1Router);
 
 // OpenAPI spec + interactive docs
 const openApiDocument = buildOpenApiDocument();
+app.get("/openapi.json", (_req, res) => res.json(openApiSpec));
 app.get("/api-docs/openapi.json", (_req, res) => res.json(openApiDocument));
 app.use(
   "/api-docs",
@@ -427,13 +463,40 @@ async function gracefulShutdown(reason: string): Promise<void> {
   stopBackgroundServices();
   stopAuthScheduler();
   stopWalResilience();
+  closeConfirmationHub();
   log("info", "shutdown_component_stopped", {
     component: "background_services",
   });
 
   await httpClosed;
 
+  // Drain in-flight sequence-locked chain submissions before closing the DB,
+  // so a proof is never accepted but left unsubmitted.
+  const pendingSequenceOps = getPendingSequenceLockOps();
+  if (pendingSequenceOps > 0) {
+    log("info", "shutdown_draining_sequence_lock", {
+      pending: pendingSequenceOps,
+      pid: process.pid,
+    });
+  }
   const drained = await waitForSequenceLockIdle(DRAIN_TIMEOUT_MS);
+  log(drained ? "info" : "warn", "shutdown_sequence_lock_drained", {
+    drained,
+    remaining: getPendingSequenceLockOps(),
+    pid: process.pid,
+  });
+
+  // Close the SQLite connection cleanly (checkpoints WAL, avoids corruption
+  // on restart).
+  try {
+    closeDb();
+    log("info", "shutdown_component_stopped", { component: "database" });
+  } catch (err) {
+    log("error", "shutdown_db_close_error", {
+      error: (err as Error).message,
+      pid: process.pid,
+    });
+  }
 
   clearTimeout(forceExitTimer);
   log("info", "shutdown_complete", {
@@ -569,6 +632,10 @@ async function startBackgroundServices(): Promise<void> {
     });
     void gracefulShutdown("memory_threshold");
   });
+
+  // Dedicated confirmation worker (#172): single poller for all outstanding
+  // transaction-confirmation waits, with exponential backoff + jitter.
+  startConfirmationWorker();
 }
 
 /**
@@ -597,6 +664,9 @@ async function stopBackgroundServices(): Promise<void> {
   stopPinMonitor();
   stopMemoryMonitor();
   stopScheduledBackups();
+
+  // Drain any outstanding confirmation waits so callers never hang on exit.
+  void stopConfirmationWorker();
 }
 
 /**
@@ -771,6 +841,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       } else {
         await startBackgroundServices();
       }
+
+      // Attach the confirmation WebSocket hub (#172) so frontends receive
+      // push notifications the moment a transaction confirms. `httpServer` is
+      // assigned synchronously by app.listen() before this callback fires.
+      attachConfirmationHub(httpServer!);
     });
 
     registerWorkerShutdownHandler((reason) => {

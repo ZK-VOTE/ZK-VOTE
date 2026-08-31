@@ -68,7 +68,7 @@ function main(): void {
     console.log(
       `openapi.json is up to date (${ENDPOINTS.length} endpoints) and API.md covers all of them.`,
     );
-    return;
+    process.exit(0);
   }
 
   fs.writeFileSync(OPENAPI_PATH, json);
@@ -77,6 +77,7 @@ function main(): void {
     console.warn("API.md is missing documentation for:");
     for (const p of mdProblems) console.warn(`  - ${p}`);
   }
+  process.exit(0);
 }
 
 main();

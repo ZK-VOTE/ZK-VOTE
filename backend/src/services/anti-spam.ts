@@ -1,5 +1,6 @@
-import type { Database as DatabaseType } from "better-sqlite3";
-import type { Kysely } from "kysely";
+import { getReadDb, getWriteDb } from "./db.js";
+import { log } from "./logger.js";
+import { kysely } from "./kysely.js";
 import { sql } from "kysely";
 import type { DB } from "../generated/db-types.js";
 import type { LoggerPort } from "./interfaces.js";
@@ -52,8 +53,7 @@ export function checkCommitmentRateLimit(
   maxPerWindow: number,
   windowMs: number,
 ): boolean {
-  const { getDb, kysely, logger } = getDeps();
-  const database = getDb();
+  const database = getReadDb();
   const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
 
   const query = kysely
@@ -89,8 +89,7 @@ export function recordCommentSubmission(
   proposalId: number,
   windowMs: number,
 ): void {
-  const { getDb, kysely } = getDeps();
-  const database = getDb();
+  const database = getWriteDb();
   const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
 
   const query = kysely
@@ -120,8 +119,7 @@ export function flagComment(
   flaggerNullifier: string,
   threshold: number,
 ): FlagResult {
-  const { getDb, kysely, logger } = getDeps();
-  const database = getDb();
+  const database = getWriteDb();
 
   const existingQuery = kysely
     .selectFrom("comment_flags")
@@ -233,8 +231,7 @@ export function getFlagStatus(
   daoId: number,
   proposalId: number,
 ): FlagStatus {
-  const { getDb, kysely } = getDeps();
-  const database = getDb();
+  const database = getReadDb();
 
   const flagCountQuery = kysely
     .selectFrom("comment_flags")
@@ -271,8 +268,7 @@ export function getHiddenCommentIds(
   daoId: number,
   proposalId: number,
 ): number[] {
-  const { getDb, kysely } = getDeps();
-  const database = getDb();
+  const database = getReadDb();
   const query = kysely
     .selectFrom("hidden_comments")
     .select("comment_id")
