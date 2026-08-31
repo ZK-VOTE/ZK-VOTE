@@ -163,6 +163,12 @@ pub enum VotingError {
     WeightOutOfRange = 69,
     /// Weighted vote domain tag does not match the configured tag
     InvalidDomainTag = 70,
+    /// Merkle depth is zero, above MAX_MERKLE_DEPTH, or has no registered VK
+    InvalidMerkleDepth = 71,
+    /// Batch is empty or larger than MAX_VOTE_BATCH
+    InvalidBatchSize = 72,
+    /// The same nullifier appears twice within one batch
+    DuplicateNullifierInBatch = 73,
 }
 
 // Maximum allowed IC vector length (num_public_inputs + 1)
@@ -174,6 +180,15 @@ const MAX_IC_LENGTH: u32 = 21;
 const MAX_TITLE_LEN: u32 = 100; // Max proposal title length (100 bytes)
 const MAX_CID_LEN: u32 = 64; // Max IPFS CID length (CIDv1 is ~59 chars)
 const MAX_UPGRADE_PAYLOAD_LEN: u32 = 4096;
+
+/// Largest Merkle depth an election may declare (#93). 2^32 members is far
+/// beyond anything the tree contract can hold; the bound exists so a bad depth
+/// cannot be used to force an unbounded proof.
+pub const MAX_MERKLE_DEPTH: u32 = 32;
+
+/// Largest batch `cast_votes` accepts (#90). Matches the verifier's own cap:
+/// the whole pairing check has to fit in one transaction's resource budget.
+pub const MAX_VOTE_BATCH: u32 = zkvote_groth16::batch::MAX_BATCH_SIZE;
 
 // Circuit constants
 /// Vote circuit public signals: root, nullifier, dao_id, proposal_id, vote_choice, num_candidates
@@ -291,6 +306,12 @@ pub enum DataKey {
     UpgradeMigration(u32),
     /// Rollback marker by rolled-back contract version.
     UpgradeRollback(u32),
+    /// Verification key registered for a specific Merkle depth (#93).
+    DepthVk(u64, u32), // (dao_id, merkle_depth) -> VerificationKey
+    /// Hash of the depth verification key, pinned when the election declared
+    /// its depth, so a later `set_vk_for_depth` cannot silently change the key
+    /// an in-flight election verifies against (#93).
+    ProposalDepthVkHash(u64, u64), // (dao_id, proposal_id) -> BytesN<32>
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -395,6 +416,14 @@ pub struct ElectionConfig {
     pub merkle_root_set_at: Option<u64>,
     /// Commitment window duration (in seconds) after registration opens during which root updates are permitted.
     pub commitment_window: u64,
+    /// Merkle depth this election's proofs are built against (#93).
+    ///
+    /// 0 means the default circuit (`vote.circom`, depth 18) and the DAO's
+    /// version-pinned verification key. A non-zero depth selects the circuit
+    /// and verification key registered for that depth via `set_vk_for_depth`,
+    /// letting a small election pay for a short Merkle path instead of a
+    /// worst-case one.
+    pub merkle_depth: u32,
 }
 
 #[contracttype]
@@ -491,6 +520,21 @@ pub struct ProposalArchivedEvent {
     pub archived_by: Address,
 }
 
+/// One vote inside a batched submission (#90).
+///
+/// Carries exactly what a single `vote` call would, so a relayer can group
+/// independent voters without any of them trusting each other: each proof is
+/// still checked against its own public signals, just inside a combined
+/// pairing check.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchVote {
+    pub vote_choice: bool,
+    pub nullifier: U256,
+    pub root: U256,
+    pub proof: Proof,
+}
+
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoteEvent {
@@ -500,6 +544,20 @@ pub struct VoteEvent {
     pub proposal_id: u64,
     pub choice: bool,
     pub nullifier: U256,
+}
+
+/// Emitted once per successful batch, alongside the per-vote `VoteEvent`s.
+/// Indexers can use it to tell a batched submission from a run of single votes.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoteBatchEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub votes: u32,
+    pub yes_votes: u32,
+    pub no_votes: u32,
 }
 
 #[soroban_sdk::contractevent]
@@ -1228,7 +1286,7 @@ impl Voting {
     }
 
     fn assert_weight_in_range(env: &Env, weight: u32) {
-        if weight < MIN_WEIGHT || weight > MAX_WEIGHT {
+        if !(MIN_WEIGHT..=MAX_WEIGHT).contains(&weight) {
             panic_with_error!(env, VotingError::WeightOutOfRange);
         }
     }
@@ -1705,60 +1763,10 @@ impl Voting {
         env.storage().persistent().set(&null_key, &true);
         Self::bump_persistent(&env, &null_key);
 
-        // Verify root based on vote mode
-        // (May involve cross-contract calls to tree contract in Trailing mode)
-        match proposal.vote_mode {
-            VoteMode::Fixed => {
-                // Fixed mode: root must exactly match the snapshot at proposal creation
-                // This prevents sybil attacks where members are added after proposal creation
-                if root != proposal.eligible_root {
-                    panic_with_error!(&env, VotingError::RootMismatch);
-                }
-            }
-            VoteMode::Trailing => {
-                // Trailing mode: root must be in tree history AND not predate proposal creation
-                // AND not predate the most recent member removal
-                // This allows new members to vote while preventing removed members from using old roots
-
-                // Get tree contract address
-                let tree_contract: Address = Self::tree_contract(env.clone());
-
-                // Check root is in valid history
-                let root_valid: bool = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if !root_valid {
-                    panic_with_error!(&env, VotingError::RootNotInHistory);
-                }
-
-                // Check root index >= earliest_root_index (prevents using roots from before proposal)
-                let root_index: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_idx"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if root_index < proposal.earliest_root_index {
-                    panic_with_error!(&env, VotingError::RootPredatesProposal);
-                }
-
-                // Check root index >= min_valid_root_index (prevents using roots from before member removal)
-                // This ensures revoked members cannot vote even on old proposals using their pre-revocation proofs
-                let min_valid_root: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env)],
-                );
-                if root_index < min_valid_root {
-                    panic_with_error!(&env, VotingError::RootPredatesRemoval);
-                }
-            }
-            VoteMode::Quadratic => {
-                // Quadratic proposals must be voted on via `cast_qv_vote`.
-                panic_with_error!(&env, VotingError::NotQuadraticProposal);
-            }
-        }
+        // Verify root based on vote mode. Shared with `cast_votes` so a batched
+        // submission is held to exactly the same eligibility rules.
+        // (May involve cross-contract calls to the tree contract in Trailing mode.)
+        Self::assert_root_eligible(&env, dao_id, &proposal, &root);
 
         // Verify proposal was created for BN254 curve (not BLS12-381)
         let curve_key = DataKey::ProposalCurve(dao_id, proposal_id);
@@ -1771,15 +1779,19 @@ impl Voting {
             panic_with_error!(&env, VotingError::VkNotSet);
         }
 
-        // Get verification key pinned to proposal version
-        let vk: VerificationKey = Self::get_vk_by_version(&env, dao_id, proposal.vk_version);
-
-        // Verify VK matches the snapshot taken at proposal creation
-        // This prevents VK changes from invalidating in-flight votes
-        let current_vk_hash = Self::hash_vk(&env, &vk);
-        if current_vk_hash != proposal.vk_hash {
-            panic_with_error!(&env, VotingError::VkChanged);
-        }
+        // Resolve the verification key. At the default Merkle depth this is the
+        // proposal's version-pinned key, checked against the hash snapshotted at
+        // proposal creation so a VK change cannot invalidate in-flight votes.
+        // An election that declared a depth (#93) uses the key registered for
+        // that depth, pinned the same way.
+        let election_depth = env
+            .storage()
+            .persistent()
+            .get::<_, ElectionConfig>(&DataKey::ElectionConfig(dao_id, proposal_id))
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0);
+        let vk: VerificationKey =
+            Self::resolve_election_vk(&env, dao_id, proposal_id, &proposal, election_depth);
 
         // Verify Groth16 proof
         // Public signals: [root, nullifier, daoId, proposalId, voteChoice]
@@ -1810,6 +1822,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
@@ -2021,6 +2034,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
@@ -2075,6 +2089,399 @@ impl Voting {
         .publish(&env);
     }
 
+    // ---------------------------------------------------------------------
+    // Merkle depth flexibility (#93)
+    // ---------------------------------------------------------------------
+
+    /// Registers the verification key for a Merkle depth.
+    ///
+    /// `vote.circom` fixes the tree depth at 18, so every proof carries 18 path
+    /// elements no matter how small the electorate is. Compiling the circuit at
+    /// other depths produces different verification keys, and this is where a
+    /// DAO admin registers them.
+    ///
+    /// Registering a key for a depth an election has already declared changes
+    /// what that election verifies against, so the pinned hash check in
+    /// `resolve_election_vk` rejects in-flight proofs with `VkChanged` — the
+    /// same protection the version-pinned default key has.
+    pub fn set_vk_for_depth(
+        env: Env,
+        dao_id: u64,
+        merkle_depth: u32,
+        vk: VerificationKey,
+        admin: Address,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        Self::assert_admin(&env, dao_id, &admin);
+
+        if merkle_depth == 0 || merkle_depth > MAX_MERKLE_DEPTH {
+            panic_with_error!(&env, VotingError::InvalidMerkleDepth);
+        }
+        // Same structural checks the default key gets: a key with the wrong IC
+        // length can never verify this circuit's public signals.
+        if vk.ic.len() != VOTE_CIRCUIT_IC_LEN {
+            panic_with_error!(&env, VotingError::VkIcLengthMismatch);
+        }
+        if vk.ic.len() > MAX_IC_LENGTH {
+            panic_with_error!(&env, VotingError::VkIcTooLarge);
+        }
+
+        let key = DataKey::DepthVk(dao_id, merkle_depth);
+        env.storage().persistent().set(&key, &vk);
+        Self::bump_persistent(&env, &key);
+    }
+
+    /// Returns the verification key registered for a Merkle depth, if any.
+    pub fn get_vk_for_depth(env: Env, dao_id: u64, merkle_depth: u32) -> Option<VerificationKey> {
+        Self::bump_instance(&env);
+        let key = DataKey::DepthVk(dao_id, merkle_depth);
+        let vk: Option<VerificationKey> = env.storage().persistent().get(&key);
+        if vk.is_some() {
+            Self::bump_persistent(&env, &key);
+        }
+        vk
+    }
+
+    /// Sets the election configuration and the Merkle depth its proofs use.
+    ///
+    /// A depth of 0 keeps the default circuit and the DAO's version-pinned key.
+    /// A non-zero depth requires a key registered by `set_vk_for_depth`, and
+    /// pins that key's hash to the proposal so a later re-registration cannot
+    /// change what in-flight votes are checked against.
+    pub fn set_election_config_with_depth(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        min_balance: i128,
+        twab_window: u64,
+        num_candidates: u32,
+        merkle_depth: u32,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+
+        if merkle_depth > MAX_MERKLE_DEPTH {
+            panic_with_error!(&env, VotingError::InvalidMerkleDepth);
+        }
+
+        // Reuse the existing setter for everything it already handles, then
+        // layer the depth on top so the two paths cannot drift apart.
+        Self::set_election_config(
+            env.clone(),
+            dao_id,
+            proposal_id,
+            min_balance,
+            twab_window,
+            num_candidates,
+        );
+
+        let key = DataKey::ElectionConfig(dao_id, proposal_id);
+        let mut config: ElectionConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::InvalidState));
+
+        if merkle_depth != 0 {
+            let vk = env
+                .storage()
+                .persistent()
+                .get::<_, VerificationKey>(&DataKey::DepthVk(dao_id, merkle_depth))
+                .unwrap_or_else(|| panic_with_error!(&env, VotingError::InvalidMerkleDepth));
+
+            // Pin the key now, exactly as proposal creation pins the default
+            // key, so re-registering a depth key mid-election is detected.
+            let hash_key = DataKey::ProposalDepthVkHash(dao_id, proposal_id);
+            let vk_hash = Self::hash_vk(&env, &vk);
+            env.storage().persistent().set(&hash_key, &vk_hash);
+            Self::bump_persistent(&env, &hash_key);
+        }
+
+        config.merkle_depth = merkle_depth;
+        env.storage().persistent().set(&key, &config);
+        Self::bump_persistent(&env, &key);
+    }
+
+    /// The Merkle depth an election's proofs are built against.
+    ///
+    /// 0 means the default depth-18 circuit. Clients use this to pick which
+    /// circuit artifacts to download and which key to verify against.
+    pub fn get_merkle_depth(env: Env, dao_id: u64, proposal_id: u64) -> u32 {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get::<_, ElectionConfig>(&DataKey::ElectionConfig(dao_id, proposal_id))
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0)
+    }
+
+    /// Resolves the verification key an election's proofs must satisfy, and
+    /// checks it still hashes to what was pinned when the election was set up.
+    ///
+    /// Elections at the default depth keep using the DAO's version-pinned key,
+    /// so nothing changes for them.
+    fn resolve_election_vk(
+        env: &Env,
+        dao_id: u64,
+        proposal_id: u64,
+        proposal: &ProposalInfo,
+        merkle_depth: u32,
+    ) -> VerificationKey {
+        if merkle_depth == 0 {
+            let vk = Self::get_vk_by_version(env, dao_id, proposal.vk_version);
+            if Self::hash_vk(env, &vk) != proposal.vk_hash {
+                panic_with_error!(env, VotingError::VkChanged);
+            }
+            return vk;
+        }
+
+        let vk = env
+            .storage()
+            .persistent()
+            .get::<_, VerificationKey>(&DataKey::DepthVk(dao_id, merkle_depth))
+            .unwrap_or_else(|| panic_with_error!(env, VotingError::InvalidMerkleDepth));
+
+        let pinned: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalDepthVkHash(dao_id, proposal_id))
+            .unwrap_or_else(|| panic_with_error!(env, VotingError::VkNotSet));
+        if Self::hash_vk(env, &vk) != pinned {
+            panic_with_error!(env, VotingError::VkChanged);
+        }
+        vk
+    }
+
+    // ---------------------------------------------------------------------
+    // Batched voting (#90)
+    // ---------------------------------------------------------------------
+
+    /// Casts several votes in one transaction, verified with a single batched
+    /// pairing check.
+    ///
+    /// Every vote is validated exactly as `vote` validates it — field bounds,
+    /// non-zero and unused nullifier, root eligibility for the proposal's vote
+    /// mode, candidate bound — and each proof is still checked against its own
+    /// public signals. What changes is only the verification: instead of four
+    /// pairings per proof, the batch is combined into `N + 3` pairings, which
+    /// measures at roughly 1.9x cheaper for four votes and 2.9x for sixty-four.
+    ///
+    /// The batch is all-or-nothing. One bad proof rejects the whole
+    /// transaction, and the failure does not say which proof was bad, so a
+    /// relayer that hits `InvalidProof` should re-submit the votes singly (or
+    /// bisect) to find the culprit rather than dropping them all.
+    ///
+    /// Returns the number of votes recorded.
+    pub fn cast_votes(env: Env, dao_id: u64, proposal_id: u64, votes: Vec<BatchVote>) -> u32 {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        Self::set_reentrancy_lock(&env);
+
+        let count = votes.len();
+        if count == 0 || count > MAX_VOTE_BATCH {
+            panic_with_error!(&env, VotingError::InvalidBatchSize);
+        }
+
+        let prop_key = DataKey::Proposal(dao_id, proposal_id);
+        let mut proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&prop_key)
+            .expect("proposal not found");
+
+        let now = env.ledger().timestamp();
+        if proposal.state != ProposalState::Active {
+            panic_with_error!(&env, VotingError::VotingClosed);
+        }
+        if proposal.end_time != 0 && now > proposal.end_time {
+            panic_with_error!(&env, VotingError::VotingClosed);
+        }
+        if proposal.vote_mode == VoteMode::Quadratic {
+            panic_with_error!(&env, VotingError::NotQuadraticProposal);
+        }
+
+        // BN254 only: the batch verifier combines BN254 pairings.
+        let proposal_curve: CurveId = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalCurve(dao_id, proposal_id))
+            .unwrap_or(CurveId::Bn254);
+        if proposal_curve != CurveId::Bn254 {
+            panic_with_error!(&env, VotingError::VkNotSet);
+        }
+
+        let election_config: Option<ElectionConfig> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ElectionConfig(dao_id, proposal_id));
+        let num_candidates = election_config
+            .as_ref()
+            .map(|config| config.num_candidates)
+            .unwrap_or(0);
+        let merkle_depth = election_config
+            .as_ref()
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0);
+
+        let vk = Self::resolve_election_vk(&env, dao_id, proposal_id, &proposal, merkle_depth);
+
+        let dao_signal = U256::from_u128(&env, dao_id as u128);
+        let proposal_signal = U256::from_u128(&env, proposal_id as u128);
+        let num_candidates_signal = U256::from_u32(&env, num_candidates);
+
+        let mut proofs: Vec<Proof> = Vec::new(&env);
+        let mut signal_sets: Vec<Vec<U256>> = Vec::new(&env);
+        let mut seen: Vec<U256> = Vec::new(&env);
+        let mut yes = 0u32;
+        let mut no = 0u32;
+
+        for i in 0..count {
+            let entry = votes.get(i).expect("vote missing");
+
+            Self::assert_in_field(&env, &entry.nullifier);
+            Self::assert_in_field(&env, &entry.root);
+            if entry.nullifier == U256::from_u32(&env, 0) {
+                panic_with_error!(&env, VotingError::InvalidNullifier);
+            }
+
+            // A batch could otherwise carry the same nullifier twice: the
+            // storage check below only sees committed state, and both copies
+            // would be written in the same transaction.
+            if seen.contains(&entry.nullifier) {
+                panic_with_error!(&env, VotingError::DuplicateNullifierInBatch);
+            }
+            seen.push_back(entry.nullifier.clone());
+
+            let null_key =
+                storage::nullifier_used_key(dao_id, proposal_id, entry.nullifier.clone());
+            if env.storage().persistent().has(&null_key) {
+                panic_with_error!(&env, VotingError::NullifierUsed);
+            }
+
+            Self::assert_root_eligible(&env, dao_id, &proposal, &entry.root);
+
+            let vote_choice_index: u32 = if entry.vote_choice { 1 } else { 0 };
+            if num_candidates > 0 && vote_choice_index >= num_candidates {
+                panic_with_error!(&env, VotingError::InvalidCandidateIndex);
+            }
+
+            let signals = soroban_sdk::vec![
+                &env,
+                entry.root.clone(),
+                entry.nullifier.clone(),
+                dao_signal.clone(),
+                proposal_signal.clone(),
+                U256::from_u32(&env, vote_choice_index),
+                num_candidates_signal.clone(),
+            ];
+            signal_sets.push_back(signals);
+            proofs.push_back(entry.proof.clone());
+
+            if entry.vote_choice {
+                yes += 1;
+            } else {
+                no += 1;
+            }
+        }
+
+        if !zkvote_groth16::batch::verify_groth16_batch(&env, &vk, &proofs, &signal_sets) {
+            panic_with_error!(&env, VotingError::InvalidProof);
+        }
+
+        // Only once the whole batch has verified do any nullifiers get burned:
+        // a failed batch must not consume the nullifiers of the honest votes
+        // that were grouped with a bad one.
+        for i in 0..count {
+            let entry = votes.get(i).expect("vote missing");
+            let null_key =
+                storage::nullifier_used_key(dao_id, proposal_id, entry.nullifier.clone());
+            env.storage().persistent().set(&null_key, &true);
+            Self::bump_persistent(&env, &null_key);
+        }
+
+        proposal.yes_votes = proposal
+            .yes_votes
+            .checked_add(yes as u64)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::TallyOverflow));
+        proposal.no_votes = proposal
+            .no_votes
+            .checked_add(no as u64)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::TallyOverflow));
+        env.storage().persistent().set(&prop_key, &proposal);
+        Self::bump_persistent(&env, &prop_key);
+
+        Self::clear_reentrancy_lock(&env);
+
+        for i in 0..count {
+            let entry = votes.get(i).expect("vote missing");
+            VoteEvent {
+                dao_id,
+                proposal_id,
+                choice: entry.vote_choice,
+                nullifier: entry.nullifier,
+            }
+            .publish(&env);
+        }
+        VoteBatchEvent {
+            dao_id,
+            proposal_id,
+            votes: count,
+            yes_votes: yes,
+            no_votes: no,
+        }
+        .publish(&env);
+
+        count
+    }
+
+    /// Root eligibility for a proposal, shared by `vote` and `cast_votes`.
+    ///
+    /// Fixed mode requires the exact snapshot root. Trailing mode accepts any
+    /// root in the tree's history that neither predates the proposal nor a
+    /// member removal, so late joiners can vote but revoked members cannot.
+    fn assert_root_eligible(env: &Env, dao_id: u64, proposal: &ProposalInfo, root: &U256) {
+        match proposal.vote_mode {
+            VoteMode::Fixed => {
+                if root != &proposal.eligible_root {
+                    panic_with_error!(env, VotingError::RootMismatch);
+                }
+            }
+            VoteMode::Trailing => {
+                let tree_contract: Address = Self::tree_contract(env.clone());
+
+                let root_valid: bool = env.invoke_contract(
+                    &tree_contract,
+                    &symbol_short!("root_ok"),
+                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
+                );
+                if !root_valid {
+                    panic_with_error!(env, VotingError::RootNotInHistory);
+                }
+
+                let root_index: u32 = env.invoke_contract(
+                    &tree_contract,
+                    &symbol_short!("root_idx"),
+                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
+                );
+                if root_index < proposal.earliest_root_index {
+                    panic_with_error!(env, VotingError::RootPredatesProposal);
+                }
+
+                let min_valid_root: u32 = env.invoke_contract(
+                    &tree_contract,
+                    &symbol_short!("min_root"),
+                    soroban_sdk::vec![env, dao_id.into_val(env)],
+                );
+                if root_index < min_valid_root {
+                    panic_with_error!(env, VotingError::RootPredatesRemoval);
+                }
+            }
+            VoteMode::Quadratic => {
+                panic_with_error!(env, VotingError::NotQuadraticProposal);
+            }
+        }
+    }
     /// Get proposal info
     pub fn get_proposal(env: Env, dao_id: u64, proposal_id: u64) -> ProposalInfo {
         Self::bump_instance(&env);
@@ -2605,6 +3012,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
@@ -2698,6 +3106,10 @@ impl Voting {
             .as_ref()
             .map(|config| config.commitment_window)
             .unwrap_or(0);
+        let merkle_depth = existing
+            .as_ref()
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0);
         let config = ElectionConfig {
             snapshot_ledger,
             min_balance,
@@ -2709,6 +3121,7 @@ impl Voting {
             max_revotes,
             merkle_root_set_at,
             commitment_window,
+            merkle_depth,
         };
         env.storage().persistent().set(&key, &config);
         Self::bump_persistent(&env, &key);
@@ -2753,6 +3166,7 @@ impl Voting {
                     max_revotes: 0,
                     merkle_root_set_at: None,
                     commitment_window: 0,
+                    merkle_depth: 0,
                 });
         config.commitment_window = commitment_window;
         env.storage().persistent().set(&key, &config);
@@ -2821,6 +3235,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         if election_config.commitment_window > 0
@@ -3282,6 +3697,7 @@ impl Voting {
                     max_revotes: 0,
                     merkle_root_set_at: None,
                     commitment_window: 0,
+                    merkle_depth: 0,
                 });
         if config.candidate_seed.is_some() {
             panic_with_error!(&env, VotingError::CandidateSeedFinalized);
@@ -3481,6 +3897,7 @@ impl Voting {
                     max_revotes: 0,
                     merkle_root_set_at: None,
                     commitment_window: 0,
+                    merkle_depth: 0,
                 });
         config.vdf_output = Some(vdf_output.clone());
         config.vdf_delay = delay;
@@ -3573,6 +3990,7 @@ impl Voting {
                         max_revotes: 0,
                         merkle_root_set_at: None,
                         commitment_window: 0,
+                        merkle_depth: 0,
                     });
 
             // Mix VDF output with existing seed if available, or use VDF output as seed

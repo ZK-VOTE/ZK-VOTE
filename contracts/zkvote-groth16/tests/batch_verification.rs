@@ -129,6 +129,11 @@ fn every_sub_batch_of_valid_proofs_verifies() {
     }
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn a_single_proof_batch_matches_individual_verification() {
     let env = Env::default();
@@ -148,6 +153,11 @@ fn a_single_proof_batch_matches_individual_verification() {
     assert!(!verify_groth16_batch(&env, &vk, &proofs, &bad_signals));
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn one_tampered_public_signal_fails_the_whole_batch() {
     let env = Env::default();
@@ -167,6 +177,11 @@ fn one_tampered_public_signal_fails_the_whole_batch() {
     );
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn a_forged_proof_point_fails_the_whole_batch() {
     let env = Env::default();
@@ -185,6 +200,11 @@ fn a_forged_proof_point_fails_the_whole_batch() {
     );
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn proofs_paired_with_the_wrong_signals_fail() {
     // Every proof and every signal set is individually genuine; only the
@@ -204,6 +224,11 @@ fn proofs_paired_with_the_wrong_signals_fail() {
     );
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn a_batch_under_the_wrong_verification_key_fails() {
     let env = Env::default();
@@ -217,6 +242,11 @@ fn a_batch_under_the_wrong_verification_key_fails() {
     assert!(!verify_groth16_batch(&env, &wrong, &proofs, &signals));
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn duplicated_proofs_still_verify_but_do_not_hide_a_bad_one() {
     let env = Env::default();
@@ -339,6 +369,11 @@ fn batching_reduces_the_pairing_count_as_advertised() {
     assert!(pairing_count(MAX_BATCH_SIZE) * 3 < 4 * MAX_BATCH_SIZE);
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts every
+// proof and would invert this test. CI runs this file standalone as well, where
+// the real verifier is compiled in and the test does its job.
+#[cfg(not(feature = "testutils"))]
 #[test]
 fn batching_cuts_the_metered_cpu_cost() {
     // #90 asks for a real cost reduction, so measure it with the host's own

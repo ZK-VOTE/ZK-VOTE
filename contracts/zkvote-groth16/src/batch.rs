@@ -188,6 +188,9 @@ fn batch_shape_is_valid(
 }
 
 /// Indices of the public-signal columns that are not constant across the batch.
+// Only the real verifier calls this; under `testutils` the stub short-circuits
+// before any curve work, but the unit tests still exercise it directly.
+#[cfg_attr(feature = "testutils", allow(dead_code))]
 fn varying_columns(pub_signals: &Vec<Vec<U256>>, env: &Env) -> Vec<u32> {
     let mut varying = Vec::new(env);
     let first = pub_signals.get(0).expect("non-empty batch");
