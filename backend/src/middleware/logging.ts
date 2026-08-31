@@ -2,23 +2,20 @@
  * Request Logging Middleware
  *
  * Provides request context and structured logging for all requests.
- * Supports PII redaction via the enhanced logger.
+ * Supports PII redaction via the enhanced logger and correlation ID
+ * propagation via AsyncLocalStorage so every downstream log call from
+ * services/routes automatically carries the request's correlation + trace ID.
  */
 
 import type { Request, Response, NextFunction } from "express";
-
-// Extend Express Request to include ctx
-declare global {
-  namespace Express {
-    interface Request {
-      ctx?: string;
-      traceId?: string;
-    }
-  }
-}
 import crypto from "crypto";
-// import { config } from "../config.js"; // Unused - kept for reference
-import { log, hashIp, getRedactionPolicy } from "../services/logger.js";
+import {
+  log,
+  hashIp,
+  getRedactionPolicy,
+  runWithContext,
+  type RequestContext,
+} from "../services/logger.js";
 
 const TRACEPARENT_RE =
   /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
@@ -41,8 +38,9 @@ export function parseIncomingTraceId(
 }
 
 /**
- * Request logging middleware
- * Adds context ID and logs request start/end
+ * Builds the correlation context for a request and runs the downstream
+ * middleware chain within it, so every nested log call (routes, services)
+ * automatically inherits the request's correlation + trace ID.
  */
 export function requestLogger(
   req: Request,
@@ -62,42 +60,48 @@ export function requestLogger(
   req.traceId = traceId;
   res.setHeader("traceparent", `00-${traceId}-${spanId}-01`);
 
-  // Build IP meta based on configuration
-  const policy = getRedactionPolicy();
-  let ipMeta: Record<string, string> = {};
-
-  if (policy.showClientIp === "plain") {
-    ipMeta = { ip: req.ip || "" };
-  } else if (policy.showClientIp === "hash") {
-    ipMeta = { ipHash: hashIp(req.ip) };
-  }
-  // If "none", ipMeta stays empty
-
-  // Build body meta (only log body keys, not values)
-  const bodyMeta = policy.showBodyKeysOnly
-    ? { bodyKeys: Object.keys(req.body || {}) }
-    : {};
-
-  log("info", "request_start", {
+  const context: RequestContext = {
     ctx,
     traceId,
     path: req.path,
     method: req.method,
-    ...ipMeta,
-    ...bodyMeta,
-  });
+  };
 
-  // Log request end on finish
-  res.on("finish", () => {
-    log("info", "request_end", {
-      ctx,
-      traceId,
+  runWithContext(context, () => {
+    // Build IP meta based on configuration
+    const policy = getRedactionPolicy();
+    let ipMeta: Record<string, string> = {};
+
+    if (policy.showClientIp === "plain") {
+      ipMeta = { ip: req.ip || "" };
+    } else if (policy.showClientIp === "hash") {
+      ipMeta = { ipHash: hashIp(req.ip) };
+    }
+    // If "none", ipMeta stays empty
+
+    // Build body meta (only log body keys, not values)
+    const bodyMeta = policy.showBodyKeysOnly
+      ? { bodyKeys: Object.keys(req.body || {}) }
+      : {};
+
+    log("info", "request_start", {
       path: req.path,
-      status: res.statusCode,
+      method: req.method,
+      ...ipMeta,
+      ...bodyMeta,
     });
-  });
 
-  next();
+    // Log request end on finish. The finish listener is registered within
+    // the correlation context, so it inherits the same ctx/traceId.
+    res.on("finish", () => {
+      log("info", "request_end", {
+        path: req.path,
+        status: res.statusCode,
+      });
+    });
+
+    next();
+  });
 }
 
 /**
@@ -110,13 +114,11 @@ export function errorLogger(
   res: Response,
   next: NextFunction,
 ): void {
-  const ctx = req.ctx || "unknown";
   const isProduction = process.env.NODE_ENV === "production";
 
-  // Log the error with redaction
+  // Log the error with redaction; correlation IDs are attached automatically
+  // via the active request context.
   log("error", "request_error", {
-    ctx,
-    traceId: req.traceId,
     path: req.path,
     method: req.method,
     error: err.message,

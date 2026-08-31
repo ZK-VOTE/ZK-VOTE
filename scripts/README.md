@@ -111,6 +111,21 @@ Known Answer Test for Poseidon hash function. Verifies circuit and on-chain Pose
 
 **MUST pass before production deployment.**
 
+## Database & Backup Scripts
+
+### `rotate-backup-key.sh`
+
+Manages the **encrypted relay DB backup key** (Issue #359). Wraps
+`backend/src/backup-key-manager.ts` — see [`docs/ENCRYPTED_BACKUPS.md`](../docs/ENCRYPTED_BACKUPS.md)
+for the full runbook.
+
+```bash
+./scripts/rotate-backup-key.sh generate --output data/backup-keys/current.key
+./scripts/rotate-backup-key.sh status
+./scripts/rotate-backup-key.sh rotate --output data/backup-keys/current.key
+./scripts/rotate-backup-key.sh restore-test --input data/backups/zkvote-backup-<ts>.enc.db
+```
+
 ## Utility Scripts
 
 ### `utils/convert-vk-to-hex.js`

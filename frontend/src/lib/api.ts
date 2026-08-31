@@ -4,6 +4,48 @@ const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
 const RELAYER_AUTH_TOKEN = import.meta.env.VITE_RELAYER_AUTH_TOKEN || "";
 
 // ============================================
+// CSRF TOKEN MANAGEMENT
+// ============================================
+
+/** In-memory CSRF token obtained from the relayer on initialization. */
+let csrfToken: string | null = null;
+
+/**
+ * Fetch a fresh CSRF token from the relayer and cache it for subsequent
+ * state-changing requests.  Should be called once on SPA startup (or
+ * lazily before the first write).  The token is returned in the
+ * X-CSRF-Token response header.
+ */
+export async function initCsrf(): Promise<void> {
+  try {
+    const url = `${RELAYER_URL}/csrf-token`;
+    const headers = new Headers();
+    if (RELAYER_AUTH_TOKEN) {
+      headers.set("X-Relayer-Auth", RELAYER_AUTH_TOKEN);
+    }
+    const response = await fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+    if (response.ok) {
+      const token = response.headers.get("X-CSRF-Token");
+      if (token) {
+        csrfToken = token;
+      }
+    }
+  } catch {
+    // Non-fatal — the first write will fail with a 403 and the UI can retry
+    console.warn("[csrf] Failed to initialise CSRF token");
+  }
+}
+
+/** Return the cached CSRF token (may be null if initCsrf has not been called). */
+export function getCsrfToken(): string | null {
+  return csrfToken;
+}
+
+// ============================================
 // ERROR TYPES
 // ============================================
 
@@ -244,6 +286,12 @@ export async function relayerFetch(
         headers.set("X-Relayer-Auth", RELAYER_AUTH_TOKEN);
       }
 
+      // Add CSRF token for all state-changing requests (POST, PUT, DELETE, PATCH).
+      // The token is obtained from GET /csrf-token on initialisation.
+      if (isWrite && csrfToken) {
+        headers.set("X-CSRF-Token", csrfToken);
+      }
+
       const response = await fetch(url, {
         ...fetchOptions,
         headers,
@@ -468,6 +516,12 @@ export async function notifyEvent(
     // Log but don't throw - this is best-effort
     console.warn("Failed to notify relayer of event:", error);
   }
+}
+
+export interface SponsoredFeeRequest {
+  sponsor?: "relayer" | "voter";
+  feePayer?: string;
+  feeBudgetStroops?: number;
 }
 
 export interface CommitVoteInput {

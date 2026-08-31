@@ -296,6 +296,32 @@ function dryRunMigration(
   };
 }
 
+function columnExists(database: DatabaseType, table: string, column: string): boolean {
+  const rows = database
+    .prepare(`PRAGMA table_info(${table})`)
+    .all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
+function shouldSkipNoopAddColumn(
+  database: DatabaseType,
+  sql: string,
+): { skip: boolean; table?: string; column?: string } {
+  const match = sql.match(
+    /ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)/i,
+  );
+  if (!match) {
+    return { skip: false };
+  }
+
+  const [, table, column] = match;
+  if (columnExists(database, table, column)) {
+    return { skip: true, table, column };
+  }
+
+  return { skip: false };
+}
+
 // ============================================
 // MIGRATION EXECUTION
 // ============================================
@@ -313,9 +339,17 @@ function applyMigration(
 
   try {
     database.transaction(() => {
-      // Execute the SQL
-      if (sql.trim()) {
+      const noopAddColumn = shouldSkipNoopAddColumn(database, sql);
+      if (!noopAddColumn.skip && sql.trim()) {
         database.exec(sql);
+      }
+
+      if (noopAddColumn.skip) {
+        log("info", "migration_skipped_existing_column", {
+          migration: migration.name,
+          table: noopAddColumn.table,
+          column: noopAddColumn.column,
+        });
       }
 
       // Record the migration in _migrations table

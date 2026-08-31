@@ -58,6 +58,8 @@ In **Fixed mode**, a proposal's eligible root is snapshotted at proposal creatio
 
 **Contrast with Trailing Mode**: In Trailing mode, the contract also checks `min_root` (the root at which the member was added). This ensures revoked members cannot vote even on older proposals, because their `min_root` will be invalidated when they're removed. Trailing mode provides stronger revocation guarantees at the cost of some privacy (admin can influence eligibility mid-proposal by revoking members).
 
+**Frontend disclosure (issue #347)**: The frontend surfaces these revocation semantics to users — the vote-mode picker when creating a proposal, a revocation-semantics explainer in the vote dialog, and an eligibility preview on the proposal page — so the "documented per proposal" guidance above is reflected in the product UI.
+
 ## BN254 Public Signal Constraints
 
 All public signals passed to Groth16 verification **must** be less than the BN254 scalar field modulus (Fr):

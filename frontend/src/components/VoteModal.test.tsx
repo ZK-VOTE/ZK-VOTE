@@ -67,6 +67,12 @@ vi.mock("../lib/zk", () => ({
     blindingFactor: "999",
     commitment: "789",
   }),
+  generateFakeZKCredentials: vi.fn().mockResolvedValue({
+    secret: "fake_secret_111",
+    salt: "fake_salt_222",
+    blindingFactor: "fake_blinding_333",
+    commitment: "fake_commitment_444",
+  }),
   getZKCredentials: vi.fn().mockReturnValue({
     secret: "123",
     salt: "456",
@@ -113,8 +119,11 @@ describe("VoteModal", () => {
     renderWithQueryClient(<VoteModal {...defaultProps} voteMode="Fixed" />);
 
     expect(
+      screen.getByText(/Revocation semantics in Fixed \(snapshot\) mode/),
+    ).toBeInTheDocument();
+    expect(
       screen.getByText(
-        /Only members present when this proposal was created can vote/,
+        /Only members who were present when the proposal was created/,
       ),
     ).toBeInTheDocument();
   });
@@ -124,9 +133,33 @@ describe("VoteModal", () => {
 
     expect(
       screen.queryByText(
-        /Only members present when this proposal was created can vote/,
+        /Only members who were present when the proposal was created/,
       ),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows revocation semantics explainer for Trailing mode", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} voteMode="Trailing" />);
+
+    expect(
+      screen.getByText(/Revocation semantics in Trailing \(dynamic\) mode/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/their eligibility ends immediately/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows accurate Fixed-mode revocation semantics when already revoked", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} voteMode="Fixed" />);
+
+    // Fixed-mode snapshot: a member revoked AFTER creation can still vote
+    // with a pre-revocation proof (intentional privacy boundary).
+    expect(
+      screen.getByText(
+        /cached a valid ZK proof generated before the revocation/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/This is intentional/)).toBeInTheDocument();
   });
 
   it("calls onClose when clicking outside the modal", () => {
@@ -331,5 +364,140 @@ describe("VoteModal success state", () => {
     expect(
       await screen.findByText(/Your anonymous vote has been recorded/),
     ).toBeInTheDocument();
+  });
+});
+
+// ─── Issue #337 – Panic-mode UI tests ───────────────────────────────────────
+
+describe("VoteModal panic-mode (coercion resistance, issue #337)", () => {
+  const defaultProps = {
+    proposalId: 1,
+    eligibleRoot: BigInt("12345"),
+    voteMode: "Fixed" as const,
+    vkVersion: 1,
+    daoId: 1,
+    publicKey: "GDTEST...",
+    kit: null,
+    onClose: vi.fn(),
+    onComplete: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ txHash: "abc123" }),
+    });
+  });
+
+  it("renders the coercion-resistant mode toggle", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    const toggle = screen.getByTestId("panic-mode-toggle");
+    expect(toggle).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle).toHaveAttribute("role", "switch");
+  });
+
+  it("does NOT show panic-mode warning when toggle is off", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    expect(screen.queryByTestId("panic-mode-warning")).not.toBeInTheDocument();
+  });
+
+  it("shows panic-mode warning after enabling the toggle", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    const toggle = screen.getByTestId("panic-mode-toggle");
+    fireEvent.click(toggle);
+
+    expect(screen.getByTestId("panic-mode-warning")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Panic mode is ON — decoy credentials will be used/),
+    ).toBeInTheDocument();
+  });
+
+  it("toggle aria-checked becomes true after enabling", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    const toggle = screen.getByTestId("panic-mode-toggle");
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("warning disappears after toggling off again", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    const toggle = screen.getByTestId("panic-mode-toggle");
+    // enable
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("panic-mode-warning")).toBeInTheDocument();
+    // disable
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId("panic-mode-warning")).not.toBeInTheDocument();
+  });
+
+  it("calls generateFakeZKCredentials (not real) when panic mode is on", async () => {
+    const { generateFakeZKCredentials, getZKCredentials } =
+      await import("../lib/zk");
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    // Enable panic mode
+    fireEvent.click(screen.getByTestId("panic-mode-toggle"));
+
+    // Cast a vote
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    await vi.waitFor(() => {
+      expect(generateFakeZKCredentials).toHaveBeenCalled();
+    });
+
+    // Real credentials must never be accessed
+    expect(getZKCredentials).not.toHaveBeenCalled();
+  });
+
+  it("real credentials are accessible after panic mode vote (real cred untouched)", async () => {
+    const { getZKCredentials } = await import("../lib/zk");
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    // Enable panic mode
+    fireEvent.click(screen.getByTestId("panic-mode-toggle"));
+
+    // Cast a panic vote
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    await vi.waitFor(() => {
+      expect(
+        screen.queryByText(/Vote Submitted|Generating|Submitting/),
+      ).toBeInTheDocument();
+    });
+
+    // getZKCredentials was never called (real creds untouched)
+    expect(getZKCredentials).not.toHaveBeenCalled();
+  });
+
+  it("still shows vote buttons when panic mode is enabled", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    fireEvent.click(screen.getByTestId("panic-mode-toggle"));
+
+    expect(screen.getByText("Vote Yes")).toBeInTheDocument();
+    expect(screen.getByText("Vote No")).toBeInTheDocument();
+  });
+
+  it("panic mode is off by default (real credentials used)", async () => {
+    const { getZKCredentials } = await import("../lib/zk");
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    // Do NOT enable panic mode, just cast vote
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    await vi.waitFor(() => {
+      expect(getZKCredentials).toHaveBeenCalled();
+    });
   });
 });

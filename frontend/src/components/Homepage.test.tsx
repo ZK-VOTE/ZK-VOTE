@@ -186,6 +186,33 @@ describe("Homepage", () => {
     });
   });
 
+  describe("Public protocol stats", () => {
+    it("loads and renders anonymized aggregate stats", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({
+            status: "ok",
+            data: {
+              totalDaos: 42,
+              totalEvents: 3210,
+              lastLedger: 987654,
+              lastUpdated: "2026-08-30T12:00:00.000Z",
+            },
+          }),
+        }),
+      );
+
+      renderWithRouter(<Homepage />);
+
+      expect(await screen.findByText("Anonymous network activity")).toBeInTheDocument();
+      expect(screen.getByText("42")).toBeInTheDocument();
+      expect(screen.getByText("3,210")).toBeInTheDocument();
+      expect(screen.getByText("987,654")).toBeInTheDocument();
+    });
+  });
+
   describe("CTA section", () => {
     it("renders the CTA heading", () => {
       renderWithRouter(<Homepage />);

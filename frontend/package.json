@@ -9,6 +9,8 @@
     "dev": "vite",
     "prebuild": "npm run sync:circuits",
     "build": "tsc -b && vite build",
+    "check:idl-drift": "node --experimental-strip-types scripts/check-idl-drift.ts",
+    "generate:types": "node --experimental-strip-types scripts/check-idl-drift.ts",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest",

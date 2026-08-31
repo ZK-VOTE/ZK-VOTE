@@ -1691,6 +1691,136 @@ Get the active and available ZK circuit versions for a DAO (supports circuit mig
 
 ---
 
+## Randomness
+
+### POST /randomness/seed
+
+Seed the VDF computation for a DAO/proposal set. Admin action that binds randomness to a specific election and introduces the mandatory time delay.
+
+**Authentication:** Required
+**Rate Limit:** No
+
+#### Request Body
+
+```json
+{
+  "daoId": 0,
+  "proposalIds": [1, 2, 3]
+}
+```
+
+#### Response (200)
+
+```json
+{ "success": true, "nonce": "deadbeef..." }
+```
+
+---
+
+### POST /randomness/contribute
+
+Submit a 32-byte random share from an independent authority. Once `requiredShares` shares are received, the ordering can be finalized.
+
+**Authentication:** Required
+**Rate Limit:** No
+
+#### Request Body
+
+```json
+{
+  "daoId": 0,
+  "authorityId": "GABCDEF...",
+  "shareHex": "0x...64 hex chars"
+}
+```
+
+#### Response (200)
+
+```json
+{ "success": true, "received": 1, "requiredShares": 3 }
+```
+
+---
+
+### POST /randomness/finalize
+
+Finalize the ordering once the required number of shares have been received.
+
+**Authentication:** Required
+**Rate Limit:** No
+
+#### Request Body
+
+```json
+{
+  "daoId": 0
+}
+```
+
+#### Response (200)
+
+```json
+{ "success": true, "finalizedAt": 1722300000000 }
+```
+
+---
+
+### GET /randomness/ordering/:daoId
+
+Get the finalized ordering for a DAO along with data needed for independent verification.
+
+**Authentication:** No
+**Rate Limit:** 60/min (queryLimiter)
+
+#### Path Parameters
+
+| Parameter | Type     | Description          |
+|-----------|----------|----------------------|
+| `daoId`   | `integer`| DAO identifier       |
+
+#### Response (200)
+
+```json
+{
+  "daoId": 0,
+  "finalizedAt": 1722300000000,
+  "ordering": []
+}
+```
+
+---
+
+### GET /randomness/verify/:daoId
+
+Verify a finalized ordering without re-running the full VDF computation.
+
+**Authentication:** No
+**Rate Limit:** 60/min (queryLimiter)
+
+#### Path Parameters
+
+| Parameter | Type     | Description          |
+|-----------|----------|----------------------|
+| `daoId`   | `integer`| DAO identifier       |
+
+#### Response (200)
+
+```json
+{
+  "daoId": 0,
+  "valid": true,
+  "checks": {
+    "vdfOutputValid": true,
+    "replayNonceValid": true,
+    "orderingValid": true
+  },
+  "replayNonce": "deadbeef...",
+  "finalizedAt": 1722300000000
+}
+```
+
+---
+
 ## Route Parameter Validation
 
 All route parameters are validated using Zod schemas before processing. Invalid parameters return `400 Bad Request` with structured error details.

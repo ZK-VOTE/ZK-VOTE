@@ -28,8 +28,8 @@ import {
   flagCommentSchema,
   manualEventSchema,
   notifyEventSchema,
+  bridgeVoteSchema,
 } from "./validation/schemas.js";
-import { bridgeVoteSchema } from "./routes/bridge.js";
 
 extendZodWithOpenApi(z);
 
@@ -652,6 +652,67 @@ export const ENDPOINTS: EndpointDef[] = [
       currentCircuit: "vote_v1",
       availableCircuits: [],
     },
+  },
+  // ---- Randomness ----
+  {
+    method: "post",
+    path: "/randomness/seed",
+    tag: "Randomness",
+    summary: "Seed the VDF computation for a DAO/proposal set (admin action)",
+    auth: true,
+    rateLimit: null,
+    responseExample: { success: true, nonce: "deadbeef..." },
+    errorStatuses: [400, 401, 500],
+  },
+  {
+    method: "post",
+    path: "/randomness/contribute",
+    tag: "Randomness",
+    summary: "Submit a 32-byte random share from an independent authority",
+    auth: true,
+    rateLimit: null,
+    responseExample: { success: true, received: 1, requiredShares: 3 },
+    errorStatuses: [400, 401, 500],
+  },
+  {
+    method: "post",
+    path: "/randomness/finalize",
+    tag: "Randomness",
+    summary: "Finalize the ordering once required shares are received",
+    auth: true,
+    rateLimit: null,
+    responseExample: { success: true, finalizedAt: 1722300000000 },
+    errorStatuses: [400, 401, 500],
+  },
+  {
+    method: "get",
+    path: "/randomness/ordering/:daoId",
+    tag: "Randomness",
+    summary: "Get the finalized ordering for a DAO with verification data",
+    auth: false,
+    rateLimit: "queryLimiter",
+    params: { daoId: idParam("0", "DAO identifier") },
+    responseExample: {
+      daoId: 0,
+      finalizedAt: 1722300000000,
+      ordering: [],
+    },
+    errorStatuses: [404, 500],
+  },
+  {
+    method: "get",
+    path: "/randomness/verify/:daoId",
+    tag: "Randomness",
+    summary: "Verify a finalized ordering without re-running the VDF",
+    auth: false,
+    rateLimit: "queryLimiter",
+    params: { daoId: idParam("0", "DAO identifier") },
+    responseExample: {
+      daoId: 0,
+      valid: true,
+      checks: { vdfOutputValid: true, replayNonceValid: true },
+    },
+    errorStatuses: [404, 500],
   },
   // ---- Admin ----
   {

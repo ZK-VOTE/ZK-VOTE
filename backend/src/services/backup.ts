@@ -4,16 +4,34 @@
  * Provides automated SQLite database backups using SQLite's backup API,
  * backup integrity verification, Point-in-Time Recovery (PITR),
  * continuous replication status reporting (Litestream), and external storage integration.
+ *
+ * Since #359 the service also supports ENCRYPTED snapshots: the online backup is
+ * wrapped in an AES-256-GCM container (see backupCrypto.ts) using the key
+ * managed by backupKeyManager.ts, so at-rest and off-site copies never contain
+ * plaintext relay data. Encrypted backups are transparently verified (decrypt +
+ * PRAGMA integrity_check) and restored (decrypt → PITR restore).
  */
 
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import os from "os";
 import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { fileURLToPath } from "url";
 import { getDb, initDb, closeDb } from "./db.js";
 import { log } from "./logger.js";
 import { config } from "../config.js";
+import {
+  probeBackupFile,
+  encryptBackupFile,
+  decryptBackupFile,
+  BackupCryptoError,
+} from "./backupCrypto.js";
+import {
+  ensureBackupEncryptionKey,
+  getCandidateBackupKeys,
+  getBackupEncryptionState,
+} from "./backupKeyManager.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +52,8 @@ export interface BackupResult {
   checksum?: string;
   durationMs?: number;
   uploadedToStorage?: boolean;
+  encrypted?: boolean;
+  keyId?: string;
   error?: string;
 }
 
@@ -46,6 +66,8 @@ export interface RestoreResult {
 export interface VerificationResult {
   valid: boolean;
   integrityResult?: string;
+  encrypted?: boolean;
+  keyId?: string;
   error?: string;
 }
 
@@ -64,12 +86,26 @@ export interface BackupStatus {
   backupDir: string;
   litestream: LitestreamStatus;
   scheduledIntervalMs: number | null;
+  lastBackupEncrypted: boolean;
+  encryption: {
+    enabled: boolean;
+    autoInit: boolean;
+    currentKeyId: string | null;
+    currentSource: string | null;
+    keyFile: string | null;
+    keyRingDir: string;
+    totalKeys: number;
+    archivedKeys: number;
+    algorithm: string;
+    kdf: string;
+  };
 }
 
 // In-memory state for backup metrics and status
 let lastBackupAt: string | null = null;
 let lastBackupStatus: "success" | "failed" | "none" = "none";
 let lastBackupError: string | null = null;
+let lastBackupEncrypted = false;
 let backupCount = 0;
 let backupTimer: NodeJS.Timeout | null = null;
 
@@ -84,23 +120,94 @@ export function ensureBackupDir(): string {
 }
 
 /**
- * Perform an automated backup using better-sqlite3's online backup API
+ * Whether a given backup file is an encrypted container.
+ */
+export function isEncryptedBackup(backupFilePath: string): boolean {
+  try {
+    return probeBackupFile(backupFilePath).encrypted;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve whether a backup should be encrypted, based on the explicit option
+ * or the configured default. Returns null when encryption is requested but no
+ * key is available (callers should fail loudly rather than write plaintext).
+ */
+function resolveEncryption(options: { encrypted?: boolean }): {
+  encrypted: boolean;
+  error?: string;
+} {
+  const encrypted = options.encrypted ?? config.backupEncryptionEnabled;
+  if (!encrypted) return { encrypted: false };
+
+  const key = ensureBackupEncryptionKey();
+  if (!key) {
+    return {
+      encrypted: true,
+      error:
+        "Encrypted backups requested but no backup encryption key is configured. " +
+        "Set BACKUP_ENCRYPTION_KEY (or BACKUP_ENCRYPTION_KEY_FILE) or enable " +
+        "BACKUP_ENCRYPTION_AUTO_INIT. Refusing to write a plaintext snapshot.",
+    };
+  }
+  return { encrypted: true };
+}
+
+/**
+ * Perform an automated backup using better-sqlite3's online backup API.
+ *
+ * When encryption is enabled the plaintext snapshot is produced transiently
+ * and immediately wrapped into an encrypted container; the plaintext file is
+ * deleted before the function returns.
  */
 export async function createBackup(
   options: {
     destinationDir?: string;
     backupName?: string;
     maxRetentionCount?: number;
+    encrypted?: boolean;
   } = {},
 ): Promise<BackupResult> {
   const startTime = Date.now();
   const targetDir = options.destinationDir || ensureBackupDir();
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const fileName = options.backupName || `zkvote-backup-${timestamp}.db`;
-  const backupFilePath = path.join(targetDir, fileName);
+  const baseName = options.backupName || `zkvote-backup-${timestamp}`;
+
+  const { encrypted, error: encryptionError } = resolveEncryption(options);
+  if (encrypted && encryptionError) {
+    lastBackupStatus = "failed";
+    lastBackupError = encryptionError;
+    lastBackupEncrypted = true;
+    log("error", "db_backup_failed", { error: encryptionError });
+    return { success: false, error: encryptionError, encrypted: true };
+  }
+
+  let finalName: string;
+  if (baseName.endsWith(".enc.db")) {
+    finalName = baseName;
+  } else if (baseName.endsWith(".db")) {
+    finalName = `${baseName.slice(0, -3)}${encrypted ? ".enc.db" : ".db"}`;
+  } else {
+    finalName = `${baseName}${encrypted ? ".enc.db" : ".db"}`;
+  }
+  const backupFilePath = path.join(targetDir, finalName);
+
+  // Transient plaintext snapshot: produced by SQLite backup API, then either
+  // kept as-is (unencrypted mode) or encrypted + deleted (encrypted mode).
+  const plainSnapshotPath = encrypted
+    ? path.join(targetDir, `${finalName}.plain`)
+    : backupFilePath;
+
+  let keyId: string | undefined;
 
   try {
-    log("info", "db_backup_start", { fileName, targetDir });
+    log("info", "db_backup_start", {
+      fileName: finalName,
+      targetDir,
+      encrypted,
+    });
 
     const activeDb = getDb();
     if (!activeDb) {
@@ -108,9 +215,20 @@ export async function createBackup(
     }
 
     // Execute SQLite backup API (online backup consistent snapshot)
-    await activeDb.backup(backupFilePath);
+    await activeDb.backup(plainSnapshotPath);
 
-    // Calculate file size and sha256 checksum
+    if (encrypted) {
+      const key = ensureBackupEncryptionKey();
+      if (!key) {
+        throw new Error("Backup encryption key disappeared during backup");
+      }
+      keyId = key.keyId;
+      await encryptBackupFile(plainSnapshotPath, backupFilePath, key.key);
+      // The plaintext snapshot must never be left behind.
+      fs.unlinkSync(plainSnapshotPath);
+    }
+
+    // Calculate file size and sha256 checksum of the on-disk artifact
     const stats = fs.statSync(backupFilePath);
     const fileBuffer = fs.readFileSync(backupFilePath);
     const checksum = crypto
@@ -118,12 +236,15 @@ export async function createBackup(
       .update(fileBuffer)
       .digest("hex");
 
-    // Perform immediate backup integrity verification
+    // Perform immediate backup verification (decrypts when encrypted)
     const verification = await verifyBackup(backupFilePath);
     if (!verification.valid) {
       // Remove corrupt backup file if integrity check fails
       if (fs.existsSync(backupFilePath)) {
         fs.unlinkSync(backupFilePath);
+      }
+      if (encrypted && fs.existsSync(plainSnapshotPath)) {
+        fs.unlinkSync(plainSnapshotPath);
       }
       throw new Error(
         `Backup integrity check failed: ${verification.error || verification.integrityResult}`,
@@ -139,7 +260,7 @@ export async function createBackup(
     ) {
       uploadedToStorage = await uploadToExternalStorage(
         backupFilePath,
-        fileName,
+        finalName,
       );
     }
 
@@ -151,41 +272,124 @@ export async function createBackup(
     lastBackupAt = new Date().toISOString();
     lastBackupStatus = "success";
     lastBackupError = null;
+    lastBackupEncrypted = encrypted;
     backupCount++;
 
     log("info", "db_backup_complete", {
-      fileName,
+      fileName: finalName,
       sizeBytes: stats.size,
       checksum,
       durationMs,
       uploadedToStorage,
+      encrypted,
+      keyId,
     });
 
     return {
       success: true,
       filePath: backupFilePath,
-      fileName,
+      fileName: finalName,
       sizeBytes: stats.size,
       checksum,
       durationMs,
       uploadedToStorage,
+      encrypted,
+      keyId,
     };
   } catch (err) {
     const errorMsg = (err as Error).message;
     lastBackupStatus = "failed";
     lastBackupError = errorMsg;
-    log("error", "db_backup_failed", { error: errorMsg });
+    lastBackupEncrypted = encrypted;
+    log("error", "db_backup_failed", { error: errorMsg, encrypted });
+
+    // Clean up any transient plaintext snapshot on failure.
+    try {
+      if (encrypted && fs.existsSync(plainSnapshotPath)) {
+        fs.unlinkSync(plainSnapshotPath);
+      }
+    } catch {
+      /* best-effort cleanup */
+    }
 
     return {
       success: false,
       error: errorMsg,
       durationMs: Date.now() - startTime,
+      encrypted,
     };
   }
 }
 
 /**
- * Verify integrity of a SQLite backup file
+ * Decrypt an encrypted backup into a temporary plaintext file. Returns the
+ * temp path plus a cleanup function. Used by verification and restore paths.
+ */
+interface TempDecryptResult {
+  tempDbPath: string;
+  keyId: string;
+  cleanup: () => void;
+}
+
+async function decryptBackupToTemp(
+  backupFilePath: string,
+): Promise<TempDecryptResult> {
+  const info = probeBackupFile(backupFilePath);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zkvote-backup-"));
+  const tempDbPath = path.join(tempDir, "restore.db");
+
+  const candidates = getCandidateBackupKeys();
+  const matching = info.keyId
+    ? candidates.filter((k) => k.keyId === info.keyId)
+    : candidates;
+
+  if (matching.length === 0) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    throw new BackupCryptoError(
+      "WRONG_KEY",
+      `No backup encryption key available for snapshot key ${info.keyId ?? "unknown"} ` +
+        "(check BACKUP_ENCRYPTION_KEY_FILE / key ring)",
+    );
+  }
+
+  try {
+    // Prefer the key whose id matches; fall back to trying all candidates for
+    // resilience against key file reordering.
+    const ordered = [...matching, ...candidates];
+    let lastError: unknown = null;
+    for (const candidate of ordered) {
+      try {
+        await decryptBackupFile(
+          backupFilePath,
+          tempDbPath,
+          candidate.key,
+          info.keyId,
+        );
+        return {
+          tempDbPath,
+          keyId: candidate.keyId,
+          cleanup: () => fs.rmSync(tempDir, { recursive: true, force: true }),
+        };
+      } catch (err) {
+        lastError = err;
+        if (fs.existsSync(tempDbPath)) fs.unlinkSync(tempDbPath);
+      }
+    }
+    throw lastError;
+  } catch (err) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    if (err instanceof BackupCryptoError) throw err;
+    throw new BackupCryptoError(
+      "WRONG_KEY",
+      `Failed to decrypt backup: ${(err as Error).message}`,
+    );
+  }
+}
+
+/**
+ * Verify integrity of a backup file. Encrypted backups are decrypted to a
+ * temporary file first and validated with PRAGMA integrity_check; the temp
+ * plaintext is removed before returning.
  */
 export async function verifyBackup(
   backupFilePath: string,
@@ -197,9 +401,55 @@ export async function verifyBackup(
     };
   }
 
+  let info;
+  try {
+    info = probeBackupFile(backupFilePath);
+  } catch (err) {
+    return { valid: false, error: (err as Error).message };
+  }
+
+  if (info.encrypted) {
+    let temp: TempDecryptResult | null = null;
+    try {
+      temp = await decryptBackupToTemp(backupFilePath);
+      const result = await checkIntegrity(temp.tempDbPath);
+      return {
+        valid: result.valid,
+        integrityResult: result.integrityResult,
+        encrypted: true,
+        keyId: info.keyId,
+        error: result.error,
+      };
+    } catch (err) {
+      return {
+        valid: false,
+        encrypted: true,
+        keyId: info.keyId,
+        error: (err as Error).message,
+      };
+    } finally {
+      if (temp) temp.cleanup();
+    }
+  }
+
+  const result = await checkIntegrity(backupFilePath);
+  return {
+    valid: result.valid,
+    integrityResult: result.integrityResult,
+    encrypted: false,
+    error: result.error,
+  };
+}
+
+/**
+ * Run PRAGMA integrity_check against a (plaintext) SQLite file.
+ */
+async function checkIntegrity(
+  dbFilePath: string,
+): Promise<{ valid: boolean; integrityResult?: string; error?: string }> {
   let tempDb: DatabaseType | null = null;
   try {
-    tempDb = new Database(backupFilePath, { readonly: true });
+    tempDb = new Database(dbFilePath, { readonly: true });
     const row = tempDb.prepare("PRAGMA integrity_check").get() as
       | { integrity_check?: string }
       | undefined;
@@ -228,17 +478,39 @@ export async function verifyBackup(
 }
 
 /**
- * Restore database from a backup file (Point-in-Time Recovery)
+ * Restore database from a backup file (Point-in-Time Recovery).
+ * Encrypted backups are decrypted to a temporary plaintext snapshot, verified,
+ * and then restored; the temporary file is deleted afterwards.
  */
 export async function restoreFromBackup(
   backupFilePath: string,
   targetDbPath?: string,
 ): Promise<RestoreResult> {
+  let temp: TempDecryptResult | null = null;
   try {
     log("info", "db_restore_start", { backupFilePath, targetDbPath });
 
-    // Step 1: Verify backup integrity before restore
-    const verification = await verifyBackup(backupFilePath);
+    let sourcePath = backupFilePath;
+    let encrypted = false;
+
+    // Step 1: detect encryption and decrypt to a temp snapshot if needed
+    try {
+      const info = probeBackupFile(backupFilePath);
+      encrypted = info.encrypted;
+      if (encrypted) {
+        temp = await decryptBackupToTemp(backupFilePath);
+        sourcePath = temp.tempDbPath;
+      }
+    } catch (err) {
+      return {
+        success: false,
+        message: "Restore aborted: unable to decrypt backup",
+        error: (err as Error).message,
+      };
+    }
+
+    // Step 2: Verify backup integrity before restore
+    const verification = await checkIntegrity(sourcePath);
     if (!verification.valid) {
       return {
         success: false,
@@ -250,7 +522,7 @@ export async function restoreFromBackup(
     const defaultDbPath = path.join(__dirname, "..", "..", "data", "zkvote.db");
     const destinationPath = targetDbPath || defaultDbPath;
 
-    // Step 2: Close current database connections if open
+    // Step 3: Close current database connections if open
     try {
       closeDb();
     } catch (err) {
@@ -268,21 +540,22 @@ export async function restoreFromBackup(
     if (fs.existsSync(walFile)) fs.unlinkSync(walFile);
     if (fs.existsSync(shmFile)) fs.unlinkSync(shmFile);
 
-    // Step 3: Copy backup file to destination path
-    fs.copyFileSync(backupFilePath, destinationPath);
+    // Step 4: Copy backup file to destination path
+    fs.copyFileSync(sourcePath, destinationPath);
 
-    // Step 4: Re-initialize and verify the restored database
+    // Step 5: Re-initialize and verify the restored database
     const restoredDb = initDb(destinationPath);
     const restoredVerification = restoredDb.prepare("PRAGMA quick_check").get();
 
     log("info", "db_restore_complete", {
       destinationPath,
+      encrypted,
       result: restoredVerification,
     });
 
     return {
       success: true,
-      message: `Database successfully restored from ${path.basename(backupFilePath)}`,
+      message: `Database successfully restored from ${path.basename(backupFilePath)}${encrypted ? " (decrypted)" : ""}`,
     };
   } catch (err) {
     const errorMsg = (err as Error).message;
@@ -292,6 +565,95 @@ export async function restoreFromBackup(
       message: "Database restore failed",
       error: errorMsg,
     };
+  } finally {
+    if (temp) temp.cleanup();
+  }
+}
+
+/**
+ * Dry-run restore verification: restores the backup to a throwaway database and
+ * reports whether integrity + content survive the round-trip. No production DB
+ * is touched. Used by the backup CLI and disaster-recovery drills.
+ */
+export async function verifyRestore(
+  backupFilePath: string,
+): Promise<RestoreResult> {
+  let temp: TempDecryptResult | null = null;
+  const tempDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "zkvote-restore-test-"),
+  );
+  const targetPath = path.join(tempDir, "restored.db");
+
+  try {
+    log("info", "db_restore_drill_start", { backupFilePath });
+
+    let sourcePath = backupFilePath;
+    let encrypted = false;
+    try {
+      const info = probeBackupFile(backupFilePath);
+      encrypted = info.encrypted;
+      if (encrypted) {
+        temp = await decryptBackupToTemp(backupFilePath);
+        sourcePath = temp.tempDbPath;
+      }
+    } catch (err) {
+      return {
+        success: false,
+        message: "Restore drill aborted: unable to decrypt backup",
+        error: (err as Error).message,
+      };
+    }
+
+    // Simulate the restore steps against a throwaway file.
+    if (fs.existsSync(targetPath)) fs.unlinkSync(targetPath);
+    fs.copyFileSync(sourcePath, targetPath);
+
+    const check = await checkIntegrity(targetPath);
+    if (!check.valid) {
+      return {
+        success: false,
+        message: "Restore drill failed integrity check",
+        error: check.error || check.integrityResult,
+      };
+    }
+
+    // Verify the restored file is a readable SQLite DB with expected schema.
+    let tableCount = 0;
+    try {
+      const db = new Database(targetPath, { readonly: true });
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all() as Array<{ name: string }>;
+      tableCount = tables.length;
+      db.close();
+    } catch (err) {
+      return {
+        success: false,
+        message: "Restore drill failed: restored file is not a valid database",
+        error: (err as Error).message,
+      };
+    }
+
+    log("info", "db_restore_drill_complete", {
+      backupFilePath,
+      encrypted,
+      integrity: "ok",
+      tableCount,
+    });
+
+    return {
+      success: true,
+      message: `Restore drill passed: integrity ok, ${tableCount} tables, ${encrypted ? "decrypted" : "plaintext"}`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      message: "Restore drill failed",
+      error: (err as Error).message,
+    };
+  } finally {
+    if (temp) temp.cleanup();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
 
@@ -308,6 +670,7 @@ async function uploadToExternalStorage(
     log("info", "db_backup_external_upload_simulated", {
       bucket,
       fileName,
+      encrypted: isEncryptedBackup(filePath),
       size: fs.statSync(filePath).size,
     });
     return true;
@@ -320,14 +683,19 @@ async function uploadToExternalStorage(
 }
 
 /**
- * Prune old local backup files beyond retention count
+ * Prune old local backup files beyond retention count.
+ * Handles both plaintext (`*.db`) and encrypted (`*.enc.db`) artifacts.
  */
 export function pruneOldBackups(dirPath: string, maxCount: number): void {
   try {
     if (!fs.existsSync(dirPath)) return;
     const files = fs
       .readdirSync(dirPath)
-      .filter((f) => f.startsWith("zkvote-backup-") && f.endsWith(".db"))
+      .filter(
+        (f) =>
+          f.startsWith("zkvote-backup-") &&
+          (f.endsWith(".db") || f.endsWith(".enc.db")),
+      )
       .map((f) => {
         const fullPath = path.join(dirPath, f);
         return {
@@ -382,6 +750,8 @@ export function getBackupStatus(): BackupStatus {
     scheduledIntervalMs: backupTimer
       ? config.backupIntervalMs || 86400000
       : null,
+    lastBackupEncrypted,
+    encryption: getBackupEncryptionState(),
   };
 }
 
@@ -410,7 +780,10 @@ export function startScheduledBackups(
     });
   }, intervalMs);
 
-  log("info", "scheduled_backups_started", { intervalMs });
+  log("info", "scheduled_backups_started", {
+    intervalMs,
+    encrypted: config.backupEncryptionEnabled,
+  });
 }
 
 /**

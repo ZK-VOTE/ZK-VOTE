@@ -7,7 +7,8 @@ import {
   novaAggregatorService,
   VoteWitnessPayload,
 } from "../services/nova-aggregator.js";
-import { bodyLimit } from "../middleware/index.js";
+import { bodyLimit, validateBody } from "../middleware/index.js";
+import { novaAggregateSchema } from "../validation/schemas.js";
 
 const router = Router();
 
@@ -18,16 +19,10 @@ const router = Router();
 router.post(
   "/aggregate",
   bodyLimit("100kb"),
+  validateBody(novaAggregateSchema),
   async (req: Request, res: Response) => {
     try {
       const { daoId, proposalId, root, witnesses } = req.body;
-
-      if (!daoId || !proposalId || !witnesses || !Array.isArray(witnesses)) {
-        return res.status(400).json({
-          error:
-            "Invalid payload. daoId, proposalId, and witnesses array are required.",
-        });
-      }
 
       const payload = await novaAggregatorService.aggregateVotes(
         Number(daoId),

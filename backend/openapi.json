@@ -528,6 +528,22 @@
                   "voterSignature": {
                     "type": "string",
                     "minLength": 1
+                  },
+                  "sponsor": {
+                    "type": "string",
+                    "enum": [
+                      "relayer",
+                      "voter"
+                    ]
+                  },
+                  "feePayer": {
+                    "type": "string",
+                    "pattern": "^G[A-Z2-7]{55}$"
+                  },
+                  "feeBudgetStroops": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1000000
                   }
                 },
                 "required": [
@@ -2553,6 +2569,298 @@
                   "circuitType": "Vote",
                   "currentCircuit": "vote_v1",
                   "availableCircuits": []
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/seed": {
+      "post": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Seed the VDF computation for a DAO/proposal set (admin action)",
+        "description": "No rate limit.",
+        "security": [
+          {
+            "RelayerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "success": true,
+                  "nonce": "deadbeef..."
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/contribute": {
+      "post": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Submit a 32-byte random share from an independent authority",
+        "description": "No rate limit.",
+        "security": [
+          {
+            "RelayerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "success": true,
+                  "received": 1,
+                  "requiredShares": 3
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/finalize": {
+      "post": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Finalize the ordering once required shares are received",
+        "description": "No rate limit.",
+        "security": [
+          {
+            "RelayerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "success": true,
+                  "finalizedAt": 1722300000000
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error (HTTP 400)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error (HTTP 401)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/ordering/{daoId}": {
+      "get": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Get the finalized ordering for a DAO with verification data",
+        "description": "Rate limit: queryLimiter.",
+        "security": [],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "description": "DAO identifier",
+              "example": "0"
+            },
+            "required": true,
+            "name": "daoId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "daoId": 0,
+                  "finalizedAt": 1722300000000,
+                  "ordering": []
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error (HTTP 404)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/randomness/verify/{daoId}": {
+      "get": {
+        "tags": [
+          "Randomness"
+        ],
+        "summary": "Verify a finalized ordering without re-running the VDF",
+        "description": "Rate limit: queryLimiter.",
+        "security": [],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "description": "DAO identifier",
+              "example": "0"
+            },
+            "required": true,
+            "name": "daoId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "daoId": 0,
+                  "valid": true,
+                  "checks": {
+                    "vdfOutputValid": true,
+                    "replayNonceValid": true
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error (HTTP 404)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error (HTTP 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }

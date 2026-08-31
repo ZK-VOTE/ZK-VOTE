@@ -110,10 +110,15 @@ export function assertValidNullifier(nullifier: bigint | string): void {
 
 // ============================================
 // CONTRACT ERROR CODES
+//
+// These objects use the frontend-conventional { ErrorName: numericCode }
+// mapping.  The wire-format variants ({ numericCode: { message } }) are
+// available in src/generated/contract-types.ts as *ErrorRaw exports.
 // ============================================
 
 /**
  * DAO Registry contract error codes
+ * Source of truth: contracts/dao-registry/src/index.ts (RegistryError)
  */
 export const RegistryError = {
   NameTooLong: 1,
@@ -125,6 +130,7 @@ export type RegistryError = (typeof RegistryError)[keyof typeof RegistryError];
 
 /**
  * Membership SBT contract error codes
+ * Source of truth: contracts/membership-sbt/src/index.ts (SbtError)
  */
 export const SbtError = {
   NotDaoAdmin: 1,
@@ -137,6 +143,7 @@ export type SbtError = (typeof SbtError)[keyof typeof SbtError];
 
 /**
  * Membership Tree contract error codes
+ * Source of truth: contracts/membership-tree/src/index.ts (TreeError)
  */
 export const TreeError = {
   NotAdmin: 1,
@@ -159,6 +166,7 @@ export type TreeError = (typeof TreeError)[keyof typeof TreeError];
 
 /**
  * Voting contract error codes
+ * Source of truth: contracts/voting/src/index.ts (VotingError)
  */
 export const VotingError = {
   NotAdmin: 1,
@@ -192,6 +200,7 @@ export type VotingError = (typeof VotingError)[keyof typeof VotingError];
 
 /**
  * Comments contract error codes
+ * Source of truth: contracts/comments/src/index.ts (CommentsError)
  */
 export const CommentsError = {
   NotAdmin: 1,
@@ -383,3 +392,20 @@ export const ERROR_MESSAGES: Record<string, Record<number, string>> = {
 export function getErrorMessage(contract: string, code: number): string {
   return ERROR_MESSAGES[contract]?.[code] ?? `Unknown error (code ${code})`;
 }
+
+// ============================================
+// CONTRACT TYPE RE-EXPORTS
+//
+// Structural types from generated stellar-sdk bindings exposed via a stable
+// import path.  Consumers can use either:
+//   import { VoteMode } from '@/types'
+//   import { VoteMode } from '@/generated/contract-types'
+// ============================================
+
+export type {
+  DaoInfo,
+  VoteMode,
+  ProposalInfo,
+  ProposalState,
+  CommentInfo,
+} from "../generated/contract-types.js";

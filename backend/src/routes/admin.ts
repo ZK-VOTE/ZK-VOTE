@@ -6,7 +6,13 @@
  * privileged graceful-shutdown trigger for controlled restarts.
  */
 import { Router, type Request, type Response } from "express";
-import { authGuard, queryLimiter, bodyLimit } from "../middleware/index.js";
+import {
+  authGuard,
+  queryLimiter,
+  bodyLimit,
+  validateBody,
+  validateQuery,
+} from "../middleware/index.js";
 import {
   getAuditLogs,
   verifyAuditChain,
@@ -15,6 +21,11 @@ import {
 import { getEventsForDao } from "../services/db.js";
 import { log } from "../services/logger.js";
 import type { AsyncHandler } from "../types/index.js";
+import {
+  adminShutdownSchema,
+  adminAuditLogQuerySchema,
+  adminSbtTransferAttemptsQuerySchema,
+} from "../validation/schemas.js";
 
 const router = Router();
 
@@ -48,6 +59,7 @@ router.post(
   bodyLimit("100kb"),
   authGuard,
   queryLimiter,
+  validateBody(adminShutdownSchema),
   (async (req: Request, res: Response) => {
     if (!shutdownHandler) {
       res.status(503).json({ error: "Shutdown handler not available" });
@@ -82,32 +94,33 @@ router.post(
  *   format   - "json" (default) or "cef"
  *   verify   - "true" to include a hash-chain integrity check
  */
-router.get("/admin/audit-log", authGuard, queryLimiter, (async (
-  req: Request,
-  res: Response,
-) => {
-  try {
-    const limit = req.query.limit ? Number(req.query.limit) : 50;
-    const offset = req.query.offset ? Number(req.query.offset) : 0;
-    const action =
-      typeof req.query.action === "string" ? req.query.action : undefined;
-    const format = req.query.format === "cef" ? "cef" : "json";
-    const includeVerification = req.query.verify === "true";
-    const { logs, total } = getAuditLogs({ limit, offset, action });
-    if (format === "cef") {
-      res.type("text/plain").send(formatAsCef(logs));
-      return;
+router.get(
+  "/admin/audit-log",
+  authGuard,
+  queryLimiter,
+  validateQuery(adminAuditLogQuerySchema),
+  (async (req: Request, res: Response) => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { limit, offset, action, format, verify } = (req as any)
+        .validatedQuery;
+      const includeVerification = verify === "true";
+      const { logs, total } = getAuditLogs({ limit, offset, action });
+      if (format === "cef") {
+        res.type("text/plain").send(formatAsCef(logs));
+        return;
+      }
+      const body: Record<string, unknown> = { logs, total, limit, offset };
+      if (includeVerification) {
+        body.chainVerification = verifyAuditChain();
+      }
+      res.json(body);
+    } catch (err) {
+      log("error", "admin_audit_log_failed", { error: (err as Error).message });
+      res.status(500).json({ error: "Failed to fetch audit log" });
     }
-    const body: Record<string, unknown> = { logs, total, limit, offset };
-    if (includeVerification) {
-      body.chainVerification = verifyAuditChain();
-    }
-    res.json(body);
-  } catch (err) {
-    log("error", "admin_audit_log_failed", { error: (err as Error).message });
-    res.status(500).json({ error: "Failed to fetch audit log" });
-  }
-}) as AsyncHandler);
+  }) as AsyncHandler,
+);
 
 // ============================================
 // SBT TRANSFER-ATTEMPT REVIEW (#357)
@@ -127,38 +140,31 @@ router.get("/admin/audit-log", authGuard, queryLimiter, (async (
  *   limit  - max rows (default 50, max 500)
  *   offset - pagination offset (default 0)
  */
-router.get("/admin/sbt-transfer-attempts", authGuard, queryLimiter, (async (
-  req: Request,
-  res: Response,
-) => {
-  const daoId = Number(req.query.daoId);
-  if (!Number.isInteger(daoId) || daoId < 1) {
-    res
-      .status(400)
-      .json({ error: "daoId is required and must be a positive integer" });
-    return;
-  }
+router.get(
+  "/admin/sbt-transfer-attempts",
+  authGuard,
+  queryLimiter,
+  validateQuery(adminSbtTransferAttemptsQuerySchema),
+  (async (req: Request, res: Response) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { daoId, limit, offset } = (req as any).validatedQuery;
 
-  try {
-    const limit = req.query.limit
-      ? Math.max(1, Math.min(Number(req.query.limit), 500))
-      : 50;
-    const offset = req.query.offset ? Math.max(0, Number(req.query.offset)) : 0;
+    try {
+      const { events, total } = getEventsForDao(daoId, {
+        types: ["sbt_transfer_attempt"],
+        limit,
+        offset,
+      });
 
-    const { events, total } = getEventsForDao(daoId, {
-      types: ["sbt_transfer_attempt"],
-      limit,
-      offset,
-    });
-
-    res.json({ daoId, attempts: events, total, limit, offset });
-  } catch (err) {
-    log("error", "admin_sbt_transfer_attempts_failed", {
-      daoId,
-      error: (err as Error).message,
-    });
-    res.status(500).json({ error: "Failed to fetch SBT transfer attempts" });
-  }
-}) as AsyncHandler);
+      res.json({ daoId, attempts: events, total, limit, offset });
+    } catch (err) {
+      log("error", "admin_sbt_transfer_attempts_failed", {
+        daoId,
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to fetch SBT transfer attempts" });
+    }
+  }) as AsyncHandler,
+);
 
 export default router;

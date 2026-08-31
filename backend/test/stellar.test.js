@@ -220,6 +220,26 @@ test("u256 ScVal conversion rejects malformed and out-of-range values", async ()
   );
 });
 
+test("validateSponsoredFeeRequest defaults to the relayer and caps abusive fee budgets", () => {
+  const defaulted = stellar.validateSponsoredFeeRequest({
+    voterPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" +"Q",
+    sponsor: "relayer",
+  });
+
+  assert.equal(defaulted.feePayer, config.relayerPublicKey || stellar.relayerKeypair.publicKey());
+  assert.equal(defaulted.feeBudgetStroops, 100000);
+
+  assert.throws(
+    () =>
+      stellar.validateSponsoredFeeRequest({
+        voterPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHFQ",
+        sponsor: "relayer",
+        feeBudgetStroops: 10_000_001,
+      }),
+    /fee budget/i,
+  );
+});
+
 test("hexToBytes pads values and rejects malformed inputs", () => {
   assert.deepEqual(
     stellar.hexToBytes("0x01", 4),

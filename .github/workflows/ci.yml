@@ -86,6 +86,8 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Enforce lockfile integrity
+        run: npm ci --ignore-scripts --audit=false
       - name: Lint (includes JSDoc validation + type check)
         run: npm run lint
       - name: Format check
@@ -125,8 +127,15 @@ jobs:
           VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+      - name: Generate SBOM artifact
+        run: npm run sbom:generate
+      - name: Upload backend SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-sbom-${{ github.run_id }}
+          path: backend/.artifacts/sbom-backend.json
       - name: Security audit
-        run: npm audit --audit-level=high || true
+        run: npm run audit:check
       - name: Build verification
         run: npm run build
 

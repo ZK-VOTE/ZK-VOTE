@@ -68,6 +68,12 @@ PLAN-*.md
 backend/data/events.json
 backend/data/*.db
 
+# Encrypted backup snapshots and backup encryption keys (Issue #359)
+# Keys are SECRETS — never commit backend/data/backup-keys or snapshots.
+backend/data/backups/
+backend/data/backup-keys/
+backend/data/restored*.db
+
 # Stress test runtime data (keep scripts, ignore runtime files)
 scripts/test/stress-accounts/*.txt
 scripts/test/stress-accounts/*.csv

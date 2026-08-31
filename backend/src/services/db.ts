@@ -140,6 +140,25 @@ export interface IndexedDao {
   eventCount: number;
 }
 
+export interface ProposalLifecycleSubscription {
+  id: number;
+  daoId: number;
+  walletAddressHash: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProposalLifecycleNotification {
+  id: number;
+  daoId: number;
+  proposalId: number;
+  eventType: string;
+  walletAddressHash: string;
+  delivered: boolean;
+  createdAt: string;
+}
+
 // ============================================
 // SCHEMA VERSIONING
 // ============================================
@@ -404,6 +423,65 @@ const EXPECTED_SCHEMA: Record<string, ExpectedTable> = {
       { name: "idx_vote_submissions_nullifier", columns: ["nullifier_hash"] },
     ],
   },
+  proposal_lifecycle_subscriptions: {
+    columns: [
+      { name: "id", type: "INTEGER", notNull: true, primaryKey: true },
+      { name: "dao_id", type: "INTEGER", notNull: true, primaryKey: false },
+      {
+        name: "wallet_address_hash",
+        type: "TEXT",
+        notNull: true,
+        primaryKey: false,
+      },
+      { name: "active", type: "INTEGER", notNull: true, primaryKey: false },
+      { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+      { name: "updated_at", type: "TEXT", notNull: true, primaryKey: false },
+    ],
+    indexes: [
+      {
+        name: "idx_proposal_lifecycle_subscriptions_dao",
+        columns: ["dao_id"],
+      },
+      {
+        name: "idx_proposal_lifecycle_subscriptions_active",
+        columns: ["dao_id", "active"],
+      },
+      {
+        name: "idx_proposal_lifecycle_subscriptions_unique",
+        columns: ["dao_id", "wallet_address_hash"],
+      },
+    ],
+  },
+  proposal_lifecycle_notifications: {
+    columns: [
+      { name: "id", type: "INTEGER", notNull: true, primaryKey: true },
+      { name: "dao_id", type: "INTEGER", notNull: true, primaryKey: false },
+      { name: "proposal_id", type: "INTEGER", notNull: true, primaryKey: false },
+      { name: "event_type", type: "TEXT", notNull: true, primaryKey: false },
+      {
+        name: "wallet_address_hash",
+        type: "TEXT",
+        notNull: true,
+        primaryKey: false,
+      },
+      { name: "delivered", type: "INTEGER", notNull: true, primaryKey: false },
+      { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+    ],
+    indexes: [
+      {
+        name: "idx_proposal_lifecycle_notifications_dao",
+        columns: ["dao_id"],
+      },
+      {
+        name: "idx_proposal_lifecycle_notifications_event",
+        columns: ["dao_id", "event_type"],
+      },
+      {
+        name: "idx_proposal_lifecycle_notifications_unique",
+        columns: ["dao_id", "proposal_id", "event_type", "wallet_address_hash"],
+      },
+    ],
+  },
   proof_commitments: {
     columns: [
       {
@@ -429,10 +507,21 @@ const EXPECTED_SCHEMA: Record<string, ExpectedTable> = {
       { name: "timestamp", type: "INTEGER", notNull: true, primaryKey: false },
       { name: "status", type: "TEXT", notNull: true, primaryKey: false },
       { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+      // Added by migration 004: malleability-safe dedup key (nullable for legacy rows)
+      {
+        name: "canonical_proof_hash",
+        type: "TEXT",
+        notNull: false,
+        primaryKey: false,
+      },
     ],
     indexes: [
       { name: "idx_commitments_nullifier", columns: ["nullifier"] },
       { name: "idx_commitments_wallet", columns: ["wallet_address"] },
+      {
+        name: "idx_proof_commitments_canonical",
+        columns: ["canonical_proof_hash"],
+      },
     ],
   },
 };
@@ -592,7 +681,7 @@ let writeDb: DatabaseType | null = null;
 /** Readonly connection — API query path (same file, WAL concurrent readers). */
 let readDb: DatabaseType | null = null;
 
-let activeDbFile: string = DB_FILE;
+let activeDbFile: string | null = DB_FILE;
 let writeHealthy = true;
 let writeFailureReason: string | null = null;
 let lastWriteAtMs = 0;
@@ -617,13 +706,14 @@ function updateConnectionGauges(): void {
   try {
     sink.setConnectionsActive(countActiveConnections());
     sink.setWriteHealthy(writeHealthy && Boolean(writeDb));
-    sink.setWalSizeBytes(getWalSizeBytes(activeDbFile));
+    sink.setWalSizeBytes(getWalSizeBytes(activeDbFile ?? DB_FILE));
   } catch {
     // Metrics sink may throw if registry is torn down in tests
   }
 }
 
-export function getWalSizeBytes(dbFile: string = activeDbFile): number {
+export function getWalSizeBytes(dbFile: string | null = activeDbFile): number {
+  if (!dbFile) return 0;
   const walPath = `${dbFile}-wal`;
   try {
     if (fs.existsSync(walPath)) return fs.statSync(walPath).size;
@@ -804,6 +894,15 @@ export function getWriteFailureReason(): string | null {
  * On connection-level failure, attempts one reconnect (failover).
  * Does not switch away from an already-open custom dbPath.
  */
+/**
+ * Whether the write connection has been initialized already (without
+ * forcing initialization). Used by best-effort audit writers (e.g. backup
+ * key rotation metadata) that should never trigger a DB bootstrap.
+ */
+export function isDbInitialized(): boolean {
+  return writeDb !== null;
+}
+
 export function getWriteDb(): DatabaseType {
   if (writeDb) {
     try {
@@ -962,7 +1061,7 @@ function getAllPartitionDaoIds(database: DatabaseType): number[] {
  * @returns The write connection (backward compatible with prior callers).
  */
 export function initDb(dbPath?: string): DatabaseType {
-  const dbFile = dbPath ?? DB_FILE;
+  const dbFile = dbPath ?? activeDbFile ?? DB_FILE;
 
   // Reuse open handles for the same file
   if (writeDb && activeDbFile === dbFile) {
@@ -1187,11 +1286,40 @@ export function initDb(dbPath?: string): DatabaseType {
       wallet_address TEXT,
       timestamp INTEGER NOT NULL,
       status TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      canonical_proof_hash TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_commitments_nullifier ON proof_commitments(nullifier);
     CREATE INDEX IF NOT EXISTS idx_commitments_wallet ON proof_commitments(wallet_address);
+
+    CREATE TABLE IF NOT EXISTS proposal_lifecycle_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dao_id INTEGER NOT NULL,
+      wallet_address_hash TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(dao_id, wallet_address_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_subscriptions_dao ON proposal_lifecycle_subscriptions(dao_id);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_subscriptions_active ON proposal_lifecycle_subscriptions(dao_id, active);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_subscriptions_unique ON proposal_lifecycle_subscriptions(dao_id, wallet_address_hash);
+
+    CREATE TABLE IF NOT EXISTS proposal_lifecycle_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dao_id INTEGER NOT NULL,
+      proposal_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      wallet_address_hash TEXT NOT NULL,
+      delivered INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(dao_id, proposal_id, event_type, wallet_address_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_notifications_dao ON proposal_lifecycle_notifications(dao_id);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_notifications_event ON proposal_lifecycle_notifications(dao_id, event_type);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_notifications_unique ON proposal_lifecycle_notifications(dao_id, proposal_id, event_type, wallet_address_hash);
+
     -- Append-only, tamper-evident audit trail for privileged/administrative
     -- actions. Each row's hash covers its own fields plus the previous row's
     -- hash (hash chain), so any edit or reordering breaks verifyAuditChain().
@@ -1402,7 +1530,10 @@ export function closeDb(): void {
     knownPartitions.clear();
     writeHealthy = true;
     writeFailureReason = null;
+    activeDbFile = null;
     log("info", "db_closed");
+  } else {
+    activeDbFile = null;
   }
   updateConnectionGauges();
 }
@@ -1708,6 +1839,15 @@ export function addEvent(event: EventInput): boolean {
     invalidateCachePrefix(`indexedDaos`);
     invalidateCachePrefix(`dbStatus`);
     incrementTransactionCounter();
+
+    const proposalLifecycleEvent =
+      event.type === "proposal_created" || event.type === "proposal_closed";
+    if (proposalLifecycleEvent) {
+      const proposalId = extractProposalId(event.data);
+      if (proposalId !== null) {
+        emitProposalLifecycleNotifications(event.daoId, proposalId, event.type);
+      }
+    }
   }
 
   return result;
@@ -1731,6 +1871,245 @@ export function addPendingEvent(
     timestamp: new Date().toISOString(),
     verified: false,
   });
+}
+
+function normalizeWalletAddress(walletAddress: string): string {
+  const value = walletAddress.trim();
+  if (!value) {
+    throw new Error("Wallet address is required");
+  }
+  return value;
+}
+
+function hashWalletAddress(walletAddress: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(normalizeWalletAddress(walletAddress).toLowerCase())
+    .digest("hex");
+}
+
+function extractProposalId(
+  data: Record<string, unknown> | null | undefined,
+): number | null {
+  if (!data || typeof data !== "object") return null;
+
+  const rawProposalId =
+    data.proposalId ?? data.proposal_id ?? data.id ?? data.proposal ?? null;
+
+  if (typeof rawProposalId === "number" && Number.isFinite(rawProposalId)) {
+    return rawProposalId > 0 ? rawProposalId : null;
+  }
+
+  if (typeof rawProposalId === "string") {
+    const parsed = Number(rawProposalId);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  return null;
+}
+
+export function subscribeToDaoProposalLifecycle(
+  daoId: number,
+  walletAddress: string,
+): { success: boolean; active: boolean; walletAddressHash: string } {
+  validateDaoId(daoId);
+  const hash = hashWalletAddress(walletAddress);
+  const database = getWriteDb();
+  const now = new Date().toISOString();
+
+  const row = database
+    .prepare(
+      `
+        INSERT INTO proposal_lifecycle_subscriptions (dao_id, wallet_address_hash, active, created_at, updated_at)
+        VALUES (?, ?, 1, ?, ?)
+        ON CONFLICT(dao_id, wallet_address_hash)
+        DO UPDATE SET active = 1, updated_at = excluded.updated_at
+      `,
+    )
+    .run(daoId, hash, now, now);
+
+  if (row.changes !== 0 || row.lastInsertRowid !== undefined) {
+    return { success: true, active: true, walletAddressHash: hash };
+  }
+
+  const existing = database
+    .prepare(
+      `SELECT active FROM proposal_lifecycle_subscriptions WHERE dao_id = ? AND wallet_address_hash = ?`,
+    )
+    .get(daoId, hash) as { active: number } | undefined;
+
+  return {
+    success: true,
+    active: existing ? Boolean(existing.active) : true,
+    walletAddressHash: hash,
+  };
+}
+
+export function unsubscribeFromDaoProposalLifecycle(
+  daoId: number,
+  walletAddress: string,
+): { success: boolean; active: boolean; walletAddressHash: string } {
+  validateDaoId(daoId);
+  const hash = hashWalletAddress(walletAddress);
+  const database = getWriteDb();
+  const row = database
+    .prepare(
+      `UPDATE proposal_lifecycle_subscriptions
+       SET active = 0, updated_at = ?
+       WHERE dao_id = ? AND wallet_address_hash = ?`,
+    )
+    .run(new Date().toISOString(), daoId, hash);
+
+  return {
+    success: row.changes > 0 || row.lastInsertRowid !== undefined,
+    active: false,
+    walletAddressHash: hash,
+  };
+}
+
+export function listDaoProposalLifecycleSubscriptions(
+  daoId: number,
+  options: { includeInactive?: boolean } = {},
+): ProposalLifecycleSubscription[] {
+  validateDaoId(daoId);
+  const database = getReadDb();
+  const includeInactive = options.includeInactive ?? false;
+
+  const rows = database
+    .prepare(
+      `
+        SELECT
+          id,
+          dao_id AS daoId,
+          wallet_address_hash AS walletAddressHash,
+          active,
+          created_at AS createdAt,
+          updated_at AS updatedAt
+        FROM proposal_lifecycle_subscriptions
+        WHERE dao_id = ? ${includeInactive ? "" : "AND active = 1"}
+        ORDER BY created_at ASC
+      `,
+    )
+    .all(daoId) as Array<{
+      id: number;
+      daoId: number;
+      walletAddressHash: string;
+      active: number;
+      createdAt: string;
+      updatedAt: string;
+    }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    daoId: row.daoId,
+    walletAddressHash: row.walletAddressHash,
+    active: Boolean(row.active),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }));
+}
+
+export function getDaoProposalLifecycleNotifications(
+  daoId: number,
+  options: { eventType?: string } = {},
+): ProposalLifecycleNotification[] {
+  validateDaoId(daoId);
+  const database = getReadDb();
+  const eventType = options.eventType;
+
+  const query = `
+        SELECT
+          id,
+          dao_id AS daoId,
+          proposal_id AS proposalId,
+          event_type AS eventType,
+          wallet_address_hash AS walletAddressHash,
+          delivered,
+          created_at AS createdAt
+        FROM proposal_lifecycle_notifications
+        WHERE dao_id = ? ${eventType ? "AND event_type = ?" : ""}
+        ORDER BY created_at ASC
+      `;
+  const rows = eventType
+    ? (database.prepare(query).all(daoId, eventType) as Array<{
+        id: number;
+        daoId: number;
+        proposalId: number;
+        eventType: string;
+        walletAddressHash: string;
+        delivered: number;
+        createdAt: string;
+      }>)
+    : (database.prepare(query).all(daoId) as Array<{
+        id: number;
+        daoId: number;
+        proposalId: number;
+        eventType: string;
+        walletAddressHash: string;
+        delivered: number;
+        createdAt: string;
+      }>);
+
+  return rows.map((row) => ({
+    id: row.id,
+    daoId: row.daoId,
+    proposalId: row.proposalId,
+    eventType: row.eventType,
+    walletAddressHash: row.walletAddressHash,
+    delivered: Boolean(row.delivered),
+    createdAt: row.createdAt,
+  }));
+}
+
+function addProposalLifecycleNotification(
+  daoId: number,
+  proposalId: number,
+  eventType: string,
+  walletAddressHash: string,
+): void {
+  const database = getWriteDb();
+  const now = new Date().toISOString();
+
+  database
+    .prepare(
+      `
+        INSERT OR IGNORE INTO proposal_lifecycle_notifications (
+          dao_id,
+          proposal_id,
+          event_type,
+          wallet_address_hash,
+          delivered,
+          created_at
+        ) VALUES (?, ?, ?, ?, 0, ?)
+      `,
+    )
+    .run(daoId, proposalId, eventType, walletAddressHash, now);
+}
+
+export function emitProposalLifecycleNotifications(
+  daoId: number,
+  proposalId: number,
+  eventType: string,
+): number {
+  const allowedEvents = new Set(["proposal_created", "proposal_closed"]);
+  if (!allowedEvents.has(eventType)) {
+    return 0;
+  }
+
+  const subscribers = listDaoProposalLifecycleSubscriptions(daoId, {
+    includeInactive: false,
+  });
+
+  for (const subscription of subscribers) {
+    addProposalLifecycleNotification(
+      daoId,
+      proposalId,
+      eventType,
+      subscription.walletAddressHash,
+    );
+  }
+
+  return subscribers.length;
 }
 
 /**
@@ -3303,6 +3682,8 @@ export interface ProofCommitmentRecord {
   timestamp: number;
   status: "COMMITTED" | "REVEALED" | "EXPIRED";
   createdAt: string;
+  /** Malleability-safe dedup key (NULL for legacy rows). */
+  canonicalProofHash: string | null;
 }
 
 export function recordProofCommitment(
@@ -3312,14 +3693,19 @@ export function recordProofCommitment(
   proposalId: number,
   timestamp: number,
   walletAddress?: string | null,
+  canonicalProofHash?: string | null,
 ): void {
   const database = getWriteDb();
   const createdAt = new Date().toISOString();
   database
     .prepare(
-      `INSERT INTO proof_commitments (commitment_hash, nullifier, dao_id, proposal_id, wallet_address, timestamp, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?)
-       ON CONFLICT(commitment_hash) DO UPDATE SET timestamp = excluded.timestamp, status = 'COMMITTED'`,
+      `INSERT INTO proof_commitments
+         (commitment_hash, nullifier, dao_id, proposal_id, wallet_address, timestamp, status, created_at, canonical_proof_hash)
+       VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
+       ON CONFLICT(commitment_hash) DO UPDATE SET
+         timestamp = excluded.timestamp,
+         status = 'COMMITTED',
+         canonical_proof_hash = COALESCE(excluded.canonical_proof_hash, proof_commitments.canonical_proof_hash)`,
     )
     .run(
       commitmentHash,
@@ -3329,6 +3715,7 @@ export function recordProofCommitment(
       walletAddress || null,
       timestamp,
       createdAt,
+      canonicalProofHash ?? null,
     );
 }
 
@@ -3351,6 +3738,42 @@ export function getProofCommitment(
     timestamp: row.timestamp as number,
     status: row.status as "COMMITTED" | "REVEALED" | "EXPIRED",
     createdAt: row.created_at as string,
+    canonicalProofHash: (row.canonical_proof_hash as string | null) ?? null,
+  };
+}
+
+/**
+ * Look up a proof commitment by its canonical proof hash.
+ *
+ * Both malleable forms of a Groth16 proof ((A,B,C) and (-A,-B,C)) produce the
+ * same canonical hash after canonicalizeProof(), so this lookup correctly
+ * deduplicates retries that arrive with the negated proof form.
+ *
+ * Returns null for records written before migration 004 (canonical_proof_hash
+ * is NULL on those rows).
+ */
+export function getProofCommitmentByCanonicalHash(
+  canonicalHash: string,
+): ProofCommitmentRecord | null {
+  const database = initDb();
+  const row = database
+    .prepare(
+      "SELECT * FROM proof_commitments WHERE canonical_proof_hash = ? LIMIT 1",
+    )
+    .get(canonicalHash) as Record<string, unknown> | undefined;
+
+  if (!row) return null;
+
+  return {
+    commitmentHash: row.commitment_hash as string,
+    nullifier: row.nullifier as string,
+    daoId: row.dao_id as number,
+    proposalId: row.proposal_id as number,
+    walletAddress: row.wallet_address as string | null,
+    timestamp: row.timestamp as number,
+    status: row.status as "COMMITTED" | "REVEALED" | "EXPIRED",
+    createdAt: row.created_at as string,
+    canonicalProofHash: (row.canonical_proof_hash as string | null) ?? null,
   };
 }
 

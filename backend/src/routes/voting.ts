@@ -4,6 +4,7 @@
  * Handles anonymous vote submission with ZK proofs and proposal results retrieval.
  */
 
+import crypto from "crypto";
 import {
   Router,
   type Request,
@@ -13,6 +14,7 @@ import {
 import * as StellarSdk from "@stellar/stellar-sdk";
 
 import { config } from "../config.js";
+import type { Groth16Proof } from "../types/index.js";
 import { log } from "../services/logger.js";
 import {
   server,
@@ -25,6 +27,8 @@ import {
   u256ToScVal,
   proofToScVal,
   scValToU256Hex,
+  validateSponsoredFeeRequest,
+  canonicalizeProof,
 } from "../services/stellar.js";
 import {
   authGuard,
@@ -49,6 +53,7 @@ import {
   updateTransactionLogStatus,
   recordProofCommitment,
   getProofCommitment,
+  getProofCommitmentByCanonicalHash,
   updateProofCommitmentStatus,
   getVoteSubmission,
   insertVoteSubmission,
@@ -66,6 +71,45 @@ import { votesProcessed } from "../services/metrics.js";
 import { sharedSingleFlight } from "../utils/singleflight.js";
 
 const router = Router();
+
+/**
+ * Compute a malleability-safe canonical proof hash for dedup.
+ *
+ * Both malleable Groth16 forms — (A, B, C) and (-A, -B, C) — canonicalize to
+ * the same (A', B') via canonicalizeProof(), so a retry that sends the negated
+ * form will hash to the same value and be correctly rejected as a duplicate.
+ *
+ * Hash = SHA256(canonical_a_hex || canonical_b_hex || c_hex)
+ *
+ * Returns null when the proof is malformed (missing or non-hex a/b/c), so the
+ * caller can fall back to the legacy commitmentHash path rather than crashing.
+ */
+function computeCanonicalProofHash(proof: unknown): string | null {
+  if (!proof || typeof proof !== "object") return null;
+  const p = proof as Partial<Groth16Proof>;
+  if (
+    typeof p.a !== "string" ||
+    typeof p.b !== "string" ||
+    typeof p.c !== "string"
+  ) {
+    return null;
+  }
+  try {
+    const aBytes = Buffer.from(p.a.replace(/^0x/, ""), "hex");
+    const bBytes = Buffer.from(p.b.replace(/^0x/, ""), "hex");
+    if (aBytes.length !== 64 || bBytes.length !== 128) return null;
+
+    const { a: canonA, b: canonB } = canonicalizeProof(aBytes, bBytes);
+    const cHex = p.c.replace(/^0x/, "").toLowerCase();
+
+    return crypto
+      .createHash("sha256")
+      .update(canonA.toString("hex") + canonB.toString("hex") + cHex)
+      .digest("hex");
+  } catch {
+    return null;
+  }
+}
 
 interface VoteExecutionInput {
   daoId: number;
@@ -181,6 +225,7 @@ router.post(
       commitmentHash,
       timestamp,
       walletAddress,
+      proof,
     } = req.body;
 
     const now = Date.now();
@@ -209,6 +254,18 @@ router.post(
         .json({ error: "Proof commitment already revealed" });
     }
 
+    // Canonical-hash dedup: both malleable forms of the proof must map to the
+    // same dedup key so a retry using (-A, -B, C) is correctly rejected.
+    const canonicalHash = computeCanonicalProofHash(proof);
+    if (canonicalHash) {
+      const canonicalRecord = getProofCommitmentByCanonicalHash(canonicalHash);
+      if (canonicalRecord && canonicalRecord.status === "REVEALED") {
+        return res
+          .status(400)
+          .json({ error: "Proof commitment already revealed" });
+      }
+    }
+
     recordProofCommitment(
       commitmentHash,
       nullifier,
@@ -216,6 +273,7 @@ router.post(
       proposalId,
       timestamp,
       walletAddress,
+      canonicalHash,
     );
 
     log("info", "proof_committed", {
@@ -246,6 +304,15 @@ router.post(
   validateBody(voteSchema),
   (async (req: Request, res: Response, next: NextFunction) => {
     let body = config.stripRequestBodies ? {} : req.body;
+    let feeMeta: {
+      sponsor: "relayer" | "voter";
+      feePayer: string;
+      feeBudgetStroops: number;
+    } = {
+      sponsor: "relayer",
+      feePayer: config.relayerPublicKey || relayerKeypair.publicKey(),
+      feeBudgetStroops: 100000,
+    };
 
     if (body.encryptedPayload) {
       try {
@@ -268,6 +335,9 @@ router.post(
       timestamp,
       voterPublicKey,
       voterSignature,
+      sponsor,
+      feePayer,
+      feeBudgetStroops,
     } = body;
 
     try {
@@ -289,7 +359,6 @@ router.post(
             Buffer.from(payloadToSign, "utf8"),
           );
 
-          // Re-build the same minimal ManageData transaction the frontend constructed
           const account = new StellarSdk.Account(voterPublicKey, "0");
           const tx = new StellarSdk.TransactionBuilder(account, {
             fee: "100",
@@ -304,13 +373,11 @@ router.post(
             .setTimeout(0)
             .build();
 
-          // Parse the signed XDR the frontend returned
           const signedTx = new StellarSdk.Transaction(
             voterSignature,
             config.networkPassphrase,
           );
 
-          // Verify the transaction hash matches what we expect
           const expectedHash = tx.hash();
           const actualHash = signedTx.hash();
           if (!expectedHash.equals(actualHash)) {
@@ -324,7 +391,6 @@ router.post(
               .json({ error: "Voter signature does not match vote payload" });
           }
 
-          // Verify the ed25519 signature on the transaction hash
           if (signedTx.signatures.length === 0) {
             return res
               .status(400)
@@ -360,6 +426,24 @@ router.post(
         }
       }
 
+      const sponsoredFee = validateSponsoredFeeRequest({
+        sponsor,
+        feePayer,
+        feeBudgetStroops,
+        voterPublicKey,
+      });
+      feeMeta = {
+        sponsor: sponsoredFee.sponsor,
+        feePayer: sponsoredFee.feePayer,
+        feeBudgetStroops: sponsoredFee.feeBudgetStroops,
+      };
+
+      log("info", "sponsored_fee_request", {
+        sponsor: sponsoredFee.sponsor,
+        feePayer: sponsoredFee.feePayer,
+        feeBudgetStroops: sponsoredFee.feeBudgetStroops,
+      });
+
       // Proof freshness validation
       if (timestamp) {
         const now = Date.now();
@@ -380,6 +464,21 @@ router.post(
       let commitmentHash: string | undefined;
       if (proof && nullifier && timestamp) {
         commitmentHash = calculateProofHash(proof, nullifier, timestamp, nonce);
+
+        // Canonical-hash dedup: both malleable forms of the proof ((A,B,C) and
+        // (-A,-B,C)) canonicalize to the same hash, so a retry with the negated
+        // form is correctly detected as a duplicate submission.
+        const canonicalHash = computeCanonicalProofHash(proof);
+        if (canonicalHash) {
+          const canonicalRecord =
+            getProofCommitmentByCanonicalHash(canonicalHash);
+          if (canonicalRecord && canonicalRecord.status === "REVEALED") {
+            return res
+              .status(400)
+              .json({ error: "Proof commitment already revealed" });
+          }
+        }
+
         const commitmentRecord = getProofCommitment(commitmentHash);
         if (commitmentRecord) {
           if (commitmentRecord.status === "REVEALED") {
@@ -414,19 +513,17 @@ router.post(
               status: "SUCCESS",
               replayed: true,
               receipt,
+              sponsoredFee: feeMeta,
             });
           }
-          // pending: tell client to retry after 5 s
           res.setHeader("Retry-After", "5");
           return res.status(202).json({
             success: false,
             txHash: existing.tx_hash,
             status: "PENDING",
+            sponsoredFee: feeMeta,
           });
         }
-        // Claim the nullifier slot before doing any on-chain work.
-        // If two concurrent requests race here, INSERT OR IGNORE means only
-        // one proceeds; the other re-reads above and gets the 202 path.
         if (!insertVoteSubmission(nullifier)) {
           const concurrent = getVoteSubmission(nullifier);
           if (concurrent) {
@@ -435,12 +532,12 @@ router.post(
               success: false,
               txHash: concurrent.tx_hash,
               status: "PENDING",
+              sponsoredFee: feeMeta,
             });
           }
         }
       }
 
-      // Convert inputs to Soroban types
       let scNullifier: StellarSdk.xdr.ScVal;
       let scRoot: StellarSdk.xdr.ScVal;
       let scProof: StellarSdk.xdr.ScVal;
@@ -481,9 +578,7 @@ router.post(
         );
       }
 
-      // Build contract call
       const contract = new StellarSdk.Contract(config.votingContractId!);
-
       const args = [
         StellarSdk.nativeToScVal(daoId, { type: "u64" }),
         StellarSdk.nativeToScVal(proposalId, { type: "u64" }),
@@ -495,15 +590,11 @@ router.post(
 
       const operation = contract.call("vote", ...args);
 
-      // Serialize account fetch + build + simulate + sign + submit under sequence lock
-      // to prevent nonce race conditions between concurrent requests
       const { sendResult, result } = await withSequenceLock(async () => {
-        // Get relayer account
         const account = await (server as StellarSdk.rpc.Server).getAccount(
           relayerKeypair.publicKey(),
         );
 
-        // Build transaction
         const tx = new StellarSdk.TransactionBuilder(account, {
           fee: "100000",
           networkPassphrase: config.networkPassphrase,
@@ -512,7 +603,6 @@ router.post(
           .setTimeout(30)
           .build();
 
-        // Simulate
         log("info", "simulate_vote", { daoId, proposalId });
         const simResult = await callWithTimeout(
           () =>
@@ -527,18 +617,14 @@ router.post(
             daoId,
             proposalId,
           });
-          // All proof/eligibility failures surface as VOTE_REJECTED — never
-          // expose which specific check failed (THREAT_MODEL.md §privacy).
           throw new Error("SIMULATION_FAILED:VOTE_REJECTED");
         }
 
-        // Prepare and sign
         const preparedTx = StellarSdk.rpc
           .assembleTransaction(tx, simResult)
           .build();
         preparedTx.sign(relayerKeypair as StellarSdk.Keypair);
 
-        // Submit
         log("info", "submit_vote", { daoId, proposalId });
         const sr = await callWithTimeout(
           () => (server as StellarSdk.rpc.Server).sendTransaction(preparedTx),
@@ -546,7 +632,6 @@ router.post(
         );
 
         if (sr.status === "ERROR") {
-          // tx_bad_seq: sequence desynchronized — mark dirty and retry once
           const isBadSeq = sequenceManager.handleTxError(
             typeof (sr as any).errorResult === "string"
               ? (sr as any).errorResult
@@ -569,7 +654,6 @@ router.post(
           recordTransactionLog(nullifier, sr.hash, "PENDING");
         }
 
-        // Wait for confirmation
         log("info", "submitted", { txHash: sr.hash, daoId, proposalId });
         const r = await callWithTimeout(
           () => waitForTransaction(sr.hash),
@@ -602,6 +686,7 @@ router.post(
           txHash: sendResult.hash,
           status: result.status,
           receipt,
+          sponsoredFee: feeMeta,
         });
       } else {
         if (nullifier && sendResult.hash) {
@@ -673,9 +758,21 @@ router.post(
         statusCode = 503;
         errorCode = ErrorCode.SERVICE_UNAVAILABLE;
         userMessage = "Transaction sequence error - please retry";
+      } else if (errMsg.includes("Invalid voter signature")) {
+        statusCode = 400;
+        errorCode = ErrorCode.VALIDATION_ERROR;
+        userMessage = "Invalid voter signature";
+      } else if (errMsg.includes("Sponsored fee budget exceeds")) {
+        statusCode = 400;
+        errorCode = ErrorCode.VALIDATION_ERROR;
+        userMessage = errMsg;
       }
 
-      return next(new ApiError(statusCode, errorCode, userMessage, errMsg));
+      res.status(statusCode).json(
+        config.genericErrors
+          ? { error: userMessage }
+          : { error: userMessage, code: errorCode, details: errMsg },
+      );
     }
   }) as AsyncHandler,
 );
@@ -721,13 +818,11 @@ router.get(
             throw new Error("PROPOSAL_NOT_FOUND");
           }
 
-          // Parse results from simulation
           const resultScVal = simResult.result?.retval;
           if (!resultScVal) {
             throw new Error("NO_RESULT_RETURNED");
           }
 
-          // Parse the tuple (yes_votes, no_votes, closed)
           const resultVec = resultScVal.vec();
           if (!resultVec || resultVec.length < 3) {
             throw new Error("INVALID_RESULT_FORMAT");

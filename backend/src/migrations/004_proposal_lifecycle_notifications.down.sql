@@ -1,0 +1,9 @@
+DROP INDEX IF EXISTS idx_proposal_lifecycle_notifications_unique;
+DROP INDEX IF EXISTS idx_proposal_lifecycle_notifications_event;
+DROP INDEX IF EXISTS idx_proposal_lifecycle_notifications_dao;
+DROP TABLE IF EXISTS proposal_lifecycle_notifications;
+
+DROP INDEX IF EXISTS idx_proposal_lifecycle_subscriptions_unique;
+DROP INDEX IF EXISTS idx_proposal_lifecycle_subscriptions_active;
+DROP INDEX IF EXISTS idx_proposal_lifecycle_subscriptions_dao;
+DROP TABLE IF EXISTS proposal_lifecycle_subscriptions;

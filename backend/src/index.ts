@@ -40,6 +40,10 @@ import {
   detectAndHandleWalIssue,
 } from "./services/walResilience.js";
 import {
+  startScheduledBackups,
+  stopScheduledBackups,
+} from "./services/backup.js";
+import {
   startMonitor as startPinMonitor,
   stopMonitor as stopPinMonitor,
 } from "./services/ipfs-monitor.js";
@@ -115,6 +119,7 @@ import {
   adminRoutes,
   thresholdRoutes,
   auditRoutes,
+  randomnessRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
 import openApiSpec from "./openapi.js";
@@ -244,6 +249,20 @@ app.use(csrfTokenMiddleware);
 app.use(csrfGuard);
 
 // ============================================
+// CSRF TOKEN ENDPOINT
+// ============================================
+
+// Dedicated endpoint for CSRF token issuance.
+// The SPA calls GET /csrf-token on startup and stores the X-CSRF-Token
+// response header value.  The csrfTokenMiddleware (applied globally above)
+// handles the actual token generation for all GET requests; this route
+// just provides a predictable, documented URL for the frontend to target.
+app.get("/csrf-token", (_req, res) => {
+  // Token is already set in the response header by csrfTokenMiddleware.
+  res.json({ ok: true });
+});
+
+// ============================================
 // ROUTE INITIALIZATION
 // ============================================
 
@@ -270,6 +289,7 @@ app.use("/api/v1/nova", novaRoutes);
 app.use(noStore, adminRoutes);
 app.use(noStore, thresholdRoutes);
 app.use(auditRoutes);
+app.use(noStore, randomnessRoutes);
 
 // ============================================
 // API VERSIONING (#139)
@@ -278,6 +298,10 @@ app.use(auditRoutes);
 // the existing unversioned paths, so existing clients keep working while new
 // clients can opt into the explicit, cache-friendly versioned path. A
 // response header also advertises which version served the request.
+//
+// Deliberately out of scope for this pass (see PR body): deprecation/Sunset
+// headers for the unversioned routes, a version-lifecycle policy doc, and
+// updating the frontend to call /api/v1.
 app.use((_req, res, next) => {
   res.setHeader("API-Version", "v1");
   next();
@@ -302,6 +326,7 @@ function mountV1(): void {
   v1Router.use(noStore, adminRoutes);
   v1Router.use(noStore, thresholdRoutes);
   v1Router.use(auditRoutes);
+  v1Router.use(noStore, randomnessRoutes);
 }
 
 mountV1();
@@ -538,6 +563,10 @@ async function startBackgroundServices(): Promise<void> {
     startWalCheckpointing(database);
     startWalMonitor(database, dbPath);
     startPeriodicBackups(database, dbPath);
+    // Encrypted snapshot backups (#359) — opt-in via BACKUP_ENCRYPTION_ENABLED.
+    if (config.backupEncryptionEnabled) {
+      startScheduledBackups(config.backupIntervalMs);
+    }
   } catch (err) {
     log("warn", "wal_resilience_start_failed", {
       error: (err as Error).message,
@@ -570,6 +599,7 @@ function stopBackgroundServices(): void {
   stopSbtTransferWatch();
   stopPinMonitor();
   stopMemoryMonitor();
+  stopScheduledBackups();
 
   // Drain any outstanding confirmation waits so callers never hang on exit.
   void stopConfirmationWorker();

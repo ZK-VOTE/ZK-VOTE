@@ -75,6 +75,61 @@ try {
 
 export const relayerKeypair = _relayerKeypair;
 
+export const MAX_SPONSORED_FEE_STROOPS = config.maxSponsoredFeeStroops;
+
+export interface SponsoredFeeRequest {
+  sponsor?: "relayer" | "voter";
+  feePayer?: string;
+  feeBudgetStroops?: number;
+  voterPublicKey?: string;
+}
+
+export function validateSponsoredFeeRequest(
+  input: SponsoredFeeRequest,
+): {
+  sponsor: "relayer" | "voter";
+  feePayer: string;
+  feeBudgetStroops: number;
+} {
+  const sponsor = input.sponsor ?? "relayer";
+  if (sponsor !== "relayer" && sponsor !== "voter") {
+    throw new Error("Unsupported fee sponsor: expected 'relayer' or 'voter'");
+  }
+
+  const requestedFee =
+    typeof input.feeBudgetStroops === "number" && Number.isFinite(input.feeBudgetStroops)
+      ? Math.trunc(input.feeBudgetStroops)
+      : MAX_SPONSORED_FEE_STROOPS;
+
+  if (requestedFee <= 0 || requestedFee > MAX_SPONSORED_FEE_STROOPS) {
+    throw new Error(
+      `Sponsored fee budget exceeds the allowed relay cap of ${MAX_SPONSORED_FEE_STROOPS} stroops`,
+    );
+  }
+
+  if (sponsor === "relayer") {
+    return {
+      sponsor,
+      feePayer: input.feePayer || config.relayerPublicKey || relayerKeypair.publicKey(),
+      feeBudgetStroops: requestedFee,
+    };
+  }
+
+  const feePayer = input.feePayer || input.voterPublicKey;
+  if (!feePayer) {
+    throw new Error("voterPublicKey is required when sponsor is 'voter'");
+  }
+  if (!/^G[A-Z2-7]{55}$/.test(feePayer)) {
+    throw new Error("Invalid Stellar account address for sponsored fee payer");
+  }
+
+  return {
+    sponsor,
+    feePayer,
+    feeBudgetStroops: requestedFee,
+  };
+}
+
 // ============================================
 // SEQUENCE LOCK (TRANSACTION NONCE MUTEX)
 // ============================================

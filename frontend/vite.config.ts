@@ -27,16 +27,24 @@ export default defineConfig(({ mode }) => {
     },
     optimizeDeps: {
       include: [
-        '@stellar/stellar-sdk',
-        'snarkjs',
-        'circomlibjs',
+        '@stellar/stellar-sdk'
       ],
+      exclude: ['snarkjs', 'circomlibjs'],
       esbuildOptions: {
         // Node.js global to browser globalThis
         define: {
           global: 'globalThis',
         },
       },
+    },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            zk: ['snarkjs', 'circomlibjs'],
+          }
+        }
+      }
     },
     test: {
       globals: true,
