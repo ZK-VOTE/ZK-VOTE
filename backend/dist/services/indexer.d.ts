@@ -9,6 +9,10 @@ import type { Event, EventQueryOptions, DbStatus } from "./db.js";
 /** Indexer status response */
 export interface IndexerStatus extends DbStatus {
     isRunning: boolean;
+    indexerLag: number;
+    hasGap: boolean;
+    catchUpMode: boolean;
+    checkpoint: string | null;
 }
 /** DAO data for synthetic events */
 export interface DaoData {

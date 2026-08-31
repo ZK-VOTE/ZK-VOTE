@@ -43,7 +43,7 @@ The membership-tree contract maintains a FIFO history of the last 30 Merkle root
 **Guidance for DAOs:**
 - DAOs with frequent membership changes (>30 changes during a proposal's voting period) may strand some voters.
 - Consider proposal duration vs. expected membership change rate.
-- Frontend could warn when root age approaches eviction threshold.
+- Frontend should warn when root age approaches the eviction threshold and show the current anonymity set size to contextualize the risk.
 - For high-activity DAOs, consider shorter voting windows or coordinating membership changes.
 
 ## Fixed Mode Revocation Semantics (Intentional Behavior)
@@ -498,105 +498,61 @@ preventing a single eligible voter from requesting many blind signatures)
 and is intentionally out of scope for this PR — see the PR description for
 the full list of deferred acceptance criteria.
 
-## End-to-End Encrypted Governance Content (Issue #324)
+## Circuit-Registry Governed VK Upgrade with Timelock + Multi-Sig (Issue #297)
 
-Before this change, only member *aliases* were encrypted
-(`frontend/src/lib/encryption.ts`). Proposal and comment **bodies** were
-plaintext to anyone who could read the relay's SQLite file, an IPFS pin, or a
-database backup. Deliberation content is often more sensitive than the tally —
-it names people, discloses treasury positions, and reveals internal
-disagreement — so this closes a gap the anonymity work around voting never
-covered.
+**Threat**: DAO admin VK trust is a documented risk. A single admin key can
+rotate the verification key at will, potentially replacing it with a malicious
+VK that allows forged proofs or invalidates ongoing elections without notice.
 
-Implementation: `backend/src/services/encryption.ts` (relay side, ciphertext
-only), `frontend/src/lib/groupEncryption.ts` (browser side, WebCrypto),
-migration `005_add_encrypted_content.sql`, routes under
-`/api/v1/encryption`.
+**Mitigation — Timelocked VK Proposals with Multi-Sig Quorum**:
+The `circuit-registry` contract now enforces a two-phase VK upgrade process
+that limits rogue VK swaps:
 
-### Scheme
+1. **Proposal Phase**: Any authorized proposer (configurable per DAO) creates a
+   VK upgrade proposal specifying the new VK, new WASM hash, timelock duration,
+   and required approval quorum. The proposal is stored on-chain with status
+   `Pending`.
 
-- **Group key**: 256-bit AES-GCM key, DAO-scoped, generated on a member device.
-  The relay never receives it in any form it can open.
-- **Distribution**: the key is sealed to each member individually
-  (`wrapGroupKeyForMember`) using a key derived by HKDF from that member's
-  long-term secret, bound to `(daoId, memberId)`. The relay stores these wraps
-  as opaque blobs.
-- **Recovery**: the group key is additionally split with Shamir secret sharing
-  over GF(2^8) into `n` shares with threshold `t`, so a DAO that loses every
-  member device can reconstruct the epoch key from a quorum. Below `t`, shares
-  are information-theoretically useless.
-- **Commitment**: `SHA-256("zkvote/e2e/v1/key-commitment" || key)` is published
-  per epoch. It lets a client confirm it reconstructed the right key without
-  revealing the key, and lets the relay distinguish epochs. Comparison is
-  constant time (`verifyGroupKey`).
-- **Nonce domain**: every ciphertext is bound to
-  `zkvote/e2e/v1/content/dao=<id>/epoch=<n>/type=<t>/id=<cid>`. The domain seeds
-  a deterministic 4-byte nonce prefix (partitioning the nonce space per content)
-  and is authenticated as GCM AAD. A ciphertext therefore cannot be moved
-  between DAOs, proposals, comment threads, or epochs.
+2. **Approval Phase**: Multiple independent approvers (multi-sig) must each
+   submit `approve_vk_upgrade` transactions. The contract tracks approval
+   count. The proposal only becomes executable once `approvals >=
+   required_approvals`.
 
-### Rotation
+3. **Timelock Phase**: After quorum is met, the proposal enters a mandatory
+   timelock period (`execute_after`). During this period, the proposal can be
+   cancelled by the proposer or governance. The timelock provides a safety
+   window for DAO members to review the change and for off-chain coordination.
 
-Membership changes rotate the key into a new epoch:
+4. **Execution Phase**: After the timelock elapses and quorum is met, any
+   authorized executor can call `execute_vk_upgrade`. This atomically updates
+   the circuit's VK, WASM hash, and `registered_at` timestamp, and emits
+   `VkProposalExecutedEvent`.
 
-| Event | New epoch wraps | Effect |
-| --- | --- | --- |
-| Member joins | existing members + joiner | joiner reads from the join epoch forward, not history |
-| Member leaves / is revoked | remaining members only | leaver cannot read anything written after departure |
+5. **Versioned VK History**: The voting contract maintains `VkByVersion`
+   mappings, preserving historical VKs. Proposals snapshotted before the
+   upgrade continue to verify against their pinned VK version, preventing
+   in-flight votes from being invalidated.
 
-Rotation gives forward and backward secrecy **at the epoch boundary**. It is
-deliberately not retroactive: a departed member keeps whatever they could
-already decrypt while a member, because they could have copied the plaintext at
-the time. Claiming otherwise would be security theatre.
+6. **Stale Rejection**: The backend and frontend reject stale VK versions
+   (ZK-013), ensuring clients cannot accidentally use deprecated verification
+   keys.
 
-### What the relay learns
+**Properties**:
+- No single admin can unilaterally rotate the VK.
+- DAO members have a timelock window to detect and respond to malicious
+  proposals.
+- Versioned VK storage ensures ongoing elections are not disrupted by
+  post-creation VK changes.
+- Frontend `CircuitUpgradePanel` displays pending VK proposals with timelock
+  countdown and approval progress.
 
-- **Can learn**: that a body exists for `(daoId, contentType, contentId)`, its
-  ciphertext length, its epoch, when it was written, and the size and membership
-  *count* of each epoch. Fetches are not gated on membership, so read access is
-  not a membership oracle — the trade-off is that the relay does not learn who
-  is reading either.
-- **Cannot learn**: any body's plaintext; the group key; which member a wrap
-  will actually be opened by (it stores the mapping, but cannot verify or use
-  it); whether a decryption attempt succeeded.
-- **Can do (malicious)**: withhold or delete ciphertext; serve a stale epoch's
-  ciphertext; refuse to hand a member their wrap. All are availability attacks,
-  detectable by the client (the epoch endpoint publishes the active epoch and
-  its commitment).
-- **Cannot do (malicious)**: substitute a body from another proposal or epoch
-  (AAD binding fails); forge a body (no key); silently downgrade a member to an
-  old epoch's content without the client noticing the epoch mismatch.
-
-### Redaction
-
-`redactContent` overwrites the `nonce`, `ciphertext` and `tag` columns with
-NULL and sets a tombstone (`redacted`, `redacted_at`, `redaction_reason`); a
-table CHECK constraint enforces that a redacted row carries no ciphertext and a
-live row is never half written. The row itself survives so governance
-references still resolve, and the API answers `410 Gone` with the tombstone
-rather than `404`.
-
-This is the only erasure the relay can perform, and its limits are worth
-stating plainly: it destroys the relay's copy, not copies already fetched by
-members, mirrored to IPFS, or present in backups taken before the redaction.
-Redaction is a moderation and compliance primitive, not a guarantee of
-unavailability.
-
-### Residual risks
-
-- **Endpoint compromise**: a member's device holds the group key for every
-  epoch it was wrapped into. Compromising one member exposes every body that
-  member could read. Rotation limits the *future* damage once the compromise is
-  known, not the past.
-- **Metadata**: ciphertext length, write timing, and the per-epoch member count
-  remain visible to the relay and to anyone with database access. Padding is not
-  implemented.
-- **Rotation is client-driven**: the relay accepts an epoch from an
-  authenticated caller and cannot verify that the wraps really contain the
-  committed key. A malicious rotator cannot read existing content, but can
-  publish an epoch whose key only they hold, causing future content to be
-  encrypted where honest members cannot read it. Clients detect this the first
-  time they fail to open their own wrap; detecting it *before* writing would
-  need a proof of correct wrapping, which is deferred.
-- **No per-content forward secrecy**: all content in an epoch shares one key, so
-  compromising it exposes the whole epoch rather than a single body.
+**Code alignment**:
+- `contracts/circuit-registry/src/lib.rs`: `propose_vk_upgrade`,
+  `approve_vk_upgrade`, `execute_vk_upgrade`, `cancel_vk_upgrade`,
+  `get_vk_proposal`, `get_dao_vk_proposal`, `VkProposal`/`VkProposalStatus`
+  types, and associated events.
+- `contracts/voting/src/lib.rs`: `get_pending_vk_proposal`,
+  `is_vk_proposal_ready`, `DaoVkProposal` storage key, `VkProposalStatus`
+  enum.
+- `backend/src/routes/circuits.ts`: REST endpoints for proposal lifecycle.
+- `frontend/src/components/CircuitUpgradePanel.tsx`: UI for pending proposals.

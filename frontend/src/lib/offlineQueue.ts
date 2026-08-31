@@ -13,17 +13,24 @@ export interface QueuedAction {
 
 const OFFLINE_QUEUE_KEY = `zkvote_offline_queue_${NETWORK_CONFIG.networkName}`;
 export const MAX_QUEUE_RETRIES = 5;
+let memoryQueue: QueuedAction[] = [];
+
+function getStorage(): Storage | undefined {
+  return globalThis.localStorage;
+}
 
 export function getOfflineQueue(): QueuedAction[] {
   try {
-    const raw = localStorage.getItem(OFFLINE_QUEUE_KEY);
-    return raw ? (JSON.parse(raw) as QueuedAction[]) : [];
+    const raw = getStorage()?.getItem(OFFLINE_QUEUE_KEY);
+    return raw ? (JSON.parse(raw) as QueuedAction[]) : memoryQueue;
   } catch {
-    return [];
+    return memoryQueue;
   }
 }
 
-export function enqueueOfflineAction(action: Omit<QueuedAction, "id" | "timestamp" | "retries">): QueuedAction {
+export function enqueueOfflineAction(
+  action: Omit<QueuedAction, "id" | "timestamp" | "retries">,
+): QueuedAction {
   const queue = getOfflineQueue();
   const entry: QueuedAction = {
     ...action,
@@ -32,8 +39,9 @@ export function enqueueOfflineAction(action: Omit<QueuedAction, "id" | "timestam
     retries: 0,
   };
   queue.push(entry);
+  memoryQueue = queue;
   try {
-    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+    getStorage()?.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
   } catch {
     // ignore quota errors
   }
@@ -42,8 +50,9 @@ export function enqueueOfflineAction(action: Omit<QueuedAction, "id" | "timestam
 
 export function dequeueOfflineAction(id: string): void {
   const queue = getOfflineQueue().filter((a) => a.id !== id);
+  memoryQueue = queue;
   try {
-    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+    getStorage()?.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
   } catch {
     // ignore
   }
@@ -57,15 +66,19 @@ export function updateQueueRetries(id: string): void {
     if (queue[idx].retries >= MAX_QUEUE_RETRIES) {
       queue.splice(idx, 1);
     }
+    memoryQueue = queue;
     try {
-      localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+      getStorage()?.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
     } catch {
       // ignore
     }
   }
 }
 
-export async function processOfflineQueue(): Promise<{ processed: number; failed: number }> {
+export async function processOfflineQueue(): Promise<{
+  processed: number;
+  failed: number;
+}> {
   const queue = getOfflineQueue();
   let processed = 0;
   let failed = 0;
@@ -99,12 +112,16 @@ export async function processOfflineQueue(): Promise<{ processed: number; failed
   return { processed, failed };
 }
 
-if (typeof window !== "undefined") {
+if (typeof window !== "undefined" && import.meta.env.MODE !== "test") {
   window.addEventListener("online", () => {
     processOfflineQueue().catch(() => {});
   });
   setInterval(() => {
-    if (typeof navigator !== "undefined" && navigator.onLine && getOfflineQueue().length > 0) {
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.onLine &&
+      getOfflineQueue().length > 0
+    ) {
       processOfflineQueue().catch(() => {});
     }
   }, 30_000);

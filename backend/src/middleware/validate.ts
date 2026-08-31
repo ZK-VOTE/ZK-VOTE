@@ -44,7 +44,7 @@ export function validateBody<T>(schema: ZodType<T, any, any>) {
       });
     }
 
-    // Replace body with validated/transformed data
+    // Replace body with validated/transformeed data
     req.body = result.data;
     next();
   };
@@ -71,6 +71,7 @@ export function validateQuery<T>(schema: ZodType<T, any, any>) {
     }
 
     // Replace query with validated/transformed data
+    req.query = result.data as any;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (req as any).validatedQuery = result.data;
     next();
@@ -92,6 +93,8 @@ export function validateParams<T>(schema: ZodType<T, any, any>) {
       });
     }
 
+    // Replace params with validated/transformed data
+    req.params = result.data as any;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (req as any).validatedParams = result.data;
     next();

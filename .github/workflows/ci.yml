@@ -127,13 +127,8 @@ jobs:
           VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-      - name: Generate SBOM artifact
-        run: npm run sbom:generate
-      - name: Upload backend SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-sbom-${{ github.run_id }}
-          path: backend/.artifacts/sbom-backend.json
+      - name: Check config schema and .env.example are in sync
+        run: npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
       - name: Security audit
         run: npm run audit:check
       - name: Build verification

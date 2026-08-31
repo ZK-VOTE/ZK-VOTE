@@ -20,8 +20,20 @@ describe("Weighted vote - constraint review", () => {
     const daoId = "1";
     const proposalId = "1";
     const weight = "100";
-    const wNull = await calculateWeightedNullifier(secret, daoId, proposalId, weight, DOMAIN_TAG_WEIGHTED);
-    const wNull2 = await calculateWeightedNullifier(secret, daoId, proposalId, weight, DOMAIN_TAG_VOTE);
+    const wNull = await calculateWeightedNullifier(
+      secret,
+      daoId,
+      proposalId,
+      weight,
+      DOMAIN_TAG_WEIGHTED,
+    );
+    const wNull2 = await calculateWeightedNullifier(
+      secret,
+      daoId,
+      proposalId,
+      weight,
+      DOMAIN_TAG_VOTE,
+    );
     expect(wNull).not.toBe(wNull2);
   });
 
@@ -52,7 +64,9 @@ describe("Weighted vote - weight bounds", () => {
   });
 
   it("rejects weight above global MAX_WEIGHT even if local max higher", () => {
-    expect(() => validateWeight("2000000", "5000000")).toThrow(/global MAX_WEIGHT/);
+    expect(() => validateWeight("2000000", "5000000")).toThrow(
+      /global MAX_WEIGHT/,
+    );
   });
 });
 

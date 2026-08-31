@@ -31,6 +31,7 @@
 
 mod storage;
 use soroban_sdk::xdr::ToXdr;
+mod stark_verifier;
 #[allow(unused_imports)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype,
@@ -60,6 +61,7 @@ mod delegation;
 const TREE_CONTRACT: Symbol = symbol_short!("tree");
 const REGISTRY: Symbol = symbol_short!("registry");
 const CIRCUIT_REGISTRY: Symbol = symbol_short!("circ_reg");
+const CIRCUIT_REGISTRY_ADMIN: Symbol = symbol_short!("cr_admin");
 const VERSION: u32 = 2;
 const STORAGE_VERSION: u32 = 1;
 const VERSION_KEY: Symbol = symbol_short!("ver");
@@ -70,6 +72,11 @@ const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
 const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
 const PERSISTENT_TTL_EXTEND: u32 = 535_680;
+// Nullifiers are Temporary: auto-expire after proposal.end_time + grace period
+// 259_200 ledgers @ ~5s/ledger = 72 hours grace for late-arriving txns
+const NULLIFIER_GRACE_LEDGERS: u32 = 259_200;
+const TEMPORARY_TTL_THRESHOLD: u32 = 51_840; // ~3 days
+const TEMPORARY_TTL_EXTEND_BASE: u32 = 259_200; // 72h base, + end_time offset
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -109,77 +116,16 @@ pub enum VotingError {
     WeightOutOfRange = 27,
     /// Invalid domain tag
     InvalidDomainTag = 28,
-
-    // ── Variants referenced across the contract but never declared ─────────
-    //
-    // `panic_with_error!(&env, VotingError::…)` call sites for all of these
-    // already existed in `lib.rs` and `quadratic.rs`, so the crate did not
-    // build. They are declared here rather than in a separate change because
-    // the VDF and quadratic paths this PR extends are exactly the paths that
-    // reference them.
-    /// Contract is paused by the guardian.
-    ContractPaused = 29,
-    /// Caller is not the guardian.
-    NotGuardian = 30,
-    RandomnessCommitClosed = 31,
-    RandomnessRevealClosed = 32,
-    RandomnessAlreadyCommitted = 33,
-    RandomnessCommitmentMissing = 34,
-    RandomnessRevealMismatch = 35,
-    CandidateSeedFinalized = 36,
-    InsufficientRandomness = 37,
-    RandomnessAlreadyRevealed = 38,
-    RandomnessParticipantLimit = 39,
-    TooManyActiveProposals = 40,
-    ProposalCooldownActive = 41,
-    InvalidProposalDeposit = 42,
-    ProposalHasVotes = 43,
-    VotingNotStarted = 44,
-    ElectionDurationTooShort = 45,
-    ElectionDurationTooLong = 46,
-    InvalidNoticePeriod = 47,
-    InvalidRegistrationPeriod = 48,
-    InvalidRegistrationGap = 49,
-    /// Regular `vote` called on a Quadratic proposal (use `cast_qv_vote`), or
-    /// `cast_qv_vote` called on a non-Quadratic proposal
-    NotQuadraticProposal = 50,
-    /// Quadratic-voting verification key not set for this DAO
-    QvVkNotSet = 51,
-    /// Quadratic ballot exceeds the fixed credit budget (sum of squares > MAX_QV_BUDGET)
-    QvBudgetExceeded = 52,
-    /// Quadratic tally verification key not set for this DAO
-    QvTallyVkNotSet = 53,
-    /// Tally proposal_ids / tallies vectors have mismatched or empty length
-    QvTallyLengthMismatch = 54,
-    /// Candidate index >= numCandidates configured for this election
-    InvalidCandidateIndex = 65,
-    UpgradeVersionMismatch = 66,
-    StorageVersionDowngrade = 67,
-    UpgradePayloadTooLarge = 68,
-    /// Reentrant call detected (defense-in-depth against cross-contract reentrancy)
-    ReentrantCall = 56,
-    /// VDF proof verification failed
-    VdfVerificationFailed = 57,
-    /// VDF output already submitted for this election
-    VdfAlreadySubmitted = 58,
-    /// VDF delay period has not elapsed yet
-    VdfDelayNotElapsed = 59,
-    /// VDF delay parameter is invalid
-    VdfInvalidDelay = 60,
-    /// VDF input (block hash) is not available
-    VdfInputNotAvailable = 61,
-    /// Invalid Nova recursive proof or tally verification failure
-    RecursiveProofInvalid = 62,
-    /// Vote tally increment overflowed maximum integer capacity
-    TallyOverflow = 55,
-    /// Merkle root locked because proposal transitioned out of Registration phase
-    MerkleRootLocked = 63,
-    /// Commitment window for root updates has expired
-    CommitmentWindowExpired = 64,
-    /// Relayer address is zero or not in BN254 scalar field
-    InvalidRelayerAddress = 69,
-    /// Relayer address in proof does not match actual relayer submitting transaction
-    RelayerMismatch = 70,
+    /// Tally proof verification failed (Groth16 pairing check)
+    TallyProofInvalid = 29,
+    /// Tally proof has not been submitted for this proposal
+    TallyProofMissing = 30,
+    /// Tally verification key has not been configured for this DAO
+    TallyVkNotSet = 31,
+    /// Vote tally overflowed u64
+    TallyOverflow = 32,
+    /// Recursive tally proof inconsistent with on-chain nullifier set
+    RecursiveProofInvalid = 33,
 }
 
 // Maximum allowed IC vector length (num_public_inputs + 1)
@@ -197,6 +143,10 @@ const MAX_UPGRADE_PAYLOAD_LEN: u32 = 4096;
 const NUM_PUBLIC_SIGNALS: u32 = 7;
 // IC (inner commitment) vector length for Groth16 VK = num_public_inputs + 1
 const VOTE_CIRCUIT_IC_LEN: u32 = NUM_PUBLIC_SIGNALS + 1;
+/// Tally circuit public signals: [dao_id, proposal_id, num_votes, yes_votes, no_votes, nullifier_acc]
+const TALLY_NUM_PUBLIC_SIGNALS: u32 = 6;
+/// IC vector length for the tally Groth16 VK = TALLY_NUM_PUBLIC_SIGNALS + 1
+const TALLY_CIRCUIT_IC_LEN: u32 = TALLY_NUM_PUBLIC_SIGNALS + 1;
 pub const MAX_PAUSE_DURATION: u64 = 72 * 60 * 60;
 pub const RANDOMNESS_COMMIT_WINDOW: u64 = 3_600;
 pub const RANDOMNESS_REVEAL_WINDOW: u64 = 3_600;
@@ -250,6 +200,7 @@ pub enum DataKey {
     VerifyOverride,
     DaoCurrentCircuit(u64), // dao_id -> current circuit_id string
     DaoMigration(u64),      // dao_id -> MigrationInfo
+    DaoVkProposal(u64),     // dao_id -> pending VK proposal ID from circuit-registry
     /// Flash loan protection: balance snapshot for token-gated proposals
     BalanceSnapshot(u64, u64), // (dao_id, proposal_id) -> BalanceSnapshotInfo
     /// Election configuration including token-gating parameters
@@ -297,61 +248,22 @@ pub enum DataKey {
     /// Whether VDF has been finalized for this election
     VdfFinalized(u64, u64),
     /// Recursive verification key for Nova/SuperNova proof composition
+    /// Verification key for the tally SNARK circuit (#94)
+    TallyVk(u64), // dao_id -> VerificationKey (BN254)
     RecursiveVk(u64), // dao_id -> Bytes
     /// Finalized recursive vote tally result
     RecursiveTally(u64, u64), // (dao_id, proposal_id) -> RecursiveTallyInfo
     /// ZK proof of correct tally computation for universal verifiability (#94)
-    TallyProof(u64, u64), // (dao_id, proposal_id) -> Bytes (proof)
+    TallyProof(u64, u64), // (dao_id, proposal_id) -> Proof (BN254 Groth16)
     /// Merkle root update history for auditability
     MerkleRootHistory(u64, u64), // (dao_id, proposal_id) -> Vec<MerkleRootRecord>
     /// Applied contract migration by target contract version.
     UpgradeMigration(u32),
     /// Rollback marker by rolled-back contract version.
     UpgradeRollback(u32),
-
-    // ── Sybil-resistance layer (#301) ──────────────────────────────────────
-    // Appended at the end so existing storage discriminants stay stable.
-    /// Weighted tally: (dao_id, proposal_id) -> WeightedTally
-    WeightedTally(u64, u64),
-    /// Per-election Sybil weight cap: (dao_id, proposal_id) -> u32
-    SybilWeightCap(u64, u64),
-    /// Anchored eligibility-attestation root the weighted-vote circuit proves
-    /// against: (dao_id, proposal_id) -> U256
-    AttestationRoot(u64, u64),
-    /// Sybil-weighted vote VK: dao_id -> VerificationKey
-    SybilVotingKey(u64),
-
-    // ── VDF-gated commit–reveal (#302) ─────────────────────────────────────
-    /// Commit–reveal schedule: (dao_id, proposal_id) -> CommitRevealConfig
-    CommitRevealConfig(u64, u64),
-    /// Published vote commitment: (dao_id, proposal_id, nullifier) -> BytesN<32>
-    VoteCommit(u64, u64, U256),
-    /// Reveal marker: (dao_id, proposal_id, nullifier) -> bool
-    VoteRevealed(u64, u64, U256),
-    /// Number of commitments accepted: (dao_id, proposal_id) -> u64
-    VoteCommitCount(u64, u64),
-    /// Commit-phase eligibility VK: dao_id -> VerificationKey
-    CommitVotingKey(u64),
-
-    // ── Anonymous delegation (#304) ────────────────────────────────────────
-    /// Registered delegation: (dao_id, proposal_id, commitment) -> DelegationRecord
-    Delegation(u64, u64, U256),
-    /// Delegation spend marker: (dao_id, proposal_id, delegation_nullifier) -> bool
-    DelegationNullifier(u64, u64, U256),
-    /// Reclaim spend marker: (dao_id, proposal_id, reclaim_nullifier) -> bool
-    ReclaimNullifier(u64, u64, U256),
-    /// Delegation accumulator root: (dao_id, proposal_id) -> U256
-    DelegationRoot(u64, u64),
-    /// Registered delegation count: (dao_id, proposal_id) -> u64
-    DelegationCount(u64, u64),
-    /// Votes cast via delegation: (dao_id, proposal_id) -> u64
-    DelegatedVoteCount(u64, u64),
-    /// Delegation verification keys: dao_id -> VerificationKey, per circuit role
-    DelegationRegisterVk(u64),
-    DelegationVoteVk(u64),
-    DelegationRevokeVk(u64),
-    /// Whether delegation is enabled for an election: (dao_id, proposal_id) -> bool
-    DelegationEnabled(u64, u64),
+    /// On-chain nullifier accumulator for tally proof binding (#94).
+    /// Appended at end so existing storage discriminants stay stable.
+    NullifierAccumulator(u64, u64),
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -447,6 +359,7 @@ pub struct StorageLayoutInfo {
     pub storage_version: u32,
     pub latest_migration_at: u64,
     pub rollback_to_version: Option<u32>,
+    pub capabilities: Vec<u32>,
 }
 
 #[contracttype]
@@ -471,6 +384,32 @@ pub enum CircuitType {
 pub struct CircuitVKResult {
     pub vk: VerificationKey,
     pub num_public_signals: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VkProposalStatus {
+    Pending,
+    Approved,
+    Executed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VkProposal {
+    pub id: u32,
+    pub circuit_id: String,
+    pub circuit_type: CircuitType,
+    pub new_vk: VerificationKey,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execute_after: u64,
+    pub required_approvals: u32,
+    pub approvals: u32,
+    pub status: VkProposalStatus,
+    pub dao_id: Option<u64>,
 }
 
 #[contracttype]
@@ -615,6 +554,16 @@ pub struct VoteEvent {
     pub proposal_id: u64,
     pub choice: bool,
     pub nullifier: U256,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtRiskVoterAlert {
+    #[topic]
+    pub dao_id: u64,
+    pub at_risk_root: U256,
+    pub proposal_id: u64,
+    pub deadline: u64,
 }
 
 #[soroban_sdk::contractevent]
@@ -863,6 +812,36 @@ impl Voting {
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     }
 
+    fn bump_temporary<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
+        env.storage()
+            .temporary()
+            .extend_ttl(key, TEMPORARY_TTL_THRESHOLD, TEMPORARY_TTL_EXTEND_BASE);
+    }
+
+    /// Bump nullifier TTL with proposal-end-time-aware extend amount.
+    /// Temporary storage lives until `end_time + NULLIFIER_GRACE_LEDGERS`.
+    /// For proposals with no end_time (end_time=0) use the base 72h window.
+    fn bump_nullifier_ttl<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+        env: &Env,
+        key: &K,
+        dao_id: u64,
+        proposal_id: u64,
+    ) {
+        let end_time = Self::get_proposal_end_time_internal(env, dao_id, proposal_id);
+        let ledger_timestamp = env.ledger().timestamp();
+        let ttl_extend: u32 = if end_time == 0 {
+            TEMPORARY_TTL_EXTEND_BASE
+        } else {
+            let remaining_secs = end_time.saturating_sub(ledger_timestamp);
+            let remaining_ledgers: u32 = (remaining_secs / 5).try_into().unwrap_or(u32::MAX);
+            remaining_ledgers.saturating_add(NULLIFIER_GRACE_LEDGERS)
+        };
+        let ttl_extend = ttl_extend.max(TEMPORARY_TTL_EXTEND_BASE);
+        env.storage()
+            .temporary()
+            .extend_ttl(key, TEMPORARY_TTL_THRESHOLD, ttl_extend);
+    }
+
     /// Constructor: Initialize contract with MembershipTree address
     pub fn __constructor(env: Env, tree_contract: Address, registry: Address, guardian: Address) {
         // Prevent accidental re-initialization
@@ -970,6 +949,7 @@ impl Voting {
                 .storage()
                 .persistent()
                 .get(&DataKey::UpgradeRollback(contract_version)),
+            capabilities: soroban_sdk::vec![&env, 1, 2], // 1: qv, 2: named_signals
         }
     }
 
@@ -1111,18 +1091,19 @@ impl Voting {
         paused && env.ledger().timestamp() < paused_at.saturating_add(MAX_PAUSE_DURATION)
     }
 
-    /// Validate that a U256 value is within the BN254 scalar field (< r)
-    /// Panics with VotingError::SignalNotInField if value >= r
-    fn assert_in_field(env: &Env, value: &U256) {
+    /// Validate that a U256 value is within the BN254 scalar field (< r).
+    /// Panics with a coarse-mapped [`VotingError::SignalNotInField`] under
+    /// [`PathContext::Anonymous`].
+    fn assert_in_field(env: &Env, ctx: PathContext, value: &U256) {
         if zkvote_groth16::assert_in_field(env, value).is_err() {
-            panic_with_error!(env, VotingError::SignalNotInField);
+            panic_coarse(env, ctx, VotingError::SignalNotInField);
         }
     }
 
-    /// Validate that a U256 value is within the BLS12-381 scalar field
-    fn assert_in_field_bls381(env: &Env, value: &U256) {
+    /// Validate that a U256 value is within the BLS12-381 scalar field.
+    fn assert_in_field_bls381(env: &Env, ctx: PathContext, value: &U256) {
         if zkvote_groth16::assert_in_field_bls381(env, value).is_err() {
-            panic_with_error!(env, VotingError::SignalNotInField);
+            panic_coarse(env, ctx, VotingError::SignalNotInField);
         }
     }
 
@@ -1261,6 +1242,20 @@ impl Voting {
         Self::bump_persistent(&env, &key);
     }
 
+    /// Set the verification key for the tally SNARK circuit (admin only).
+    pub fn set_tally_vk(env: Env, dao_id: u64, vk: VerificationKey, admin: Address) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+        if vk.ic.len() != TALLY_CIRCUIT_IC_LEN {
+            panic_with_error!(&env, VotingError::VkIcLengthMismatch);
+        }
+        let key = DataKey::TallyVk(dao_id);
+        env.storage().persistent().set(&key, &vk);
+        Self::bump_persistent(&env, &key);
+    }
+
     /// Fetch recursive verification key for a DAO
     pub fn get_recursive_vk(env: Env, dao_id: u64) -> Option<Bytes> {
         env.storage()
@@ -1277,14 +1272,10 @@ impl Voting {
         yes_votes: u64,
         no_votes: u64,
         final_nullifier_acc: U256,
-        proof: Bytes,
+        proof: Proof,
     ) -> Result<(), VotingError> {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
-
-        if proof.is_empty() {
-            return Err(VotingError::InvalidProof);
-        }
 
         let total_votes = yes_votes
             .checked_add(no_votes)
@@ -1292,6 +1283,17 @@ impl Voting {
         if total_votes != num_votes {
             return Err(VotingError::RecursiveProofInvalid);
         }
+
+        Self::verify_tally_proof_data(
+            &env,
+            dao_id,
+            proposal_id,
+            &proof,
+            num_votes,
+            yes_votes,
+            no_votes,
+            &final_nullifier_acc,
+        )?;
 
         let key = DataKey::Proposal(dao_id, proposal_id);
         let mut proposal: ProposalInfo = env
@@ -1363,19 +1365,138 @@ impl Voting {
             .get(&DataKey::RecursiveTally(dao_id, proposal_id))
     }
 
-    /// Return the stored tally proof bytes, or None if not yet finalized.
-    ///
-    /// The returned bytes are the raw recursive proof submitted via
-    /// `submit_recursive_tally`. Any observer can call this function and
-    /// verify the proof off-chain against the recursive VK set for the DAO,
-    /// providing universal verifiability of the tally (#94).
-    ///
-    /// On-chain verification against the recursive VK will be added once a
-    /// tally-aggregation circuit is finalised.
-    pub fn verify_tally_proof(env: Env, dao_id: u64, proposal_id: u64) -> Option<Bytes> {
+    /// Return the raw stored tally proof bytes without verification.
+    pub fn get_tally_proof(env: Env, dao_id: u64, proposal_id: u64) -> Option<Bytes> {
+        let proof: Option<Proof> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TallyProof(dao_id, proposal_id));
+        proof.map(|proof| proof.to_xdr(&env))
+    }
+
+    /// Return the current nullifier accumulator for an election.
+    pub fn get_nullifier_accumulator(env: Env, dao_id: u64, proposal_id: u64) -> U256 {
+        Self::bump_instance(&env);
         env.storage()
             .persistent()
-            .get(&DataKey::TallyProof(dao_id, proposal_id))
+            .get(&DataKey::NullifierAccumulator(dao_id, proposal_id))
+            .unwrap_or(U256::from_u32(&env, 0))
+    }
+
+    /// Update the election nullifier accumulator with a newly used nullifier.
+    ///
+    /// The accumulator is SHA256(prev_acc || nullifier); the tally SNARK must
+    /// reproduce the same final value. This binds the tally proof to the
+    /// on-chain nullifier set (issue #94).
+    fn accumulate_nullifier(env: &Env, dao_id: u64, proposal_id: u64, nullifier: &U256) {
+        let key = DataKey::NullifierAccumulator(dao_id, proposal_id);
+        let current: U256 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(U256::from_u32(env, 0));
+        let mut data = Bytes::new(env);
+        data.append(&Bytes::from_array(env, &current.to_bytes().to_array()));
+        data.append(&Bytes::from_array(env, &nullifier.to_bytes().to_array()));
+        let hash: BytesN<32> = env.crypto().sha256(&data).into();
+        let next = U256::from_bytes(env, &hash);
+        env.storage().persistent().set(&key, &next);
+        Self::bump_persistent(env, &key);
+    }
+
+    /// Verify the tally SNARK proof for a finalized election.
+    ///
+    /// Recomputes the public signals from the on-chain proposal and recursive
+    /// tally, then performs the Groth16 pairing check. A wrong tally, or a
+    /// proof for a different election, is rejected with
+    /// [`VotingError::TallyProofInvalid`].
+    pub fn verify_tally_proof(env: Env, dao_id: u64, proposal_id: u64) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+
+        let proof_key = DataKey::TallyProof(dao_id, proposal_id);
+        let proof: Proof = env
+            .storage()
+            .persistent()
+            .get(&proof_key)
+            .ok_or(VotingError::TallyProofMissing)?;
+        Self::bump_persistent(&env, &proof_key);
+
+        let tally_key = DataKey::RecursiveTally(dao_id, proposal_id);
+        let tally: RecursiveTallyInfo = env
+            .storage()
+            .persistent()
+            .get(&tally_key)
+            .ok_or(VotingError::TallyProofMissing)?;
+        Self::bump_persistent(&env, &tally_key);
+
+        Self::verify_tally_proof_data(
+            &env,
+            dao_id,
+            proposal_id,
+            &proof,
+            tally.num_votes,
+            tally.yes_votes,
+            tally.no_votes,
+            &tally.final_nullifier_acc,
+        )
+    }
+
+    fn verify_tally_proof_data(
+        env: &Env,
+        dao_id: u64,
+        proposal_id: u64,
+        proof: &Proof,
+        num_votes: u64,
+        yes_votes: u64,
+        no_votes: u64,
+        final_nullifier_acc: &U256,
+    ) -> Result<(), VotingError> {
+        let vk_key = DataKey::TallyVk(dao_id);
+        let vk: VerificationKey = env
+            .storage()
+            .persistent()
+            .get(&vk_key)
+            .ok_or(VotingError::TallyVkNotSet)?;
+        Self::bump_persistent(env, &vk_key);
+
+        if vk.ic.len() != TALLY_CIRCUIT_IC_LEN {
+            return Err(VotingError::VkIcLengthMismatch);
+        }
+
+        Self::assert_in_field(env, final_nullifier_acc);
+
+        let acc_key = DataKey::NullifierAccumulator(dao_id, proposal_id);
+        let expected_acc: U256 = match env.storage().persistent().get(&acc_key) {
+            Some(acc) => {
+                Self::bump_persistent(env, &acc_key);
+                acc
+            }
+            None => U256::from_u32(env, 0),
+        };
+        if &expected_acc != final_nullifier_acc {
+            return Err(VotingError::TallyProofInvalid);
+        }
+
+        let dao_signal = U256::from_u128(env, dao_id as u128);
+        let proposal_signal = U256::from_u128(env, proposal_id as u128);
+        let num_votes_signal = U256::from_u128(env, num_votes as u128);
+        let yes_signal = U256::from_u128(env, yes_votes as u128);
+        let no_signal = U256::from_u128(env, no_votes as u128);
+
+        let pub_signals = soroban_sdk::vec![
+            env,
+            dao_signal,
+            proposal_signal,
+            num_votes_signal,
+            yes_signal,
+            no_signal,
+            final_nullifier_acc.clone(),
+        ];
+
+        if !Self::verify_groth16(env, &vk, proof, &pub_signals) {
+            return Err(VotingError::TallyProofInvalid);
+        }
+        Ok(())
     }
 
     /// Internal helper to fetch a BN254 VK by version or fail with a clear error
@@ -1436,15 +1557,15 @@ impl Voting {
         new_version
     }
 
-    fn assert_weight_in_range(env: &Env, weight: u32) {
+    fn assert_weight_in_range(env: &Env, ctx: PathContext, weight: u32) {
         if weight < MIN_WEIGHT || weight > MAX_WEIGHT {
-            panic_with_error!(env, VotingError::WeightOutOfRange);
+            panic_coarse(env, ctx, VotingError::WeightOutOfRange);
         }
     }
 
-    fn assert_domain_tag_valid(env: &Env, domain_tag: u32) {
+    fn assert_domain_tag_valid(env: &Env, ctx: PathContext, domain_tag: u32) {
         if domain_tag != DOMAIN_TAG_WEIGHTED {
-            panic_with_error!(env, VotingError::InvalidDomainTag);
+            panic_coarse(env, ctx, VotingError::InvalidDomainTag);
         }
     }
 
@@ -1744,6 +1865,12 @@ impl Voting {
         env.storage().persistent().set(&curve_key, &curve_id);
         Self::bump_persistent(&env, &curve_key);
 
+        // Cache end_time for Temporary nullifier TTL computation
+        // Stored in Persistent (immutable after creation) so ttl.ts can look it up
+        let end_time_key = DataKey::ProposalEndTime(dao_id, proposal_id);
+        env.storage().persistent().set(&end_time_key, &end_time);
+        Self::bump_persistent(&env, &end_time_key);
+
         ProposalEvent {
             dao_id,
             proposal_id,
@@ -1864,25 +1991,27 @@ impl Voting {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
 
+        let ctx = PathContext::Anonymous;
+
         // ── DEFENSE-IN-DEPTH: Set reentrancy lock BEFORE any state mutations ──
         Self::set_reentrancy_lock(&env);
 
         // SECURITY: Validate public signals are within BN254 scalar field FIRST
         // This prevents modular reduction attacks where values >= r verify identically
         // to their reduced equivalents but are stored as different keys.
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, ctx, &nullifier);
+        Self::assert_in_field(&env, ctx, &root);
 
         // Check nullifier is non-zero (zero is not a valid nullifier)
         if nullifier == U256::from_u32(&env, 0) {
-            panic_with_error!(&env, VotingError::InvalidNullifier);
+            panic_coarse(&env, ctx, VotingError::InvalidNullifier);
         }
 
         // Check nullifier hasn't been used for THIS election (dao_id, proposal_id).
         // Election-scoped storage prevents cross-election DoS from a flat namespace (#64).
         let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
         if env.storage().persistent().has(&null_key) {
-            panic_with_error!(&env, VotingError::NullifierUsed);
+            panic_coarse(&env, ctx, VotingError::NullifierUsed);
         }
 
         // Get proposal
@@ -1897,10 +2026,10 @@ impl Voting {
         // If end_time is 0, there's no deadline (voting never closes)
         let now = env.ledger().timestamp();
         if proposal.state != ProposalState::Active {
-            panic_with_error!(&env, VotingError::VotingClosed);
+            panic_coarse(&env, ctx, VotingError::VotingClosed);
         }
         if proposal.end_time != 0 && now > proposal.end_time {
-            panic_with_error!(&env, VotingError::VotingClosed);
+            panic_coarse(&env, ctx, VotingError::VotingClosed);
         }
 
         // Revocation is now enforced by zeroing leaves in the Merkle tree.
@@ -1911,8 +2040,8 @@ impl Voting {
         // ── cross-contract calls or proof verification. This prevents      ──
         // ── double-vote reentrancy attacks even if the execution model     ──
         // ── allows reentrant calls.                                       ──
-        env.storage().persistent().set(&null_key, &true);
-        Self::bump_persistent(&env, &null_key);
+        env.storage().temporary().set(&null_key, &true);
+        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
 
         // Verify root based on vote mode
         // (May involve cross-contract calls to tree contract in Trailing mode)
@@ -1921,7 +2050,7 @@ impl Voting {
                 // Fixed mode: root must exactly match the snapshot at proposal creation
                 // This prevents sybil attacks where members are added after proposal creation
                 if root != proposal.eligible_root {
-                    panic_with_error!(&env, VotingError::RootMismatch);
+                    panic_coarse(&env, ctx, VotingError::RootMismatch);
                 }
             }
             VoteMode::Trailing => {
@@ -1939,7 +2068,7 @@ impl Voting {
                     soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
                 );
                 if !root_valid {
-                    panic_with_error!(&env, VotingError::RootNotInHistory);
+                    panic_coarse(&env, ctx, VotingError::RootNotInHistory);
                 }
 
                 // Check root index >= earliest_root_index (prevents using roots from before proposal)
@@ -1949,7 +2078,7 @@ impl Voting {
                     soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
                 );
                 if root_index < proposal.earliest_root_index {
-                    panic_with_error!(&env, VotingError::RootPredatesProposal);
+                    panic_coarse(&env, ctx, VotingError::RootPredatesProposal);
                 }
 
                 // Check root index >= min_valid_root_index (prevents using roots from before member removal)
@@ -1960,12 +2089,12 @@ impl Voting {
                     soroban_sdk::vec![&env, dao_id.into_val(&env)],
                 );
                 if root_index < min_valid_root {
-                    panic_with_error!(&env, VotingError::RootPredatesRemoval);
+                    panic_coarse(&env, ctx, VotingError::RootPredatesRemoval);
                 }
             }
             VoteMode::Quadratic => {
                 // Quadratic proposals must be voted on via `cast_qv_vote`.
-                panic_with_error!(&env, VotingError::NotQuadraticProposal);
+                panic_coarse(&env, ctx, VotingError::NotQuadraticProposal);
             }
         }
 
@@ -1977,7 +2106,7 @@ impl Voting {
             .get(&curve_key)
             .unwrap_or(CurveId::Bn254);
         if proposal_curve != CurveId::Bn254 {
-            panic_with_error!(&env, VotingError::VkNotSet);
+            panic_coarse(&env, ctx, VotingError::VkNotSet);
         }
 
         // Get verification key pinned to proposal version
@@ -1987,7 +2116,7 @@ impl Voting {
         // This prevents VK changes from invalidating in-flight votes
         let current_vk_hash = Self::hash_vk(&env, &vk);
         if current_vk_hash != proposal.vk_hash {
-            panic_with_error!(&env, VotingError::VkChanged);
+            panic_coarse(&env, ctx, VotingError::VkChanged);
         }
 
         // Verify Groth16 proof
@@ -2024,7 +2153,7 @@ impl Voting {
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
         if election_config.num_candidates > 0 && vote_choice_index >= election_config.num_candidates
         {
-            panic_with_error!(&env, VotingError::InvalidCandidateIndex);
+            panic_coarse(&env, ctx, VotingError::InvalidCandidateIndex);
         }
 
         let vote_signal = U256::from_u32(&env, vote_choice_index);
@@ -2057,20 +2186,24 @@ impl Voting {
         ];
 
         if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, VotingError::InvalidProof);
+            panic_coarse(&env, ctx, VotingError::InvalidProof);
         }
+
+        // Bind this vote's nullifier into the election accumulator so the
+        // final tally proof can be verified against the on-chain nullifier set.
+        Self::accumulate_nullifier(&env, dao_id, proposal_id, &nullifier);
 
         // Update vote count with checked arithmetic
         if vote_choice {
             proposal.yes_votes = proposal
                 .yes_votes
                 .checked_add(1)
-                .unwrap_or_else(|| panic_with_error!(&env, VotingError::TallyOverflow));
+                .unwrap_or_else(|| panic_coarse(&env, ctx, VotingError::TallyOverflow));
         } else {
             proposal.no_votes = proposal
                 .no_votes
                 .checked_add(1)
-                .unwrap_or_else(|| panic_with_error!(&env, VotingError::TallyOverflow));
+                .unwrap_or_else(|| panic_coarse(&env, ctx, VotingError::TallyOverflow));
         }
         env.storage().persistent().set(&prop_key, &proposal);
         Self::bump_persistent(&env, &prop_key);
@@ -2103,8 +2236,9 @@ impl Voting {
         domain_tag: u32,
     ) {
         Self::bump_instance(&env);
-        Self::assert_weight_in_range(&env, weight);
-        Self::assert_domain_tag_valid(&env, domain_tag);
+        let ctx = PathContext::Anonymous;
+        Self::assert_weight_in_range(&env, ctx, weight);
+        Self::assert_domain_tag_valid(&env, ctx, domain_tag);
         // Delegate to standard vote after weight validation
         // Note: weight-specific tally (weighted sum) would be stored separately in a full implementation;
         // here we validate bounds and domain, then record as standard vote for e2e testing
@@ -2119,8 +2253,16 @@ impl Voting {
         );
     }
 
-    /// Get proposal info
-    pub fn get_proposal(env: Env, dao_id: u64, proposal_id: u64) -> ProposalInfo {
+    /// Cast a BLS12-381-backed anonymous vote.
+    pub fn vote_bls381(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        vote_choice: bool,
+        nullifier: U256,
+        root: U256,
+        proof: ProofBls381,
+    ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
 
@@ -2135,7 +2277,7 @@ impl Voting {
         }
 
         let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().persistent().has(&null_key) {
+        if env.storage().temporary().has(&null_key) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
 
@@ -2156,8 +2298,8 @@ impl Voting {
 
         // ── CHECKS-EFFECTS-INTERACTIONS: Mark nullifier as used BEFORE ──
         // ── cross-contract calls or proof verification.                   ──
-        env.storage().persistent().set(&null_key, &true);
-        Self::bump_persistent(&env, &null_key);
+        env.storage().temporary().set(&null_key, &true);
+        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
 
         match proposal.vote_mode {
             VoteMode::Fixed => {
@@ -2347,6 +2489,77 @@ impl Voting {
             .unwrap_or(0)
     }
 
+    /// Cross-contract query: return true if `candidate_root` is the eligible_root
+    /// of any Active Fixed-mode proposal. Used by membership-tree to block FIFO
+    /// root eviction when a Fixed snapshot is still being voted against.
+    pub fn root_pin(env: Env, dao_id: u64, candidate_root: U256) -> bool {
+        Self::bump_instance(&env);
+        let count = Self::proposal_count(env.clone(), dao_id);
+        for id in 0..count {
+            let proposal_id = id + 1;
+            let key = DataKey::Proposal(dao_id, proposal_id);
+            if let Some(proposal) = env.storage().persistent().get::<_, ProposalInfo>(&key) {
+                if proposal.state == ProposalState::Active
+                    && proposal.vote_mode == VoteMode::Fixed
+                    && proposal.eligible_root == candidate_root
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Cross-contract hook: emit [`AtRiskVoterAlert`] events for every Active
+    /// Trailing-mode proposal whose earliest_root_index allows the candidate
+    /// root (i.e. voters with proofs against this root could still cast valid
+    /// votes). Called by membership-tree right before FIFO eviction.
+    pub fn chk_risk(env: Env, dao_id: u64, candidate_root: U256) {
+        Self::bump_instance(&env);
+        let count = Self::proposal_count(env.clone(), dao_id);
+        let now = env.ledger().timestamp();
+        for id in 0..count {
+            let proposal_id = id + 1;
+            let key = DataKey::Proposal(dao_id, proposal_id);
+            if let Some(proposal) = env.storage().persistent().get::<_, ProposalInfo>(&key) {
+                if proposal.state == ProposalState::Active
+                    && proposal.vote_mode == VoteMode::Trailing
+                {
+                    let deadline = if proposal.end_time == 0 {
+                        now.saturating_add(72 * 60 * 60)
+                    } else {
+                        proposal.end_time
+                    };
+                    AtRiskVoterAlert {
+                        dao_id,
+                        at_risk_root: candidate_root.clone(),
+                        proposal_id,
+                        deadline,
+                    }
+                    .publish(&env);
+                }
+            }
+        }
+    }
+
+    /// Read proposal end_time from cache (written at proposal creation).
+    /// Returns 0 if proposal has no end_time (never closes) or is unknown.
+    /// TTL-aware backend helpers use this to skip renewal of Temporary
+    /// nullifier records whose proposal voting window has closed + grace elapsed.
+    pub fn get_proposal_end_time(env: Env, dao_id: u64, proposal_id: u64) -> u64 {
+        Self::bump_instance(&env);
+        Self::get_proposal_end_time_internal(&env, dao_id, proposal_id)
+    }
+
+    /// Internal version of get_proposal_end_time (avoids double bump_instance).
+    #[inline(always)]
+    fn get_proposal_end_time_internal(env: &Env, dao_id: u64, proposal_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProposalEndTime(dao_id, proposal_id))
+            .unwrap_or(0)
+    }
+
     /// Check if a nullifier has been used for a specific election.
     ///
     /// Requires election identity `(dao_id, proposal_id)` — never queries a
@@ -2354,7 +2567,7 @@ impl Voting {
     pub fn is_nullifier_used(env: Env, dao_id: u64, proposal_id: u64, nullifier: U256) -> bool {
         Self::bump_instance(&env);
         let key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
-        env.storage().persistent().has(&key)
+        env.storage().temporary().has(&key)
     }
 
     /// Verify a voter receipt by checking if the nullifier was recorded
@@ -2402,6 +2615,7 @@ impl Voting {
         let scoped_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
         env.storage().persistent().set(&scoped_key, &true);
         Self::bump_persistent(&env, &scoped_key);
+        Self::accumulate_nullifier(&env, dao_id, proposal_id, &nullifier);
         env.storage().persistent().remove(&legacy_key);
         true
     }
@@ -2701,6 +2915,55 @@ impl Voting {
         result.vk
     }
 
+    /// Check if there is a pending VK upgrade proposal for this DAO in the circuit-registry.
+    /// Returns Some(proposal_id) if pending, None otherwise.
+    pub fn get_pending_vk_proposal(env: Env, dao_id: u64) -> Option<u32> {
+        Self::bump_instance(&env);
+        let circuit_registry: Address = match env.storage().instance().get(&CIRCUIT_REGISTRY) {
+            Some(addr) => addr,
+            None => return None,
+        };
+
+        let result: Option<VkProposal> = env.invoke_contract(
+            &circuit_registry,
+            &Symbol::new(env, "get_dao_vk_proposal"),
+            soroban_sdk::vec![env, dao_id.into_val(env)],
+        );
+        result.and_then(|p| {
+            if p.status == VkProposalStatus::Pending {
+                Some(p.id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Check if a VK proposal has met its timelock and quorum.
+    /// Returns true if the proposal is ready to be executed.
+    pub fn is_vk_proposal_ready(env: Env, proposal_id: u32) -> bool {
+        Self::bump_instance(&env);
+        let circuit_registry: Address = match env.storage().instance().get(&CIRCUIT_REGISTRY) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let result: Option<VkProposal> = env.invoke_contract(
+            &circuit_registry,
+            &Symbol::new(env, "get_vk_proposal"),
+            soroban_sdk::vec![env, proposal_id.into_val(env)],
+        );
+
+        match result {
+            Some(proposal) => {
+                let now = env.ledger().timestamp();
+                proposal.status == VkProposalStatus::Pending
+                    && now >= proposal.execute_after
+                    && proposal.approvals >= proposal.required_approvals
+            }
+            None => false,
+        }
+    }
+
     fn check_migration_window(env: &Env, dao_id: u64) -> Option<(String, String)> {
         let migration_key = DataKey::DaoMigration(dao_id);
         if !env.storage().persistent().has(&migration_key) {
@@ -2735,7 +2998,7 @@ impl Voting {
         }
 
         let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().persistent().has(&null_key) {
+        if env.storage().temporary().has(&null_key) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
 
@@ -2868,8 +3131,8 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidProof);
         }
 
-        env.storage().persistent().set(&null_key, &true);
-        Self::bump_persistent(&env, &null_key);
+        env.storage().temporary().set(&null_key, &true);
+        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
 
         if vote_choice {
             proposal.yes_votes = proposal

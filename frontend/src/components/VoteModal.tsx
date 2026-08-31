@@ -225,7 +225,7 @@ export default function VoteModal({
         console.log("Proof input ready, generating proof...");
       }
 
-      const { proof, publicSignals } = await generateVoteProof(
+      const { proof, publicSignals, redundantProof } = await generateVoteProof(
         proofInput,
         wasm,
         zkey,
@@ -252,6 +252,9 @@ export default function VoteModal({
       // Step 5: Format proof for Soroban
       setProgress("Formatting proof...");
       const { proof_a, proof_b, proof_c } = formatProofForSoroban(proof);
+      const formattedRedundantProof = redundantProof
+        ? formatProofForSoroban(redundantProof)
+        : null;
 
       // Step 6: Build the vote payload
       setStep("submitting");
@@ -261,6 +264,29 @@ export default function VoteModal({
       const toHexBE = (value: string | bigint): string => {
         const bigInt = typeof value === "string" ? BigInt(value) : value;
         return bigInt.toString(16).padStart(64, "0");
+      };
+
+      const votePayload = {
+        daoId: Number(daoId),
+        proposalId: Number(proposalId),
+        choice: choice,
+        nullifier: toHexBE(nullifier),
+        root: toHexBE(root),
+        proof: {
+          a: proof_a,
+          b: proof_b,
+          c: proof_c,
+        },
+        ...(formattedRedundantProof
+          ? {
+              redundantProof: {
+                a: formattedRedundantProof.proof_a,
+                b: formattedRedundantProof.proof_b,
+                c: formattedRedundantProof.proof_c,
+              },
+            }
+          : {}),
+        timestamp: Date.now(),
       };
 
       // Sign the vote payload with the voter's Stellar keypair

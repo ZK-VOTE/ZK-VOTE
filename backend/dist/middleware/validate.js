@@ -58,6 +58,7 @@ export function validateQuery(schema) {
             });
         }
         // Replace query with validated/transformed data
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         req.validatedQuery = result.data;
         next();
     };
@@ -75,6 +76,7 @@ export function validateParams(schema) {
                 details: config.genericErrors ? undefined : errors,
             });
         }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         req.validatedParams = result.data;
         next();
     };

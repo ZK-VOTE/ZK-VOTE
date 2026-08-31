@@ -5,6 +5,8 @@ import BridgePanel from "./BridgePanel";
 // Mock window.ethereum
 const mockEthereum = {
   request: vi.fn(),
+  on: vi.fn(),
+  removeListener: vi.fn(),
 };
 
 describe("BridgePanel", () => {
@@ -16,7 +18,7 @@ describe("BridgePanel", () => {
         ok: true,
         json: () => Promise.resolve({ success: true, txHash: "0xabc123" }),
       } as unknown as Response);
-    // @ts-expect-error - test shim for browser wallet API
+    // @ts-expect-error test injects a minimal EIP-1193 provider mock
     window.ethereum = mockEthereum;
     mockEthereum.request.mockResolvedValue([
       "0x1234567890123456789012345678901234567890",
@@ -74,7 +76,7 @@ describe("BridgePanel", () => {
   });
 
   it("handles EVM wallet missing error", async () => {
-    // @ts-expect-error - test shim for missing browser wallet API
+    // @ts-expect-error test removes the injected EIP-1193 provider mock
     window.ethereum = undefined;
     render(<BridgePanel daoId={1} proposalId={1} isConnected={true} />);
     fireEvent.click(screen.getByText("Connect MetaMask"));

@@ -41,13 +41,46 @@ export interface EncryptedVote {
   voteProof?: string;
 }
 
+export interface RelayNode {
+  id: string;
+  address: string;
+  publicKey: string;
+  weight: number;
+  healthy: boolean;
+}
+
+export interface RelaySubmission {
+  electionId: string;
+  encryptedVote: EncryptedVote;
+  receivedAt: number;
+  viaRelay: string[];
+}
+
+export interface CoverTrafficConfig {
+  enabled: boolean;
+  minIntervalMs: number;
+  maxIntervalMs: number;
+  paddingVotesPerInterval: number;
+}
+
+export interface MissingVoteAlert {
+  electionId: string;
+  nullifier: string;
+  detectedAt: number;
+  reason: string;
+}
+
 export type ProtocolEvent =
   | { type: "authority_registered"; authority: string }
   | { type: "dkg_commitment"; authority: string; commitment: string }
   | { type: "joint_key_set"; key: string }
   | { type: "vote_encrypted"; count: number }
   | { type: "decryption_share"; authority: string }
-  | { type: "tally_decrypted"; tally: string };
+  | { type: "tally_decrypted"; tally: string }
+  | { type: "relay_registered"; relay: string }
+  | { type: "relay_quorum_reached"; relayPath: string[] }
+  | { type: "cover_traffic_sent"; count: number }
+  | { type: "missing_vote_detected"; nullifier: string };
 
 type EventHandler = (event: ProtocolEvent) => void;
 
@@ -179,6 +212,112 @@ function emitEvent(event: ProtocolEvent): void {
   }
 }
 
+export async function registerRelayNode(
+  daoId: number,
+  proposalId: number,
+  node: Omit<RelayNode, "healthy">,
+): Promise<void> {
+  state.addRelayNode(daoId, proposalId, { ...node, healthy: true });
+  emitEvent({ type: "relay_registered", relay: node.address });
+}
+
+export async function submitVoteViaRelayQuorum(
+  daoId: number,
+  proposalId: number,
+  encryptedVote: EncryptedVote,
+  relayPath: string[],
+): Promise<void> {
+  const round = state.getRound(daoId, proposalId);
+  if (!round || !round.jointPublicKey) {
+    throw new Error("DKG not completed for this election");
+  }
+
+  const healthyRelays = state
+    .getRelayNodes(daoId, proposalId)
+    .filter((relay) => relayPath.includes(relay.id) && relay.healthy);
+
+  if (healthyRelays.length < round.thresholdT) {
+    throw new Error("Relay quorum not reached");
+  }
+
+  state.addEncryptedVote(daoId, proposalId, encryptedVote);
+  state.addRelaySubmission(daoId, proposalId, {
+    electionId: state.getRoundKey(daoId, proposalId),
+    encryptedVote,
+    receivedAt: Date.now(),
+    viaRelay: relayPath,
+  });
+
+  emitEvent({ type: "relay_quorum_reached", relayPath });
+  emitEvent({
+    type: "vote_encrypted",
+    count: state.getEncryptedVotes(daoId, proposalId).length,
+  });
+}
+
+export function startCoverTrafficScheduler(
+  daoId: number,
+  proposalId: number,
+  config: CoverTrafficConfig,
+): void {
+  if (state.getCoverTrafficTimer()) return;
+
+  const tick = () => {
+    if (!config.enabled) return;
+    const round = state.getRound(daoId, proposalId);
+    if (!round || !round.jointPublicKey) return;
+
+    for (let i = 0; i < config.paddingVotesPerInterval; i++) {
+      // Padding ciphertexts are intentionally discarded so they never
+      // enter the encrypted tally.
+      tc.encryptVote(round.jointPublicKey, 0n);
+    }
+
+    emitEvent({
+      type: "cover_traffic_sent",
+      count: config.paddingVotesPerInterval,
+    });
+  };
+
+  state.setCoverTrafficTimer(
+    setInterval(tick, Math.max(config.minIntervalMs, 1)),
+  );
+}
+
+export function stopCoverTrafficScheduler(): void {
+  const timer = state.getCoverTrafficTimer();
+  if (timer) {
+    clearInterval(timer);
+    state.setCoverTrafficTimer(null);
+  }
+}
+
+export async function monitorMissingVotes(
+  daoId: number,
+  proposalId: number,
+  expectedNullifiers: string[],
+): Promise<MissingVoteAlert[]> {
+  const submitted = new Set(
+    state.getEncryptedVotes(daoId, proposalId).map((vote) => vote.voterNullifier),
+  );
+  const missing = expectedNullifiers.filter(
+    (nullifier) => !submitted.has(nullifier),
+  );
+  const alerts: MissingVoteAlert[] = missing.map((nullifier) => ({
+    electionId: state.getRoundKey(daoId, proposalId),
+    nullifier,
+    detectedAt: Date.now(),
+    reason: "vote_not_received_by_relay_quorum",
+  }));
+
+  for (const alert of alerts) {
+    state.recordMissingVote(alert);
+    emitEvent({ type: "missing_vote_detected", nullifier: alert.nullifier });
+  }
+
+  return alerts;
+}
+
 // ── DKG Ceremony ──────────────────────────────────────────────────────
 
 /**
@@ -297,6 +436,7 @@ export async function encryptAndSubmitVote(
   proposalId: number,
   voteChoice: number,
   voterNullifier: string,
+  relayPath: string[] = [],
 ): Promise<tc.Ciphertext> {
   const round = state.getRound(daoId, proposalId);
   if (!round || !round.jointPublicKey) {
@@ -305,6 +445,14 @@ export async function encryptAndSubmitVote(
 
   const vote = BigInt(voteChoice);
   const ciphertext = tc.encryptVote(round.jointPublicKey, vote);
+
+  if (relayPath.length > 0) {
+    await submitVoteViaRelayQuorum(daoId, proposalId, {
+      voterNullifier,
+      ciphertext,
+    }, relayPath);
+    return ciphertext;
+  }
 
   state.addEncryptedVote(daoId, proposalId, {
     voterNullifier,

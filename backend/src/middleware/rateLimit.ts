@@ -35,6 +35,52 @@ if (process.env.NODE_ENV === "production" && isTestMode) {
   process.exit(1);
 }
 
+// CORS hardening: exact-match allowlist; no wildcards in production.
+const corsOriginList = String(config.corsOrigins || "*")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (process.env.NODE_ENV === "production" && corsOriginList.includes("*")) {
+  console.error("[fatal] CORS_ORIGIN='*' is forbidden when NODE_ENV=production");
+  process.exit(1);
+}
+
+/**
+ * Strict CORS options for the `cors` middleware.
+ * Validates against an exact list, restricts methods/headers, caches preflight.
+ */
+export const corsOptions = {
+  origin(
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: unknown) => void,
+  ): void {
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
+    if (corsOriginList.includes("*") && process.env.NODE_ENV !== "production") {
+      callback(null, true);
+      return;
+    }
+    if (corsOriginList.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    log("warn", "cors_origin_rejected", { origin });
+    callback(new Error(`Origin "${origin}" is not allowed by CORS`));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Wallet-Address",
+    "X-CSRF-Token",
+  ],
+  credentials: true,
+  maxAge: 3600,
+};
+
 /**
  * No-op middleware for test mode - skips rate limiting
  */
@@ -149,12 +195,15 @@ const headerOptions = {
 
 /**
  * Key generator for wallet address rate limiter
+ *
+ * Wallet-only: no IP fallback. Anonymous relay/Tor clients share egress IPs,
+ * so keying on IP would both leak linkability and false-positive under the
+ * MPC submitter / cover-traffic scheduler.
  */
 const walletKeyGenerator = (req: Express.Request): string => {
   const wallet =
     (req as any).body?.walletAddress ||
     (req as any).headers?.["x-wallet-address"] ||
-    (req as any).ip ||
     "";
   return crypto.createHash("sha256").update(String(wallet)).digest("hex");
 };
@@ -194,7 +243,7 @@ export const walletRateLimiter = isTestMode
 
 /**
  * Rate limiter for vote submissions
- * 10 votes per minute per IP
+ * 10 votes per minute per wallet
  */
 export const voteLimiter = isTestMode
   ? noopMiddleware
@@ -205,7 +254,7 @@ export const voteLimiter = isTestMode
         max: 10,
         ...headerOptions,
         store: getStore("vote"),
-        keyGenerator,
+        keyGenerator: walletKeyGenerator,
         handler: makeHandler(
           "vote",
           "Too many vote requests, please try again later",
@@ -316,7 +365,7 @@ export const graduatedSlowDown = isTestMode
 
 /**
  * Rate limiter for vote-to-earn claim submissions
- * 10 claims per minute per IP (same as vote, anonymity-sensitive)
+ * 10 claims per minute per wallet (same as vote, anonymity-sensitive)
  */
 export const claimLimiter = isTestMode
   ? noopMiddleware
@@ -326,7 +375,7 @@ export const claimLimiter = isTestMode
       message: { error: "Too many claim requests, please try again later" },
       standardHeaders: true,
       legacyHeaders: false,
-      keyGenerator,
+      keyGenerator: walletKeyGenerator,
     });
 
 // ============================================
@@ -397,3 +446,25 @@ export const commitmentRegistrationLimiter = isTestMode
         "Too many commitment registrations for this member, please try again later",
       onBlocked: () => membershipRegistrationLimited.inc({ reason: "api_rate_limit" }),
     });
+
+/**
+ * Rate limiter for tally proof verification requests.
+ * Verification is public (any observer can check final tallies), but the
+ * endpoint performs expensive SNARK/pairing checks, so it is still capped.
+ */
+export const verifyTallyProofLimiter = isTestMode
+  ? noopMiddleware
+  : withMetrics(
+      "verifyTallyProof",
+      rateLimit({
+        windowMs: 60 * 1000, // 1 minute
+        max: 30,
+        ...headerOptions,
+        store: getStore("verifyTallyProof"),
+        keyGenerator,
+        handler: makeHandler(
+          "verifyTallyProof",
+          "Too many tally proof verification requests, please try again later",
+        ),
+      }),
+    );

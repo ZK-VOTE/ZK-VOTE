@@ -10,13 +10,11 @@ import cluster from "node:cluster";
 import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import helmet from "helmet";
-import swaggerUi from "swagger-ui-express";
 
 import { config, validateEnv, isValidContractId } from "./config.js";
 // Composition root (#358) — explicit construction/wiring of service deps.
 import { buildAppServices } from "./composition-root.js";
 
-// Cluster Service
 import {
   startClusterMaster,
   initWorkerIpc,
@@ -25,7 +23,6 @@ import {
   registerWorkerShutdownHandler,
 } from "./services/cluster.js";
 
-// Services
 import { log, logger } from "./services/logger.js";
 import * as ipfsService from "./services/ipfs.js";
 import { initPinManager } from "./services/ipfs-pin-manager.js";
@@ -46,6 +43,20 @@ import {
   startMonitor as startPinMonitor,
   stopMonitor as stopPinMonitor,
 } from "./services/ipfs-monitor.js";
+import {
+  server,
+  relayerKeypair,
+  getPendingSequenceLockOps,
+  waitForSequenceLockIdle,
+} from "./services/stellar.js";
+import {
+  startConfirmationWorker,
+  stopConfirmationWorker,
+} from "./services/confirmation-queue.js";
+import {
+  attachConfirmationHub,
+  closeConfirmationHub,
+} from "./services/confirmation-hub.js";
 import {
   startDaoSync,
   stopDaoSync,
@@ -68,23 +79,23 @@ import {
   startMemoryMonitor,
   stopMemoryMonitor,
 } from "./services/memory-monitor.js";
-import { closeDb } from "./services/db.js";
-import { ServiceSupervisor } from "./services/supervisor.js";
 
 // Middleware
 import {
   csrfGuard,
+  csrfTokenMiddleware,
   requestLogger,
   errorHandler,
   auditMiddleware,
-  metricsMiddleware,
+  graduatedSlowDown,
   degradationContext,
+  metricsMiddleware,
 } from "./middleware/index.js";
 
-// Routes
 import {
   healthRoutes,
   initHealthRoutes,
+  analyticsRoutes,
   votingRoutes,
   daoRoutes,
   ipfsRoutes,
@@ -94,12 +105,17 @@ import {
   initIndexerRoutes,
   bridgeRoutes,
   circuitRoutes,
-  sybilRoutes,
-  vdfRoutes,
-  delegationRoutes,
+  transactionRoutes,
+  authRoutes,
+  quadraticRoutes,
+  metricsRoutes,
+  remediationRoutes,
+  novaRoutes,
+  adminRoutes,
+  thresholdRoutes,
+  auditRoutes,
+  randomnessRoutes,
 } from "./routes/index.js";
-import metricsRoutes from "./routes/metrics.js";
-import remediationRoutes from "./routes/remediation.js";
 import { registerShutdownHandler } from "./routes/admin.js";
 import openApiSpec from "./openapi.js";
 
@@ -194,10 +210,49 @@ app.use(metricsMiddleware);
 app.use(degradationContext);
 
 // Security: CORS configuration
-const corsOrigins = config.corsOrigins === "*" ? "*" : config.corsOrigins;
+function parseCorsOrigins(value: string): string[] {
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins);
+const isProduction = process.env.NODE_ENV === "production";
+
+if (allowedCorsOrigins.length === 0) {
+  throw new Error("CORS_ORIGIN must specify at least one origin");
+}
+
+if (isProduction && allowedCorsOrigins.includes("*")) {
+  throw new Error(
+    "CORS_ORIGIN must not be '*' in production; configure exact origins",
+  );
+}
+
+for (const origin of allowedCorsOrigins) {
+  if (origin !== "*" && /[*?]/.test(origin)) {
+    throw new Error(
+      "CORS_ORIGIN origins must be exact URLs, not wildcard patterns",
+    );
+  }
+}
+
+const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
+
 const corsOptions: cors.CorsOptions = {
-  origin: corsOrigins,
-  methods: ["GET", "POST"],
+  origin: (origin, callback) => {
+    if (!origin || allowAllCors || allowedCorsOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    log("warn", "cors_origin_rejected", {
+      origin,
+      allowedOrigins: allowedCorsOrigins,
+    });
+    callback(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
     "Authorization",
@@ -212,7 +267,8 @@ const corsOptions: cors.CorsOptions = {
     "X-Service-Degraded",
     "X-Service-Status",
   ],
-  maxAge: 86400, // 24 hours
+  maxAge: 3600,
+  credentials: !allowAllCors,
 };
 app.use(cors(corsOptions));
 
@@ -225,6 +281,10 @@ app.use(requestLogger);
 
 // Graduated throttling (delays before a client is hard rate-limited)
 app.use(graduatedSlowDown);
+
+// Audit middleware - must be after body parsing and requestLogger, before routes
+// Audits every mutating route (POST/PUT/PATCH/DELETE) with PII redaction, append-only
+app.use(auditMiddleware);
 
 // CSRF token generation for safe methods (GET, HEAD, OPTIONS)
 app.use(csrfTokenMiddleware);
@@ -257,6 +317,9 @@ initIndexerRoutes(triggerDaoMembershipSync);
 // Mount route handlers (metrics first, before CSRF/auth middleware)
 app.use(metricsRoutes);
 app.use(healthRoutes);
+app.use(analyticsRoutes);
+app.use(remediationRoutes);
+app.use(adminRoutes);
 app.use(noStore, votingRoutes);
 app.use(daoRoutes);
 app.use(ipfsRoutes);
@@ -265,9 +328,75 @@ app.use(claimRoutes);
 app.use(indexerRoutes);
 app.use(bridgeRoutes);
 app.use(circuitRoutes);
-app.use(sybilRoutes);
-app.use(noStore, vdfRoutes);
-app.use(noStore, delegationRoutes);
+app.use(transactionRoutes);
+app.use(authRoutes);
+app.use(quadraticRoutes);
+app.use("/api/v1/nova", novaRoutes);
+app.use(noStore, adminRoutes);
+app.use(noStore, thresholdRoutes);
+app.use(auditRoutes);
+app.use(noStore, randomnessRoutes);
+
+// ============================================
+// API VERSIONING (#139)
+// ============================================
+// URL-based versioning: mount the same routers under /api/v1 in addition to
+// the existing unversioned paths, so existing clients keep working while new
+// clients can opt into the explicit, cache-friendly versioned path. A
+// response header also advertises which version served the request.
+//
+// Deliberately out of scope for this pass (see PR body): deprecation/Sunset
+// headers for the unversioned routes, a version-lifecycle policy doc, and
+// updating the frontend to call /api/v1.
+app.use((_req, res, next) => {
+  res.setHeader("API-Version", "v1");
+  next();
+});
+
+const v1Router = express.Router();
+
+function mountV1(): void {
+  v1Router.use(metricsRoutes);
+  v1Router.use(healthRoutes);
+  v1Router.use(remediationRoutes);
+  v1Router.use(noStore, votingRoutes);
+  v1Router.use(daoRoutes);
+  v1Router.use(ipfsRoutes);
+  v1Router.use(commentsRoutes);
+  v1Router.use(claimRoutes);
+  v1Router.use(indexerRoutes);
+  v1Router.use(bridgeRoutes);
+  v1Router.use(circuitRoutes);
+  v1Router.use(transactionRoutes);
+  v1Router.use(quadraticRoutes);
+  v1Router.use(noStore, adminRoutes);
+  v1Router.use(noStore, thresholdRoutes);
+  v1Router.use(auditRoutes);
+  v1Router.use(noStore, randomnessRoutes);
+}
+
+mountV1();
+app.use("/api/v1", v1Router);
+
+// OpenAPI spec + interactive docs
+const openApiDocument = buildOpenApiDocument();
+app.get("/openapi.json", (_req, res) => res.json(openApiSpec));
+app.get("/api-docs/openapi.json", (_req, res) => res.json(openApiDocument));
+app.use(
+  "/api-docs",
+  // helmet's default CSP blocks the inline scripts/styles Swagger UI's
+  // bundled assets need; relax it for this documentation-only route.
+  (
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) => {
+    res.removeHeader("Content-Security-Policy");
+    next();
+  },
+  swaggerUi.serve,
+  swaggerUi.setup(openApiDocument),
+);
 
 // Global error handler (must be last)
 app.use(errorHandler);
@@ -334,28 +463,47 @@ async function gracefulShutdown(reason: string): Promise<void> {
   stopBackgroundServices();
   stopAuthScheduler();
   stopWalResilience();
+  closeConfirmationHub();
   log("info", "shutdown_component_stopped", {
     component: "background_services",
   });
 
   await httpClosed;
 
-  // Wait for any in-flight sequence-locked chain submissions to drain.
-  // Returns false on timeout with work still outstanding.
-  const drained = await waitForSequenceLockIdle(DRAIN_TIMEOUT_MS);
-
-  clearTimeout(forceExitTimer);
-  if (!drained) {
-    log("error", "shutdown_drain_timeout", {
-      pendingSequenceLockOps: getPendingSequenceLockOps(),
+  // Drain in-flight sequence-locked chain submissions before closing the DB,
+  // so a proof is never accepted but left unsubmitted.
+  const pendingSequenceOps = getPendingSequenceLockOps();
+  if (pendingSequenceOps > 0) {
+    log("info", "shutdown_draining_sequence_lock", {
+      pending: pendingSequenceOps,
+      pid: process.pid,
     });
   }
-  log("info", "shutdown_complete", {
-    reason,
-    cleanDrain: drained,
+  const drained = await waitForSequenceLockIdle(DRAIN_TIMEOUT_MS);
+  log(drained ? "info" : "warn", "shutdown_sequence_lock_drained", {
+    drained,
+    remaining: getPendingSequenceLockOps(),
     pid: process.pid,
   });
-  process.exit(drained ? 0 : 1);
+
+  // Close the SQLite connection cleanly (checkpoints WAL, avoids corruption
+  // on restart).
+  try {
+    closeDb();
+    log("info", "shutdown_component_stopped", { component: "database" });
+  } catch (err) {
+    log("error", "shutdown_db_close_error", {
+      error: (err as Error).message,
+      pid: process.pid,
+    });
+  }
+
+  clearTimeout(forceExitTimer);
+  log("info", "shutdown_complete", {
+    reason,
+    pid: process.pid,
+  });
+  process.exit(0);
 }
 
 async function startBackgroundServices(): Promise<void> {
@@ -484,6 +632,10 @@ async function startBackgroundServices(): Promise<void> {
     });
     void gracefulShutdown("memory_threshold");
   });
+
+  // Dedicated confirmation worker (#172): single poller for all outstanding
+  // transaction-confirmation waits, with exponential backoff + jitter.
+  startConfirmationWorker();
 }
 
 /**
@@ -512,6 +664,9 @@ async function stopBackgroundServices(): Promise<void> {
   stopPinMonitor();
   stopMemoryMonitor();
   stopScheduledBackups();
+
+  // Drain any outstanding confirmation waits so callers never hang on exit.
+  void stopConfirmationWorker();
 }
 
 /**
@@ -697,12 +852,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       } else {
         await startBackgroundServices();
       }
+
+      // Attach the confirmation WebSocket hub (#172) so frontends receive
+      // push notifications the moment a transaction confirms. `httpServer` is
+      // assigned synchronously by app.listen() before this callback fires.
+      attachConfirmationHub(httpServer!);
     });
 
     registerWorkerShutdownHandler((reason) => {
       void gracefulShutdown(reason);
     });
-    registerShutdownHandler(gracefulShutdown);
 
     process.on("SIGTERM", () => {
       void gracefulShutdown("SIGTERM");

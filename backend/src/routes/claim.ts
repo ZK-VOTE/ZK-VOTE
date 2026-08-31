@@ -22,6 +22,7 @@ import {
 } from "../services/stellar.js";
 import {
   authGuard,
+  bodyLimit,
   claimLimiter,
   queryLimiter,
   validateBody,
@@ -38,6 +39,7 @@ const router = Router();
  */
 router.post(
   "/api/v1/claim",
+  bodyLimit("100kb"),
   authGuard,
   claimLimiter,
   validateBody(claimSchema),
@@ -238,6 +240,7 @@ router.post(
 // Also support POST /claim alias for backwards compat (query tests may hit /claim)
 router.post(
   "/claim",
+  bodyLimit("100kb"),
   authGuard,
   claimLimiter,
   validateBody(claimSchema),

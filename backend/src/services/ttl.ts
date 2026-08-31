@@ -159,8 +159,10 @@ interface SubmitCallResult {
 
 let renewalTimerId: ReturnType<typeof setInterval> | null = null;
 
-function getContractId(envKey: keyof TtlServiceDeps["contractIds"]): string | null {
-  const val = deps().contractIds[envKey];
+const NULLIFIER_GRACE_SECONDS = 72 * 60 * 60;
+
+function getContractId(envKey: keyof typeof config): string | null {
+  const val = config[envKey];
   if (typeof val === "string" && isValidContractId(val)) return val;
   return null;
 }
@@ -256,6 +258,50 @@ function makeDaoIdScVal(daoId: number): StellarSdk.xdr.ScVal {
   return StellarSdk.nativeToScVal(daoId, { type: "u64" });
 }
 
+async function getProposalEndTime(
+  contractId: string,
+  daoId: number,
+  proposalId: number,
+): Promise<number | null> {
+  try {
+    const rpcServer = server as StellarSdk.rpc.Server;
+    const sourceAccount = await rpcServer.getAccount(
+      relayerKeypair.publicKey(),
+    );
+    const contract = new StellarSdk.Contract(contractId);
+
+    const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+      fee: "100",
+      networkPassphrase: config.networkPassphrase,
+    })
+      .addOperation(
+        contract.call(
+          "get_proposal_end_time",
+          makeDaoIdScVal(daoId),
+          StellarSdk.nativeToScVal(proposalId, { type: "u64" }),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const simResult = await callWithTimeout(
+      () => rpcServer.simulateTransaction(tx),
+      "ttl_get_proposal_end_time",
+    );
+
+    if (
+      !StellarSdk.rpc.Api.isSimulationSuccess(simResult) ||
+      !simResult.result?.retval
+    ) {
+      return null;
+    }
+    const endTime = Number(StellarSdk.scValToNative(simResult.result.retval));
+    return endTime === 0 ? null : endTime;
+  } catch {
+    return null;
+  }
+}
+
 async function hasActiveProposals(
   contractId: string,
   daoId: number,
@@ -290,7 +336,21 @@ async function hasActiveProposals(
     }
 
     const count = Number(StellarSdk.scValToNative(simResult.result.retval));
-    return count > 0;
+    if (count === 0) return false;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const recentLookback = Math.min(count, 5);
+    for (let offset = 0; offset < recentLookback; offset++) {
+      const pid = count - offset;
+      const endTime = await getProposalEndTime(contractId, daoId, pid);
+      if (endTime === null) {
+        return true;
+      }
+      if (endTime + NULLIFIER_GRACE_SECONDS >= nowSec) {
+        return true;
+      }
+    }
+    return false;
   } catch {
     return true;
   }

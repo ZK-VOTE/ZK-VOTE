@@ -677,7 +677,7 @@ export function getEventsForDao(
   daoId: number,
   options: EventQueryOptions = {},
 ): EventsResult {
-  db.initDb(); // Ensure DB is initialized
+  db.getReadDb(); // Ensure DB is initialized
   const result = db.getEventsForDao(daoId, options);
   return {
     events: result.events,
@@ -689,7 +689,7 @@ export function getEventsForDao(
  * Get all indexed DAOs
  */
 export function getIndexedDaos(): number[] {
-  db.initDb();
+  db.getReadDb();
   const daos = db.getIndexedDaos();
   return daos.map((d) => d.daoId);
 }
@@ -760,7 +760,7 @@ export async function startStreamingIndexer(
  * Get indexer status
  */
 export function getIndexerStatus(): IndexerStatus {
-  db.initDb();
+  db.getReadDb();
   const status = db.getDbStatus();
   return {
     isRunning: isPolling,
@@ -783,7 +783,7 @@ export function addManualEvent(
   data: Record<string, unknown>,
   ledger = 0,
 ): void {
-  db.initDb();
+  db.getWriteDb();
   db.addEvent({
     daoId: Number(daoId),
     type,
@@ -805,7 +805,7 @@ export function notifyEvent(
   data: Record<string, unknown>,
   txHash: string,
 ): void {
-  db.initDb();
+  db.getWriteDb();
   db.addPendingEvent(daoId, type, data, txHash);
   log("info", "event_notified", { daoId, type, txHash });
 }
@@ -823,7 +823,7 @@ export function getRpcServer(): StellarSdk.rpc.Server | null {
  * This handles DAOs created before the indexer started watching
  */
 export function ensureDaoCreateEvent(daoId: number, daoData: DaoData): boolean {
-  db.initDb();
+  db.getWriteDb();
 
   // Check if dao_create event already exists for this DAO
   const existingEvents = db.getEventsForDao(daoId, {

@@ -97,3 +97,21 @@ if (mismatches.length) {
   console.log("\n✅ Drift guard PASSED — no drift");
   process.exit(0);
 }
+
+// Check NUM_PUBLIC_SIGNALS mismatch (IDL source-of-truth drift)
+try {
+  const votingLib = fs.readFileSync(path.resolve(__dirname, "../contracts/voting/src/lib.rs"), "utf-8");
+  const frontendTypes = fs.readFileSync(path.resolve(__dirname, "../frontend/src/types/index.ts"), "utf-8");
+  
+  const rustMatch = votingLib.match(/NUM_PUBLIC_SIGNALS:\s*u32\s*=\s*(\d+)/);
+  const tsMatch = frontendTypes.match(/NUM_PUBLIC_SIGNALS\s*=\s*(\d+)/);
+  
+  if (rustMatch && tsMatch) {
+    if (rustMatch[1] !== tsMatch[1]) {
+      console.error(`❌ Drift guard FAILED: NUM_PUBLIC_SIGNALS mismatch! Rust: ${rustMatch[1]}, TS: ${tsMatch[1]}`);
+      process.exit(1);
+    }
+  }
+} catch (e) {
+  console.error("Failed to check NUM_PUBLIC_SIGNALS drift", e);
+}

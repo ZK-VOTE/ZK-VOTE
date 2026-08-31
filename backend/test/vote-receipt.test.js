@@ -4,7 +4,20 @@ import {
   storeVoteReceipt,
   getVoteReceipt,
   getVoteReceiptsByDao,
+  upsertDao,
 } from "../src/services/db.js";
+
+// vote_receipts.dao_id references daos(id); seed the DAOs these tests insert
+// against so the FK constraint holds regardless of shared database state.
+for (const id of [1, 2, 42, 43]) {
+  upsertDao({
+    id,
+    name: `test-dao-${id}`,
+    creator: "GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMN",
+    membership_open: true,
+    members_can_propose: true,
+  });
+}
 
 test("vote-receipt: stores and retrieves vote receipt", () => {
   const testNullifier = `test-nullifier-${Date.now()}`;
@@ -12,6 +25,7 @@ test("vote-receipt: stores and retrieves vote receipt", () => {
   const proposalId = 123;
   const daoId = 1;
 
+  ensureDao(daoId);
   storeVoteReceipt(testNullifier, testTxHash, proposalId, daoId, "confirmed");
 
   const receipt = getVoteReceipt(testNullifier);
@@ -35,6 +49,8 @@ test("vote-receipt: handles duplicate nullifier idempotently", () => {
   const testTxHash1 = "hash-" + Math.random().toString(36);
   const testTxHash2 = "hash-" + Math.random().toString(36);
 
+  ensureDao(1);
+  ensureDao(2);
   storeVoteReceipt(testNullifier, testTxHash1, 123, 1, "confirmed");
   storeVoteReceipt(testNullifier, testTxHash2, 456, 2, "confirmed");
 
@@ -52,6 +68,7 @@ test("vote-receipt: stores receipt with pending status", () => {
   const testNullifier = `pending-${Date.now()}`;
   const testTxHash = "hash-" + Math.random().toString(36);
 
+  ensureDao(1);
   storeVoteReceipt(testNullifier, testTxHash, 789, 1, "pending");
 
   const receipt = getVoteReceipt(testNullifier);
@@ -64,6 +81,7 @@ test("vote-receipt: stores receipt with failed status", () => {
   const testNullifier = `failed-${Date.now()}`;
   const testTxHash = "hash-" + Math.random().toString(36);
 
+  ensureDao(1);
   storeVoteReceipt(testNullifier, testTxHash, 999, 1, "failed");
 
   const receipt = getVoteReceipt(testNullifier);
@@ -77,6 +95,7 @@ test("vote-receipt: retrieves receipts by DAO", () => {
   const nullifier1 = `dao-receipt-1-${Date.now()}`;
   const nullifier2 = `dao-receipt-2-${Date.now()}`;
 
+  ensureDao(daoId);
   storeVoteReceipt(nullifier1, "hash-1", 100, daoId, "confirmed");
   storeVoteReceipt(nullifier2, "hash-2", 101, daoId, "confirmed");
 
@@ -103,6 +122,7 @@ test("vote-receipt: respects limit and offset", () => {
     `offset-test-${i}-${Date.now()}`.slice(0, 50),
   );
 
+  ensureDao(daoId);
   nullifiers.forEach((n, i) => {
     storeVoteReceipt(n, `hash-${i}`, 200 + i, daoId, "confirmed");
   });

@@ -115,7 +115,9 @@ export function getCache(): CircuitRegistryCache {
   return cache;
 }
 
-export async function getCurrentVersion(circuitId: string): Promise<number | null> {
+export async function getCurrentVersion(
+  circuitId: string,
+): Promise<number | null> {
   const cached = versionCache.get(circuitId);
   if (cached && Date.now() - cached.fetchedAt < VERSION_TTL_MS) {
     return cached.version;
@@ -139,7 +141,10 @@ export function isStaleVersion(requested: number, current: number): boolean {
   return requested < current;
 }
 
-export function detectVKMismatch(proposalVersion: number, clientVersion: number): boolean {
+export function detectVKMismatch(
+  proposalVersion: number,
+  clientVersion: number,
+): boolean {
   return proposalVersion !== clientVersion;
 }
 
@@ -341,4 +346,221 @@ export async function getDaoCurrentCircuit(
   const response = await simulateContractCall("get_dao_current_circuit", args);
   if (!response?.result) return null;
   return response.result.retval.str()?.toString() ?? null;
+}
+
+export async function proposeVkUpgrade(args: {
+  circuitId: string;
+  circuitType: "Vote" | "Comment";
+  newVk: CircuitVKResult["vk"];
+  newWasmHash: string;
+  timelockDuration: number;
+  requiredApprovals: number;
+  daoId?: number;
+  proposer: string;
+}): Promise<number> {
+  const {
+    circuitId,
+    circuitType,
+    newVk,
+    newWasmHash,
+    timelockDuration,
+    requiredApprovals,
+    daoId,
+    proposer,
+  } = args;
+
+  const vkArgs = [
+    StellarSdk.nativeToScVal(circuitId, { type: "string" }),
+    StellarSdk.nativeToScVal(circuitType, { type: "symbol" }),
+    StellarSdk.nativeToScVal(
+      {
+        alpha: newVk.alpha,
+        beta: newVk.beta,
+        gamma: newVk.gamma,
+        delta: newVk.delta,
+        ic: newVk.ic,
+      },
+      { type: "map" },
+    ),
+    StellarSdk.nativeToScVal(Buffer.from(newWasmHash, "hex"), { type: "bytes" }),
+    StellarSdk.nativeToScVal(timelockDuration, { type: "u64" }),
+    StellarSdk.nativeToScVal(requiredApprovals, { type: "u32" }),
+    StellarSdk.nativeToScVal(daoId ?? null, { type: "u64" }),
+    StellarSdk.nativeToScVal(proposer, { type: "address" }),
+  ];
+
+  const response = await simulateContractCall("propose_vk_upgrade", vkArgs);
+  if (!response?.result) {
+    throw new Error("Failed to propose VK upgrade");
+  }
+  return Number(response.result.retval.u32?.toString() ?? response.result.retval.i32?.toString() ?? 0);
+}
+
+export async function approveVkUpgrade(proposalId: number, approver: string): Promise<void> {
+  const args = [
+    StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
+    StellarSdk.nativeToScVal(approver, { type: "address" }),
+  ];
+
+  const response = await simulateContractCall("approve_vk_upgrade", args);
+  if (StellarSdk.rpc.Api.isSimulationError(response)) {
+    throw new Error(response.error);
+  }
+}
+
+export async function executeVkUpgrade(proposalId: number, executor: string): Promise<void> {
+  const args = [
+    StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
+    StellarSdk.nativeToScVal(executor, { type: "address" }),
+  ];
+
+  const response = await simulateContractCall("execute_vk_upgrade", args);
+  if (StellarSdk.rpc.Api.isSimulationError(response)) {
+    throw new Error(response.error);
+  }
+}
+
+export async function cancelVkUpgrade(proposalId: number, canceller: string): Promise<void> {
+  const args = [
+    StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
+    StellarSdk.nativeToScVal(canceller, { type: "address" }),
+  ];
+
+  const response = await simulateContractCall("cancel_vk_upgrade", args);
+  if (StellarSdk.rpc.Api.isSimulationError(response)) {
+    throw new Error(response.error);
+  }
+}
+
+export async function getVkProposal(proposalId: number): Promise<{
+  id: number;
+  circuitId: string;
+  circuitType: "Vote" | "Comment";
+  proposedBy: string;
+  proposedAt: number;
+  executeAfter: number;
+  requiredApprovals: number;
+  approvals: number;
+  status: "Pending" | "Approved" | "Executed" | "Cancelled";
+  daoId?: number;
+} | null> {
+  const args = [StellarSdk.nativeToScVal(proposalId, { type: "u32" })];
+
+  const response = await simulateContractCall("get_vk_proposal", args);
+  if (!response?.result) return null;
+
+  const scVal = response.result.retval;
+  const mapEntries = scVal.map() ?? [];
+  const parsed: Record<string, unknown> = {};
+
+  for (const entry of mapEntries) {
+    const key = entry.key().sym()?.toString() ?? "";
+    const val = entry.val();
+    switch (key) {
+      case "id":
+        parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+        break;
+      case "circuit_id":
+        parsed[key] = val.str()?.toString() ?? val.sym()?.toString() ?? "";
+        break;
+      case "circuit_type":
+        parsed[key] = val.sym()?.toString() ?? "";
+        break;
+      case "proposed_by":
+        parsed[key] = val.addr()?.toString() ?? "";
+        break;
+      case "proposed_at":
+      case "execute_after":
+        parsed[key] = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+        break;
+      case "required_approvals":
+      case "approvals":
+        parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+        break;
+      case "status":
+        parsed[key] = val.sym()?.toString() ?? "";
+        break;
+      case "dao_id":
+        parsed[key] = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+        break;
+    }
+  }
+
+  return {
+    id: parsed.id as number,
+    circuitId: parsed.circuit_id as string,
+    circuitType: (parsed.circuit_type as "Vote" | "Comment") ?? "Vote",
+    proposedBy: parsed.proposed_by as string,
+    proposedAt: parsed.proposed_at as number,
+    executeAfter: parsed.execute_after as number,
+    requiredApprovals: parsed.required_approvals as number,
+    approvals: parsed.approvals as number,
+    status: parsed.status as "Pending" | "Approved" | "Executed" | "Cancelled",
+    daoId: parsed.dao_id as number | undefined,
+  };
+}
+
+export async function getDaoVkProposal(daoId: number): Promise<{
+  id: number;
+  circuitId: string;
+  circuitType: "Vote" | "Comment";
+  proposedBy: string;
+  proposedAt: number;
+  executeAfter: number;
+  requiredApprovals: number;
+  approvals: number;
+  status: "Pending" | "Approved" | "Executed" | "Cancelled";
+} | null> {
+  const args = [StellarSdk.nativeToScVal(daoId, { type: "u64" })];
+
+  const response = await simulateContractCall("get_dao_vk_proposal", args);
+  if (!response?.result) return null;
+
+  const scVal = response.result.retval;
+  if (!scVal.map()) return null;
+
+  const mapEntries = scVal.map() ?? [];
+  const parsed: Record<string, unknown> = {};
+
+  for (const entry of mapEntries) {
+    const key = entry.key().sym()?.toString() ?? "";
+    const val = entry.val();
+    switch (key) {
+      case "id":
+        parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+        break;
+      case "circuit_id":
+        parsed[key] = val.str()?.toString() ?? val.sym()?.toString() ?? "";
+        break;
+      case "circuit_type":
+        parsed[key] = val.sym()?.toString() ?? "";
+        break;
+      case "proposed_by":
+        parsed[key] = val.addr()?.toString() ?? "";
+        break;
+      case "proposed_at":
+      case "execute_after":
+        parsed[key] = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+        break;
+      case "required_approvals":
+      case "approvals":
+        parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+        break;
+      case "status":
+        parsed[key] = val.sym()?.toString() ?? "";
+        break;
+    }
+  }
+
+  return {
+    id: parsed.id as number,
+    circuitId: parsed.circuit_id as string,
+    circuitType: (parsed.circuit_type as "Vote" | "Comment") ?? "Vote",
+    proposedBy: parsed.proposed_by as string,
+    proposedAt: parsed.proposed_at as number,
+    executeAfter: parsed.execute_after as number,
+    requiredApprovals: parsed.required_approvals as number,
+    approvals: parsed.approvals as number,
+    status: parsed.status as "Pending" | "Approved" | "Executed" | "Cancelled",
+  };
 }

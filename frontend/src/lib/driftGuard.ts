@@ -19,18 +19,30 @@ export async function checkContractDrift(
     for (const [key, val] of Object.entries(expected)) {
       const frontendVal = (CONTRACTS as Record<string, string>)[key];
       if (frontendVal && frontendVal !== val) {
-        mismatches.push({ field: key, frontend: frontendVal, expected: val as string });
+        mismatches.push({
+          field: key,
+          frontend: frontendVal,
+          expected: val as string,
+        });
       }
     }
   } else {
     for (const [key, val] of Object.entries(CONTRACTS)) {
       if (!/^C[A-Z2-7]{55}$/.test(val as string)) {
-        mismatches.push({ field: key, frontend: val as string, expected: "valid C... address" });
+        mismatches.push({
+          field: key,
+          frontend: val as string,
+          expected: "valid C... address",
+        });
       }
     }
     // Also ensure network config is consistent
     if (!NETWORK_CONFIG.rpcUrl || !NETWORK_CONFIG.networkPassphrase) {
-      mismatches.push({ field: "NETWORK_CONFIG", frontend: JSON.stringify(NETWORK_CONFIG), expected: "valid network config" });
+      mismatches.push({
+        field: "NETWORK_CONFIG",
+        frontend: JSON.stringify(NETWORK_CONFIG),
+        expected: "valid network config",
+      });
     }
   }
   const report: DriftReport = {
@@ -46,7 +58,9 @@ export async function checkContractDrift(
 
 export function assertNoDrift(report: DriftReport): void {
   if (report.driftDetected) {
-    throw new Error(`Contract drift detected: ${JSON.stringify(report.mismatches, null, 2)}`);
+    throw new Error(
+      `Contract drift detected: ${JSON.stringify(report.mismatches, null, 2)}`,
+    );
   }
 }
 

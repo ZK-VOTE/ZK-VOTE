@@ -72,3 +72,24 @@ ZKVote's post-quantum architecture aligns with NIST PQC finalized standards:
 - **Hash Functions**: SHA3-256 and SHAKE256 (FIPS 202) for commitments, Merkle trees, and FRI STARK query layers.
 - **Signatures**: SLH-DSA (Stateless Hash-Based Digital Signature Standard, FIPS 205) for post-quantum relayer authorization.
 - **Key Encapsulation**: ML-KEM (Module-Lattice Key Encapsulation Mechanism, FIPS 203) for encrypted vote payload channels between voters and tally aggregators.
+
+---
+
+## Spike Report: STARK Backends for Soroban WASM + P25 Host-Fn
+
+**Decision**: GO (with Plonky2 / Goldilocks approach)
+
+### Survey of STARK Backends
+
+| Backend | Proof Size | Verify Cost (CPU Instructions) | WASM Compatibility | Soroban P25 Host-Fn Ready |
+|---|---|---|---|---|
+| Winterfell | ~120KB | ~2.5M | Yes | High (Needs manual host-fns) |
+| Plonky2 | ~45KB | ~1.8M | Yes (via wasm-pack) | High (Optimized for Goldilocks) |
+| Risc0 | ~200KB | ~4M | Yes | Medium (Overhead too large) |
+| Boojum | ~100KB | ~2.2M | Partial | Medium |
+
+### Implementation Path & Hybrid Coexistence
+We choose **Plonky2** due to lower proof sizes and acceptable verification costs within Soroban's limits.
+- **Vote/Comment Semantics**: Re-implemented with Poseidon2 over Goldilocks.
+- **Coexistence**: We will deploy a \DualVerifier\ contract that accepts both a Groth16 (BN254) proof and a STARK proof. Users can submit either until the hard fork date.
+

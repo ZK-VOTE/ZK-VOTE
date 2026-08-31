@@ -14,6 +14,8 @@ interface BridgeVoteState {
   gasEstimate?: string;
 }
 
+const PROOF_GENERATION_DELAY_MS = import.meta.env.MODE === "test" ? 0 : 2000;
+
 /**
  * BridgePanel - Cross-chain voting UI
  *
@@ -82,7 +84,9 @@ export function BridgePanel({
       // 4. Wait for VoteForwarded event
 
       // Simulate proof generation
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) =>
+        setTimeout(resolve, PROOF_GENERATION_DELAY_MS),
+      );
 
       setVoteState({ status: "submitting" });
 

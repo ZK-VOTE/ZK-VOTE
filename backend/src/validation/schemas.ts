@@ -45,6 +45,26 @@ export const bn254Field = z.string().refine(
 );
 
 /**
+ * BN254 field element — anonymous-path variant.
+ * Uses a single generic message so a probing relayer cannot learn which
+ * sub-check (format / length / modulus bound) tripped.
+ */
+const bn254FieldAnon = z.string().refine(
+  (val) => {
+    const hex = val.startsWith("0x") ? val.slice(2) : val;
+    if (hex.length === 0 || hex.length > 64) return false;
+    if (!/^[0-9a-fA-F]*$/.test(hex)) return false;
+    try {
+      const value = BigInt("0x" + hex);
+      return value < BN254_MODULUS;
+    } catch {
+      return false;
+    }
+  },
+  { message: "Invalid submission" },
+);
+
+/**
  * Groth16 proof component validators
  *
  * BN254 Point Encoding (CAP-74 / EIP-196/197):
@@ -64,6 +84,9 @@ export const bn254Field = z.string().refine(
  * Soroban host's job at proof-verification time (see module comment above).
  */
 function coordinatesInFieldRange(paddedHex: string, count: number): boolean {
+  // Non-hex input (e.g. a malformed proof from a client) must fail validation
+  // cleanly instead of throwing a SyntaxError out of BigInt() (#172).
+  if (!/^[0-9a-fA-F]+$/.test(paddedHex)) return false;
   const coordHexLen = paddedHex.length / count;
   for (let i = 0; i < count; i++) {
     const coordHex = paddedHex.slice(i * coordHexLen, (i + 1) * coordHexLen);
@@ -116,6 +139,41 @@ const proofC = hexString(128).refine(
 );
 
 /**
+ * Anonymous-path variants — single generic message per component so a
+ * probing relayer cannot distinguish "all zeros" from "coordinate out of
+ * range" from "invalid hex length".
+ */
+const proofAAnon = hexString(128).refine(
+  (val) => {
+    const hex = val.startsWith("0x") ? val.slice(2) : val;
+    const padded = hex.padStart(128, "0");
+    if (/^0*$/.test(padded)) return false;
+    return coordinatesInFieldRange(padded, 2);
+  },
+  { message: "Invalid submission" },
+);
+
+const proofBAnon = hexString(256).refine(
+  (val) => {
+    const hex = val.startsWith("0x") ? val.slice(2) : val;
+    const padded = hex.padStart(256, "0");
+    if (/^0*$/.test(padded)) return false;
+    return coordinatesInFieldRange(padded, 4);
+  },
+  { message: "Invalid submission" },
+);
+
+const proofCAnon = hexString(128).refine(
+  (val) => {
+    const hex = val.startsWith("0x") ? val.slice(2) : val;
+    const padded = hex.padStart(128, "0");
+    if (/^0*$/.test(padded)) return false;
+    return coordinatesInFieldRange(padded, 2);
+  },
+  { message: "Invalid submission" },
+);
+
+/**
  * Groth16 proof object
  */
 export const groth16Proof = z.object({
@@ -123,6 +181,22 @@ export const groth16Proof = z.object({
   b: proofB,
   c: proofC,
 });
+
+/**
+ * Groth16 proof object — anonymous-path variant.
+ * Uses the generic-message component validators above so no single
+ * sub-check leak is exposed to a probing relayer.
+ */
+export const groth16ProofAnon = z.object(
+  {
+    a: proofAAnon,
+    b: proofBAnon,
+    c: proofCAnon,
+  },
+  {
+    errorMap: () => ({ message: "Invalid submission" }),
+  },
+);
 
 // ============================================
 // ROUTE PARAMETER VALIDATORS
@@ -149,7 +223,17 @@ export const positiveInteger = z
  */
 export const ipfsCid = z.string().refine(
   (val) => {
-    // CIDv0: exact-length base58-encoded Qm... digest.
+    if (!val || typeof val !== "string") return false;
+    const trimmed = val.trim();
+    if (/[/?#\s\0\r\n\t]/.test(trimmed)) return false;
+    // CIDv0: Qm + 44 base58 chars (exact length)
+    if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(trimmed)) return true;
+    // CIDv1: bafy/bafk + base32 content (59+ chars)
+    if ((trimmed.startsWith("bafy") || trimmed.startsWith("bafk")) && trimmed.length >= 59) {
+      const content = trimmed.slice(4);
+      return /^[a-z2-7]+$/.test(content);
+    }
+    // CIDv0: exact-length Bitcoin base58 encoding.
     if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(val)) return true;
     // CIDv1: bafy... or bafk... (59+ chars).
     if ((val.startsWith("bafy") || val.startsWith("bafk")) && val.length >= 59)
@@ -315,9 +399,9 @@ export const voteSchema = z
       required_error: "choice is required",
       invalid_type_error: "choice must be a boolean",
     }),
-    nullifier: bn254Field.optional(),
-    root: bn254Field.optional(),
-    proof: groth16Proof.optional(),
+    nullifier: bn254FieldAnon.optional(),
+    root: bn254FieldAnon.optional(),
+    proof: groth16ProofAnon.optional(),
     nonce: z.string().optional(),
     timestamp: z.number().int().optional(),
     walletAddress: z.string().optional(),
@@ -337,8 +421,7 @@ export const voteSchema = z
     (data) =>
       data.encryptedPayload || (data.nullifier && data.root && data.proof),
     {
-      message:
-        "Either encryptedPayload or full vote payload (nullifier, root, proof) must be provided",
+      message: "Invalid submission",
     },
   );
 
@@ -348,24 +431,44 @@ export type VoteRequest = z.infer<typeof voteSchema>;
 // ANONYMOUS COMMENT SCHEMA
 // ============================================
 
-export const anonymousCommentSchema = z.object({
-  daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
-  proposalId: z
-    .number()
-    .int()
-    .nonnegative("proposalId must be a non-negative integer"),
-  contentCid: ipfsCid,
-  parentId: z.number().int().nonnegative().nullable().optional(),
-  voteChoice: z.boolean({
-    required_error: "voteChoice is required",
-    invalid_type_error: "voteChoice must be a boolean",
-  }),
-  nullifier: bn254Field,
-  root: bn254Field,
-  proof: groth16Proof,
-  serverId: z.string().optional(),
-  workNonce: z.string().optional(),
-});
+export const anonymousCommentSchema = z
+  .object(
+    {
+      daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+      proposalId: z
+        .number()
+        .int()
+        .nonnegative("proposalId must be a non-negative integer"),
+      contentCid: z
+        .string()
+        .refine(
+          (val) => {
+            if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(val)) return true;
+            if ((val.startsWith("bafy") || val.startsWith("bafk")) && val.length >= 59)
+              return true;
+            return false;
+            if (!val || typeof val !== "string") return false;
+            const trimmed = val.trim();
+            if (/[/?\\#\s\0\r\n\t]/.test(trimmed)) return false;
+            return CIDV0_REGEX.test(trimmed) || CIDV1_REGEX.test(trimmed);
+          },
+          { message: "Invalid submission" },
+        ),
+      parentId: z.number().int().nonnegative().nullable().optional(),
+      voteChoice: z.boolean({
+        required_error: "Invalid submission",
+        invalid_type_error: "Invalid submission",
+      }),
+      nullifier: bn254FieldAnon,
+      root: bn254FieldAnon,
+      proof: groth16ProofAnon,
+      serverId: z.string().optional(),
+      workNonce: z.string().optional(),
+    },
+    {
+      errorMap: () => ({ message: "Invalid submission" }),
+    },
+  );
 
 export type AnonymousCommentRequest = z.infer<typeof anonymousCommentSchema>;
 
@@ -396,21 +499,26 @@ export type DeleteCommentRequest = z.infer<typeof deleteCommentSchema>;
 // ANTI-SPAM: FLAG SCHEMA
 // ============================================
 
-export const flagCommentSchema = z.object({
-  daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
-  proposalId: z
-    .number()
-    .int()
-    .nonnegative("proposalId must be a non-negative integer"),
-  commentId: z
-    .number()
-    .int()
-    .nonnegative("commentId must be a non-negative integer"),
-  flaggerCommitment: bn254Field,
-  flaggerNullifier: bn254Field,
-  serverId: z.string(),
-  workNonce: z.string(),
-});
+export const flagCommentSchema = z.object(
+  {
+    daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+    proposalId: z
+      .number()
+      .int()
+      .nonnegative("proposalId must be a non-negative integer"),
+    commentId: z
+      .number()
+      .int()
+      .nonnegative("commentId must be a non-negative integer"),
+    flaggerCommitment: bn254FieldAnon,
+    flaggerNullifier: bn254FieldAnon,
+    serverId: z.string(),
+    workNonce: z.string(),
+  },
+  {
+    errorMap: () => ({ message: "Invalid submission" }),
+  },
+);
 
 export type FlagCommentRequest = z.infer<typeof flagCommentSchema>;
 
@@ -523,12 +631,33 @@ export const eventsQuerySchema = cursorPaginationSchema.extend({
 export const daosQuerySchema = limitOffsetPaginationSchema
   .extend({
     user: stellarAddress.optional(),
+    /** Free-text search against DAO name (case-insensitive substring match) */
+    search: z.string().min(1).max(100).optional(),
+    /** Filter by membership type: open | closed */
+    membershipType: z.enum(["open", "closed"]).optional(),
     cursor: z.coerce.number().int().min(0).optional(),
   })
   .transform(({ cursor, offset, ...rest }) => ({
     ...rest,
     offset: cursor ?? offset,
   }));
+
+// ============================================
+// PROPOSAL SEARCH / FILTER SCHEMA (issue #377)
+// ============================================
+
+/**
+ * Query-string schema for the GET /proposals/:daoId endpoint.
+ *
+ * - `status`  : filter by proposal lifecycle state (active / closed / all)
+ * - `search`  : free-text substring match on proposal title stored in event data
+ * - `limit`   : page size (1 – 500, default 100)
+ * - `offset`  : zero-based page start
+ */
+export const proposalsQuerySchema = limitOffsetPaginationSchema.extend({
+  status: z.enum(["active", "closed", "all"]).default("all"),
+  search: z.string().min(1).max(100).optional(),
+});
 
 export const commentCountQuerySchema = limitOffsetPaginationSchema.extend({
   types: z
@@ -545,17 +674,22 @@ export const commentNonceQuerySchema = z.object({
 // VOTE-TO-EARN CLAIM SCHEMA
 // ============================================
 
-export const claimSchema = z.object({
-  daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
-  proposalId: z
-    .number()
-    .int()
-    .nonnegative("proposalId must be a non-negative integer"),
-  voteNullifier: bn254Field,
-  claimNullifier: bn254Field,
-  root: bn254Field,
-  proof: groth16Proof,
-});
+export const claimSchema = z.object(
+  {
+    daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+    proposalId: z
+      .number()
+      .int()
+      .nonnegative("proposalId must be a non-negative integer"),
+    voteNullifier: bn254FieldAnon,
+    claimNullifier: bn254FieldAnon,
+    root: bn254FieldAnon,
+    proof: groth16ProofAnon,
+  },
+  {
+    errorMap: () => ({ message: "Invalid submission" }),
+  },
+);
 
 export type ClaimRequest = z.infer<typeof claimSchema>;
 

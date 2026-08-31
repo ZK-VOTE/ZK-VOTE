@@ -682,7 +682,7 @@ let writeDb: DatabaseType | null = null;
 /** Readonly connection — API query path (same file, WAL concurrent readers). */
 let readDb: DatabaseType | null = null;
 
-let activeDbFile: string = DB_FILE;
+let activeDbFile: string | null = DB_FILE;
 let writeHealthy = true;
 let writeFailureReason: string | null = null;
 let lastWriteAtMs = 0;
@@ -707,13 +707,14 @@ function updateConnectionGauges(): void {
   try {
     sink.setConnectionsActive(countActiveConnections());
     sink.setWriteHealthy(writeHealthy && Boolean(writeDb));
-    sink.setWalSizeBytes(getWalSizeBytes(activeDbFile));
+    sink.setWalSizeBytes(getWalSizeBytes(activeDbFile ?? DB_FILE));
   } catch {
     // Metrics sink may throw if registry is torn down in tests
   }
 }
 
-export function getWalSizeBytes(dbFile: string = activeDbFile): number {
+export function getWalSizeBytes(dbFile: string | null = activeDbFile): number {
+  if (!dbFile) return 0;
   const walPath = `${dbFile}-wal`;
   try {
     if (fs.existsSync(walPath)) return fs.statSync(walPath).size;
@@ -1253,6 +1254,23 @@ export function initDb(dbPath?: string): DatabaseType {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_vote_submissions_nullifier ON vote_submissions(nullifier_hash);
+
+    CREATE TABLE IF NOT EXISTS vote_jobs (
+      id TEXT PRIMARY KEY,
+      nullifier_hash TEXT NOT NULL,
+      dao_id INTEGER NOT NULL,
+      proposal_id INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      tx_hash TEXT,
+      error_message TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_vote_jobs_status ON vote_jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_vote_jobs_nullifier ON vote_jobs(nullifier_hash);
 
     -- Auth tokens table: stores hashed authentication tokens with expiration and metadata
     CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -2180,11 +2198,6 @@ export function getEventsForDao(
   const database = getReadDb();
   const tableName = partitionTableName(daoId); // Validates daoId
 
-  // Reads must not run DDL — missing partitions return empty results.
-  if (!partitionTableExists(database, daoId)) {
-    return { events: [], total: 0, daoId };
-  }
-
   const {
     limit = 100,
     offset = 0,
@@ -2196,20 +2209,30 @@ export function getEventsForDao(
     cursorField = "id",
   } = options;
 
+  // SECURITY: Validate ORDER BY and event-type filters up front, before any
+  // early return, so malicious input is rejected even when the partition does
+  // not exist yet (input validation must not depend on data state).
+  const { column: orderColumn, direction } = validateOrderBy(
+    orderBy,
+    orderDirection,
+  );
+  const validatedTypes =
+    types && types.length > 0 ? validateEventTypes(types) : null;
+
   // SECURITY: Validate limit and offset
   const validLimit = Math.max(1, Math.min(limit, 1000));
   const validOffset = Math.max(0, offset);
 
-  // SECURITY: Validate filters before returning early or compiling a query.
-  if (types && types.length > 0) validateEventTypes(types);
-  const { column: orderColumn, direction } = validateOrderBy(orderBy, orderDirection);
+  // Reads must not run DDL — missing partitions return empty results.
+  if (!partitionTableExists(database, daoId)) {
+    return { events: [], total: 0, daoId };
+  }
 
   let query = kysely
     .selectFrom(sql<any>`${sql.raw(tableName)}`.as("events"))
     .selectAll();
 
-  if (types && types.length > 0) {
-    const validatedTypes = validateEventTypes(types);
+  if (validatedTypes) {
     query = query.where("type", "in", validatedTypes);
   }
 
@@ -2250,8 +2273,8 @@ export function getEventsForDao(
     .selectFrom(sql<any>`${sql.raw(tableName)}`.as("events"))
     .select(sql<number>`COUNT(*)`.as("total"));
 
-  if (types && types.length > 0) {
-    countQuery = countQuery.where("type", "in", validateEventTypes(types));
+  if (validatedTypes) {
+    countQuery = countQuery.where("type", "in", validatedTypes);
   }
   if (verifiedOnly) {
     countQuery = countQuery.where("verified", "=", 1);
@@ -2473,6 +2496,21 @@ export interface VoteSubmissionRow {
   updated_at: number;
 }
 
+export interface VoteJobRow {
+  id: string;
+  nullifier_hash: string;
+  dao_id: number;
+  proposal_id: number;
+  payload: string;
+  status: "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "DEAD_LETTER";
+  attempts: number;
+  max_attempts: number;
+  tx_hash: string | null;
+  error_message: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 /**
  * Look up an existing vote submission by nullifier hash.
  */
@@ -2539,6 +2577,85 @@ export function cleanupExpiredVoteSubmissions(ttlMs: number): number {
     )
     .run(cutoff);
   return result.changes;
+}
+
+export function createVoteJob(
+  jobId: string,
+  nullifierHash: string,
+  daoId: number,
+  proposalId: number,
+  payload: string,
+): VoteJobRow {
+  const database = getWriteDb();
+  const now = Date.now();
+  database
+    .prepare(
+      `INSERT INTO vote_jobs (id, nullifier_hash, dao_id, proposal_id, payload, status, attempts, max_attempts, tx_hash, error_message, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'QUEUED', 0, 3, NULL, NULL, ?, ?)`,
+    )
+    .run(jobId, nullifierHash, daoId, proposalId, payload, now, now);
+
+  return (
+    getVoteJobById(jobId) ?? {
+      id: jobId,
+      nullifier_hash: nullifierHash,
+      dao_id: daoId,
+      proposal_id: proposalId,
+      payload,
+      status: "QUEUED",
+      attempts: 0,
+      max_attempts: 3,
+      tx_hash: null,
+      error_message: null,
+      created_at: now,
+      updated_at: now,
+    }
+  );
+}
+
+export function getVoteJobById(jobId: string): VoteJobRow | null {
+  const database = getReadDb();
+  const row = database
+    .prepare("SELECT * FROM vote_jobs WHERE id = ?")
+    .get(jobId) as VoteJobRow | undefined;
+  return row ?? null;
+}
+
+export function updateVoteJobStatus(
+  jobId: string,
+  status: VoteJobRow["status"],
+  update: {
+    txHash?: string;
+    errorMessage?: string;
+    attempts?: number;
+  } = {},
+): VoteJobRow | null {
+  const database = getWriteDb();
+  const now = Date.now();
+  const existing = getVoteJobById(jobId);
+  const currentAttempts = update.attempts ?? existing?.attempts ?? 0;
+  const txHash = update.txHash ?? existing?.tx_hash ?? null;
+  const errorMessage = update.errorMessage ?? existing?.error_message ?? null;
+
+  database
+    .prepare(
+      `UPDATE vote_jobs
+       SET status = ?, attempts = ?, tx_hash = ?, error_message = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(status, currentAttempts, txHash, errorMessage, now, jobId);
+
+  return getVoteJobById(jobId);
+}
+
+export function getVoteQueueDepth(): number {
+  const database = getReadDb();
+  const row = database
+    .prepare(
+      "SELECT COUNT(*) AS count FROM vote_jobs WHERE status IN ('QUEUED', 'PROCESSING')",
+    )
+    .get() as { count: number } | undefined;
+  return row?.count ?? 0;
 }
 
 // ============================================
@@ -3472,7 +3589,7 @@ export function createAuthToken(token: {
   rotationGroupId?: string | null;
   isLegacy?: boolean;
 }): void {
-  const database = initDb();
+  const database = getWriteDb();
   const query = `
     INSERT INTO auth_tokens (id, token_hash, client_id, description, expires_at, rotation_group_id, is_legacy)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3491,7 +3608,7 @@ export function createAuthToken(token: {
 }
 
 export function getAuthTokenByHash(tokenHash: string): AuthToken | null {
-  const database = initDb();
+  const database = getReadDb();
   const row = database
     .prepare("SELECT * FROM auth_tokens WHERE token_hash = ?")
     .get(tokenHash) as Record<string, unknown> | undefined;
@@ -3499,7 +3616,7 @@ export function getAuthTokenByHash(tokenHash: string): AuthToken | null {
 }
 
 export function getAuthTokenById(id: string): AuthToken | null {
-  const database = initDb();
+  const database = getReadDb();
   const row = database
     .prepare("SELECT * FROM auth_tokens WHERE id = ?")
     .get(id) as Record<string, unknown> | undefined;
@@ -3507,7 +3624,7 @@ export function getAuthTokenById(id: string): AuthToken | null {
 }
 
 export function getAllAuthTokens(): AuthToken[] {
-  const database = initDb();
+  const database = getReadDb();
   const rows = database
     .prepare("SELECT * FROM auth_tokens ORDER BY created_at DESC")
     .all() as Record<string, unknown>[];
@@ -3516,7 +3633,7 @@ export function getAllAuthTokens(): AuthToken[] {
 
 export function getActiveAuthTokens(): AuthToken[] {
   const now = new Date().toISOString();
-  const database = initDb();
+  const database = getReadDb();
   const rows = database
     .prepare(
       `SELECT * FROM auth_tokens 
@@ -3531,7 +3648,7 @@ export function getActiveAuthTokens(): AuthToken[] {
 export function getValidAuthTokens(transitionMs: number): AuthToken[] {
   const now = new Date().toISOString();
   const transitionCutoff = new Date(Date.now() - transitionMs).toISOString();
-  const database = initDb();
+  const database = getReadDb();
   const rows = database
     .prepare(
       `SELECT * FROM auth_tokens 
@@ -3553,22 +3670,39 @@ export function updateAuthTokenStatus(
   id: string,
   status: AuthToken["status"],
 ): void {
-  const database = initDb();
+  const database = getWriteDb();
   const query = "UPDATE auth_tokens SET status = ? WHERE id = ?";
   logQuery(query, [status, id], "update_auth_token_status");
   database.prepare(query).run(status, id);
 }
 
 export function revokeAuthToken(id: string): void {
-  const database = initDb();
+  const database = getWriteDb();
   const query =
     "UPDATE auth_tokens SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP WHERE id = ?";
   logQuery(query, [id], "revoke_auth_token");
   database.prepare(query).run(id);
 }
 
+/**
+ * Refresh a token record's hash (used by the legacy-token migration when the
+ * RELAYER_AUTH_TOKEN env var changes: the env var is the source of truth, so
+ * the stored hash must track it or the new value would never validate).
+ */
+export function updateAuthTokenHash(
+  id: string,
+  tokenHash: string,
+  expiresAt: string,
+): void {
+  const database = getWriteDb();
+  const query =
+    "UPDATE auth_tokens SET token_hash = ?, status = 'active', expires_at = ?, revoked_at = NULL WHERE id = ?";
+  logQuery(query, [tokenHash, expiresAt, id], "update_auth_token_hash");
+  database.prepare(query).run(tokenHash, expiresAt, id);
+}
+
 export function markTokenRotated(oldId: string, newId: string): void {
-  const database = initDb();
+  const database = getWriteDb();
   database.transaction(() => {
     // Mark old token as rotating
     database
@@ -3581,7 +3715,7 @@ export function markTokenRotated(oldId: string, newId: string): void {
 }
 
 export function recordTokenUsage(id: string, ipHash: string | null): void {
-  const database = initDb();
+  const database = getWriteDb();
   const query =
     "UPDATE auth_tokens SET last_used_at = CURRENT_TIMESTAMP, use_count = use_count + 1 WHERE id = ?";
   logQuery(query, [id], "record_token_usage");
@@ -3590,7 +3724,7 @@ export function recordTokenUsage(id: string, ipHash: string | null): void {
 
 export function expireAuthTokens(): number {
   const now = new Date().toISOString();
-  const database = initDb();
+  const database = getWriteDb();
   const query = `
     UPDATE auth_tokens SET status = 'expired' 
     WHERE status = 'active' 
@@ -3604,7 +3738,7 @@ export function expireAuthTokens(): number {
 
 export function cleanupRevokedTokens(maxAgeMs = 7_776_000_000): number {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const database = initDb();
+  const database = getWriteDb();
   const query = `
     DELETE FROM auth_tokens 
     WHERE status IN ('revoked', 'expired', 'rotating') 
@@ -3617,7 +3751,7 @@ export function cleanupRevokedTokens(maxAgeMs = 7_776_000_000): number {
 }
 
 export function getAuthTokensByClient(clientId: string): AuthToken[] {
-  const database = initDb();
+  const database = getReadDb();
   const rows = database
     .prepare(
       "SELECT * FROM auth_tokens WHERE client_id = ? ORDER BY created_at DESC",
@@ -3628,7 +3762,7 @@ export function getAuthTokensByClient(clientId: string): AuthToken[] {
 
 export function getTokensNeedingRotation(maxAgeMs: number): AuthToken[] {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const database = initDb();
+  const database = getReadDb();
   const rows = database
     .prepare(
       `SELECT * FROM auth_tokens 
@@ -3688,7 +3822,7 @@ export function recordProofCommitment(
   walletAddress?: string | null,
   canonicalProofHash?: string | null,
 ): void {
-  const database = initDb();
+  const database = getWriteDb();
   const createdAt = new Date().toISOString();
   database
     .prepare(
@@ -3715,7 +3849,7 @@ export function recordProofCommitment(
 export function getProofCommitment(
   commitmentHash: string,
 ): ProofCommitmentRecord | null {
-  const database = initDb();
+  const database = getReadDb();
   const row = database
     .prepare("SELECT * FROM proof_commitments WHERE commitment_hash = ?")
     .get(commitmentHash) as Record<string, unknown> | undefined;
@@ -3780,7 +3914,7 @@ export function recordAuthAudit(entry: {
   success?: boolean;
   errorMessage?: string | null;
 }): void {
-  const database = initDb();
+  const database = getWriteDb();
   const query = `
     INSERT INTO auth_token_audit (token_id, client_id, action, path, method, ip_hash, success, error_message)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -3808,7 +3942,7 @@ export function getAuditLog(
   } = {},
 ): AuthTokenAuditEntry[] {
   const { tokenId, clientId, action, limit = 100, offset = 0 } = options;
-  const database = initDb();
+  const database = getReadDb();
 
   let query = "SELECT * FROM auth_token_audit WHERE 1=1";
   const params: (string | number)[] = [];
@@ -3838,7 +3972,7 @@ export function getAuditLog(
 
 export function cleanupAuditLog(maxAgeMs = 15_552_000_000): number {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const database = initDb();
+  const database = getWriteDb();
   const result = database
     .prepare("DELETE FROM auth_token_audit WHERE created_at < ?")
     .run(cutoff);
@@ -3848,7 +3982,7 @@ export function updateProofCommitmentStatus(
   commitmentHash: string,
   status: "COMMITTED" | "REVEALED" | "EXPIRED",
 ): void {
-  const database = initDb();
+  const database = getWriteDb();
   database
     .prepare(
       "UPDATE proof_commitments SET status = ? WHERE commitment_hash = ?",

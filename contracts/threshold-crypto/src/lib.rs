@@ -53,36 +53,10 @@ pub struct DkgConfig {
 pub enum DataKey {
     Config,
     Participant(Address),
-    ParticipantList,                       // Vec<Address>
-    Share(Address),                        // U256 share per participant
-    ShareCount,                            // u32
-    FinalKey,                              // U256 aggregated key
-    AnalyticsCfg,                          // u32 minimum cohort (privacy budget)
-    AnalyticsAggregate(u64, u64),          // (dao_id, round_id) -> AnalyticsAggregate
-    AnalyticsSubmitted(u64, u64, Address), // (dao_id, round_id, address) -> bool
-}
-
-/// An on-chain homomorphic aggregate of encrypted analytic contributions for one
-/// (dao, round).
-///
-/// Each contributor submits an ElGamal ciphertext `(c1, c2) = (r·G, m·G + r·Y)`
-/// over BN254 G1 (with `m` the contributed value, `Y` the joint public key). The
-/// contract accumulates them with the `bn254_g1_add` host function, so it only ever
-/// stores the *sum* ciphertext:
-///
-/// `sum_c1 = R·G`, `sum_c2 = (Σm)·G + R·Y`
-///
-/// No intermediate aggregate equals any single contributor's ciphertext, so the
-/// per-voter value `m` never appears on-chain in a decodable form. The aggregate
-/// is only readable once `contribution_count >= minimum_cohort` (the privacy
-/// budget), after which a threshold decryption of `Σm` is permitted. The curve
-/// point at infinity (64 zero bytes) is used as the identity element for `g1_add`.
-#[contracttype]
-#[derive(Clone)]
-pub struct AnalyticsAggregate {
-    pub c1: Bn254G1Affine,       // Σ r_i·G
-    pub c2: Bn254G1Affine,       // (Σ m_i)·G + R·Y
-    pub contribution_count: u64, // number of accumulated contributions
+    ParticipantList, // Vec<Address>
+    Share(Address),  // U256 share per participant
+    ShareCount,      // u32
+    FinalKey,        // U256 aggregated key
 }
 
 #[contract]
@@ -329,114 +303,6 @@ impl ThresholdCrypto {
             .instance()
             .get(&VERSION_KEY)
             .unwrap_or(VERSION)
-    }
-
-    // ===== Privacy Analytics (#306) =====
-
-    /// Configure the privacy budget (minimum cohort) for decryption. Admin only,
-    /// call once per contract. `min_cohort` is the smallest number of accumulated
-    /// contributions that must be present before an aggregate may be decrypted, so
-    /// no single (or few) contributor(s) can be singled out.
-    pub fn init_analytics(env: Env, min_cohort: u32, admin: Address) {
-        Self::bump_instance(&env);
-        if env.storage().instance().has(&DataKey::AnalyticsCfg) {
-            panic_with_error!(&env, ThresholdError::AlreadyInitialized);
-        }
-        admin.require_auth();
-        if min_cohort < 1 {
-            panic_with_error!(&env, ThresholdError::InvalidCohort);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::AnalyticsCfg, &min_cohort);
-    }
-
-    /// Accumulate one encrypted contribution `(c1, c2)` homomorphically into the
-    /// aggregate for `(dao_id, round_id)`. A given contributor may contribute at
-    /// most once per round; the per-contributor ciphertext is never stored in
-    /// decodable form, only the running sum.
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_analytic_contribution(
-        env: Env,
-        dao_id: u64,
-        round_id: u64,
-        c1: Bn254G1Affine,
-        c2: Bn254G1Affine,
-        contributor: Address,
-    ) {
-        Self::bump_instance(&env);
-        if !env.storage().instance().has(&DataKey::AnalyticsCfg) {
-            panic_with_error!(&env, ThresholdError::AnalyticsNotConfigured);
-        }
-        contributor.require_auth();
-
-        // One contribution per contributor per round.
-        let submitted_key = DataKey::AnalyticsSubmitted(dao_id, round_id, contributor.clone());
-        if env.storage().persistent().has(&submitted_key) {
-            panic_with_error!(&env, ThresholdError::AlreadySubmitted);
-        }
-        env.storage().persistent().set(&submitted_key, &true);
-        Self::bump_persistent(&env, &submitted_key);
-
-        let agg_key = DataKey::AnalyticsAggregate(dao_id, round_id);
-        // Identity element for g1_add is the point at infinity: 64 zero bytes.
-        let identity = |env: &Env| Bn254G1Affine::from_array(env, &[0u8; 64]);
-        let mut agg: AnalyticsAggregate =
-            env.storage()
-                .persistent()
-                .get(&agg_key)
-                .unwrap_or_else(|| AnalyticsAggregate {
-                    c1: identity(&env),
-                    c2: identity(&env),
-                    contribution_count: 0,
-                });
-        agg.c1 = env.crypto().bn254().g1_add(&agg.c1, &c1);
-        agg.c2 = env.crypto().bn254().g1_add(&agg.c2, &c2);
-        agg.contribution_count += 1;
-        env.storage().persistent().set(&agg_key, &agg);
-        Self::bump_persistent(&env, &agg_key);
-    }
-
-    /// Return the on-chain homomorphic aggregate for a `(dao_id, round_id)`,
-    /// refusing to reveal it until the minimum cohort (privacy budget) has been
-    /// met. Once released, it is still encrypted: only a threshold of key shares
-    /// can decrypt `Σ m_i` off-chain.
-    pub fn analytics_aggregate(env: Env, dao_id: u64, round_id: u64) -> AnalyticsAggregate {
-        Self::bump_instance(&env);
-        let min_cohort: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AnalyticsCfg)
-            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::AnalyticsNotConfigured));
-        let agg_key = DataKey::AnalyticsAggregate(dao_id, round_id);
-        let agg: AnalyticsAggregate = env
-            .storage()
-            .persistent()
-            .get(&agg_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::AnalyticsNotConfigured));
-        if agg.contribution_count < min_cohort as u64 {
-            panic_with_error!(&env, ThresholdError::AnalyticsBelowMinCohort);
-        }
-        Self::bump_persistent(&env, &agg_key);
-        agg
-    }
-
-    /// Number of contributions accumulated for a `(dao_id, round_id)`, always
-    /// visible (counts are not sensitive in aggregate).
-    pub fn analytics_count(env: Env, dao_id: u64, round_id: u64) -> u64 {
-        env.storage()
-            .persistent()
-            .get::<DataKey, AnalyticsAggregate>(&DataKey::AnalyticsAggregate(dao_id, round_id))
-            .map(|a| a.contribution_count)
-            .unwrap_or(0)
-    }
-
-    /// The configured minimum cohort (privacy budget) for this contract.
-    pub fn analytics_min_cohort(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get::<_, _>(&DataKey::AnalyticsCfg)
-            .unwrap_or(0)
     }
 }
 

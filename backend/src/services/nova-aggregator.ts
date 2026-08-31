@@ -39,6 +39,15 @@ export interface RecursiveProofPayload {
   timestamp: number;
 }
 
+export interface TallyProofPayload {
+  nullifier_root: string;
+  yes_votes: number;
+  no_votes: number;
+  proof_a: string;
+  proof_b: string;
+  proof_c: string;
+}
+
 export class NovaAggregatorService {
   private tempDir: string;
   private _exec: typeof execAsync;
@@ -51,16 +60,7 @@ export class NovaAggregatorService {
     }
   }
 
-  /**
-   * Allows tests to inject a mock exec function to avoid spawning cargo.
-   */
-  _setExecForTest(mockFn: typeof execAsync): void {
-    this._exec = mockFn;
-  }
-
-  /**
-   * Aggregates a batch of vote witnesses off-chain into a single Nova recursive proof payload
-   */
+  /// Default aggregate Votes method
   async aggregateVotes(
     daoId: number,
     proposalId: number,
@@ -70,7 +70,7 @@ export class NovaAggregatorService {
     const timestamp = Date.now();
     const batchPath = path.join(
       this.tempDir,
-      `batch_${daoId}_${proposalId}_${timestamp}.json`,
+      ``batch_${daoId}_${proposalId}_${timestamp}.json`,
     );
     const outputPath = path.join(
       this.tempDir,
@@ -84,8 +84,8 @@ export class NovaAggregatorService {
       // 2. Invoke nova-aggregator CLI tool
       const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --batch "${batchPath}" --out "${outputPath}" --root "${root}" --benchmark`;
 
-      const { stdout } = await this._exec(cargoCmd, {
-        cwd: path.resolve(process.cwd(), ".."),
+      const { stdout, stderr } = await execCmd(cargoCmd, {
+        cwd: path.resolve(__dirname, "../../"),
       });
 
       console.info("[NovaService] Aggregation CLI output:", stdout);
@@ -108,47 +108,45 @@ export class NovaAggregatorService {
     }
   }
 
-  /**
-   * Verifies a previously generated recursive proof by invoking the CLI --verify mode.
-   * Returns { verified: true } on exit code 0, { verified: false } on exit code 1.
-   * Never throws — returns { verified: false } on any error.
-   */
-  async verifyProof(
-    payload: RecursiveProofPayload,
-  ): Promise<{ verified: boolean }> {
+  /// Generate a tally proof for on-chain verification
+  async generateTallyProof(
+    doId: number,
+    proposalId: number,
+    root: string,
+    witnesses: VoteWitnessPayload[],
+  ): Promise<TallyProofPayload> {
     const timestamp = Date.now();
-    const proofPath = path.join(this.tempDir, `verify_${timestamp}.json`);
+    const batchPath = path.join(
+      this.tempDir,
+      `tally_batch_${doId}_${proposalId}_${timestamp}.json`,
+    );
+    const outputPath = path.join(
+      this.tempDir,
+      `tally_proof_${doId}_${proposalId}_${timestamp}.json`,
+    );
 
     try {
-      fs.writeFileSync(proofPath, JSON.stringify(payload, null, 2), "utf8");
+      fs.writeFileSync(batchPath, JSON.stringify(witnesses, null, 2), "utf8");
 
-      const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --verify "${proofPath}"`;
+      const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --tally --batch "${batchPath}" --out "${outputPath}" --root "$root}"`;
 
-      try {
-        const { stdout } = await this._exec(cargoCmd, {
-          cwd: path.resolve(process.cwd(), ".."),
-        });
-        // Exit code 0 → stdout contains {"verified":true}
-        const result = JSON.parse(stdout.trim());
-        return { verified: result.verified === true };
-      } catch (err: any) {
-        // execAsync rejects on non-zero exit code
-        // exit code 1 → {"verified":false} on stdout
-        if (err.stdout) {
-          try {
-            const result = JSON.parse(err.stdout.trim());
-            if (typeof result.verified === "boolean") {
-              return { verified: result.verified };
-            }
-          } catch {
-            // stdout not parseable — fall through to false
-          }
-        }
-        // exit code 2 or any other unexpected error
-        return { verified: false };
+      const { stdout, stderr } = await execCmd(cargoCmd, {
+        cwd: path.resolve(__dirname, "../../"),
+      });
+
+      console.info("[NovaService] Tally proof CLI output:", stdout);
+
+      if (!fs.existsSync(outputPath)) {
+        throw new Error(
+          `Nova aggregator failed to create tally proof file: ${stderr}`,
+        );
       }
+
+      const proofRaw = fs.readFileSync(outputPath, "utf8");
+      return JSON.parse(proofRaw) as TallyProofPayload;
     } finally {
-      if (fs.existsSync(proofPath)) fs.unlinkSync(proofPath);
+      if (fs.existsSync(batchPath)) fs.unlinkSync(batchPath);
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     }
   }
 }

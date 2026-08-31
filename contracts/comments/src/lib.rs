@@ -26,7 +26,8 @@ use soroban_sdk::{
 
 // Re-export shared Groth16 types and utilities
 pub use zkvote_groth16::{
-    CurveId, Groth16Error, Proof, ProofBls381, VerificationKey, VerificationKeyBls381,
+    CurveId, Groth16Error, PathContext, Proof, ProofBls381, VerificationKey,
+    VerificationKeyBls381,
 };
 
 const TREE_CONTRACT: Symbol = symbol_short!("tree");
@@ -65,6 +66,76 @@ pub enum CommentsError {
     InvalidNullifier = 32,
     /// Root predates member removal (invalid for Trailing mode after revocation)
     RootPredatesRemoval = 33,
+
+    /// ── Coarse error codes (100–106) ──────────────────────────────────
+    /// Collapsed categories for anonymous-submission production paths.
+    /// Admin and test contexts continue to return the specific fine-grained
+    /// discriminants above.  See [`CommentsError::to_coarse`].
+    InvalidInput = 100,
+    EligibilityFailed = 101,
+    ProofInvalid = 102,
+    AlreadySubmitted = 103,
+    WindowClosed = 104,
+    InsufficientFunds = 105,
+    ConfigError = 106,
+}
+
+impl CommentsError {
+    /// Collapse fine-grained discriminants into one of the seven stable
+    /// coarse categories (codes 100–106) when `ctx` is
+    /// [`PathContext::Anonymous`].  [`PathContext::Admin`] returns the
+    /// original value unchanged so administrative tooling and tests keep
+    /// full diagnostic granularity.
+    pub fn to_coarse(&self, ctx: PathContext) -> CommentsError {
+        match ctx {
+            PathContext::Admin => *self,
+            PathContext::Anonymous => match self {
+                // ── Input / field / content failures → InvalidInput (100) ──
+                CommentsError::SignalNotInField
+                | CommentsError::InvalidNullifier
+                | CommentsError::CommentContentTooLong
+                | CommentsError::InvalidParentComment => CommentsError::InvalidInput,
+
+                // ── Eligibility / root / revocation → EligibilityFailed (101) ──
+                CommentsError::CommitmentRevoked
+                | CommentsError::RootMismatch
+                | CommentsError::RootNotInHistory
+                | CommentsError::RootPredatesProposal
+                | CommentsError::RootPredatesRemoval => CommentsError::EligibilityFailed,
+
+                // ── Proof verification → ProofInvalid (102) ──
+                CommentsError::InvalidProof => CommentsError::ProofInvalid,
+
+                // ── Pass-throughs (public-state / admin-only) ──
+                CommentsError::ProposalNotFound
+                | CommentsError::CommentNotFound
+                | CommentsError::CommentDeleted
+                | CommentsError::NotCommentOwner
+                | CommentsError::NotAdmin
+                | CommentsError::Unauthorized
+                | CommentsError::NotDaoMember
+                | CommentsError::ContractNotSet
+                | CommentsError::AlreadyInitialized => *self,
+
+                // Already-coarse variants are idempotent.
+                CommentsError::InvalidInput
+                | CommentsError::EligibilityFailed
+                | CommentsError::ProofInvalid
+                | CommentsError::AlreadySubmitted
+                | CommentsError::WindowClosed
+                | CommentsError::InsufficientFunds
+                | CommentsError::ConfigError => *self,
+            },
+        }
+    }
+}
+
+/// Panic with a coarse version of `err` when the submission context is
+/// anonymous, otherwise panic with the specific error.  Shorthand for
+/// `panic_with_error!(env, err.to_coarse(ctx))`.
+#[inline]
+fn panic_coarse(env: &Env, ctx: PathContext, err: CommentsError) {
+    panic_with_error!(env, err.to_coarse(ctx));
 }
 
 /// Vote mode for proposal eligibility (mirrors voting contract)
@@ -197,17 +268,18 @@ impl Comments {
     }
 
     /// Validate that a U256 value is within the BN254 scalar field (< r)
-    /// Panics with CommentsError::SignalNotInField if value >= r
-    fn assert_in_field(env: &Env, value: &U256) {
+    /// Panics with a coarse-mapped CommentsError::SignalNotInField under
+    /// [`PathContext::Anonymous`].
+    fn assert_in_field(env: &Env, ctx: PathContext, value: &U256) {
         if zkvote_groth16::assert_in_field(env, value).is_err() {
-            panic_with_error!(env, CommentsError::SignalNotInField);
+            panic_coarse(env, ctx, CommentsError::SignalNotInField);
         }
     }
 
     /// Validate that a U256 value is within the BLS12-381 scalar field
-    fn assert_in_field_bls381(env: &Env, value: &U256) {
+    fn assert_in_field_bls381(env: &Env, ctx: PathContext, value: &U256) {
         if zkvote_groth16::assert_in_field_bls381(env, value).is_err() {
-            panic_with_error!(env, CommentsError::SignalNotInField);
+            panic_coarse(env, ctx, CommentsError::SignalNotInField);
         }
     }
 
@@ -261,7 +333,13 @@ impl Comments {
     }
 
     /// Validate root matches proposal eligibility (Fixed vs Trailing mode)
-    fn validate_root_eligibility(env: &Env, dao_id: u64, proposal_id: u64, root: &U256) {
+    fn validate_root_eligibility(
+        env: &Env,
+        ctx: PathContext,
+        dao_id: u64,
+        proposal_id: u64,
+        root: &U256,
+    ) {
         let (vote_mode, eligible_root, earliest_root_index) =
             Self::get_proposal_eligibility(env, dao_id, proposal_id);
 
@@ -271,7 +349,7 @@ impl Comments {
             VoteMode::Fixed => {
                 // Fixed mode: root must exactly match the snapshot at proposal creation
                 if root != &eligible_root {
-                    panic_with_error!(env, CommentsError::RootMismatch);
+                    panic_coarse(env, ctx, CommentsError::RootMismatch);
                 }
             }
             VoteMode::Trailing => {
@@ -282,7 +360,7 @@ impl Comments {
                     soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
                 );
                 if !root_valid {
-                    panic_with_error!(env, CommentsError::RootNotInHistory);
+                    panic_coarse(env, ctx, CommentsError::RootNotInHistory);
                 }
 
                 // Check root index >= earliest_root_index
@@ -292,7 +370,7 @@ impl Comments {
                     soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
                 );
                 if root_index < earliest_root_index {
-                    panic_with_error!(env, CommentsError::RootPredatesProposal);
+                    panic_coarse(env, ctx, CommentsError::RootPredatesProposal);
                 }
 
                 // SECURITY: Check root index >= min_valid_root_index
@@ -303,7 +381,7 @@ impl Comments {
                     soroban_sdk::vec![env, dao_id.into_val(env)],
                 );
                 if root_index < min_valid_root {
-                    panic_with_error!(env, CommentsError::RootPredatesRemoval);
+                    panic_coarse(env, ctx, CommentsError::RootPredatesRemoval);
                 }
             }
         }
@@ -403,18 +481,21 @@ impl Comments {
         proof: Proof,
     ) -> u64 {
         Self::bump_instance(&env);
+
+        let ctx = PathContext::Anonymous;
+
         // SECURITY: Validate public signals are within BN254 scalar field FIRST
         // This prevents modular reduction attacks where values >= r verify identically
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, ctx, &nullifier);
+        Self::assert_in_field(&env, ctx, &root);
 
         // Check nullifier is non-zero
         if nullifier == U256::from_u32(&env, 0) {
-            panic_with_error!(&env, CommentsError::InvalidNullifier);
+            panic_coarse(&env, ctx, CommentsError::InvalidNullifier);
         }
 
         if content_cid.len() > MAX_CID_LEN {
-            panic_with_error!(&env, CommentsError::CommentContentTooLong);
+            panic_coarse(&env, ctx, CommentsError::CommentContentTooLong);
         }
 
         // NOTE: We intentionally do NOT check nullifier uniqueness for comments!
@@ -425,7 +506,7 @@ impl Comments {
         if let Some(pid) = parent_id {
             let parent_key = DataKey::Comment(dao_id, proposal_id, pid);
             if !env.storage().persistent().has(&parent_key) {
-                panic_with_error!(&env, CommentsError::InvalidParentComment);
+                panic_coarse(&env, ctx, CommentsError::InvalidParentComment);
             }
         }
 
@@ -433,7 +514,7 @@ impl Comments {
         Self::assert_proposal_exists(&env, dao_id, proposal_id);
 
         // Validate root eligibility (Fixed vs Trailing mode - matches voting contract logic)
-        Self::validate_root_eligibility(&env, dao_id, proposal_id, &root);
+        Self::validate_root_eligibility(&env, ctx, dao_id, proposal_id, &root);
 
         // Get VK from voting contract (single source of truth)
         let vk = Self::get_vk_from_voting(&env, dao_id);
@@ -459,7 +540,7 @@ impl Comments {
         ];
 
         if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, CommentsError::InvalidProof);
+            panic_coarse(&env, ctx, CommentsError::InvalidProof);
         }
 
         // No nullifier tracking for comments - allow unlimited comments per user
@@ -511,26 +592,29 @@ impl Comments {
         proof: ProofBls381,
     ) -> u64 {
         Self::bump_instance(&env);
-        Self::assert_in_field_bls381(&env, &nullifier);
-        Self::assert_in_field_bls381(&env, &root);
+
+        let ctx = PathContext::Anonymous;
+
+        Self::assert_in_field_bls381(&env, ctx, &nullifier);
+        Self::assert_in_field_bls381(&env, ctx, &root);
 
         if nullifier == U256::from_u32(&env, 0) {
-            panic_with_error!(&env, CommentsError::InvalidNullifier);
+            panic_coarse(&env, ctx, CommentsError::InvalidNullifier);
         }
 
         if content_cid.len() > MAX_CID_LEN {
-            panic_with_error!(&env, CommentsError::CommentContentTooLong);
+            panic_coarse(&env, ctx, CommentsError::CommentContentTooLong);
         }
 
         if let Some(pid) = parent_id {
             let parent_key = DataKey::Comment(dao_id, proposal_id, pid);
             if !env.storage().persistent().has(&parent_key) {
-                panic_with_error!(&env, CommentsError::InvalidParentComment);
+                panic_coarse(&env, ctx, CommentsError::InvalidParentComment);
             }
         }
 
         Self::assert_proposal_exists(&env, dao_id, proposal_id);
-        Self::validate_root_eligibility(&env, dao_id, proposal_id, &root);
+        Self::validate_root_eligibility(&env, ctx, dao_id, proposal_id, &root);
 
         let vk = Self::get_vk_from_voting_bls381(&env, dao_id);
 
@@ -552,7 +636,7 @@ impl Comments {
         ];
 
         if !Self::verify_groth16_bls381(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, CommentsError::InvalidProof);
+            panic_coarse(&env, ctx, CommentsError::InvalidProof);
         }
 
         let comment_id = Self::next_comment_id(&env, dao_id, proposal_id);
@@ -653,12 +737,15 @@ impl Comments {
         proof: Proof,
     ) {
         Self::bump_instance(&env);
+
+        let ctx = PathContext::Anonymous;
+
         // SECURITY: Validate public signals are within BN254 scalar field FIRST
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, ctx, &nullifier);
+        Self::assert_in_field(&env, ctx, &root);
 
         if new_content_cid.len() > MAX_CID_LEN {
-            panic_with_error!(&env, CommentsError::CommentContentTooLong);
+            panic_coarse(&env, ctx, CommentsError::CommentContentTooLong);
         }
 
         let key = DataKey::Comment(dao_id, proposal_id, comment_id);
@@ -707,7 +794,7 @@ impl Comments {
         ];
 
         if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, CommentsError::InvalidProof);
+            panic_coarse(&env, ctx, CommentsError::InvalidProof);
         }
 
         if comment.revision_cids.len() < MAX_REVISIONS {
@@ -741,11 +828,14 @@ impl Comments {
         proof: ProofBls381,
     ) {
         Self::bump_instance(&env);
-        Self::assert_in_field_bls381(&env, &nullifier);
-        Self::assert_in_field_bls381(&env, &root);
+
+        let ctx = PathContext::Anonymous;
+
+        Self::assert_in_field_bls381(&env, ctx, &nullifier);
+        Self::assert_in_field_bls381(&env, ctx, &root);
 
         if new_content_cid.len() > MAX_CID_LEN {
-            panic_with_error!(&env, CommentsError::CommentContentTooLong);
+            panic_coarse(&env, ctx, CommentsError::CommentContentTooLong);
         }
 
         let key = DataKey::Comment(dao_id, proposal_id, comment_id);
@@ -788,7 +878,7 @@ impl Comments {
         ];
 
         if !Self::verify_groth16_bls381(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, CommentsError::InvalidProof);
+            panic_coarse(&env, ctx, CommentsError::InvalidProof);
         }
 
         if comment.revision_cids.len() < MAX_REVISIONS {
@@ -864,9 +954,12 @@ impl Comments {
         proof: Proof,
     ) {
         Self::bump_instance(&env);
+
+        let ctx = PathContext::Anonymous;
+
         // SECURITY: Validate public signals are within BN254 scalar field FIRST
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, ctx, &nullifier);
+        Self::assert_in_field(&env, ctx, &root);
 
         let key = DataKey::Comment(dao_id, proposal_id, comment_id);
         let mut comment: CommentInfo = env
@@ -908,7 +1001,7 @@ impl Comments {
         ];
 
         if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
-            panic_with_error!(&env, CommentsError::InvalidProof);
+            panic_coarse(&env, ctx, CommentsError::InvalidProof);
         }
 
         comment.deleted = true;

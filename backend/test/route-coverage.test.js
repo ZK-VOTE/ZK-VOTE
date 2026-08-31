@@ -111,8 +111,8 @@ test("backend route matrix covers deterministic success and failure paths", asyn
   response = await request(app).get("/events/1");
 
   assert.equal(response.statusCode, 200);
-  assert.ok(Array.isArray(response.body.events));
-  assert.ok(response.body.events.length >= 1);
+  assert.ok(Array.isArray(response.body.data));
+  assert.ok(response.body.data.length >= 1);
 
   response = await request(app).post("/events/notify").set(auth).send({});
 
@@ -151,8 +151,10 @@ test("backend route matrix covers deterministic success and failure paths", asyn
   response = await request(app).get("/root/1");
   assert.equal(response.statusCode, 500);
 
+  // The comments list fails gracefully with 503 (service unavailable) when
+  // the Soroban boundary is down, rather than a bare 500.
   response = await request(app).get("/comments/1/1");
-  assert.equal(response.statusCode, 500);
+  assert.equal(response.statusCode, 503);
 
   response = await request(app).get("/comment/1/1/1");
   assert.equal(response.statusCode, 500);

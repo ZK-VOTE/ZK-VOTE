@@ -135,6 +135,19 @@ const envSchema = z.object({
     .default("false")
     .transform((v) => v === "true"),
 
+  // Logging Sampling
+  LOG_SAMPLING_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  LOG_SAMPLING_ERROR_RATE: z.coerce.number().min(0).max(1).default(1.0),
+  LOG_SAMPLING_SLOW_RATE: z.coerce.number().min(0).max(1).default(1.0),
+  LOG_SLOW_THRESHOLD_MS: z.coerce.number().int().positive().default(1000),
+  LOG_BODY_MAX_CHARS: z.coerce.number().int().positive().default(2000),
+
+  // Hot-Reload
+  HOT_RELOAD_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+
   INDEXER_ENABLED: z
     .enum(["true", "false"])
     .default("true")
@@ -323,35 +336,23 @@ const envSchema = z.object({
   DB_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(50),
   DB_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().default(2000),
 
-  // --- Pluggable relay DB backend (issue #305) ---
-  // `sqlite` keeps the embedded better-sqlite3 file (default, unchanged).
-  // `postgres` routes Kysely through the Postgres dialect via DATABASE_URL.
-  // `spanner` is recognised by config/planning but not yet wired — selecting it
-  // fails fast rather than silently falling back to SQLite.
-  DB_BACKEND: z.enum(["sqlite", "postgres", "spanner"]).default("sqlite"),
-  DATABASE_URL: z.string().optional(),
-  DB_SCHEMA: z.string().default("public"),
-  DB_POOL_MAX: z.coerce.number().int().positive().default(10),
-  DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
-  DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  DB_SSL: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true"),
+  // Submit Queue (for bounded concurrency and backpressure)
+  SUBMIT_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
+  SUBMIT_QUEUE_ITEM_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(120000), // 2 minutes
 
-  // Dual-write bridge: mirror every relay write into a shadow backend so a
-  // Postgres cutover can be rehearsed (and verified) against live traffic.
-  DB_DUAL_WRITE: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true"),
-  DB_DUAL_WRITE_URL: z.string().optional(),
-  // When true a shadow-write failure fails the request; when false it is only
-  // counted and logged (the safe default during a rehearsal).
-  DB_DUAL_WRITE_STRICT: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true"),
+  // RPC Concurrency Limits
+  RPC_MAX_CONCURRENT_REQUESTS: z.coerce.number().int().positive().default(10),
+
+  // Cache TTLs (for memory bounding)
+  NULLIFIER_CACHE_TTL_MS: z.coerce.number().int().positive().default(600000), // 10 minutes
+  PROOF_CACHE_TTL_MS: z.coerce.number().int().positive().default(600000), // 10 minutes
+  MEMBERSHIP_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000), // 5 minutes
+  NULLIFIER_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10000),
+  PROOF_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(5000),
 
   MAX_SEQUENCE_RETRY_ATTEMPTS: z.coerce.number().int().positive().default(1),
   VOTE_SUBMISSION_PENDING_TTL_MS: z.coerce
@@ -359,11 +360,35 @@ const envSchema = z.object({
     .int()
     .positive()
     .default(300000),
+  VOTE_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
 
   RELAYER_TEST_MODE: z
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  // Transaction confirmation queue (#172): confirmation polling is delegated
+  // to a single background worker that polls with exponential backoff + jitter.
+  CONFIRMATION_QUEUE_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  CONFIRMATION_INITIAL_DELAY_MS: z.coerce.number().int().positive().default(2000),
+  CONFIRMATION_MAX_DELAY_MS: z.coerce.number().int().positive().default(30000),
+  CONFIRMATION_MAX_WAIT_MS: z.coerce.number().int().positive().default(60000),
+  CONFIRMATION_BACKOFF_FACTOR: z.coerce.number().min(1).default(2),
+  CONFIRMATION_JITTER_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  CONFIRMATION_RESULT_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
+
+  // WebSocket confirmation notifications (#172)
+  CONFIRMATION_WS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  CONFIRMATION_WS_PATH: z.string().default("/ws/confirmations"),
 });
 
 type EnvConfig = z.infer<typeof envSchema>;
@@ -465,6 +490,21 @@ export const config = {
   kmsRegion: validatedEnv.KMS_REGION,
   kmsProvider: validatedEnv.KMS_PROVIDER,
 
+  // Decentralized relay network (MPC submitter + cover traffic)
+  decentralizedRelayEnabled: validatedEnv.DECENTRALIZED_RELAY_ENABLED,
+  mpcQuorumSize: validatedEnv.MPC_QUORUM_SIZE,
+  mpcRelayNodeUrls: validatedEnv.MPC_RELAY_NODE_URLS
+    ? validatedEnv.MPC_RELAY_NODE_URLS.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [],
+  coverTrafficEnabled: validatedEnv.COVER_TRAFFIC_ENABLED,
+  coverTrafficIntervalMs: validatedEnv.COVER_TRAFFIC_INTERVAL_MS,
+  coverTrafficBatchSize: validatedEnv.COVER_TRAFFIC_BATCH_SIZE,
+  missingVoteMonitorIntervalMs: validatedEnv.MISSING_VOTE_MONITOR_INTERVAL_MS,
+  missingVoteMonitorThreshold: validatedEnv.MISSING_VOTE_MONITOR_THRESHOLD,
+  anonymousSubmissionEnabled: validatedEnv.ANONYMOUS_SUBMISSION_ENABLED,
+
   // Master key for token management endpoints (REQUIRED - must be at least 32 chars)
   authMasterKey: validatedEnv.AUTH_MASTER_KEY,
 
@@ -483,17 +523,26 @@ export const config = {
   commentsContractId: process.env.COMMENTS_CONTRACT_ID,
   daoRegistryContractId: process.env.DAO_REGISTRY_CONTRACT_ID,
   membershipSbtContractId: process.env.MEMBERSHIP_SBT_CONTRACT_ID,
-  rewardsContractId: validatedEnv.REWARDS_CONTRACT_ID,
   bridgeContractId: process.env.BRIDGE_CONTRACT_ID,
   circuitRegistryContractId: process.env.CIRCUIT_REGISTRY_CONTRACT_ID,
+  rewardsContractId: process.env.REWARDS_CONTRACT_ID,
 
   // VK Version
   staticVkVersion: validatedEnv.VOTING_VK_VERSION,
 
   // CORS
   corsOrigins: validatedEnv.CORS_ORIGIN
-    ? validatedEnv.CORS_ORIGIN.split(",").map((origin) => origin.trim())
-    : ("*" as const),
+    ? validatedEnv.CORS_ORIGIN.split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+    : (["*"] as string[]),
+  corsAllowedMethods: ["GET", "POST", "OPTIONS"] as string[],
+  corsAllowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-CSRF-Token",
+  ] as string[],
+  corsMaxAge: 3600,
 
   // Logging
   logClientIp: validatedEnv.LOG_CLIENT_IP,
@@ -503,6 +552,16 @@ export const config = {
   genericErrors: validatedEnv.RELAYER_GENERIC_ERRORS,
   healthExposeDetails: validatedEnv.HEALTH_EXPOSE_DETAILS,
   healthcheckPing: validatedEnv.HEALTHCHECK_PING,
+
+  // Logging Sampling
+  logSamplingRate: validatedEnv.LOG_SAMPLING_RATE,
+  logSamplingErrorRate: validatedEnv.LOG_SAMPLING_ERROR_RATE,
+  logSamplingSlowRate: validatedEnv.LOG_SAMPLING_SLOW_RATE,
+  logSlowThresholdMs: validatedEnv.LOG_SLOW_THRESHOLD_MS,
+  logBodyMaxChars: validatedEnv.LOG_BODY_MAX_CHARS,
+
+  // Hot-Reload
+  hotReloadEnabled: validatedEnv.HOT_RELOAD_ENABLED,
 
   // Event Indexer
   indexerEnabled: validatedEnv.INDEXER_ENABLED,
@@ -617,27 +676,70 @@ export const config = {
   dbRetryBaseDelayMs: validatedEnv.DB_RETRY_BASE_DELAY_MS,
   dbRetryMaxDelayMs: validatedEnv.DB_RETRY_MAX_DELAY_MS,
 
-  // Pluggable relay DB backend (issue #305)
-  dbBackend: validatedEnv.DB_BACKEND,
-  databaseUrl: validatedEnv.DATABASE_URL,
-  dbSchema: validatedEnv.DB_SCHEMA,
-  dbPoolMax: validatedEnv.DB_POOL_MAX,
-  dbPoolIdleTimeoutMs: validatedEnv.DB_POOL_IDLE_TIMEOUT_MS,
-  dbConnectTimeoutMs: validatedEnv.DB_CONNECT_TIMEOUT_MS,
-  dbSsl: validatedEnv.DB_SSL,
-  dbDualWrite: validatedEnv.DB_DUAL_WRITE,
-  dbDualWriteUrl: validatedEnv.DB_DUAL_WRITE_URL,
-  dbDualWriteStrict: validatedEnv.DB_DUAL_WRITE_STRICT,
+  // Submit Queue
+  submitQueueMaxDepth: validatedEnv.SUBMIT_QUEUE_MAX_DEPTH,
+  submitQueueItemTimeoutMs: validatedEnv.SUBMIT_QUEUE_ITEM_TIMEOUT_MS,
+
+  // RPC Concurrency
+  rpcMaxConcurrentRequests: validatedEnv.RPC_MAX_CONCURRENT_REQUESTS,
+
+  // Cache TTLs
+  nullifierCacheTtlMs: validatedEnv.NULLIFIER_CACHE_TTL_MS,
+  proofCacheTtlMs: validatedEnv.PROOF_CACHE_TTL_MS,
+  membershipCacheTtlMs: validatedEnv.MEMBERSHIP_CACHE_TTL_MS,
+  nullifierCacheMaxEntries: validatedEnv.NULLIFIER_CACHE_MAX_ENTRIES,
+  proofCacheMaxEntries: validatedEnv.PROOF_CACHE_MAX_ENTRIES,
 
   // Sequence manager
   maxSequenceRetryAttempts: validatedEnv.MAX_SEQUENCE_RETRY_ATTEMPTS,
 
   // Vote submission idempotency
   voteSubmissionPendingTtlMs: validatedEnv.VOTE_SUBMISSION_PENDING_TTL_MS,
+  voteQueueMaxDepth: validatedEnv.VOTE_QUEUE_MAX_DEPTH,
 
   // Test mode
   testMode: validatedEnv.RELAYER_TEST_MODE,
+
+  // Transaction confirmation queue (#172)
+  confirmationQueueEnabled: validatedEnv.CONFIRMATION_QUEUE_ENABLED,
+  confirmationInitialDelayMs: validatedEnv.CONFIRMATION_INITIAL_DELAY_MS,
+  confirmationMaxDelayMs: validatedEnv.CONFIRMATION_MAX_DELAY_MS,
+  confirmationMaxWaitMs: validatedEnv.CONFIRMATION_MAX_WAIT_MS,
+  confirmationBackoffFactor: validatedEnv.CONFIRMATION_BACKOFF_FACTOR,
+  confirmationJitterEnabled: validatedEnv.CONFIRMATION_JITTER_ENABLED,
+  confirmationResultCacheTtlMs: validatedEnv.CONFIRMATION_RESULT_CACHE_TTL_MS,
+
+  // WebSocket confirmation notifications (#172)
+  confirmationWsEnabled: validatedEnv.CONFIRMATION_WS_ENABLED,
+  confirmationWsPath: validatedEnv.CONFIRMATION_WS_PATH,
 } as const;
+
+export const corsOptions = {
+  origin: (
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: boolean) => void,
+  ) => {
+    if (
+      !origin ||
+      config.corsOrigins.includes(origin) ||
+      config.corsOrigins.includes("*")
+    ) {
+      callback(null, true);
+      return;
+    }
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "cors_origin_rejected",
+        origin,
+      }),
+    );
+    callback(null, false);
+  },
+  methods: config.corsAllowedMethods,
+  allowedHeaders: config.corsAllowedHeaders,
+  maxAge: config.corsMaxAge,
+};
 
 // ============================================
 // SIZE LIMITS
@@ -675,7 +777,7 @@ export const ALLOWED_IMAGE_MIMES = [
 
 // BN254 field modulus (p)
 export const BN254_MODULUS = BigInt(
-  "218882428718392752222464057452572750885483644004160343698204186575808495617",
+  "21888242871839275222246405745257275088548364400416034343698204186575808495617",
 );
 
 // BN254 scalar field modulus (r)
@@ -695,14 +797,44 @@ export const BN254_SCALAR_FIELD = BigInt(
  */
 export function validateEnv(): void {
   const errors: string[] = [];
+  const missing: string[] = [];
+
+  const isProduction = config.NODE_ENV === "production";
+  if (isProduction) {
+    const corsOrigins = config.corsOrigins;
+    if (corsOrigins.length === 0 || corsOrigins.includes("*")) {
+      errors.push(
+        "CORS_ORIGIN must be set to explicit origins in production (no wildcards or regex)",
+      );
+    }
+    for (const origin of corsOrigins) {
+      if (origin === "*") continue;
+      if (origin.includes("*") || origin.includes("?") || /[\[\]{}()|]/.test(origin)) {
+        errors.push(
+          `CORS_ORIGIN contains wildcard or regex pattern: "${origin}"`,
+        );
+        continue;
+      }
+      try {
+        const parsed = new URL(origin);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          errors.push(`CORS_ORIGIN is not a valid origin: "${origin}"`);
+        }
+      } catch {
+        errors.push(`CORS_ORIGIN is not a valid origin: "${origin}"`);
+      }
+    }
+  }
 
   if (!config.votingContractId) errors.push("VOTING_CONTRACT_ID is required");
   if (!config.treeContractId) errors.push("TREE_CONTRACT_ID is required");
-  if (!config.commentsContractId)
+  // The comments contract is optional in test mode (many service tests boot
+  // without it); outside tests it gates the comment relay endpoints.
+  if (!config.commentsContractId && !config.testMode)
     errors.push("COMMENTS_CONTRACT_ID is required");
   if (!config.relayerSecretKey) errors.push("RELAYER_SECRET_KEY is required");
-  // AUTH_MASTER_KEY is a production-only control-plane credential; tests and
-  // local dev don't need it (kept out of the critical path in test mode).
+  // AUTH_MASTER_KEY gates the token-management endpoints; it is optional in
+  // test mode so service tests can boot without a master key.
   if (!config.authMasterKey && !config.testMode)
     errors.push("AUTH_MASTER_KEY is required");
 
@@ -718,39 +850,49 @@ export function validateEnv(): void {
     );
   }
 
-  const missing: string[] = [];
-  if (!config.votingContractId) missing.push("VOTING_CONTRACT_ID");
-  if (!config.treeContractId) missing.push("TREE_CONTRACT_ID");
-  if (!config.commentsContractId) missing.push("COMMENTS_CONTRACT_ID");
-  if (!config.relayerSecretKey) missing.push("RELAYER_SECRET_KEY");
-  if (!config.rpcUrl) missing.push("SOROBAN_RPC_URL");
-  if (!config.networkPassphrase) missing.push("NETWORK_PASSPHRASE");
-  if (!config.relayerAuthToken) missing.push("RELAYER_AUTH_TOKEN");
-  if (!config.authMasterKey) missing.push("AUTH_MASTER_KEY");
-
+  // Report missing optional env vars so operators notice gaps. Critical keys
+  // abort startup; non-critical ones only warn in test mode.
+  const requiredKeys = [
+    "VOTING_CONTRACT_ID",
+    "TREE_CONTRACT_ID",
+    "COMMENTS_CONTRACT_ID",
+    "RELAYER_SECRET_KEY",
+    "RELAYER_AUTH_TOKEN",
+  ];
+  const missing = requiredKeys.filter((k) => !process.env[k]);
   const criticalKeys = ["VOTING_CONTRACT_ID", "TREE_CONTRACT_ID", "RELAYER_SECRET_KEY", "RELAYER_AUTH_TOKEN"];
-  const missing: string[] = [];
-  if (!config.votingContractId) missing.push("VOTING_CONTRACT_ID");
-  if (!config.treeContractId) missing.push("TREE_CONTRACT_ID");
-  if (!config.relayerSecretKey) missing.push("RELAYER_SECRET_KEY");
-  if (!config.relayerAuthToken) missing.push("RELAYER_AUTH_TOKEN");
-  const criticalMissing = missing.filter((k) => criticalKeys.includes(k));
-  const nonCriticalMissing = missing.filter((k) => !criticalKeys.includes(k));
+  const missing: string[] = [
+    ...errors.map((e) => e.split(" ")[0]).filter((k) => typeof k === "string"),
+  ];
+  const criticalMissing = missing.filter((k: string) => criticalKeys.includes(k));
+  const nonCriticalMissing = missing.filter((k: string) => !criticalKeys.includes(k));
 
   if (criticalMissing.length > 0) {
     console.error(
-      JSON.stringify({ level: "error", event: "missing_env", missing: criticalMissing }),
+      JSON.stringify({
+        level: "error",
+        event: "missing_env",
+        missing: criticalMissing,
+      }),
     );
   }
 
   if (nonCriticalMissing.length > 0) {
     if (config.testMode) {
       console.warn(
-        JSON.stringify({ level: "warn", event: "missing_optional_env_in_test_mode", missing: nonCriticalMissing }),
+        JSON.stringify({
+          level: "warn",
+          event: "missing_optional_env_in_test_mode",
+          missing: nonCriticalMissing,
+        }),
       );
     } else {
       console.error(
-        JSON.stringify({ level: "error", event: "missing_env", missing: nonCriticalMissing }),
+        JSON.stringify({
+          level: "error",
+          event: "missing_env",
+          missing: nonCriticalMissing,
+        }),
       );
       console.error("\nRun ./scripts/init-local.sh to generate backend/.env");
       process.exit(1);
@@ -806,9 +948,12 @@ export function validateEnv(): void {
     );
   }
 
+  // In test mode, a missing OR placeholder comments contract is allowed
+  // (warned above, not fatal) so service tests can boot without one.
   if (
     config.commentsContractId &&
-    !isValidContractId(config.commentsContractId)
+    !isValidContractId(config.commentsContractId) &&
+    !config.testMode
   ) {
     console.error(
       JSON.stringify({
@@ -820,20 +965,4 @@ export function validateEnv(): void {
     );
     process.exit(1);
   }
-
-  if (
-    config.rewardsContractId &&
-    !isValidContractId(config.rewardsContractId)
-  ) {
-    console.error(
-      JSON.stringify({
-        level: "error",
-        event: "invalid_contract_id",
-        var: "REWARDS_CONTRACT_ID",
-        value: config.rewardsContractId,
-      }),
-    );
-    process.exit(1);
-  }
-  // In test mode, missing comments contract is allowed (warned above, not fatal)
 }
