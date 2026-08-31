@@ -29,7 +29,11 @@
     "test:coverage": "jest --coverage",
     "poseidon:audit": "node utils/poseidon_param_audit.js",
     "poseidon:audit:all": "node utils/poseidon_param_audit.js --all",
-    "poseidon:golden": "node utils/gen_poseidon_golden.js"
+    "poseidon:golden": "node utils/gen_poseidon_golden.js",
+    "depths:gen": "node utils/gen_depth_circuits.js",
+    "depths:check": "node utils/gen_depth_circuits.js --check",
+    "depths:benchmark": "node utils/benchmark_depths.js",
+    "batch:fixture": "node utils/gen_batch_fixture.js"
   },
   "dependencies": {
     "circomlib": "^2.0.5",

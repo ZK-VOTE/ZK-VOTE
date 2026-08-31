@@ -7,6 +7,8 @@ use soroban_sdk::{
     Bytes, BytesN, Env, IntoVal, TryFromVal, Val, Vec, U256,
 };
 
+// Batch verification for proofs sharing one verification key (#90)
+pub mod batch;
 // Proof canonicalization module for malleability prevention
 pub mod proof_canonicalization;
 // Audit-friendly, versioned proof serialization format (ZKV1)
