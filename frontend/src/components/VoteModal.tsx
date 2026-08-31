@@ -4,6 +4,7 @@ import Alert from "./ui/Alert";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
 import { getZkVoteClient } from "../lib/client";
 import { relayerFetch } from "../lib/api";
+import { resolveCircuitUrls } from "../lib/circuitDepth";
 import {
   generateVoteProof,
   formatProofForSoroban,
@@ -30,6 +31,11 @@ interface VoteModalProps {
   eligibleRoot: bigint; // Snapshot of Merkle root when proposal was created
   voteMode: "Fixed" | "Trailing"; // Vote mode: Fixed (snapshot) or Trailing (dynamic)
   vkVersion?: number | null;
+  /**
+   * The election's declared Merkle depth, as stored on-chain. `0` — the
+   * default — means the election uses the default circuit (#93).
+   */
+  merkleDepth?: number;
   daoId: number;
   publicKey: string;
   kit: StellarWalletsKit | null;
@@ -44,6 +50,7 @@ export default function VoteModal({
   eligibleRoot,
   voteMode,
   vkVersion: _vkVersion,
+  merkleDepth = 0,
   daoId,
   publicKey,
   kit,
@@ -190,8 +197,12 @@ export default function VoteModal({
 
       // Step 4: Download circuit artifacts with progress (the proving key
       // is several MB and is the main bottleneck for perceived performance)
+      // Merkle depth is fixed at circuit compile time, so a depth-N election
+      // needs the artifacts built for Vote(N); the default circuit's are used
+      // when the election declares no depth (#93).
+      const artifacts = resolveCircuitUrls(merkleDepth);
       const zkey = await fetchWithProgress(
-        "/circuits/vote_final.zkey",
+        artifacts.zkeyUrl,
         ({ loadedBytes, totalBytes }) => {
           const pct = totalBytes
             ? Math.round((loadedBytes / totalBytes) * 100)
@@ -199,7 +210,7 @@ export default function VoteModal({
           setProgress(`Downloading proving key... ${pct}%`);
         },
       );
-      const wasm = await fetchWithProgress("/circuits/vote.wasm");
+      const wasm = await fetchWithProgress(artifacts.wasmUrl);
 
       // Step 4b: Generate ZK proof
       setProgress("Generating zero-knowledge proof...");

@@ -65,7 +65,11 @@ beforeAll(async () => {
 }, 30000);
 
 test("v1 vote/comment circuits share the DOMAIN_TAG constant", () => {
-  const files = ["vote.circom", "comment.circom"];
+  // Upstream narrowed this to the v1 circuits, which are the ones that
+  // actually declare the tag. The Vote template moved to
+  // vote_template.circom so every Merkle depth can instantiate it (#93),
+  // and the constant went with it.
+  const files = ["vote_template.circom", "comment.circom"];
   for (const file of files) {
     const src = fs.readFileSync(path.join(__dirname, file), "utf8");
     const match = src.match(/var DOMAIN_TAG = (\d+);/);

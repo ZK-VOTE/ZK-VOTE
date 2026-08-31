@@ -25,6 +25,10 @@ fi
 
 USE_DOCKER=false
 SIGN_ARTIFACTS=false
+# Merkle depths to compile alongside the default depth-18 vote.circom (#93).
+# Each depth is a separate circuit because circom fixes `component main` at
+# compile time; see circuits/utils/gen_depth_circuits.js.
+DEPTHS="10 15 20 25"
 
 for arg in "$@"; do
     case $arg in
@@ -36,12 +40,22 @@ for arg in "$@"; do
             SIGN_ARTIFACTS=true
             shift
             ;;
+        --depths=*)
+            DEPTHS="$(echo "${arg#*=}" | tr ',' ' ')"
+            shift
+            ;;
+        --no-depths)
+            DEPTHS=""
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--docker] [--sign]"
+            echo "Usage: $0 [--docker] [--sign] [--depths=10,15,20,25 | --no-depths]"
             echo ""
             echo "Options:"
-            echo "  --docker  Use Docker container for reproducible build"
-            echo "  --sign    Sign generated checksums with PGP key"
+            echo "  --docker         Use Docker container for reproducible build"
+            echo "  --sign           Sign generated checksums with PGP key"
+            echo "  --depths=LIST    Merkle depths to compile (default: 10,15,20,25)"
+            echo "  --no-depths      Compile only the default depth-18 vote.circom"
             exit 0
             ;;
     esac
@@ -96,6 +110,18 @@ else
 
     echo "Compiling vote.circom..."
     circom vote.circom --r1cs --wasm --sym -o build -l node_modules
+
+    # Regenerate the per-depth wrappers so a stale committed file can never be
+    # what gets compiled, then build each depth into its own directory.
+    if [ -n "$DEPTHS" ]; then
+        node utils/gen_depth_circuits.js $DEPTHS
+        for depth in $DEPTHS; do
+            echo "Compiling vote_d${depth}.circom (Merkle depth $depth)..."
+            mkdir -p "build/depth_${depth}"
+            circom "vote_d${depth}.circom" --r1cs --wasm --sym \
+                -o "build/depth_${depth}" -l node_modules
+        done
+    fi
 fi
 
 # Ensure verification key derivation if zkey exists
@@ -125,6 +151,14 @@ if [ -f "build/vote.r1cs" ]; then TRACKED_ARTIFACTS+=("build/vote.r1cs"); fi
 if [ -f "build/vote_js/vote.wasm" ]; then TRACKED_ARTIFACTS+=("build/vote_js/vote.wasm"); fi
 if [ -f "build/verification_key.json" ]; then TRACKED_ARTIFACTS+=("build/verification_key.json"); fi
 if [ -f "build/verification_key_soroban.json" ]; then TRACKED_ARTIFACTS+=("build/verification_key_soroban.json"); fi
+for depth in $DEPTHS; do
+    if [ -f "build/depth_${depth}/vote_d${depth}.r1cs" ]; then
+        TRACKED_ARTIFACTS+=("build/depth_${depth}/vote_d${depth}.r1cs")
+    fi
+    if [ -f "build/depth_${depth}/vote_d${depth}_js/vote_d${depth}.wasm" ]; then
+        TRACKED_ARTIFACTS+=("build/depth_${depth}/vote_d${depth}_js/vote_d${depth}.wasm")
+    fi
+done
 
 if [ ${#TRACKED_ARTIFACTS[@]} -gt 0 ]; then
     sha256sum "${TRACKED_ARTIFACTS[@]}" > "$CHECKSUM_FILE"

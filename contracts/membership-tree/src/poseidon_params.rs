@@ -1,5 +1,18 @@
 // BN254 Poseidon parameters (circomlib-compatible, t=3)
 // Copied from soroban-sdk internal poseidon_params.rs since the module is private
+//
+// PROVENANCE (#91): these tables are not arbitrary. They are the parameters the
+// Poseidon designers' reference generator produces for
+//
+//     sage generate_parameters_grain.sage 1 0 254 3 8 57 \
+//         0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+//
+// `circuits/utils/poseidon_param_audit.js` re-derives them from that seed,
+// re-runs the generator's three matrix-security tests against them, and checks
+// the round numbers against the security inequality in `calc_round_numbers.py`.
+// The `tests` module at the bottom of this file hashes the vendored copy and
+// compares the digest with `circuits/utils/poseidon_params_golden.json`, so
+// this file and the circuits cannot drift apart silently.
 use soroban_sdk::{bytesn, vec, Env, Vec, U256};
 
 pub const T: u32 = 3;
@@ -357,4 +370,117 @@ pub fn get_rc3(e: &Env) -> Vec<Vec<U256>> {
             U256::from_be_bytes(e, &bytesn!(e, 0x1da55cc900f0d21f4a3e694391918a1b3c23b2ac773c6b3ef88e2e4228325161).into()),
         ],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{Bytes, BytesN, Env};
+
+    /// BN254 scalar field modulus, big-endian.
+    const BN254_FR_MODULUS: [u8; 32] = [
+        0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58,
+        0x5d, 0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00,
+        0x00, 0x01,
+    ];
+
+    /// `widths[t=3].digest_sha256` from `circuits/utils/poseidon_params_golden.json`,
+    /// which is regenerated with `npm run poseidon:golden` in `circuits/`.
+    const GOLDEN_DIGEST: [u8; 32] = [
+        0x31, 0x09, 0x41, 0xf1, 0x02, 0xaf, 0x31, 0x91, 0xa9, 0x72, 0xd4, 0xc8, 0xab, 0xac, 0x5f,
+        0x86, 0xf8, 0xd9, 0x2b, 0x55, 0xe0, 0x56, 0xa3, 0xff, 0x31, 0x94, 0x2b, 0x42, 0xaf, 0x0b,
+        0x75, 0xa6,
+    ];
+
+    /// SHA-256 over the vendored tables in the order the golden file commits to:
+    /// the MDS matrix row-major, then the round constants round-major, each
+    /// element as 32 big-endian bytes. Order is part of the commitment, so a
+    /// transposed or reordered table is caught as well as a changed value.
+    fn digest_tables(env: &Env) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        for row in get_mds3(env).iter() {
+            for cell in row.iter() {
+                buf.append(&cell.to_be_bytes());
+            }
+        }
+        for row in get_rc3(env).iter() {
+            for cell in row.iter() {
+                buf.append(&cell.to_be_bytes());
+            }
+        }
+        env.crypto().sha256(&buf).into()
+    }
+
+    #[test]
+    fn vendored_tables_match_the_derived_golden_digest() {
+        let env = Env::default();
+        assert_eq!(
+            digest_tables(&env),
+            BytesN::from_array(&env, &GOLDEN_DIGEST),
+            "vendored Poseidon parameters no longer match the parameters derived \
+             from the specification; regenerate with `npm run poseidon:golden` in \
+             circuits/ and review why they changed"
+        );
+    }
+
+    #[test]
+    fn declared_round_numbers_are_the_audited_ones() {
+        // The audit checks these against the paper's security inequality; if
+        // they change here, the vendored tables above are no longer the ones the
+        // analysis covers.
+        assert_eq!(T, 3);
+        assert_eq!(SBOX_D, 5);
+        assert_eq!(ROUNDS_F, 8);
+        assert_eq!(ROUNDS_P, 57);
+    }
+
+    #[test]
+    fn table_shapes_follow_from_the_round_numbers() {
+        let env = Env::default();
+        let mds = get_mds3(&env);
+        assert_eq!(mds.len(), T);
+        for row in mds.iter() {
+            assert_eq!(row.len(), T);
+        }
+
+        let rc = get_rc3(&env);
+        assert_eq!(rc.len(), ROUNDS_F + ROUNDS_P);
+        for row in rc.iter() {
+            assert_eq!(row.len(), T);
+        }
+    }
+
+    #[test]
+    fn every_parameter_is_a_reduced_field_element() {
+        let env = Env::default();
+        let modulus = U256::from_be_bytes(&env, &Bytes::from_array(&env, &BN254_FR_MODULUS));
+        for row in get_mds3(&env).iter() {
+            for cell in row.iter() {
+                assert!(cell < modulus, "MDS entry is not reduced mod r");
+            }
+        }
+        for row in get_rc3(&env).iter() {
+            for cell in row.iter() {
+                assert!(cell < modulus, "round constant is not reduced mod r");
+            }
+        }
+    }
+
+    #[test]
+    fn mds_entries_are_distinct_and_nonzero() {
+        // A Cauchy matrix over distinct sampling points has no repeated and no
+        // zero entries; a zero or duplicated entry would mean the vendored copy
+        // is not the generated matrix.
+        let env = Env::default();
+        let zero = U256::from_u32(&env, 0);
+        let mds = get_mds3(&env);
+        let mut seen: soroban_sdk::Vec<U256> = soroban_sdk::Vec::new(&env);
+        for row in mds.iter() {
+            for cell in row.iter() {
+                assert!(cell != zero, "MDS entry is zero");
+                assert!(!seen.contains(&cell), "MDS entry is repeated");
+                seen.push_back(cell);
+            }
+        }
+    }
 }

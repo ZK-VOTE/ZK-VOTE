@@ -1517,6 +1517,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "stor_ver"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "tree"
                       },
                       "val": {

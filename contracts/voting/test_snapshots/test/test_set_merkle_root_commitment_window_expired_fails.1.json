@@ -413,6 +413,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "merkle_depth"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "merkle_root_set_at"
                     },
                     "val": "void"

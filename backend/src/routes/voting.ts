@@ -28,6 +28,7 @@ import {
   monitorMissingVotes,
   u256ToScVal,
   proofToScVal,
+  batchVoteToScVal,
   canonicalProofFingerprint,
   scValToU256Hex,
   validateSponsoredFeeRequest,
@@ -45,6 +46,7 @@ import {
 } from "../middleware/index.js";
 import {
   voteSchema,
+  voteBatchSchema,
   commitSchema,
   proposalParamsSchema,
   daoParamsSchema,
@@ -1092,6 +1094,186 @@ router.get("/vote/status/:jobId", (req: Request, res: Response) => {
 
   return res.json(payload);
 });
+
+/**
+ * POST /vote/batch - Submit several votes in one transaction (#90)
+ *
+ * The contract's `cast_votes` verifies the batch under a single aggregated
+ * pairing check rather than one per vote, so the per-vote verification cost
+ * falls sharply as the batch grows. The batch is all-or-nothing: `cast_votes`
+ * panics on the first invalid vote and no nullifier is burned, which is why a
+ * caller gets one status for the whole submission rather than per-vote results.
+ */
+router.post(
+  "/vote/batch",
+  bodyLimit("256kb"),
+  authGuard,
+  tlsClientCertGuard,
+  walletRateLimiter,
+  voteLimiter,
+  validateBody(voteBatchSchema),
+  (async (req: Request, res: Response, next: NextFunction) => {
+    const { daoId, proposalId, votes } = req.body;
+
+    try {
+      log("info", "vote_batch_request", {
+        daoId,
+        proposalId,
+        batchSize: votes.length,
+      });
+
+      let scVotes: StellarSdk.xdr.ScVal;
+      try {
+        scVotes = StellarSdk.xdr.ScVal.scvVec(votes.map(batchVoteToScVal));
+      } catch (err) {
+        return res.status(400).json({ error: (err as Error).message });
+      }
+
+      if (config.testMode) {
+        return res.status(400).json({ error: "Simulation failed (test mode)" });
+      }
+
+      const contract = new StellarSdk.Contract(config.votingContractId!);
+      const operation = contract.call(
+        "cast_votes",
+        StellarSdk.nativeToScVal(daoId, { type: "u64" }),
+        StellarSdk.nativeToScVal(proposalId, { type: "u64" }),
+        scVotes,
+      );
+
+      const { sendResult, result } = await withSequenceLock(async () => {
+        const account = await (server as StellarSdk.rpc.Server).getAccount(
+          relayerKeypair.publicKey(),
+        );
+
+        const tx = new StellarSdk.TransactionBuilder(account, {
+          fee: "100000",
+          networkPassphrase: config.networkPassphrase,
+        })
+          .addOperation(operation)
+          .setTimeout(30)
+          .build();
+
+        log("info", "simulate_vote_batch", { daoId, proposalId });
+        const simResult = await callWithTimeout(
+          () =>
+            simulateWithBackoff(() =>
+              (server as StellarSdk.rpc.Server).simulateTransaction(tx),
+            ),
+          "simulate_vote_batch",
+        );
+
+        if (!StellarSdk.rpc.Api.isSimulationSuccess(simResult)) {
+          // As with a single vote, never say which vote or which check failed:
+          // that would identify a voter within the batch (THREAT_MODEL.md
+          // §privacy).
+          throw new Error("SIMULATION_FAILED:VOTE_REJECTED");
+        }
+
+        const preparedTx = StellarSdk.rpc
+          .assembleTransaction(tx, simResult)
+          .build();
+        preparedTx.sign(relayerKeypair as StellarSdk.Keypair);
+
+        log("info", "submit_vote_batch", { daoId, proposalId });
+        const sr = await callWithTimeout(
+          () => (server as StellarSdk.rpc.Server).sendTransaction(preparedTx),
+          "send_vote_batch",
+        );
+
+        if (sr.status === "ERROR") {
+          const isBadSeq = sequenceManager.handleTxError(
+            typeof (sr as any).errorResult === "string"
+              ? (sr as any).errorResult
+              : JSON.stringify((sr as any).errorResult ?? ""),
+          );
+          log("error", "submit_batch_failed", {
+            daoId,
+            proposalId,
+            isBadSeq,
+          });
+          throw new Error(isBadSeq ? "SUBMIT_FAILED_BAD_SEQ" : "SUBMIT_FAILED");
+        }
+
+        const r = await callWithTimeout(
+          () => waitForTransaction(sr.hash),
+          "wait_for_vote_batch",
+        );
+
+        return { sendResult: sr, result: r };
+      });
+
+      if (result.status === "SUCCESS") {
+        // The batch lands atomically, so every nullifier in it is now spent.
+        for (const vote of votes) {
+          if (sendResult.hash) {
+            recordTransactionLog(vote.nullifier, sendResult.hash, "SUCCESS");
+            storeVoteReceipt(
+              vote.nullifier,
+              sendResult.hash,
+              proposalId,
+              daoId,
+              "confirmed",
+            );
+          }
+        }
+        votesProcessed.inc({ status: "success" }, votes.length);
+        log("info", "vote_batch_success", {
+          txHash: sendResult.hash,
+          daoId,
+          proposalId,
+          batchSize: votes.length,
+        });
+        return res.json({
+          success: true,
+          txHash: sendResult.hash,
+          status: result.status,
+          accepted: votes.length,
+        });
+      }
+
+      votesProcessed.inc({ status: "failed" }, votes.length);
+      log("error", "vote_batch_failed", {
+        txHash: sendResult.hash,
+        status: result.status,
+      });
+      return res.status(500).json({
+        error: "Transaction failed",
+        txHash: sendResult.hash,
+        status: result.status,
+      });
+    } catch (err) {
+      votesProcessed.inc({ status: "error" }, votes.length);
+      log("error", "vote_batch_exception", {
+        message: (err as Error).message,
+      });
+
+      if (err instanceof ApiError) return next(err);
+
+      const errMsg = (err as Error).message || "";
+      let statusCode = 500;
+      let errorCode = ErrorCode.INTERNAL_ERROR;
+      let userMessage = "Internal server error";
+
+      if (errMsg.includes("SIMULATION_FAILED:VOTE_REJECTED")) {
+        statusCode = 400;
+        errorCode = ErrorCode.VOTE_REJECTED;
+        userMessage = "VOTE_REJECTED";
+      } else if (
+        errMsg === "SUBMIT_FAILED" ||
+        errMsg === "SUBMIT_FAILED_BAD_SEQ"
+      ) {
+        userMessage = "Transaction submission failed";
+      } else if (errMsg.includes("Timeout:")) {
+        statusCode = 504;
+        errorCode = ErrorCode.TIMEOUT;
+        userMessage = "Request timeout - please try again";
+      }
+
+      return next(new ApiError(statusCode, errorCode, userMessage, errMsg));
+    }
+  }) as AsyncHandler,
+);
 
 /**
  * GET /proposal/:daoId/:proposalId - Get proposal results
