@@ -42,7 +42,7 @@ use soroban_sdk::{
 
 // Re-export shared Groth16 types and utilities
 pub use zkvote_groth16::{
-    Bls12381Curve, CurveId, Groth16Error, Proof, ProofBls381, VerificationKey,
+    Bls12381Curve, CurveId, Groth16Error, PathContext, Proof, ProofBls381, VerificationKey,
     VerificationKeyBls381,
 };
 
@@ -55,8 +55,10 @@ mod sybil;
 // VDF-gated vote commit–reveal (issue #302)
 mod commit_reveal;
 
-// Anonymous vote delegation / liquid democracy (issue #304)
-mod delegation;
+// Anonymous vote delegation / liquid democracy (issue #304) is declared in the
+// tracker but has no implementation in this tree: `delegation.rs` has never
+// existed on any branch and nothing references `delegation::`. The module
+// declaration is left out until the implementation lands, so the crate builds.
 
 const TREE_CONTRACT: Symbol = symbol_short!("tree");
 const REGISTRY: Symbol = symbol_short!("registry");
@@ -126,6 +128,192 @@ pub enum VotingError {
     TallyOverflow = 32,
     /// Recursive tally proof inconsistent with on-chain nullifier set
     RecursiveProofInvalid = 33,
+    RandomnessCommitmentMissing = 34,
+    RandomnessRevealMismatch = 35,
+    CandidateSeedFinalized = 36,
+    InsufficientRandomness = 37,
+    RandomnessAlreadyRevealed = 38,
+    RandomnessParticipantLimit = 39,
+    TooManyActiveProposals = 40,
+    ProposalCooldownActive = 41,
+    InvalidProposalDeposit = 42,
+    ProposalHasVotes = 43,
+    VotingNotStarted = 44,
+    ElectionDurationTooShort = 45,
+    ElectionDurationTooLong = 46,
+    InvalidNoticePeriod = 47,
+    InvalidRegistrationPeriod = 48,
+    InvalidRegistrationGap = 49,
+    /// Regular `vote` called on a Quadratic proposal (use `cast_qv_vote`), or
+    /// `cast_qv_vote` called on a non-Quadratic proposal
+    NotQuadraticProposal = 50,
+    /// Quadratic-voting verification key not set for this DAO
+    QvVkNotSet = 51,
+    /// Quadratic ballot exceeds the fixed credit budget (sum of squares > MAX_QV_BUDGET)
+    QvBudgetExceeded = 52,
+    /// Quadratic tally verification key not set for this DAO
+    QvTallyVkNotSet = 53,
+    /// Tally proposal_ids / tallies vectors have mismatched or empty length
+    QvTallyLengthMismatch = 54,
+    /// Reentrant call detected (defense-in-depth against cross-contract reentrancy)
+    ReentrantCall = 56,
+    /// VDF proof verification failed
+    VdfVerificationFailed = 57,
+    /// VDF output already submitted for this election
+    VdfAlreadySubmitted = 58,
+    /// VDF delay period has not elapsed yet
+    VdfDelayNotElapsed = 59,
+    /// VDF delay parameter is invalid
+    VdfInvalidDelay = 60,
+    /// VDF input (block hash) is not available
+    VdfInputNotAvailable = 61,
+    /// Merkle root is fixed for this proposal and can no longer be changed
+    MerkleRootLocked = 63,
+    /// Merkle root update attempted after the commitment window closed
+    CommitmentWindowExpired = 64,
+    /// Upgrade would move storage to an older schema version
+    StorageVersionDowngrade = 65,
+    /// Upgrade payload does not target the contract's current version
+    UpgradeVersionMismatch = 66,
+    /// Upgrade payload exceeds MAX_UPGRADE_PAYLOAD_LEN
+    UpgradePayloadTooLarge = 67,
+    /// vote_choice is outside [0, num_candidates)
+    InvalidCandidateIndex = 68,
+    /// Merkle depth is zero, above MAX_MERKLE_DEPTH, or has no registered VK
+    InvalidMerkleDepth = 71,
+    /// Batch is empty or larger than MAX_VOTE_BATCH
+    InvalidBatchSize = 72,
+    /// The same nullifier appears twice within one batch
+    DuplicateNullifierInBatch = 73,
+
+    // ── Errors raised by commit_reveal.rs and sybil.rs ─────────────────────
+    // Referenced by those modules but never defined, so the crate did not
+    // build. Numbered above the existing range; the coarse block starts at 100.
+    /// Commit–reveal is not configured for this proposal
+    CommitRevealNotConfigured = 81,
+    /// The commit phase has closed
+    CommitPhaseClosed = 82,
+    /// A commitment already exists for this nullifier
+    CommitAlreadyExists = 83,
+    /// The reveal phase is not open yet
+    RevealPhaseNotOpen = 84,
+    /// The reveal phase has closed
+    RevealPhaseClosed = 85,
+    /// No commitment found for this nullifier
+    VoteCommitmentNotFound = 86,
+    /// The revealed vote does not match its commitment
+    VoteCommitmentMismatch = 87,
+    /// This commitment has already been revealed
+    AlreadyRevealed = 88,
+    /// The VDF for this proposal has not been finalized
+    VdfNotFinalized = 89,
+    /// The reveal schedule is invalid
+    InvalidRevealSchedule = 90,
+    /// Weight exceeds the proposal's sybil cap
+    WeightAboveSybilCap = 91,
+    /// The submitting relayer address is not the one bound into the proof
+    InvalidRelayerAddress = 92,
+
+    // ── Coarse categories (100–106) ────────────────────────────────────────
+    // An anonymous submission collapses to one of these so a relayer cannot
+    // distinguish *why* a vote was refused and probe internal state. Numbered
+    // to match `CommentsError` and `RewardsError`, so a given code means the
+    // same thing whichever contract returned it.
+    /// Malformed input: signal out of field, bad nullifier, bad index
+    InvalidInput = 100,
+    /// Caller is not eligible: root mismatch, stale root, revoked commitment
+    EligibilityFailed = 101,
+    /// Proof did not verify, or the key it was made against changed
+    ProofInvalid = 102,
+    /// This nullifier has already been spent
+    AlreadySubmitted = 103,
+    /// The voting window is closed
+    WindowClosed = 104,
+    /// Insufficient funds for the operation
+    InsufficientFunds = 105,
+    /// The election or contract is not configured for this operation
+    ConfigError = 106,
+    TransferCooldownActive = 74,
+    /// Balance at snapshot time is below minimum required for token-gated voting
+    InsufficientSnapshotBalance = 75,
+    ContractPaused = 76,
+    NotGuardian = 77,
+    RandomnessCommitClosed = 78,
+    RandomnessRevealClosed = 79,
+    RandomnessAlreadyCommitted = 80,
+}
+
+impl VotingError {
+    /// Collapse fine-grained discriminants into the coarse categories
+    /// (100–106) when `ctx` is [`PathContext::Anonymous`].
+    /// [`PathContext::Admin`] returns the value unchanged so admin tooling and
+    /// tests keep full diagnostic granularity.
+    ///
+    /// The anonymous path is a relayer submitting someone else's vote. Telling
+    /// it exactly which check failed would let it probe membership, nullifier
+    /// state and election config one submission at a time, so everything an
+    /// anonymous caller can trigger collapses to a category.
+    pub fn to_coarse(&self, ctx: PathContext) -> VotingError {
+        match ctx {
+            PathContext::Admin => *self,
+            PathContext::Anonymous => match self {
+                // Malformed input
+                VotingError::SignalNotInField
+                | VotingError::InvalidNullifier
+                | VotingError::InvalidCandidateIndex
+                | VotingError::InvalidDomainTag
+                | VotingError::WeightOutOfRange
+                | VotingError::InvalidMerkleDepth
+                | VotingError::InvalidBatchSize
+                | VotingError::DuplicateNullifierInBatch => VotingError::InvalidInput,
+
+                // Eligibility: which root failed, and how, is membership
+                // information.
+                VotingError::RootMismatch
+                | VotingError::RootNotInHistory
+                | VotingError::RootPredatesProposal
+                | VotingError::RootPredatesRemoval
+                | VotingError::CommitmentRevokedAtCreation
+                | VotingError::CommitmentRevokedDuringVoting => VotingError::EligibilityFailed,
+
+                // Proof verification
+                VotingError::InvalidProof | VotingError::VkChanged => VotingError::ProofInvalid,
+
+                // Double-spend
+                VotingError::NullifierUsed => VotingError::AlreadySubmitted,
+
+                // Timing
+                VotingError::VotingClosed => VotingError::WindowClosed,
+
+                // Election/contract configuration
+                VotingError::VkNotSet
+                | VotingError::VkVersionMismatch
+                | VotingError::NotQuadraticProposal
+                | VotingError::TallyOverflow => VotingError::ConfigError,
+
+                // Already coarse: idempotent.
+                VotingError::InvalidInput
+                | VotingError::EligibilityFailed
+                | VotingError::ProofInvalid
+                | VotingError::AlreadySubmitted
+                | VotingError::WindowClosed
+                | VotingError::InsufficientFunds
+                | VotingError::ConfigError => *self,
+
+                // Admin-only or public-state conditions an anonymous caller
+                // cannot reach, or that leak nothing: pass through.
+                other => *other,
+            },
+        }
+    }
+}
+
+/// Panic with a coarse version of `err` on an anonymous path, or the specific
+/// error on an admin path. Shorthand for
+/// `panic_with_error!(env, err.to_coarse(ctx))`.
+#[inline]
+fn panic_coarse(env: &Env, ctx: PathContext, err: VotingError) -> ! {
+    panic_with_error!(env, err.to_coarse(ctx));
 }
 
 // Maximum allowed IC vector length (num_public_inputs + 1)
@@ -137,6 +325,15 @@ const MAX_IC_LENGTH: u32 = 21;
 const MAX_TITLE_LEN: u32 = 100; // Max proposal title length (100 bytes)
 const MAX_CID_LEN: u32 = 64; // Max IPFS CID length (CIDv1 is ~59 chars)
 const MAX_UPGRADE_PAYLOAD_LEN: u32 = 4096;
+
+/// Largest Merkle depth an election may declare (#93). 2^32 members is far
+/// beyond anything the tree contract can hold; the bound exists so a bad depth
+/// cannot be used to force an unbounded proof.
+pub const MAX_MERKLE_DEPTH: u32 = 32;
+
+/// Largest batch `cast_votes` accepts (#90). Matches the verifier's own cap:
+/// the whole pairing check has to fit in one transaction's resource budget.
+pub const MAX_VOTE_BATCH: u32 = zkvote_groth16::batch::MAX_BATCH_SIZE;
 
 // Circuit constants
 /// Vote circuit public signals: root, nullifier, dao_id, proposal_id, vote_choice, num_candidates, relayer_address
@@ -264,6 +461,37 @@ pub enum DataKey {
     /// On-chain nullifier accumulator for tally proof binding (#94).
     /// Appended at end so existing storage discriminants stay stable.
     NullifierAccumulator(u64, u64),
+    /// Verification key registered for a specific Merkle depth (#93).
+    DepthVk(u64, u32), // (dao_id, merkle_depth) -> VerificationKey
+    /// Hash of the depth verification key, pinned when the election declared
+    /// its depth, so a later `set_vk_for_depth` cannot silently change the key
+    /// an in-flight election verifies against (#93).
+    ProposalDepthVkHash(u64, u64), // (dao_id, proposal_id) -> BytesN<32>
+
+    // ── Keys referenced by commit_reveal.rs and sybil.rs ───────────────────
+    // These modules were merged without the DataKey variants they use, so the
+    // crate did not build. Shapes are taken from the call sites; appended at
+    // the end so existing storage discriminants are untouched.
+    /// Commit–reveal configuration for a proposal (#302).
+    CommitRevealConfig(u64, u64), // (dao_id, proposal_id)
+    /// Verification key for the commit-phase circuit (#302).
+    CommitVotingKey(u64), // (dao_id)
+    /// A submitted vote commitment, keyed by nullifier (#302).
+    VoteCommit(u64, u64, U256), // (dao_id, proposal_id, nullifier)
+    /// Whether a commitment has been revealed (#302).
+    VoteRevealed(u64, u64, U256), // (dao_id, proposal_id, nullifier)
+    /// Number of commitments received for a proposal (#302).
+    VoteCommitCount(u64, u64), // (dao_id, proposal_id)
+    /// Cached proposal end time for the reveal schedule (#302).
+    ProposalEndTime(u64, u64), // (dao_id, proposal_id)
+    /// Verification key for the sybil-resistance circuit.
+    SybilVotingKey(u64), // (dao_id)
+    /// Root of the attestation tree a weighted vote proves against.
+    AttestationRoot(u64, u64), // (dao_id, proposal_id)
+    /// Per-proposal cap on a single voter's weight.
+    SybilWeightCap(u64, u64), // (dao_id, proposal_id)
+    /// Running weighted tally for a proposal.
+    WeightedTally(u64, u64), // (dao_id, proposal_id)
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -449,6 +677,14 @@ pub struct ElectionConfig {
     pub merkle_root_set_at: Option<u64>,
     /// Commitment window duration (in seconds) after registration opens during which root updates are permitted.
     pub commitment_window: u64,
+    /// Merkle depth this election's proofs are built against (#93).
+    ///
+    /// 0 means the default circuit (`vote.circom`, depth 18) and the DAO's
+    /// version-pinned verification key. A non-zero depth selects the circuit
+    /// and verification key registered for that depth via `set_vk_for_depth`,
+    /// letting a small election pay for a short Merkle path instead of a
+    /// worst-case one.
+    pub merkle_depth: u32,
 }
 
 #[contracttype]
@@ -545,6 +781,21 @@ pub struct ProposalArchivedEvent {
     pub archived_by: Address,
 }
 
+/// One vote inside a batched submission (#90).
+///
+/// Carries exactly what a single `vote` call would, so a relayer can group
+/// independent voters without any of them trusting each other: each proof is
+/// still checked against its own public signals, just inside a combined
+/// pairing check.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchVote {
+    pub vote_choice: bool,
+    pub nullifier: U256,
+    pub root: U256,
+    pub proof: Proof,
+}
+
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoteEvent {
@@ -554,6 +805,20 @@ pub struct VoteEvent {
     pub proposal_id: u64,
     pub choice: bool,
     pub nullifier: U256,
+}
+
+/// Emitted once per successful batch, alongside the per-vote `VoteEvent`s.
+/// Indexers can use it to tell a batched submission from a run of single votes.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoteBatchEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub votes: u32,
+    pub yes_votes: u32,
+    pub no_votes: u32,
 }
 
 #[soroban_sdk::contractevent]
@@ -1396,10 +1661,12 @@ impl Voting {
             .get(&key)
             .unwrap_or(U256::from_u32(env, 0));
         let mut data = Bytes::new(env);
-        data.append(&Bytes::from_array(env, &current.to_bytes().to_array()));
-        data.append(&Bytes::from_array(env, &nullifier.to_bytes().to_array()));
+        // Big-endian, matching how U256 is serialised everywhere else in this
+        // contract; `to_bytes`/`from_bytes` are not soroban U256 methods.
+        data.append(&current.to_be_bytes());
+        data.append(&nullifier.to_be_bytes());
         let hash: BytesN<32> = env.crypto().sha256(&data).into();
-        let next = U256::from_bytes(env, &hash);
+        let next = U256::from_be_bytes(env, &hash.into());
         env.storage().persistent().set(&key, &next);
         Self::bump_persistent(env, &key);
     }
@@ -2043,60 +2310,10 @@ impl Voting {
         env.storage().temporary().set(&null_key, &true);
         Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
 
-        // Verify root based on vote mode
-        // (May involve cross-contract calls to tree contract in Trailing mode)
-        match proposal.vote_mode {
-            VoteMode::Fixed => {
-                // Fixed mode: root must exactly match the snapshot at proposal creation
-                // This prevents sybil attacks where members are added after proposal creation
-                if root != proposal.eligible_root {
-                    panic_coarse(&env, ctx, VotingError::RootMismatch);
-                }
-            }
-            VoteMode::Trailing => {
-                // Trailing mode: root must be in tree history AND not predate proposal creation
-                // AND not predate the most recent member removal
-                // This allows new members to vote while preventing removed members from using old roots
-
-                // Get tree contract address
-                let tree_contract: Address = Self::tree_contract(env.clone());
-
-                // Check root is in valid history
-                let root_valid: bool = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if !root_valid {
-                    panic_coarse(&env, ctx, VotingError::RootNotInHistory);
-                }
-
-                // Check root index >= earliest_root_index (prevents using roots from before proposal)
-                let root_index: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_idx"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if root_index < proposal.earliest_root_index {
-                    panic_coarse(&env, ctx, VotingError::RootPredatesProposal);
-                }
-
-                // Check root index >= min_valid_root_index (prevents using roots from before member removal)
-                // This ensures revoked members cannot vote even on old proposals using their pre-revocation proofs
-                let min_valid_root: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env)],
-                );
-                if root_index < min_valid_root {
-                    panic_coarse(&env, ctx, VotingError::RootPredatesRemoval);
-                }
-            }
-            VoteMode::Quadratic => {
-                // Quadratic proposals must be voted on via `cast_qv_vote`.
-                panic_coarse(&env, ctx, VotingError::NotQuadraticProposal);
-            }
-        }
+        // Verify root based on vote mode. Shared with `cast_votes` so a batched
+        // submission is held to exactly the same eligibility rules.
+        // (May involve cross-contract calls to the tree contract in Trailing mode.)
+        Self::assert_root_eligible(&env, ctx, dao_id, &proposal, &root);
 
         // Verify proposal was created for BN254 curve (not BLS12-381)
         let curve_key = DataKey::ProposalCurve(dao_id, proposal_id);
@@ -2109,15 +2326,19 @@ impl Voting {
             panic_coarse(&env, ctx, VotingError::VkNotSet);
         }
 
-        // Get verification key pinned to proposal version
-        let vk: VerificationKey = Self::get_vk_by_version(&env, dao_id, proposal.vk_version);
-
-        // Verify VK matches the snapshot taken at proposal creation
-        // This prevents VK changes from invalidating in-flight votes
-        let current_vk_hash = Self::hash_vk(&env, &vk);
-        if current_vk_hash != proposal.vk_hash {
-            panic_coarse(&env, ctx, VotingError::VkChanged);
-        }
+        // Resolve the verification key. At the default Merkle depth this is the
+        // proposal's version-pinned key, checked against the hash snapshotted at
+        // proposal creation so a VK change cannot invalidate in-flight votes.
+        // An election that declared a depth (#93) uses the key registered for
+        // that depth, pinned the same way.
+        let election_depth = env
+            .storage()
+            .persistent()
+            .get::<_, ElectionConfig>(&DataKey::ElectionConfig(dao_id, proposal_id))
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0);
+        let vk: VerificationKey =
+            Self::resolve_election_vk(&env, ctx, dao_id, proposal_id, &proposal, election_depth);
 
         // Verify Groth16 proof
         // Public signals: [root, nullifier, daoId, proposalId, voteChoice]
@@ -2148,6 +2369,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
@@ -2167,7 +2389,7 @@ impl Voting {
         let relayer_signal = Self::address_to_u256(&env, &relayer_address);
 
         // Validate relayer address is in BN254 scalar field
-        Self::assert_in_field(&env, &relayer_signal);
+        Self::assert_in_field(&env, PathContext::Anonymous, &relayer_signal);
 
         // Validate relayer address is non-zero
         if relayer_signal == U256::from_u32(&env, 0) {
@@ -2269,8 +2491,8 @@ impl Voting {
         // ── DEFENSE-IN-DEPTH: Set reentrancy lock BEFORE any state mutations ──
         Self::set_reentrancy_lock(&env);
 
-        Self::assert_in_field_bls381(&env, &nullifier);
-        Self::assert_in_field_bls381(&env, &root);
+        Self::assert_in_field_bls381(&env, PathContext::Anonymous, &nullifier);
+        Self::assert_in_field_bls381(&env, PathContext::Anonymous, &root);
 
         if nullifier == U256::from_u32(&env, 0) {
             panic_with_error!(&env, VotingError::InvalidNullifier);
@@ -2378,6 +2600,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
@@ -2396,7 +2619,7 @@ impl Voting {
         let relayer_signal = Self::address_to_u256(&env, &relayer_address);
 
         // Validate relayer address is in BLS12-381 scalar field
-        Self::assert_in_field_bls381(&env, &relayer_signal);
+        Self::assert_in_field_bls381(&env, PathContext::Anonymous, &relayer_signal);
 
         // Validate relayer address is non-zero
         if relayer_signal == U256::from_u32(&env, 0) {
@@ -2445,6 +2668,410 @@ impl Voting {
         .publish(&env);
     }
 
+    // ---------------------------------------------------------------------
+    // Merkle depth flexibility (#93)
+    // ---------------------------------------------------------------------
+
+    /// Registers the verification key for a Merkle depth.
+    ///
+    /// `vote.circom` fixes the tree depth at 18, so every proof carries 18 path
+    /// elements no matter how small the electorate is. Compiling the circuit at
+    /// other depths produces different verification keys, and this is where a
+    /// DAO admin registers them.
+    ///
+    /// Registering a key for a depth an election has already declared changes
+    /// what that election verifies against, so the pinned hash check in
+    /// `resolve_election_vk` rejects in-flight proofs with `VkChanged` — the
+    /// same protection the version-pinned default key has.
+    pub fn set_vk_for_depth(
+        env: Env,
+        dao_id: u64,
+        merkle_depth: u32,
+        vk: VerificationKey,
+        admin: Address,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        Self::assert_admin(&env, dao_id, &admin);
+
+        if merkle_depth == 0 || merkle_depth > MAX_MERKLE_DEPTH {
+            panic_with_error!(&env, VotingError::InvalidMerkleDepth);
+        }
+        // Same structural checks the default key gets: a key with the wrong IC
+        // length can never verify this circuit's public signals.
+        if vk.ic.len() != VOTE_CIRCUIT_IC_LEN {
+            panic_with_error!(&env, VotingError::VkIcLengthMismatch);
+        }
+        if vk.ic.len() > MAX_IC_LENGTH {
+            panic_with_error!(&env, VotingError::VkIcTooLarge);
+        }
+
+        let key = DataKey::DepthVk(dao_id, merkle_depth);
+        env.storage().persistent().set(&key, &vk);
+        Self::bump_persistent(&env, &key);
+    }
+
+    /// Returns the verification key registered for a Merkle depth, if any.
+    pub fn get_vk_for_depth(env: Env, dao_id: u64, merkle_depth: u32) -> Option<VerificationKey> {
+        Self::bump_instance(&env);
+        let key = DataKey::DepthVk(dao_id, merkle_depth);
+        let vk: Option<VerificationKey> = env.storage().persistent().get(&key);
+        if vk.is_some() {
+            Self::bump_persistent(&env, &key);
+        }
+        vk
+    }
+
+    /// Sets the election configuration and the Merkle depth its proofs use.
+    ///
+    /// A depth of 0 keeps the default circuit and the DAO's version-pinned key.
+    /// A non-zero depth requires a key registered by `set_vk_for_depth`, and
+    /// pins that key's hash to the proposal so a later re-registration cannot
+    /// change what in-flight votes are checked against.
+    pub fn set_election_config_with_depth(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        min_balance: i128,
+        twab_window: u64,
+        num_candidates: u32,
+        merkle_depth: u32,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+
+        if merkle_depth > MAX_MERKLE_DEPTH {
+            panic_with_error!(&env, VotingError::InvalidMerkleDepth);
+        }
+
+        // Reuse the existing setter for everything it already handles, then
+        // layer the depth on top so the two paths cannot drift apart.
+        Self::set_election_config(
+            env.clone(),
+            dao_id,
+            proposal_id,
+            min_balance,
+            twab_window,
+            num_candidates,
+        );
+
+        let key = DataKey::ElectionConfig(dao_id, proposal_id);
+        let mut config: ElectionConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::InvalidState));
+
+        if merkle_depth != 0 {
+            let vk = env
+                .storage()
+                .persistent()
+                .get::<_, VerificationKey>(&DataKey::DepthVk(dao_id, merkle_depth))
+                .unwrap_or_else(|| panic_with_error!(&env, VotingError::InvalidMerkleDepth));
+
+            // Pin the key now, exactly as proposal creation pins the default
+            // key, so re-registering a depth key mid-election is detected.
+            let hash_key = DataKey::ProposalDepthVkHash(dao_id, proposal_id);
+            let vk_hash = Self::hash_vk(&env, &vk);
+            env.storage().persistent().set(&hash_key, &vk_hash);
+            Self::bump_persistent(&env, &hash_key);
+        }
+
+        config.merkle_depth = merkle_depth;
+        env.storage().persistent().set(&key, &config);
+        Self::bump_persistent(&env, &key);
+    }
+
+    /// The Merkle depth an election's proofs are built against.
+    ///
+    /// 0 means the default depth-18 circuit. Clients use this to pick which
+    /// circuit artifacts to download and which key to verify against.
+    pub fn get_merkle_depth(env: Env, dao_id: u64, proposal_id: u64) -> u32 {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get::<_, ElectionConfig>(&DataKey::ElectionConfig(dao_id, proposal_id))
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0)
+    }
+
+    /// Resolves the verification key an election's proofs must satisfy, and
+    /// checks it still hashes to what was pinned when the election was set up.
+    ///
+    /// Elections at the default depth keep using the DAO's version-pinned key,
+    /// so nothing changes for them.
+    fn resolve_election_vk(
+        env: &Env,
+        ctx: PathContext,
+        dao_id: u64,
+        proposal_id: u64,
+        proposal: &ProposalInfo,
+        merkle_depth: u32,
+    ) -> VerificationKey {
+        if merkle_depth == 0 {
+            let vk = Self::get_vk_by_version(env, dao_id, proposal.vk_version);
+            if Self::hash_vk(env, &vk) != proposal.vk_hash {
+                panic_coarse(env, ctx, VotingError::VkChanged);
+            }
+            return vk;
+        }
+
+        let vk = env
+            .storage()
+            .persistent()
+            .get::<_, VerificationKey>(&DataKey::DepthVk(dao_id, merkle_depth))
+            .unwrap_or_else(|| panic_coarse(env, ctx, VotingError::InvalidMerkleDepth));
+
+        let pinned: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalDepthVkHash(dao_id, proposal_id))
+            .unwrap_or_else(|| panic_coarse(env, ctx, VotingError::VkNotSet));
+        if Self::hash_vk(env, &vk) != pinned {
+            panic_coarse(env, ctx, VotingError::VkChanged);
+        }
+        vk
+    }
+
+    // ---------------------------------------------------------------------
+    // Batched voting (#90)
+    // ---------------------------------------------------------------------
+
+    /// Casts several votes in one transaction, verified with a single batched
+    /// pairing check.
+    ///
+    /// Every vote is validated exactly as `vote` validates it — field bounds,
+    /// non-zero and unused nullifier, root eligibility for the proposal's vote
+    /// mode, candidate bound — and each proof is still checked against its own
+    /// public signals. What changes is only the verification: instead of four
+    /// pairings per proof, the batch is combined into `N + 3` pairings, which
+    /// measures at roughly 1.9x cheaper for four votes and 2.9x for sixty-four.
+    ///
+    /// The batch is all-or-nothing. One bad proof rejects the whole
+    /// transaction, and the failure does not say which proof was bad, so a
+    /// relayer that hits `InvalidProof` should re-submit the votes singly (or
+    /// bisect) to find the culprit rather than dropping them all.
+    ///
+    /// Returns the number of votes recorded.
+    pub fn cast_votes(env: Env, dao_id: u64, proposal_id: u64, votes: Vec<BatchVote>) -> u32 {
+        // A batch is a relayer submitting other people's votes, so errors
+        // collapse to coarse codes for the same reason a single vote's do:
+        // a per-vote reason would say which voter in the batch failed.
+        let ctx = PathContext::Anonymous;
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        Self::set_reentrancy_lock(&env);
+
+        let count = votes.len();
+        if count == 0 || count > MAX_VOTE_BATCH {
+            panic_with_error!(&env, VotingError::InvalidBatchSize);
+        }
+
+        let prop_key = DataKey::Proposal(dao_id, proposal_id);
+        let mut proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&prop_key)
+            .expect("proposal not found");
+
+        let now = env.ledger().timestamp();
+        if proposal.state != ProposalState::Active {
+            panic_with_error!(&env, VotingError::VotingClosed);
+        }
+        if proposal.end_time != 0 && now > proposal.end_time {
+            panic_with_error!(&env, VotingError::VotingClosed);
+        }
+        if proposal.vote_mode == VoteMode::Quadratic {
+            panic_with_error!(&env, VotingError::NotQuadraticProposal);
+        }
+
+        // BN254 only: the batch verifier combines BN254 pairings.
+        let proposal_curve: CurveId = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalCurve(dao_id, proposal_id))
+            .unwrap_or(CurveId::Bn254);
+        if proposal_curve != CurveId::Bn254 {
+            panic_with_error!(&env, VotingError::VkNotSet);
+        }
+
+        let election_config: Option<ElectionConfig> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ElectionConfig(dao_id, proposal_id));
+        let num_candidates = election_config
+            .as_ref()
+            .map(|config| config.num_candidates)
+            .unwrap_or(0);
+        let merkle_depth = election_config
+            .as_ref()
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0);
+
+        let vk = Self::resolve_election_vk(&env, ctx, dao_id, proposal_id, &proposal, merkle_depth);
+
+        let dao_signal = U256::from_u128(&env, dao_id as u128);
+        let proposal_signal = U256::from_u128(&env, proposal_id as u128);
+        let num_candidates_signal = U256::from_u32(&env, num_candidates);
+
+        let mut proofs: Vec<Proof> = Vec::new(&env);
+        let mut signal_sets: Vec<Vec<U256>> = Vec::new(&env);
+        let mut seen: Vec<U256> = Vec::new(&env);
+        let mut yes = 0u32;
+        let mut no = 0u32;
+
+        for i in 0..count {
+            let entry = votes.get(i).expect("vote missing");
+
+            Self::assert_in_field(&env, PathContext::Anonymous, &entry.nullifier);
+            Self::assert_in_field(&env, PathContext::Anonymous, &entry.root);
+            if entry.nullifier == U256::from_u32(&env, 0) {
+                panic_with_error!(&env, VotingError::InvalidNullifier);
+            }
+
+            // A batch could otherwise carry the same nullifier twice: the
+            // storage check below only sees committed state, and both copies
+            // would be written in the same transaction.
+            if seen.contains(&entry.nullifier) {
+                panic_with_error!(&env, VotingError::DuplicateNullifierInBatch);
+            }
+            seen.push_back(entry.nullifier.clone());
+
+            let null_key =
+                storage::nullifier_used_key(dao_id, proposal_id, entry.nullifier.clone());
+            if env.storage().persistent().has(&null_key) {
+                panic_with_error!(&env, VotingError::NullifierUsed);
+            }
+
+            Self::assert_root_eligible(&env, ctx, dao_id, &proposal, &entry.root);
+
+            let vote_choice_index: u32 = if entry.vote_choice { 1 } else { 0 };
+            if num_candidates > 0 && vote_choice_index >= num_candidates {
+                panic_with_error!(&env, VotingError::InvalidCandidateIndex);
+            }
+
+            let signals = soroban_sdk::vec![
+                &env,
+                entry.root.clone(),
+                entry.nullifier.clone(),
+                dao_signal.clone(),
+                proposal_signal.clone(),
+                U256::from_u32(&env, vote_choice_index),
+                num_candidates_signal.clone(),
+            ];
+            signal_sets.push_back(signals);
+            proofs.push_back(entry.proof.clone());
+
+            if entry.vote_choice {
+                yes += 1;
+            } else {
+                no += 1;
+            }
+        }
+
+        if !zkvote_groth16::batch::verify_groth16_batch(&env, &vk, &proofs, &signal_sets) {
+            panic_with_error!(&env, VotingError::InvalidProof);
+        }
+
+        // Only once the whole batch has verified do any nullifiers get burned:
+        // a failed batch must not consume the nullifiers of the honest votes
+        // that were grouped with a bad one.
+        for i in 0..count {
+            let entry = votes.get(i).expect("vote missing");
+            let null_key =
+                storage::nullifier_used_key(dao_id, proposal_id, entry.nullifier.clone());
+            env.storage().persistent().set(&null_key, &true);
+            Self::bump_persistent(&env, &null_key);
+        }
+
+        proposal.yes_votes = proposal
+            .yes_votes
+            .checked_add(yes as u64)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::TallyOverflow));
+        proposal.no_votes = proposal
+            .no_votes
+            .checked_add(no as u64)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::TallyOverflow));
+        env.storage().persistent().set(&prop_key, &proposal);
+        Self::bump_persistent(&env, &prop_key);
+
+        Self::clear_reentrancy_lock(&env);
+
+        for i in 0..count {
+            let entry = votes.get(i).expect("vote missing");
+            VoteEvent {
+                dao_id,
+                proposal_id,
+                choice: entry.vote_choice,
+                nullifier: entry.nullifier,
+            }
+            .publish(&env);
+        }
+        VoteBatchEvent {
+            dao_id,
+            proposal_id,
+            votes: count,
+            yes_votes: yes,
+            no_votes: no,
+        }
+        .publish(&env);
+
+        count
+    }
+
+    /// Root eligibility for a proposal, shared by `vote` and `cast_votes`.
+    ///
+    /// Fixed mode requires the exact snapshot root. Trailing mode accepts any
+    /// root in the tree's history that neither predates the proposal nor a
+    /// member removal, so late joiners can vote but revoked members cannot.
+    fn assert_root_eligible(
+        env: &Env,
+        ctx: PathContext,
+        dao_id: u64,
+        proposal: &ProposalInfo,
+        root: &U256,
+    ) {
+        match proposal.vote_mode {
+            VoteMode::Fixed => {
+                if root != &proposal.eligible_root {
+                    panic_coarse(env, ctx, VotingError::RootMismatch);
+                }
+            }
+            VoteMode::Trailing => {
+                let tree_contract: Address = Self::tree_contract(env.clone());
+
+                let root_valid: bool = env.invoke_contract(
+                    &tree_contract,
+                    &symbol_short!("root_ok"),
+                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
+                );
+                if !root_valid {
+                    panic_coarse(env, ctx, VotingError::RootNotInHistory);
+                }
+
+                let root_index: u32 = env.invoke_contract(
+                    &tree_contract,
+                    &symbol_short!("root_idx"),
+                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
+                );
+                if root_index < proposal.earliest_root_index {
+                    panic_coarse(env, ctx, VotingError::RootPredatesProposal);
+                }
+
+                let min_valid_root: u32 = env.invoke_contract(
+                    &tree_contract,
+                    &symbol_short!("min_root"),
+                    soroban_sdk::vec![env, dao_id.into_val(env)],
+                );
+                if root_index < min_valid_root {
+                    panic_coarse(env, ctx, VotingError::RootPredatesRemoval);
+                }
+            }
+            VoteMode::Quadratic => {
+                panic_coarse(env, ctx, VotingError::NotQuadraticProposal);
+            }
+        }
+    }
     /// Get proposal info
     pub fn get_proposal(env: Env, dao_id: u64, proposal_id: u64) -> ProposalInfo {
         Self::bump_instance(&env);
@@ -2601,7 +3228,7 @@ impl Voting {
         Self::require_not_paused(&env);
         admin.require_auth();
         Self::assert_admin(&env, dao_id, &admin);
-        Self::assert_in_field(&env, &nullifier);
+        Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
 
         if nullifier == U256::from_u32(&env, 0) {
             panic_with_error!(&env, VotingError::InvalidNullifier);
@@ -2990,8 +3617,8 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
-        Self::assert_in_field(&env, &nullifier);
-        Self::assert_in_field(&env, &root);
+        Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
+        Self::assert_in_field(&env, PathContext::Anonymous, &root);
 
         if nullifier == U256::from_u32(&env, 0) {
             panic_with_error!(&env, VotingError::InvalidNullifier);
@@ -3104,6 +3731,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         let vote_choice_index: u32 = if vote_choice { 1 } else { 0 };
@@ -3197,6 +3825,10 @@ impl Voting {
             .as_ref()
             .map(|config| config.commitment_window)
             .unwrap_or(0);
+        let merkle_depth = existing
+            .as_ref()
+            .map(|config| config.merkle_depth)
+            .unwrap_or(0);
         let config = ElectionConfig {
             snapshot_ledger,
             min_balance,
@@ -3208,6 +3840,7 @@ impl Voting {
             max_revotes,
             merkle_root_set_at,
             commitment_window,
+            merkle_depth,
         };
         env.storage().persistent().set(&key, &config);
         Self::bump_persistent(&env, &key);
@@ -3252,6 +3885,7 @@ impl Voting {
                     max_revotes: 0,
                     merkle_root_set_at: None,
                     commitment_window: 0,
+                    merkle_depth: 0,
                 });
         config.commitment_window = commitment_window;
         env.storage().persistent().set(&key, &config);
@@ -3320,6 +3954,7 @@ impl Voting {
                 max_revotes: 0,
                 merkle_root_set_at: None,
                 commitment_window: 0,
+                merkle_depth: 0,
             });
 
         if election_config.commitment_window > 0
@@ -3781,6 +4416,7 @@ impl Voting {
                     max_revotes: 0,
                     merkle_root_set_at: None,
                     commitment_window: 0,
+                    merkle_depth: 0,
                 });
         if config.candidate_seed.is_some() {
             panic_with_error!(&env, VotingError::CandidateSeedFinalized);
@@ -3980,6 +4616,7 @@ impl Voting {
                     max_revotes: 0,
                     merkle_root_set_at: None,
                     commitment_window: 0,
+                    merkle_depth: 0,
                 });
         config.vdf_output = Some(vdf_output.clone());
         config.vdf_delay = delay;
@@ -4072,6 +4709,7 @@ impl Voting {
                         max_revotes: 0,
                         merkle_root_set_at: None,
                         commitment_window: 0,
+                        merkle_depth: 0,
                     });
 
             // Mix VDF output with existing seed if available, or use VDF output as seed

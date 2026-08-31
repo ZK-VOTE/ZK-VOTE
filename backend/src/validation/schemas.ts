@@ -6,7 +6,7 @@
  */
 
 import { z } from "zod";
-import { BN254_MODULUS } from "../config.js";
+import { BN254_SCALAR_FIELD } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
 
 // ============================================
@@ -36,7 +36,7 @@ export const bn254Field = z.string().refine(
     if (!/^[0-9a-fA-F]*$/.test(hex)) return false;
     try {
       const value = BigInt("0x" + hex);
-      return value < BN254_MODULUS;
+      return value < BN254_SCALAR_FIELD;
     } catch {
       return false;
     }
@@ -426,6 +426,60 @@ export const voteSchema = z
   );
 
 export type VoteRequest = z.infer<typeof voteSchema>;
+
+// ============================================
+// BATCHED VOTE SCHEMA (#90)
+// ============================================
+
+/**
+ * Upper bound on a submitted batch.
+ *
+ * Mirrors `MAX_VOTE_BATCH` in the voting contract, which is
+ * `zkvote_groth16::batch::MAX_BATCH_SIZE`. Rejecting an oversized batch here
+ * saves a round trip to a simulation that would panic anyway.
+ */
+export const MAX_VOTE_BATCH = 64;
+
+/**
+ * One vote inside a batch.
+ *
+ * Unlike a single vote there is no `encryptedPayload` variant: the relayer has
+ * to see every nullifier to reject a batch that repeats one, and the contract
+ * verifies the whole batch under one aggregated pairing check, so a partially
+ * opaque batch could not be assembled.
+ */
+export const batchVoteSchema = z.object({
+  choice: z.boolean({
+    required_error: "choice is required",
+    invalid_type_error: "choice must be a boolean",
+  }),
+  nullifier: bn254Field,
+  root: bn254Field,
+  proof: groth16Proof,
+});
+
+export const voteBatchSchema = z
+  .object({
+    daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+    proposalId: z
+      .number()
+      .int()
+      .nonnegative("proposalId must be a non-negative integer"),
+    votes: z
+      .array(batchVoteSchema)
+      .min(1, "votes must contain at least one vote")
+      .max(MAX_VOTE_BATCH, `votes must contain at most ${MAX_VOTE_BATCH} votes`),
+  })
+  .refine(
+    (data) =>
+      new Set(data.votes.map((v) => v.nullifier)).size === data.votes.length,
+    {
+      message: "votes contains a duplicate nullifier",
+      path: ["votes"],
+    },
+  );
+
+export type VoteBatchRequest = z.infer<typeof voteBatchSchema>;
 
 // ============================================
 // ANONYMOUS COMMENT SCHEMA

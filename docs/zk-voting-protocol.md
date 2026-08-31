@@ -220,6 +220,41 @@ fn vote_with_token_gate(..., voter, proposal_id) {
 | Voting | `InsufficientSnapshotBalance` | 28 | Balance at snapshot time below minimum |
 | SBT | `CooldownActive` | 6 | Cannot leave DAO during active election |
 
+## Poseidon Hash Parameters
+
+Every commitment, nullifier and Merkle node in the protocol is a Poseidon hash
+over the BN254 scalar field, so the parameter set is part of the protocol's
+security argument rather than an implementation detail.
+
+| Parameter | Value |
+|-----------|-------|
+| Field | BN254 `Fr` (254-bit prime) |
+| S-box | `x^5` |
+| Full rounds `R_F` | 8 |
+| Partial rounds `R_P` | 57 for `t=3`, 56 for `t=4`, 60 for `t=5` |
+| Security level | 128 bits |
+
+State widths in use: `t=3` for Merkle node and leaf-domain hashing (the only
+width the on-chain contract carries parameters for), `t=4` for the vote
+nullifier `Poseidon(secret, daoId, proposalId)`, `t=5` for the identity
+commitment `Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)`.
+
+These values are not chosen; they are derived. The round constants come from
+the Grain LFSR specified in Grassi et al. (USENIX Security 2021, Appendix F),
+seeded only by the parameters above, and the MDS matrix is the Cauchy matrix
+built from the continuation of that same stream. `circuits/utils/poseidon_param_audit.js`
+re-derives both from the seed, re-runs the reference generator's three
+matrix-security tests (no invariant subspace, no subspace trail, no iterated
+subspace trail) against the shipped values, and checks `R_F`/`R_P` against the
+published statistical, interpolation and Gröbner-basis bounds — including with
+the designers' security margin stripped off, to show how much margin remains.
+`circuits/poseidon_params.test.js` runs all of it in CI, and the on-chain
+vendored copy in `contracts/membership-tree/src/poseidon_params.rs` is pinned
+to the same derivation by a shared SHA-256 digest.
+
+Full detail, including the current cryptanalysis picture and why Poseidon2 is
+not adopted, is in [docs/poseidon-parameters.md](./poseidon-parameters.md).
+
 ## Security Considerations
 
 1. **Ledger sequence vs timestamp**: Snapshots use ledger sequence numbers which are monotonically increasing and cannot be manipulated. Timestamps are used only for cooldown expiry.

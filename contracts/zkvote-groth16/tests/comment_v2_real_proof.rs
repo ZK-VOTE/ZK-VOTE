@@ -126,7 +126,12 @@ fn comment_v2_real_proof_verifies() {
     );
 }
 
+// Under `cargo test --workspace`, feature unification pulls in the `testutils`
+// stub verifier (the sibling contracts dev-depend on it), which accepts any
+// proof. Guarding the negative test the same way `bn254_edge_case_corpus.rs`
+// does keeps it meaningful instead of silently inverted.
 #[test]
+#[cfg(not(feature = "testutils"))]
 fn comment_v2_real_proof_rejects_a_tampered_public_signal() {
     let env = Env::default();
     let vk = comment_v2_vk(&env);

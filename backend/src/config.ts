@@ -797,7 +797,6 @@ export const BN254_SCALAR_FIELD = BigInt(
  */
 export function validateEnv(): void {
   const errors: string[] = [];
-  const missing: string[] = [];
 
   const isProduction = config.NODE_ENV === "production";
   if (isProduction) {
@@ -861,9 +860,6 @@ export function validateEnv(): void {
   ];
   const missing = requiredKeys.filter((k) => !process.env[k]);
   const criticalKeys = ["VOTING_CONTRACT_ID", "TREE_CONTRACT_ID", "RELAYER_SECRET_KEY", "RELAYER_AUTH_TOKEN"];
-  const missing: string[] = [
-    ...errors.map((e) => e.split(" ")[0]).filter((k) => typeof k === "string"),
-  ];
   const criticalMissing = missing.filter((k: string) => criticalKeys.includes(k));
   const nonCriticalMissing = missing.filter((k: string) => !criticalKeys.includes(k));
 
