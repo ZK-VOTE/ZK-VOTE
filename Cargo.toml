@@ -9,6 +9,11 @@ members = [
     "contracts/comments",
     "contracts/bridge/soroban",
     "contracts/circuit-registry",
+    "contracts/poc-bls12-381",
+    "contracts/token",
+    "contracts/vdf",
+    "contracts/threshold-crypto",
+    "contracts/rewards",
     "tests/integration",
 ]
 default-members = [

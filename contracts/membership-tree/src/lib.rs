@@ -976,14 +976,22 @@ impl MembershipTree {
         }
 
         let leaf_index_key = DataKey::LeafIndex(dao_id, commitment.clone());
-        let leaf_value_key = if let Some(index) = env.storage().persistent().get::<_, Option<u32>>(&leaf_index_key) {
+        let leaf_value_key = if let Some(index) = env
+            .storage()
+            .persistent()
+            .get::<_, Option<u32>>(&leaf_index_key)
+        {
             Some(DataKey::LeafValue(dao_id, index.unwrap_or(0)))
         } else {
             None
         };
 
         if let Some(key) = leaf_value_key {
-            let current_value: U256 = env.storage().persistent().get(&key).unwrap_or_else(|| U256::zero(&env));
+            let current_value: U256 = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| U256::from_u32(&env, 0));
             current_value == Self::zero_value(&env)
         } else {
             true

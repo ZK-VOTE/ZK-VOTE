@@ -96,10 +96,73 @@ pub enum VotingError {
     SignalNotInField = 25,
     /// Nullifier is zero (invalid)
     InvalidNullifier = 26,
-    /// Weighted vote weight out of bounds
-    WeightOutOfRange = 27,
-    /// Invalid domain tag
-    InvalidDomainTag = 28,
+    TransferCooldownActive = 27,
+    /// Balance at snapshot time is below minimum required for token-gated voting
+    InsufficientSnapshotBalance = 28,
+    ContractPaused = 29,
+    NotGuardian = 30,
+    RandomnessCommitClosed = 31,
+    RandomnessRevealClosed = 32,
+    RandomnessAlreadyCommitted = 33,
+    RandomnessCommitmentMissing = 34,
+    RandomnessRevealMismatch = 35,
+    CandidateSeedFinalized = 36,
+    InsufficientRandomness = 37,
+    RandomnessAlreadyRevealed = 38,
+    RandomnessParticipantLimit = 39,
+    TooManyActiveProposals = 40,
+    ProposalCooldownActive = 41,
+    InvalidProposalDeposit = 42,
+    ProposalHasVotes = 43,
+    VotingNotStarted = 44,
+    ElectionDurationTooShort = 45,
+    ElectionDurationTooLong = 46,
+    InvalidNoticePeriod = 47,
+    InvalidRegistrationPeriod = 48,
+    InvalidRegistrationGap = 49,
+    /// Regular `vote` called on a Quadratic proposal (use `cast_qv_vote`), or
+    /// `cast_qv_vote` called on a non-Quadratic proposal
+    NotQuadraticProposal = 50,
+    /// Quadratic-voting verification key not set for this DAO
+    QvVkNotSet = 51,
+    /// Quadratic ballot exceeds the fixed credit budget (sum of squares > MAX_QV_BUDGET)
+    QvBudgetExceeded = 52,
+    /// Quadratic tally verification key not set for this DAO
+    QvTallyVkNotSet = 53,
+    /// Tally proposal_ids / tallies vectors have mismatched or empty length
+    QvTallyLengthMismatch = 54,
+    /// Vote tally would overflow u64
+    TallyOverflow = 55,
+    /// Reentrant call detected (defense-in-depth against cross-contract reentrancy)
+    ReentrantCall = 56,
+    /// VDF proof verification failed
+    VdfVerificationFailed = 57,
+    /// VDF output already submitted for this election
+    VdfAlreadySubmitted = 58,
+    /// VDF delay period has not elapsed yet
+    VdfDelayNotElapsed = 59,
+    /// VDF delay parameter is invalid
+    VdfInvalidDelay = 60,
+    /// VDF input (block hash) is not available
+    VdfInputNotAvailable = 61,
+    /// Invalid Nova recursive proof or tally verification failure
+    RecursiveProofInvalid = 62,
+    /// Merkle root is fixed for this proposal and can no longer be changed
+    MerkleRootLocked = 63,
+    /// Merkle root update attempted after the commitment window closed
+    CommitmentWindowExpired = 64,
+    /// Upgrade would move storage to an older schema version
+    StorageVersionDowngrade = 65,
+    /// Upgrade payload does not target the contract's current version
+    UpgradeVersionMismatch = 66,
+    /// Upgrade payload exceeds MAX_UPGRADE_PAYLOAD_LEN
+    UpgradePayloadTooLarge = 67,
+    /// vote_choice is outside [0, num_candidates)
+    InvalidCandidateIndex = 68,
+    /// Weighted vote weight outside [MIN_WEIGHT, MAX_WEIGHT]
+    WeightOutOfRange = 69,
+    /// Weighted vote domain tag does not match the configured tag
+    InvalidDomainTag = 70,
 }
 
 // Maximum allowed IC vector length (num_public_inputs + 1)
@@ -1833,8 +1896,16 @@ impl Voting {
         );
     }
 
-    /// Get proposal info
-    pub fn get_proposal(env: Env, dao_id: u64, proposal_id: u64) -> ProposalInfo {
+    /// Cast an anonymous vote proved over BLS12-381 instead of BN254.
+    pub fn vote_bls381(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        vote_choice: bool,
+        nullifier: U256,
+        root: U256,
+        proof: ProofBls381,
+    ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
 
