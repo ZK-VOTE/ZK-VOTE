@@ -25,7 +25,13 @@ import {
   adminShutdownSchema,
   adminAuditLogQuerySchema,
   adminSbtTransferAttemptsQuerySchema,
+  adminRelayerRotateSchema,
+  adminRelayerRegisterKeySchema,
+  adminRelayerGenerateKeySchema,
+  adminRelayerFundKeySchema,
 } from "../validation/schemas.js";
+import { relayerKeyManager } from "../services/relayerKeyManager.js";
+import { server } from "../services/stellar.js";
 
 const router = Router();
 
@@ -535,6 +541,258 @@ router.post(
         error: (err as Error).message,
       });
       res.status(500).json({ error: "Failed to execute multisig proposal" });
+    }
+  }) as AsyncHandler,
+);
+
+// ============================================
+// RELAYER KEY ROTATION & MANAGEMENT (#177)
+// ============================================
+
+/**
+ * GET /admin/relayer/keys - List all relayer keys and metadata (admin only).
+ */
+router.get(
+  "/admin/relayer/keys",
+  authGuard,
+  queryLimiter,
+  (async (_req: Request, res: Response) => {
+    try {
+      const keys = relayerKeyManager.getAllKeys();
+      const activeKey = relayerKeyManager.getActiveKey();
+      res.json({
+        status: "success",
+        total: keys.length,
+        activeKeyId: activeKey?.id,
+        activePublicKey: activeKey?.publicKey,
+        keys,
+      });
+    } catch (err) {
+      log("error", "admin_get_relayer_keys_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to fetch relayer keys" });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * GET /admin/relayer/health - Get relayer keys health status and balances (admin only).
+ */
+router.get(
+  "/admin/relayer/health",
+  authGuard,
+  queryLimiter,
+  (async (_req: Request, res: Response) => {
+    try {
+      if (server) {
+        await relayerKeyManager.checkAllBalances(server as any);
+      }
+      const health = relayerKeyManager.getKeyHealth();
+      const statusCode = health.status === "critical" ? 503 : 200;
+      res.status(statusCode).json(health);
+    } catch (err) {
+      log("error", "admin_relayer_health_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to check relayer key health" });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/rotate - Hot key rotation without server restart (admin only).
+ */
+router.post(
+  "/admin/relayer/rotate",
+  bodyLimit("10kb"),
+  authGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotateSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const { targetKeyId, targetPublicKey, reason } = req.body || {};
+      const target = targetKeyId || targetPublicKey;
+
+      log("info", "admin_relayer_rotate_requested", { target, reason });
+
+      const result = await relayerKeyManager.rotateActiveKey(target, "api");
+      res.json({
+        status: "success",
+        message: "Relayer key rotated successfully with zero downtime",
+        activeKey: result.activeKey,
+        previousKey: result.previousKey,
+      });
+    } catch (err) {
+      log("error", "admin_relayer_rotate_failed", {
+        error: (err as Error).message,
+      });
+      res.status(400).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/keys - Register a new secondary / standby relayer key (admin only).
+ */
+router.post(
+  "/admin/relayer/keys",
+  bodyLimit("10kb"),
+  authGuard,
+  queryLimiter,
+  validateBody(adminRelayerRegisterKeySchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const {
+        id,
+        secretKey,
+        publicKey,
+        signerType,
+        kmsKeyId,
+        kmsRegion,
+        role,
+        makeActive,
+      } = req.body || {};
+
+      const key = relayerKeyManager.registerKey({
+        id,
+        secretKey,
+        publicKey,
+        signerType,
+        kmsKeyId,
+        kmsRegion,
+        role,
+        makeActive,
+      });
+
+      if (server) {
+        await relayerKeyManager.checkBalance(key.id, server as any);
+      }
+
+      res.status(201).json({
+        status: "success",
+        message: "Relayer key registered successfully",
+        key: {
+          id: key.id,
+          publicKey: key.publicKey,
+          role: key.role,
+          status: key.status,
+          signerType: key.signerType,
+          createdAt: key.createdAt,
+        },
+      });
+    } catch (err) {
+      log("error", "admin_relayer_register_key_failed", {
+        error: (err as Error).message,
+      });
+      res.status(400).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/generate - Generate a fresh keypair and register it (admin only).
+ */
+router.post(
+  "/admin/relayer/generate",
+  bodyLimit("10kb"),
+  authGuard,
+  queryLimiter,
+  validateBody(adminRelayerGenerateKeySchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const { role, makeActive } = req.body || {};
+      const key = relayerKeyManager.generateKey(role, makeActive);
+
+      res.status(201).json({
+        status: "success",
+        message: "Generated and registered new relayer key",
+        key: {
+          id: key.id,
+          publicKey: key.publicKey,
+          role: key.role,
+          status: key.status,
+          signerType: key.signerType,
+          createdAt: key.createdAt,
+        },
+      });
+    } catch (err) {
+      log("error", "admin_relayer_generate_key_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/fund - Fund a relayer key via Friendbot (admin only).
+ */
+router.post(
+  "/admin/relayer/fund",
+  bodyLimit("10kb"),
+  authGuard,
+  queryLimiter,
+  validateBody(adminRelayerFundKeySchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const { publicKey, friendbotUrl } = req.body || {};
+      const result = await relayerKeyManager.fundKey(publicKey, friendbotUrl);
+
+      if (server) {
+        await relayerKeyManager.checkBalance(publicKey, server as any);
+      }
+
+      if (result.success) {
+        res.json({
+          status: "success",
+          message: result.message,
+          publicKey,
+        });
+      } else {
+        res.status(400).json({
+          status: "error",
+          message: result.message,
+          publicKey,
+        });
+      }
+    } catch (err) {
+      log("error", "admin_relayer_fund_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/check-balances - Trigger balance checks and low-balance failover (admin only).
+ */
+router.post(
+  "/admin/relayer/check-balances",
+  authGuard,
+  queryLimiter,
+  (async (_req: Request, res: Response) => {
+    try {
+      const balances = await relayerKeyManager.checkAllBalances(
+        server as any,
+      );
+      const failoverResult = await relayerKeyManager.checkAndHandleLowBalance(
+        undefined,
+        server as any,
+      );
+
+      res.json({
+        status: "success",
+        balances,
+        failover: failoverResult,
+        health: relayerKeyManager.getKeyHealth(),
+      });
+    } catch (err) {
+      log("error", "admin_relayer_check_balances_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to check balances" });
     }
   }) as AsyncHandler,
 );

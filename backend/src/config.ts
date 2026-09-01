@@ -63,6 +63,14 @@ const envSchema = z.object({
 
   RELAYER_AUTH_TOKEN: z.string().optional(),
   RELAYER_SECRET_KEY: z.string().optional(),
+  RELAYER_SECONDARY_SECRET_KEY: z.string().optional(),
+  RELAYER_SECONDARY_PUBLIC_KEY: z.string().optional(),
+  RELAYER_MIN_BALANCE_XLM: z.coerce.number().positive().default(5),
+  RELAYER_AUTO_ROTATE_LOW_BALANCE: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  FRIENDBOT_URL: z.string().url().optional(),
   RELAYER_SIGNER_TYPE: z
     .enum(["local", "aws_kms", "gcp_kms", "pkcs11"])
     .default("local"),
@@ -319,6 +327,14 @@ const envSchema = z.object({
   MAX_CACHED_DAOS: z.coerce.number().int().positive().default(5000),
   DB_QUERY_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(500),
 
+  DB_BACKEND: z.enum(["sqlite", "postgres", "spanner"]).default("sqlite"),
+  DATABASE_URL: z.string().optional(),
+  DB_DUAL_WRITE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  DB_DUAL_WRITE_URL: z.string().optional(),
+
   DB_BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   DB_CHECKPOINT_INTERVAL_MS: z.coerce.number().int().positive().default(60000),
   DB_CHECKPOINT_TRANSACTION_COUNT: z.coerce
@@ -484,6 +500,11 @@ export const config = {
   // Authentication (read from env as fallback; see getSecret() for dynamic retrieval)
   relayerAuthToken: validatedEnv.RELAYER_AUTH_TOKEN,
   relayerSecretKey: validatedEnv.RELAYER_SECRET_KEY,
+  relayerSecondarySecretKey: validatedEnv.RELAYER_SECONDARY_SECRET_KEY,
+  relayerSecondaryPublicKey: validatedEnv.RELAYER_SECONDARY_PUBLIC_KEY,
+  relayerMinBalanceXlm: validatedEnv.RELAYER_MIN_BALANCE_XLM,
+  relayerAutoRotateLowBalance: validatedEnv.RELAYER_AUTO_ROTATE_LOW_BALANCE,
+  friendbotUrl: validatedEnv.FRIENDBOT_URL,
   relayerSignerType: validatedEnv.RELAYER_SIGNER_TYPE,
   relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
   kmsKeyId: validatedEnv.KMS_KEY_ID,
@@ -665,6 +686,12 @@ export const config = {
   // Cache eviction bounds
   maxCachedDaos: validatedEnv.MAX_CACHED_DAOS,
   dbQueryCacheMaxEntries: validatedEnv.DB_QUERY_CACHE_MAX_ENTRIES,
+
+  // Pluggable Database Dialect
+  dbBackend: validatedEnv.DB_BACKEND,
+  databaseUrl: validatedEnv.DATABASE_URL,
+  dbDualWrite: validatedEnv.DB_DUAL_WRITE,
+  dbDualWriteUrl: validatedEnv.DB_DUAL_WRITE_URL,
 
   // Database / WAL Resilience
   dbBusyTimeoutMs: validatedEnv.DB_BUSY_TIMEOUT_MS,

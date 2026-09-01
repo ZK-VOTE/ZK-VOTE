@@ -485,41 +485,6 @@ export function auditMiddleware(
  * Synchronous helper to manually audit an action inside route handlers.
  * Use when you need to record audit with custom action name or extra context.
  */
-/**
- * Route-level audit middleware factory (backward-compatible with the
- * pre-refactor `auditLog(action)` helper used across routes). Returns an
- * Express middleware that records an audit entry for the request with the
- * given action name when the response finishes. The global auditMiddleware
- * already covers every mutating route; this exists so routes can pin an
- * explicit, stable action label.
- */
-export function auditLog(action: string) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const start = Date.now();
-    res.on("finish", () => {
-      try {
-        appendAudit({
-          requestId: (req as any).ctx || crypto.randomBytes(6).toString("hex"),
-          method: req.method,
-          path: req.path || req.originalUrl?.split("?")[0] || "unknown",
-          action,
-          actor: deriveActor(req),
-          actorIpHash: hashIp(req.ip),
-          requestBody: req.body ? redactBody(req.body) : undefined,
-          query: req.query ? (redactPii({ ...req.query }) as unknown) : undefined,
-          params: req.params ? (redactPii({ ...req.params }) as unknown) : undefined,
-          statusCode: res.statusCode,
-          durationMs: Date.now() - start,
-          userAgent: (req.headers["user-agent"] as string) || undefined,
-        });
-      } catch (_e) {
-        // Never fail request due to audit error
-      }
-    });
-    next();
-  };
-}
-
 export function auditAction(
   req: Request,
   action: string,
@@ -544,11 +509,4 @@ export function auditAction(
     statusCode: extra?.statusCode,
     userAgent: (req.headers["user-agent"] as string) || undefined,
   });
-}
-
-export function auditLog(action: string) {
-  return (req: Request, _res: Response, next: NextFunction): void => {
-    auditAction(req, action);
-    next();
-  };
 }

@@ -52,105 +52,25 @@ export interface TestServer {
 
 export type SorobanServer = StellarSdk.rpc.Server | TestServer;
 
-export interface StellarSigner {
-  getPublicKey(): string;
-  signTransaction(tx: StellarSdk.Transaction): Promise<void> | void;
-  signHash?(hash: Buffer): Promise<Buffer> | Buffer;
-}
+import {
+  relayerKeyManager,
+  LocalKeypairSigner,
+  KmsSigner,
+  HsmSigner,
+  MockTestSigner,
+  type StellarSigner,
+  type RelayerKeypair,
+} from "./relayerKeyManager.js";
 
-export class LocalKeypairSigner implements StellarSigner {
-  constructor(private keypair: StellarSdk.Keypair) {}
-  getPublicKey(): string {
-    return this.keypair.publicKey();
-  }
-  signTransaction(tx: StellarSdk.Transaction): void {
-    tx.sign(this.keypair);
-  }
-  signHash(hash: Buffer): Buffer {
-    return this.keypair.sign(hash);
-  }
-}
-
-export class KmsSigner implements StellarSigner {
-  private publicKey: string;
-  private keyId: string;
-  private region: string;
-
-  constructor(publicKey: string, keyId: string, region = "us-east-1") {
-    this.publicKey = publicKey;
-    this.keyId = keyId;
-    this.region = region;
-  }
-
-  getPublicKey(): string {
-    return this.publicKey;
-  }
-
-  async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
-    const txHash = tx.hash();
-    const signature = await this.signHash(txHash);
-    const rawPublicKey = StellarSdk.StrKey.decodeEd25519PublicKey(this.publicKey);
-    const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
-    const decoratedSig = new StellarSdk.xdr.DecoratedSignature({
-      hint,
-      signature,
-    });
-    tx.signatures.push(decoratedSig);
-  }
-
-  async signHash(hash: Buffer): Promise<Buffer> {
-    logger.info("kms_sign_request", {
-      keyId: this.keyId,
-      region: this.region,
-      hashLength: hash.length,
-    });
-    // In production AWS KMS / GCP KMS Sign API (ECC_ED25519)
-    // Key material is non-exportable and NEVER loaded into memory
-    return Buffer.alloc(64);
-  }
-}
-
-export class HsmSigner implements StellarSigner {
-  private publicKey: string;
-  private slotId: number;
-
-  constructor(publicKey: string, slotId = 0) {
-    this.publicKey = publicKey;
-    this.slotId = slotId;
-  }
-
-  getPublicKey(): string {
-    return this.publicKey;
-  }
-
-  async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
-    const txHash = tx.hash();
-    const signature = await this.signHash(txHash);
-    const rawPublicKey = StellarSdk.StrKey.decodeEd25519PublicKey(this.publicKey);
-    const hint = rawPublicKey.subarray(rawPublicKey.length - 4);
-    const decoratedSig = new StellarSdk.xdr.DecoratedSignature({
-      hint,
-      signature,
-    });
-    tx.signatures.push(decoratedSig);
-  }
-
-  async signHash(hash: Buffer): Promise<Buffer> {
-    logger.info("hsm_pkcs11_sign_request", {
-      slotId: this.slotId,
-      hashLength: hash.length,
-    });
-    return Buffer.alloc(64);
-  }
-}
-
-let _activeSigner: StellarSigner;
-
-// ============================================
-// RELAYER KEYPAIR
-// ============================================
-
-export type RelayerKeypair = StellarSdk.Keypair | { publicKey: () => string };
+export {
+  relayerKeyManager,
+  LocalKeypairSigner,
+  KmsSigner,
+  HsmSigner,
+  MockTestSigner,
+  type StellarSigner,
+  type RelayerKeypair,
+};
 
 /**
  * Construct the relayer keypair from config. Extracted from the module so the
@@ -166,32 +86,11 @@ export function createRelayerKeypair(
       publicKey: () =>
         "GTESTRELAYERADDRESS000000000000000000000000000000000000",
     };
-    _activeSigner = {
-      getPublicKey: () => _relayerKeypair.publicKey(),
-      signTransaction: () => {},
-    };
-    logger.info("relayer_loaded", {
-      relayer: _relayerKeypair.publicKey(),
-      testMode: true,
-    });
-  } else if (config.relayerSignerType === "aws_kms" && config.kmsKeyId && config.relayerPublicKey) {
-    _activeSigner = new KmsSigner(config.relayerPublicKey, config.kmsKeyId, config.kmsRegion);
-    _relayerKeypair = {
+  }
+  if (config.relayerSignerType === "aws_kms" && config.kmsKeyId && config.relayerPublicKey) {
+    return {
       publicKey: () => config.relayerPublicKey!,
     };
-    logger.info("relayer_kms_loaded", {
-      relayer: config.relayerPublicKey,
-      keyId: config.kmsKeyId,
-      signerType: "aws_kms",
-    });
-  } else {
-    if (!config.relayerSecretKey) {
-      throw new Error("RELAYER_SECRET_KEY is not set");
-    }
-    const kp = StellarSdk.Keypair.fromSecret(config.relayerSecretKey);
-    _relayerKeypair = kp;
-    _activeSigner = new LocalKeypairSigner(kp);
-    logger.info("relayer_loaded", { relayer: _relayerKeypair.publicKey() });
   }
   if (!relayerSecretKey) {
     throw new Error("RELAYER_SECRET_KEY is not set");
@@ -199,12 +98,11 @@ export function createRelayerKeypair(
   return StellarSdk.Keypair.fromSecret(relayerSecretKey);
 }
 
-let _relayerKeypair: RelayerKeypair;
-
+// Initialize the relayer key manager
 try {
-  _relayerKeypair = createRelayerKeypair(config.relayerSecretKey, config.testMode);
+  relayerKeyManager.initialize();
   logger.info("relayer_loaded", {
-    relayer: _relayerKeypair.publicKey(),
+    relayer: relayerKeyManager.getPublicKey(),
     testMode: config.testMode,
   });
 } catch (err) {
@@ -213,8 +111,51 @@ try {
   process.exit(1);
 }
 
-export const relayerKeypair = _relayerKeypair;
-export const activeSigner = _activeSigner;
+/**
+ * Dynamic relayerKeypair proxy that delegates to the active key in relayerKeyManager.
+ * Ensures zero-downtime hot swapping across all existing routes and callers.
+ */
+export const relayerKeypair = {
+  publicKey: () => relayerKeyManager.getPublicKey(),
+  sign: (tx: StellarSdk.Transaction) => {
+    const kp = relayerKeyManager.getActiveKeypair();
+    if ("sign" in kp && typeof (kp as any).sign === "function") {
+      (kp as any).sign(tx);
+    }
+  },
+  rawPublicKey: () => {
+    const kp = relayerKeyManager.getActiveKeypair();
+    if ("rawPublicKey" in kp && typeof (kp as any).rawPublicKey === "function") {
+      return (kp as any).rawPublicKey();
+    }
+    return StellarSdk.StrKey.decodeEd25519PublicKey(
+      relayerKeyManager.getPublicKey(),
+    );
+  },
+  secret: () => {
+    const active = relayerKeyManager.getActiveKey();
+    if (active?.secretKey) return active.secretKey;
+    const kp = relayerKeyManager.getActiveKeypair();
+    if ("secret" in kp && typeof (kp as any).secret === "function") {
+      return (kp as any).secret();
+    }
+    throw new Error("Secret key is not exportable for this relayer signer");
+  },
+} as unknown as RelayerKeypair;
+
+/**
+ * Dynamic activeSigner proxy that delegates to the active signer in relayerKeyManager.
+ */
+export const activeSigner: StellarSigner = {
+  getPublicKey: () => relayerKeyManager.getPublicKey(),
+  signTransaction: (tx: StellarSdk.Transaction) =>
+    relayerKeyManager.signTransaction(tx),
+  signHash: (hash: Buffer) => {
+    const s = relayerKeyManager.getActiveSigner();
+    if (s.signHash) return s.signHash(hash);
+    return Buffer.alloc(64);
+  },
+};
 
 // ============================================
 // SEQUENCE LOCK (TRANSACTION NONCE MUTEX)
@@ -401,6 +342,17 @@ export class SequenceManager {
 }
 
 export const sequenceManager = new SequenceManager();
+
+// Automatically invalidate and resync sequence numbers on hot key swap
+relayerKeyManager.onRotate(async (newKey, oldKey, trigger) => {
+  sequenceManager.markDirty();
+  log("info", "relayer_key_swapped_hot", {
+    trigger,
+    newPublicKey: newKey.publicKey,
+    oldPublicKey: oldKey?.publicKey,
+    role: newKey.role,
+  });
+});
 
 export async function withSequenceLock<T>(fn: () => Promise<T>): Promise<T> {
   if (config.clusterEnabled && nodeCluster.isWorker) {
@@ -597,8 +549,13 @@ export const sorobanRpcBreaker = registerCircuitBreaker("soroban_rpc", {
   resetTimeoutMs: config.circuitBreakerRpcResetMs,
 });
 
-export const server: SorobanServer = config.testMode
-  ? {
+export function createSorobanServer(options: {
+  testMode: boolean;
+  pool: RpcPoolManager;
+  breaker: CircuitBreaker;
+}): SorobanServer {
+  if (options.testMode) {
+    return {
       getHealth: async () => ({ status: "online" }),
       simulateTransaction: async () => {
         throw new Error("simulate disabled in RELAYER_TEST_MODE");
@@ -609,41 +566,42 @@ export const server: SorobanServer = config.testMode
       }),
       getTransaction: async () => ({ status: "NOT_FOUND" }),
       getAccount: async () => ({ accountId: "GTEST", sequence: "0" }),
-    }
-  : (new Proxy(
-      {},
-      {
-        get(_target, prop) {
-          const activeServer = rpcPoolManager.getActiveServer() as any;
-          const value = activeServer[prop];
-          if (typeof value !== "function") return value;
+    };
+  }
 
-          return async function (...args: unknown[]) {
-            const method = String(prop);
-            const start = process.hrtime.bigint();
-            try {
-              const result = await sorobanRpcBreaker.execute(() =>
-                withRpcConcurrency(() => value.apply(activeServer, args)),
-              );
-              const duration = Number(process.hrtime.bigint() - start) / 1e9;
-              rpcCallsTotal.inc({ method, status: "success" });
-              rpcCallDuration.observe({ method, status: "success" }, duration);
-              return result;
-            } catch (err) {
-              const duration = Number(process.hrtime.bigint() - start) / 1e9;
-              const errorType =
-                err instanceof CircuitBreakerOpenError
-                  ? "CircuitBreakerOpen"
-                  : err instanceof Error
-                    ? err.constructor.name
-                    : "unknown";
-              rpcCallsTotal.inc({ method, status: "error" });
-              rpcCallDuration.observe({ method, status: "error" }, duration);
-              rpcErrors.inc({ method, error_type: errorType });
-              throw err;
-            }
-          };
-        },
+  return new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        const activeServer = options.pool.getActiveServer() as any;
+        const value = activeServer[prop];
+        if (typeof value !== "function") return value;
+
+        return async function (...args: unknown[]) {
+          const method = String(prop);
+          const start = process.hrtime.bigint();
+          try {
+            const result = await options.breaker.execute(() =>
+              withRpcConcurrency(() => value.apply(activeServer, args)),
+            );
+            const duration = Number(process.hrtime.bigint() - start) / 1e9;
+            rpcCallsTotal.inc({ method, status: "success" });
+            rpcCallDuration.observe({ method, status: "success" }, duration);
+            return result;
+          } catch (err) {
+            const duration = Number(process.hrtime.bigint() - start) / 1e9;
+            const errorType =
+              err instanceof CircuitBreakerOpenError
+                ? "CircuitBreakerOpen"
+                : err instanceof Error
+                  ? err.constructor.name
+                  : "unknown";
+            rpcCallsTotal.inc({ method, status: "error" });
+            rpcCallDuration.observe({ method, status: "error" }, duration);
+            rpcErrors.inc({ method, error_type: errorType });
+            throw err;
+          }
+        };
       },
     },
   ) as SorobanServer;

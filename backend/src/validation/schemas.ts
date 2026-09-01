@@ -7,10 +7,38 @@
 
 import { z } from "zod";
 import { createHash } from "node:crypto";
-import { fileTypeFromBuffer } from "file-type";
 import sharp from "sharp";
 import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+
+async function fileTypeFromBuffer(buffer: Buffer): Promise<{ mime: string; ext: string } | null> {
+  if (!buffer || buffer.length < 12) return null;
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mime: "image/jpeg", ext: "jpg" };
+  }
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return { mime: "image/png", ext: "png" };
+  }
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+    return { mime: "image/gif", ext: "gif" };
+  }
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return { mime: "image/webp", ext: "webp" };
+  }
+  const text = buffer.subarray(0, 256).toString("utf8");
+  if (text.includes("<svg") || text.includes("<?xml")) {
+    return { mime: "image/svg+xml", ext: "svg" };
+  }
+  return null;
+}
 
 const ALLOWED_IMAGE_MIME_SET = new Set<string>(ALLOWED_IMAGE_MIMES);
 
@@ -1192,6 +1220,35 @@ export const adminSbtTransferAttemptsQuerySchema = z.object({
     .int()
     .min(0, "offset must be non-negative")
     .default(0),
+});
+
+export const adminRelayerRotateSchema = z.object({
+  targetKeyId: z.string().optional(),
+  targetPublicKey: z.string().optional(),
+  reason: z.string().max(500).optional(),
+});
+
+export const adminRelayerRegisterKeySchema = z.object({
+  id: z.string().optional(),
+  secretKey: z.string().optional(),
+  publicKey: z.string().optional(),
+  signerType: z
+    .enum(["local", "aws_kms", "gcp_kms", "pkcs11", "test"])
+    .default("local"),
+  kmsKeyId: z.string().optional(),
+  kmsRegion: z.string().optional(),
+  role: z.enum(["primary", "secondary", "standby"]).default("secondary"),
+  makeActive: z.boolean().default(false),
+});
+
+export const adminRelayerGenerateKeySchema = z.object({
+  role: z.enum(["primary", "secondary", "standby"]).default("secondary"),
+  makeActive: z.boolean().default(false),
+});
+
+export const adminRelayerFundKeySchema = z.object({
+  publicKey: z.string().min(50, "publicKey must be a valid Stellar address"),
+  friendbotUrl: z.string().url().optional(),
 });
 
 // ============================================

@@ -74,7 +74,9 @@ export function metricsMiddleware(
     if (Number.isFinite(resContentLength) && resContentLength > 0) {
       httpResponseSize.observe({ method, route, status }, resContentLength);
     }
-  });
+
+    return (originalEnd as any).apply(this, args);
+  };
 
   next();
 }

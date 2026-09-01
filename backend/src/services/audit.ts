@@ -196,14 +196,14 @@ export function formatAsCef(rows: AuditLogRow[]): string {
     .map((row) => {
       const ext = [
         `rt=${row.timestamp}`,
-        request=${row.endpoint}`,
-        suser=${row.auth_token_id ?? "unknown"}`,
-        src=${row.ip_hash ?? "unknown"}`,
-        outcome=${row.status_code || ""}`,
-        bs1Label=requestId`,
-        cs1=${row.request_id || ""}`,
-        bs2Label=hash`,
-        cs2=${row.hash}`,
+        `request=${row.endpoint}`,
+        `suser=${row.auth_token_id ?? "unknown"}`,
+        `src=${row.ip_hash ?? "unknown"}`,
+        `outcome=${row.status_code || ""}`,
+        `cs1Label=requestId`,
+        `cs1=${row.request_id || ""}`,
+        `cs2Label=hash`,
+        `cs2=${row.hash}`,
       ].join(" ");
       // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
       return `CEF:0|ZK-VOTE|backend|1.0|${row.action}|${row.action}|3|${ext}`;

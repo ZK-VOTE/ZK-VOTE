@@ -389,6 +389,7 @@ export function requestLogger(
       ...ipMeta,
       ...bodyMeta,
     });
+  });
 
   runWithSpanContext(spanContext, next);
 }

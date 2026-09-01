@@ -384,7 +384,7 @@ export function anonymousGuard(
   next: NextFunction,
 ): void {
   const ipHash = config.logClientIp ? hashIp(req.ip) : null;
-  const is.Cover = req.headers["x-cover-traffic"] === "true" || req.headers["x-cover-traffic"] === "1";
+  const isCover = req.headers["x-cover-traffic"] === "true" || req.headers["x-cover-traffic"] === "1";
 
   // Store cover traffic flag for downstream processing
   req.isCoverTraffic = isCover;
