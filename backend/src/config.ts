@@ -63,6 +63,14 @@ const envSchema = z.object({
 
   RELAYER_AUTH_TOKEN: z.string().optional(),
   RELAYER_SECRET_KEY: z.string().optional(),
+  RELAYER_SECONDARY_SECRET_KEY: z.string().optional(),
+  RELAYER_SECONDARY_PUBLIC_KEY: z.string().optional(),
+  RELAYER_MIN_BALANCE_XLM: z.coerce.number().positive().default(5),
+  RELAYER_AUTO_ROTATE_LOW_BALANCE: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  FRIENDBOT_URL: z.string().url().optional(),
   RELAYER_SIGNER_TYPE: z
     .enum(["local", "aws_kms", "gcp_kms", "pkcs11"])
     .default("local"),
@@ -492,6 +500,11 @@ export const config = {
   // Authentication (read from env as fallback; see getSecret() for dynamic retrieval)
   relayerAuthToken: validatedEnv.RELAYER_AUTH_TOKEN,
   relayerSecretKey: validatedEnv.RELAYER_SECRET_KEY,
+  relayerSecondarySecretKey: validatedEnv.RELAYER_SECONDARY_SECRET_KEY,
+  relayerSecondaryPublicKey: validatedEnv.RELAYER_SECONDARY_PUBLIC_KEY,
+  relayerMinBalanceXlm: validatedEnv.RELAYER_MIN_BALANCE_XLM,
+  relayerAutoRotateLowBalance: validatedEnv.RELAYER_AUTO_ROTATE_LOW_BALANCE,
+  friendbotUrl: validatedEnv.FRIENDBOT_URL,
   relayerSignerType: validatedEnv.RELAYER_SIGNER_TYPE,
   relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
   kmsKeyId: validatedEnv.KMS_KEY_ID,

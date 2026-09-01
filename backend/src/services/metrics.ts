@@ -503,6 +503,38 @@ export const wsMessagesSent = new Counter({
 });
 
 // ============================================
+// RELAYER KEY ROTATION METRICS (#177)
+// ============================================
+
+export const relayerKeyBalance = new Gauge({
+  name: "zkvote_relayer_key_balance_xlm",
+  help: "Current balance of relayer keys in XLM",
+  labelNames: ["key_id", "public_key", "role"] as const,
+  registers: [register],
+});
+
+export const relayerKeyRotationsTotal = new Counter({
+  name: "zkvote_relayer_key_rotations_total",
+  help: "Total number of relayer key rotations",
+  labelNames: ["trigger", "status"] as const,
+  registers: [register],
+});
+
+export const relayerKeyAgeSeconds = new Gauge({
+  name: "zkvote_relayer_key_age_seconds",
+  help: "Age of relayer key in seconds since activation",
+  labelNames: ["key_id", "public_key"] as const,
+  registers: [register],
+});
+
+export const relayerKeyTransactionsTotal = new Counter({
+  name: "zkvote_relayer_key_transactions_total",
+  help: "Total transactions signed by relayer key",
+  labelNames: ["key_id", "public_key"] as const,
+  registers: [register],
+});
+
+// ============================================
 // HELPER: Normalise route labels
 // ============================================
 

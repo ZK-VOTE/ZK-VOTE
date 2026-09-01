@@ -24,6 +24,7 @@ import { getWalHealth } from "../services/walResilience.js";
 
 import { checkRotationHealth, getSecretBackend } from "../services/secrets/index.js";
 import { getWalHealth } from "../services/walResilience.js";
+import { relayerKeyManager } from "../services/relayerKeyManager.js";
 
 import { rpcPoolManager, sequenceManager } from "../services/stellar.js";
 import { getAllCircuitBreakerMetrics } from "../services/circuit-breaker.js";
@@ -203,7 +204,8 @@ router.get("/health", async (req: Request, res: Response) => {
   if (config.healthExposeDetails) {
     const token = extractAuthToken(req);
     if (token === config.relayerAuthToken) {
-      base.relayer = relayerPublicKey;
+      base.relayer = relayerKeyManager.getPublicKey() || relayerPublicKey;
+      base.relayerKeys = relayerKeyManager.getKeyHealth();
       base.votingContract = config.votingContractId;
       base.treeContract = config.treeContractId;
       base.vkVersion = config.staticVkVersion;
