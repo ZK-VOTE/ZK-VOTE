@@ -405,6 +405,32 @@ const envSchema = z.object({
     .default("true")
     .transform((v) => v !== "false"),
   CONFIRMATION_WS_PATH: z.string().default("/ws/confirmations"),
+
+  // Multi-tenant resource isolation & quota enforcement (#307)
+  QUOTA_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  QUOTA_DEFAULT_RATE_LIMIT: z.coerce.number().int().positive().default(100),
+  QUOTA_DEFAULT_RATE_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60000),
+  QUOTA_DEFAULT_LEDGER_LIMIT: z.coerce.number().int().positive().default(1000),
+  QUOTA_DEFAULT_STORAGE_LIMIT_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(104857600), // 100MB
+  QUOTA_DEFAULT_QUEUE_DEPTH: z.coerce.number().int().positive().default(20),
+  QUOTA_ABUSE_ALERT_THRESHOLD: z.coerce.number().int().positive().default(3),
+  QUOTA_ABUSE_ALERT_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60000),
+  QUOTA_OVERAGE_JSON: z.string().optional(),
 });
 
 type EnvConfig = z.infer<typeof envSchema>;
@@ -739,6 +765,17 @@ export const config = {
   // WebSocket confirmation notifications (#172)
   confirmationWsEnabled: validatedEnv.CONFIRMATION_WS_ENABLED,
   confirmationWsPath: validatedEnv.CONFIRMATION_WS_PATH,
+
+  // Multi-tenant resource isolation & quota enforcement (#307)
+  quotaEnabled: validatedEnv.QUOTA_ENABLED,
+  quotaDefaultRateLimit: validatedEnv.QUOTA_DEFAULT_RATE_LIMIT,
+  quotaDefaultRateWindowMs: validatedEnv.QUOTA_DEFAULT_RATE_WINDOW_MS,
+  quotaDefaultLedgerLimit: validatedEnv.QUOTA_DEFAULT_LEDGER_LIMIT,
+  quotaDefaultStorageLimitBytes: validatedEnv.QUOTA_DEFAULT_STORAGE_LIMIT_BYTES,
+  quotaDefaultQueueDepth: validatedEnv.QUOTA_DEFAULT_QUEUE_DEPTH,
+  quotaAbuseAlertThreshold: validatedEnv.QUOTA_ABUSE_ALERT_THRESHOLD,
+  quotaAbuseAlertWindowMs: validatedEnv.QUOTA_ABUSE_ALERT_WINDOW_MS,
+  quotaOverageJson: validatedEnv.QUOTA_OVERAGE_JSON,
 } as const;
 
 export const corsOptions = {
