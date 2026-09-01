@@ -319,6 +319,14 @@ const envSchema = z.object({
   MAX_CACHED_DAOS: z.coerce.number().int().positive().default(5000),
   DB_QUERY_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(500),
 
+  DB_BACKEND: z.enum(["sqlite", "postgres", "spanner"]).default("sqlite"),
+  DATABASE_URL: z.string().optional(),
+  DB_DUAL_WRITE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  DB_DUAL_WRITE_URL: z.string().optional(),
+
   DB_BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   DB_CHECKPOINT_INTERVAL_MS: z.coerce.number().int().positive().default(60000),
   DB_CHECKPOINT_TRANSACTION_COUNT: z.coerce
@@ -665,6 +673,12 @@ export const config = {
   // Cache eviction bounds
   maxCachedDaos: validatedEnv.MAX_CACHED_DAOS,
   dbQueryCacheMaxEntries: validatedEnv.DB_QUERY_CACHE_MAX_ENTRIES,
+
+  // Pluggable Database Dialect
+  dbBackend: validatedEnv.DB_BACKEND,
+  databaseUrl: validatedEnv.DATABASE_URL,
+  dbDualWrite: validatedEnv.DB_DUAL_WRITE,
+  dbDualWriteUrl: validatedEnv.DB_DUAL_WRITE_URL,
 
   // Database / WAL Resilience
   dbBusyTimeoutMs: validatedEnv.DB_BUSY_TIMEOUT_MS,
