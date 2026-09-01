@@ -23,7 +23,6 @@ import { getLogMetrics } from "../middleware/logging.js";
 import { getWalHealth } from "../services/walResilience.js";
 
 import { checkRotationHealth, getSecretBackend } from "../services/secrets/index.js";
-import { getWalHealth } from "../services/walResilience.js";
 import { relayerKeyManager } from "../services/relayerKeyManager.js";
 
 import { rpcPoolManager, sequenceManager } from "../services/stellar.js";
