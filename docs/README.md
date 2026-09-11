@@ -56,6 +56,7 @@ flowchart LR
 - [vdf-randomness.md](vdf-randomness.md) — verifiable delay function for election randomness
 - [merkle-depth-and-batched-voting.md](merkle-depth-and-batched-voting.md) — per-election Merkle depth selection and batched vote submission
 - [bn254-edge-case-findings.md](bn254-edge-case-findings.md) — BN254 Groth16 edge-case findings
+- [circuit-field-modulus-and-input-ranges.md](circuit-field-modulus-and-input-ranges.md) — BN254 field modulus & circuit input range specifications (#88)
 - [adr-0001-bn254-groth16-validation-boundary.md](adr-0001-bn254-groth16-validation-boundary.md) — ADR: BN254 Groth16 validation boundary
 - [trusted-setup-ceremony.md](trusted-setup-ceremony.md) — multi-party trusted setup ceremony
 - [voter-guide.md](voter-guide.md) — HD multi-election key management for voters

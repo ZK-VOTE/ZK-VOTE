@@ -22,6 +22,7 @@
  */
 
 import { groth16 } from "snarkjs";
+import { validateCircuitInputs } from "../services/proofService";
 
 export interface ProofRequest {
   id: string;
@@ -40,12 +41,27 @@ export interface ProofResponse {
 
 async function prove(req: ProofRequest): Promise<ProofResponse> {
   try {
+    // Validate circuit inputs before calling snarkjs (#88):
+    // 1. Verify pathIndices are binary (0 or 1)
+    // 2. Verify all field elements are strictly < BN254 scalar field modulus
+    validateCircuitInputs(req.input);
+
     const wasm = req.wasm instanceof ArrayBuffer ? new Uint8Array(req.wasm) : req.wasm;
     const zkey = req.zkey instanceof ArrayBuffer ? new Uint8Array(req.zkey) : req.zkey;
 
     const { proof, publicSignals } = await groth16.fullProve(req.input, wasm, zkey);
     return { id: req.id, ok: true, proof, publicSignals };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : "Proof generation failed";
+    // Preserve input validation error details while masking internal witness constraint errors
+    if (
+      msg.includes("Field element overflow") ||
+      msg.includes("Invalid path index") ||
+      msg.includes("must be less than BN254") ||
+      msg.includes("must be non-negative")
+    ) {
+      return { id: req.id, ok: false, error: msg };
+    }
     // Report only that proving failed. The message from snarkjs can name the
     // constraint that was not satisfied, which is a statement about the
     // witness — that is, about the voter.
