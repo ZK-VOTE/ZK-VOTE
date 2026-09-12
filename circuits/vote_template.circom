@@ -89,4 +89,10 @@ template Vote(levels) {
     validChoice.in[0] <== voteChoice;
     validChoice.in[1] <== numCandidates;
     validChoice.out === 1;
+
+    // 5. Verify numCandidates is strictly positive (at least 1 candidate) and within 32-bit range
+    component nonZeroCandidates = LessThan(32);
+    nonZeroCandidates.in[0] <== 0;
+    nonZeroCandidates.in[1] <== numCandidates;
+    nonZeroCandidates.out === 1;
 }

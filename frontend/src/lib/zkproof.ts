@@ -6,8 +6,9 @@
 // (Rust→WASM) it is never loaded. `CircuitSignals` is used only as a type.
 import type { CircuitSignals, Groth16Proof } from "snarkjs";
 
-// Shared BN254 field/nullifier validation helpers (#370)
+// Shared BN254 field/nullifier validation helpers (#370, #88)
 import { assertValidFieldElement, assertValidNullifier } from "../types/index";
+import { validateCircuitInputs } from "../services/proofService";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -225,42 +226,6 @@ export interface GeneratedProof {
   redundantProof?: Groth16Proof;
 }
 
-/**
- * Generate a Snark proof for a final tally.
- *
- * The circuit proves that `tallyYes` and `tallyNo` are the correct sums of
- * all valid votes that were cast for a proposal. The proof is verified
- * on-chain by the `verify_tally_proof` entrypoint.
- *
- * @param input - All tally inputs (root, nullifiers, vote choices, weights,
- *                merkle paths).
- * @param wasmPath - Path to the compiled tally circuit WASM (or a Uint8Array
- *                   containing the WASM bytes).
- * @param zkeyPath - Path to the tally circuit final zkey (or a Uint8Array
- *                   containing the zkey bytes).
- * @returns The generated Groth16 proof and public signals.
- */
-export async function generateTallyProof(
-  input: TallyProofInput,
-  wasmPath: string | Uint8Array,
-  zkeyPath: string | Uint8Array,
-): Promise<GeneratedProof> {
-  // Normalize input for the circuit.
-  const circuitInput = {
-    root: input.root,
-    daoId: input.daoId,
-    proposalId: input.proposalId,
-    tallyYes: input.tallyYes,
-    tallyNo: input.tallyNo,
-    nullifiers: input.nullifiers,
-    voteChoices: input.voteChoices,
-    weights: input.weights ?? input.voteChoices.map(() => "1"),
-    pathElements: input.pathElements,
-    pathIndices: input.pathIndices,
-  } as unknown as Record<string, unknown>;
-
-  return proveWithRust(circuitInput, wasmPath, zkeyPath);
-}
 
 // ============================================
 // Versioned VK Cache (Task 1: ZK-013)
@@ -649,6 +614,8 @@ export async function generateVoteProof(
         pathIndices: input.pathIndices,
       };
     }
+    // Validate field elements and binary pathIndices before proving (#88)
+    validateCircuitInputs(circuitInput);
 
     // Mask the timing of the whole prover selection, not of a single prover
     // (#92). snarkjs is variable-time, so duration correlates with the secret
@@ -712,6 +679,7 @@ export async function generateWeightedVoteProof(
       pathElements: input.pathElements,
       pathIndices: input.pathIndices,
     };
+    validateCircuitInputs(circuitInput);
     return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
   } catch (error) {
     console.error("Failed to generate weighted vote proof:", error);
@@ -744,6 +712,7 @@ export async function generateTallyProof(
       pathIndices: input.pathIndices,
     };
     if (input.weights) circuitInput.voteWeights = input.weights;
+    validateCircuitInputs(circuitInput);
 
     if (USE_RUST_PROVER) {
       try {
@@ -792,6 +761,7 @@ export async function generateBridgeProof(
       sbtPathIndices: input.sbtPathIndices,
       sbtLeaf: input.sbtLeaf,
     };
+    validateCircuitInputs(circuitInput as unknown as Record<string, unknown>);
     return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
   } catch (error) {
     console.error("Failed to generate bridge proof:", error);
@@ -849,6 +819,7 @@ export async function generateCommentProof(
         pathIndices: input.pathIndices,
       };
     }
+    validateCircuitInputs(circuitInput as unknown as Record<string, unknown>);
 
     // Generate proof with the Rust WASM prover (snarkjs fallback).
     if (USE_RUST_PROVER) {
