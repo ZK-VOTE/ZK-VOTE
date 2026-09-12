@@ -175,6 +175,7 @@ export default function CommentForm({
           daoId: daoId.toString(),
           proposalId: proposalId.toString(),
           voteChoice: "0", // Arbitrary - contract ignores this for comments
+          relayerAddress: "0",
           commitment: commitment.toString(),
           secret: secret.toString(),
           salt: salt.toString(),

@@ -15,6 +15,37 @@
  * detect every attempt, without needing a dedicated on-chain event.
  */
 import * as StellarSdk from "@stellar/stellar-sdk";
+import type { RpcServerPort, LoggerPort } from "./interfaces.js";
+import type { EventInput } from "./db.js";
+/**
+ * Dependencies of the SBT transfer-watch service, injected explicitly via
+ * `initSbtGuard` (called by the composition root) so this module never
+ * imports the `stellar.js`/`db.js`/`service-health.js` module singletons
+ * to get what it needs (#358).
+ */
+export interface SbtGuardDeps {
+    /** Active RPC server (pool-backed proxy in production). */
+    server: RpcServerPort;
+    /** Config: relayer test mode (disables the background watch loop). */
+    testMode: boolean;
+    /** Config: membership SBT contract ID (watch target). */
+    membershipSbtContractId?: string;
+    /** Config: default poll interval (ms). */
+    sbtTransferWatchIntervalMs: number;
+    /** Config: admin alert webhook URL (optional). */
+    adminAlertWebhookUrl?: string;
+    /** Event persistence (events table, DAO-partitioned). */
+    addEvent(event: EventInput): boolean;
+    /** Health reporting for the watch loop. */
+    health: {
+        markHealthy(service: "sbt_transfer_watch"): void;
+        markDegraded(service: "sbt_transfer_watch", reason?: string): void;
+    };
+    /** Structured logger (called as `deps.log(level, event, meta)`). */
+    log: LoggerPort["log"];
+}
+/** Explicitly wire the SBT guard's dependencies (composition root only). */
+export declare function initSbtGuard(d: SbtGuardDeps): void;
 /** The three SEP-41-shaped entrypoints the contract stubs out and always rejects. */
 export declare const SBT_GUARDED_FUNCTIONS: ReadonlySet<string>;
 export interface DetectedAttempt {
@@ -56,7 +87,7 @@ export declare function alertAdmin(payload: Record<string, unknown>): Promise<vo
  * `alertAdmin` regardless, which doesn't need a DAO attribution to be useful.
  */
 export declare function recordTransferAttempt(attempt: DetectedAttempt, txHash: string, ledger: number, successful: boolean): boolean;
-/** Minimal shape this module needs from a `server.getTransactions()` entry. */
+/** Minimal shape this module needs from a `deps().server.getTransactions()` entry. */
 export interface TransactionLike {
     envelopeXdr: StellarSdk.xdr.TransactionEnvelope;
     txHash: string;

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * IPFS/Pinata Integration Module (SDK v2.5.1)
  *

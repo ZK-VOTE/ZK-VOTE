@@ -1,14 +1,22 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { server } from "./stellar.js";
-import { config } from "../config.js";
-import { log } from "./logger.js";
-import { getTTLTracking, upsertTTLTracking, } from "./db.js";
+let checkerDeps = null;
+/** Explicitly wire the TTL checker (composition root only). */
+export function initTtlChecker(d) {
+    checkerDeps = d;
+}
+function deps() {
+    if (!checkerDeps) {
+        throw new Error("ttl-checker: initTtlChecker() must be called before use");
+    }
+    return checkerDeps;
+}
+//__TTL_CHECKER_DEPS_END__
 const SOROBAN_TTL_LEDGERS = 31 * 17280;
 const LEDGER_DURATION_MS = 5000;
 function categorizeUrgency(remainingMs) {
-    if (remainingMs < config.ttlGracePeriodMs)
+    if (remainingMs < deps().ttlGracePeriodMs)
         return "grace";
-    if (remainingMs < config.ttlRenewalThresholdMs)
+    if (remainingMs < deps().ttlRenewalThresholdMs)
         return "warning";
     return "healthy";
 }
@@ -34,7 +42,7 @@ export function estimateRemainingFromTracked(entry) {
 }
 export async function queryContractInstanceTTL(contractId) {
     try {
-        if (config.testMode)
+        if (deps().testMode)
             return null;
         const rawId = StellarSdk.StrKey.decodeContract(contractId);
         const ledgerKey = StellarSdk.xdr.LedgerKey.contractData(new StellarSdk.xdr.LedgerKeyContractData({
@@ -42,7 +50,7 @@ export async function queryContractInstanceTTL(contractId) {
             key: StellarSdk.xdr.ScVal.scvLedgerKeyContractInstance(),
             durability: StellarSdk.xdr.ContractDataDurability.persistent(),
         }));
-        const response = await server.getLedgerEntries(ledgerKey);
+        const response = await deps().server.getLedgerEntries(ledgerKey);
         if (!response || !response.entries || response.entries.length === 0)
             return null;
         const entry = response.entries[0];
@@ -57,7 +65,7 @@ export async function queryContractInstanceTTL(contractId) {
         };
     }
     catch (err) {
-        log("debug", "ttl_query_instance_failed", {
+        deps().log("debug", "ttl_query_instance_failed", {
             contract: contractId.slice(0, 8) + "...",
             error: err.message,
         });
@@ -72,7 +80,7 @@ export async function queryInstanceTTLWithFallback(contractId, entryId) {
         remainingLedgers = onChain.remainingLedgers;
         const remainingMs = remainingLedgers * LEDGER_DURATION_MS;
         urgency = categorizeUrgency(remainingMs);
-        upsertTTLTracking({
+        deps().upsertTTLTracking({
             entryId,
             contractId,
             daoId: null,
@@ -83,7 +91,7 @@ export async function queryInstanceTTLWithFallback(contractId, entryId) {
         });
     }
     else {
-        const tracked = getTTLTracking(entryId);
+        const tracked = deps().getTTLTracking(entryId);
         const estimated = estimateRemainingFromTracked(tracked);
         if (estimated) {
             remainingLedgers = estimated.remainingLedgers;
@@ -107,7 +115,7 @@ export async function queryInstanceTTLWithFallback(contractId, entryId) {
     };
 }
 export async function queryPersistentTTLWithFallback(contractId, daoId, method, entryId) {
-    const tracked = getTTLTracking(entryId);
+    const tracked = deps().getTTLTracking(entryId);
     const estimated = estimateRemainingFromTracked(tracked);
     if (estimated) {
         return { ...estimated, tracked: true };
@@ -125,7 +133,7 @@ export async function queryPersistentTTLWithFallback(contractId, daoId, method, 
     };
 }
 export function needsRenewal(info) {
-    return info.remainingMs < config.ttlRenewalThresholdMs;
+    return info.remainingMs < deps().ttlRenewalThresholdMs;
 }
 export function isInGracePeriod(info) {
     return info.urgency === "grace";

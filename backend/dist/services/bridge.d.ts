@@ -4,6 +4,42 @@
  * Watches EVM bridge contract for VoteForwarded events and
  * relays votes to the Soroban bridge contract.
  */
+import * as StellarSdk from "@stellar/stellar-sdk";
+import type { LoggerPort, RpcServerPort } from "./interfaces.js";
+/**
+ * Dependencies injected via `initBridgeRelay` (#358) so this module never
+ * imports the `stellar.js`/`config.js`/`logger.js` module singletons directly.
+ */
+export interface BridgeDeps {
+    /** Active RPC server (pool-backed proxy in production). */
+    server: RpcServerPort;
+    /** Relayer keypair used to sign relay transactions. */
+    relayerKeypair: {
+        publicKey(): string;
+    } & Partial<StellarSdk.Keypair>;
+    /** Config: relayer test mode (relay short-circuits as failed). */
+    testMode: boolean;
+    /** Config: Soroban bridge contract id (C...). */
+    bridgeContractId?: string;
+    /** Config: Stellar network passphrase. */
+    networkPassphrase: string;
+    /** Run `fn` with a timeout, labelled for logs/metrics. */
+    callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
+    /** Serialize transaction submissions against the relayer account. */
+    withSequenceLock<T>(fn: () => Promise<T>): Promise<T>;
+    /** Simulate a transaction with retry/backoff. */
+    simulateWithBackoff<T>(fn: () => Promise<T>, attempts?: number): Promise<T>;
+    /** Wait for an on-chain transaction to settle. */
+    waitForTransaction(hash: string, timeoutSeconds?: number): Promise<{
+        status: string;
+    }>;
+    /** Convert a U256 hex string into an ScVal argument. */
+    u256ToScVal(hexString: string): StellarSdk.xdr.ScVal;
+    /** Structured logger (called as `deps.log(level, event, meta)`). */
+    log: LoggerPort["log"];
+}
+/** Explicitly wire the bridge relay service (composition root only). */
+export declare function initBridgeRelay(d: BridgeDeps): void;
 export interface EVMVoteEvent {
     daoId: number;
     proposalId: number;

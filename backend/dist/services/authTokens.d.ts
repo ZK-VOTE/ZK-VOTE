@@ -70,5 +70,11 @@ export declare function logAuthAttempt(params: {
     success: boolean;
     errorMessage?: string | null;
 }): void;
+export declare const CREDENTIAL_REQUEST_RATE_LIMIT = 3;
+export declare const CREDENTIAL_REQUEST_WINDOW_MS: number;
+export declare const CREDENTIAL_ISSUANCE_REQUEST_ACTION = "credential_issuance_requested";
+export declare function validateTokenForCredentialIssuance(rawToken: string): TokenValidationResult;
+/** Revokes a token after successful credential issuance to enforce one-credential-per-voter. */
+export declare function revokeTokenAfterCredentialIssuance(tokenId: string): boolean;
 export declare function validateMasterKey(rawKey: string): boolean;
 //# sourceMappingURL=authTokens.d.ts.map

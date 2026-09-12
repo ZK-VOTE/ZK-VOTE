@@ -35,7 +35,7 @@ export function validateBody(schema) {
                 details: config.genericErrors ? undefined : errors,
             });
         }
-        // Replace body with validated/transformed data
+        // Replace body with validated/transformeed data
         req.body = result.data;
         next();
     };
@@ -58,6 +58,7 @@ export function validateQuery(schema) {
             });
         }
         // Replace query with validated/transformed data
+        req.query = result.data;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         req.validatedQuery = result.data;
         next();
@@ -76,6 +77,8 @@ export function validateParams(schema) {
                 details: config.genericErrors ? undefined : errors,
             });
         }
+        // Replace params with validated/transformed data
+        req.params = result.data;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         req.validatedParams = result.data;
         next();

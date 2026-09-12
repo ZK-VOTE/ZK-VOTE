@@ -4,7 +4,7 @@ import { getReadOnlyVoting } from "../lib/readOnlyContracts";
 import { calculateNullifier } from "../lib/zkproof";
 import { getZKCredentials } from "../lib/zk";
 import { queryKeys } from "../lib/queryClient";
-import type { Client as VotingClient } from "../client/voting/dist/index.js";
+import type { Client as VotingClient } from "../contracts/voting/dist/index.js";
 
 export interface Proposal {
   id: number;

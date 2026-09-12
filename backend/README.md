@@ -2,6 +2,12 @@
 
 Relayer service for anonymous vote submission and DAO management on Stellar Soroban.
 
+## Recent Fixes (2026-09-11)
+
+- `tsc` 0 errors: `src/services/nova-aggregator.ts:73` ``→``, `src/utils/magic-bytes.ts:65` `readUInt32EB→BE`, `better-sqlite3` rebuilt, `src/middleware/metrics.ts:50` `route is not defined`, `src/middleware/logging.ts:35` `config`/`spanContext`, `src/middleware/validate.ts:74` `query` getter, `src/routes/daos.ts:60` `search`, `src/services/stellar.ts:1142` stubs, `backend/.env.development:16` `RELAYER_SECRET_KEY` + `CORS_ORIGINS` 5173.
+- `http://localhost:3001/health` `200` `degraded` (was `500`), `http://localhost:3001/daos?limit=1` `200` `{"data":[],"pagination":...}` (was `500`).
+- New real payments: `src/services/payments.ts:1` `XLM`/`USDC`/`EURC` `MuxedAccount` `M...` + `POST /pay`/`POST /pay/batch` 100 ops/tx, `src/services/swap.ts:1` `GET /swap/quote` Horizon `strict-send` + Soroswap, `src/services/anchor.ts:1` `GET /ramp/deposit|withdraw` `SEP-6/24/31` Circle. See `http://localhost:5173/pay/`.
+
 ## Overview
 
 The relayer provides anonymity by submitting vote transactions on behalf of users:
@@ -20,6 +26,7 @@ The relayer provides anonymity by submitting vote transactions on behalf of user
 - **Rate limiting** per endpoint type
 - **Security hardening** (CORS, Helmet, CSRF protection)
 - **Prometheus RED metrics** at `/metrics` and optional OTLP/HTTP tracing
+- **Fintech Payments (real, no mocks)** — `XLM`/`USDC`/`EURC` `Payment`/`PathPaymentStrictSend` via `payments.ts:1`, `MuxedAccount` `M...`, `POST /pay` + `POST /pay/batch` 100 ops/tx `withSequenceLock:358`, `GET /swap/quote` Horizon `strict-send` + Soroswap `SOROSWAP_API` (`swap.ts:1`) → `POST /swap/submit`, `GET /ramp/deposit|withdraw` `SEP-6/24/31` Circle anchors (`anchor.ts:1`, `ANCHOR_USDC_URL`/`EURC_URL`)
 
 ## Setup
 
@@ -390,6 +397,35 @@ Edit a public comment (requires auth).
 
 #### `POST /comment/delete`
 Delete a public comment (requires auth).
+
+### Payments — XLM / USDC / EURC (real, high-volume)
+
+#### `POST /pay`
+Send `XLM`/`USDC`/`EURC` via `StellarSdk.Operation.payment` (`withSequenceLock:358`, `MuxedAccount` `M...`).
+
+```bash
+curl -X POST http://localhost:3001/pay -H "Origin: http://localhost:5173" -H "Content-Type: application/json" -d '{"asset":"XLM","destination":"G...","amount":"1.0000000"}'
+```
+
+#### `POST /pay/batch`
+Batch 100 ops/tx.
+
+```bash
+curl -X POST http://localhost:3001/pay/batch -H "Content-Type: application/json" -d '{"ops":[{"destination":"G...","asset":"XLM","amount":"1"}]}'
+```
+
+#### `GET /swap/quote?from=XLM&to=USDC&amount=10`
+Horizon `strict-send` + Soroswap `SOROSWAP_API` fallback.
+
+```bash
+curl "http://localhost:3001/swap/quote?from=XLM&to=USDC&amount=10"
+```
+
+#### `POST /swap/submit`
+`PathPaymentStrictSend` `XLM→USDC/EURC`.
+
+#### `GET /ramp/deposit?asset=USDC&account=G...&amount=100` / `GET /ramp/withdraw`
+`SEP-6/24/31` Circle `ANCHOR_USDC_URL`/`ANCHOR_EURC_URL`.
 
 ### IPFS
 

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Auth Token Management Routes
  *
@@ -5,56 +6,27 @@
  * All endpoints require the AUTH_MASTER_KEY for access.
  */
 import { Router } from "express";
-import { z } from "zod";
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
-import { masterKeyGuard, validateBody, validateParams, bodyLimit, } from "../middleware/index.js";
+import { masterKeyGuard, validateBody, validateParams, validateQuery, bodyLimit, } from "../middleware/index.js";
 import { createNewToken, revokeToken, listTokens, listActiveTokens, getToken, runTokenRotation, rotateSingleToken, runMaintenanceTasks, getAuditEntries, listTokensForClient, } from "../services/authTokens.js";
-import { buildDidAttributeProofSeed } from "../services/blindSignature.js";
+import { buildDidAttributeProofSeed, getBlindSignaturePublicKey, issueBlindSignature, } from "../services/blindSignature.js";
+import { createTokenSchema, tokenIdSchema, clientIdQuerySchema, auditQuerySchema, didAttributeClaimSchema, } from "../validation/schemas.js";
 const router = Router();
-// ============================================
-// SCHEMAS
-// ============================================
-const createTokenSchema = z.object({
-    clientId: z.string().min(1).max(100),
-    description: z.string().max(500).optional().nullable(),
-    lifetimeMs: z.number().int().positive().optional().nullable(),
-});
-const tokenIdSchema = z.object({
-    tokenId: z.string().min(1),
-});
-const clientIdQuerySchema = z.object({
-    clientId: z.string().min(1).optional(),
-    activeOnly: z
-        .union([z.string(), z.boolean()])
-        .optional()
-        .transform((v) => v === "true" || v === true),
-});
-const auditQuerySchema = z.object({
-    tokenId: z.string().min(1).optional(),
-    clientId: z.string().min(1).optional(),
-    action: z.string().min(1).optional(),
-    limit: z
-        .union([z.string(), z.number()])
-        .optional()
-        .transform((v) => Math.min(Number(v) || 100, 1000)),
-    offset: z
-        .union([z.string(), z.number()])
-        .optional()
-        .transform((v) => Math.max(Number(v) || 0, 0)),
-});
-const didAttributeClaimSchema = z.object({
-    claim: z.object({
-        issuer: z.string().min(1).max(256),
-        subjectDid: z.string().min(1).max(512),
-        attributeKey: z.string().min(1).max(128),
-        attributeValue: z.number().int().nonnegative(),
-        issuedAt: z.number().int().nonnegative(),
-        expiresAt: z.number().int().nonnegative(),
-        signature: z.string().min(1).max(4096),
-    }),
-    minAttributeValue: z.number().int().nonnegative(),
-});
+const blindSignatureIssuedForClient = new Set();
+const blindSignatureAttempts = new Map();
+function isBlindSignatureRateLimited(key) {
+    const now = Date.now();
+    const windowMs = 60_000;
+    const maxAttempts = 5;
+    const recent = (blindSignatureAttempts.get(key) ?? []).filter((timestamp) => now - timestamp < windowMs);
+    if (recent.length >= maxAttempts) {
+        return true;
+    }
+    recent.push(now);
+    blindSignatureAttempts.set(key, recent);
+    return false;
+}
 // ============================================
 // TOKEN MANAGEMENT ENDPOINTS
 // ============================================
@@ -123,9 +95,9 @@ router.post("/auth/tokens", bodyLimit("100kb"), masterKeyGuard, validateBody(cre
  * Requires: AUTH_MASTER_KEY
  * Query params: clientId (optional filter), activeOnly (optional boolean)
  */
-router.get("/auth/tokens", masterKeyGuard, (async (req, res) => {
-    const parsed = clientIdQuerySchema.safeParse(req.query);
-    const { clientId, activeOnly } = parsed.success ? parsed.data : {};
+router.get("/auth/tokens", masterKeyGuard, validateQuery(clientIdQuerySchema), (async (req, res) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { clientId, activeOnly } = req.validatedQuery;
     let tokens;
     if (clientId) {
         tokens = listTokensForClient(clientId);
@@ -295,9 +267,9 @@ router.post("/auth/maintenance", bodyLimit("100kb"), masterKeyGuard, (async (_re
  * Requires: AUTH_MASTER_KEY
  * Query params: tokenId, clientId, action, limit, offset
  */
-router.get("/auth/audit", masterKeyGuard, (async (req, res) => {
-    const parsed = auditQuerySchema.safeParse(req.query);
-    const options = (parsed.success ? parsed.data : {});
+router.get("/auth/audit", masterKeyGuard, validateQuery(auditQuerySchema), (async (req, res) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const options = req.validatedQuery;
     const entries = getAuditEntries({
         tokenId: options.tokenId,
         clientId: options.clientId,
@@ -341,5 +313,67 @@ router.get("/auth/config", masterKeyGuard, (_req, res) => {
         },
     });
 });
+/**
+ * GET /auth/blind-signature/public-key - Get the RSA public key used for blind signing
+ */
+router.get("/auth/blind-signature/public-key", (async (_req, res) => {
+    try {
+        const publicKey = await getBlindSignaturePublicKey();
+        return res.json({
+            success: true,
+            publicKey,
+        });
+    }
+    catch (err) {
+        return res.status(500).json({
+            success: false,
+            error: err.message,
+        });
+    }
+}));
+/**
+ * POST /auth/blind-signature/sign - Issue a blind signature on a blinded value.
+ * Requires: AUTH_MASTER_KEY
+ */
+router.post("/auth/blind-signature/sign", bodyLimit("100kb"), masterKeyGuard, (async (req, res) => {
+    const { clientId, blindedValue } = req.body;
+    if (typeof clientId !== "string" || typeof blindedValue !== "string") {
+        return res.status(400).json({
+            success: false,
+            error: "clientId and blindedValue are required",
+        });
+    }
+    if (isBlindSignatureRateLimited(req.ip ?? "unknown")) {
+        return res.status(429).json({
+            success: false,
+            error: "Blind signature rate limit exceeded",
+        });
+    }
+    if (blindSignatureIssuedForClient.has(clientId)) {
+        return res.status(409).json({
+            success: false,
+            error: "A blind signature has already been issued for this voter",
+        });
+    }
+    try {
+        const blindSignature = await issueBlindSignature({ clientId, blindedValue });
+        blindSignatureIssuedForClient.add(clientId);
+        log("info", "blind_signature_issued", { clientId });
+        return res.status(201).json({
+            success: true,
+            blindSignature,
+        });
+    }
+    catch (err) {
+        log("error", "blind_signature_issue_failed", {
+            error: err.message,
+            clientId,
+        });
+        return res.status(400).json({
+            success: false,
+            error: err.message,
+        });
+    }
+}));
 export default router;
 //# sourceMappingURL=auth.js.map

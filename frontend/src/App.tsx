@@ -16,6 +16,9 @@ import ProposalPage from "./components/ProposalPage";
 import { ErrorBoundary, RouteErrorBoundary } from "./components/ErrorBoundary";
 import { CreateDAOForm } from "./components/CreateDAOForm";
 import Profile from "./components/Profile";
+import PayPanel from "./components/PayPanel";
+import SwapPanel from "./components/SwapPanel";
+import DepositWithdraw from "./components/DepositWithdraw";
 import { useWallet } from "./hooks/useWallet";
 import { useTheme } from "./hooks/useTheme";
 import { useDaoInfoQuery, useRelayerStatusQuery } from "./queries";
@@ -121,11 +124,13 @@ function App() {
     | "browse"
     | "votes"
     | "docs"
-    | "profile" => {
+    | "profile"
+    | "pay" => {
     if (location.pathname.startsWith("/daos/")) return "browse";
     if (location.pathname === "/public-votes/") return "votes";
     if (location.pathname === "/docs/") return "docs";
     if (location.pathname === "/profile/") return "profile";
+    if (location.pathname.startsWith("/pay")) return "pay";
     return "home";
   };
 
@@ -162,6 +167,11 @@ function App() {
         description:
           "Manage your anonymous voting receipts and verify them on-chain.",
       },
+      pay: {
+        title: "ZKVote - Pay / Swap",
+        description:
+          "High-volume XLM / USDC / EURC payments and swaps via Stellar DEX and Soroswap, plus SEP-6/24 on/off-ramps.",
+      },
     };
     const meta = pageMeta[currentView] || pageMeta.home;
     document.title = meta.title;
@@ -180,13 +190,14 @@ function App() {
       : relayerStatusState?.message || null;
 
   const handleNavigate = (
-    view: "home" | "browse" | "votes" | "docs" | "profile",
+    view: "home" | "browse" | "votes" | "docs" | "profile" | "pay",
   ) => {
     if (view === "home") navigate("/");
     else if (view === "browse") navigate("/daos/");
     else if (view === "votes") navigate("/public-votes/");
     else if (view === "docs") navigate("/docs/");
     else if (view === "profile") navigate("/profile/");
+    else if (view === "pay") navigate("/pay/");
   };
 
   const handleSelectDao = (daoId: number, daoName?: string) => {
@@ -251,6 +262,22 @@ function App() {
                 element={
                   <RouteErrorBoundary>
                     <Profile publicKey={publicKey} isConnected={isConnected} />
+                  </RouteErrorBoundary>
+                }
+              />
+
+              {/* Pay / Swap / Ramp Route - XLM/USDC/EURC real */}
+              <Route
+                path="/pay/"
+                element={
+                  <RouteErrorBoundary>
+                    <div className="max-w-3xl mx-auto space-y-6 animate-fade-in">
+                      <h1 className="text-3xl font-bold tracking-tight">Payments — XLM / USDC / EURC</h1>
+                      <p className="text-muted-foreground">Real assets, no mocks. High-volume via M... + 100 ops/tx.</p>
+                      <PayPanel />
+                      <SwapPanel />
+                      <DepositWithdraw />
+                    </div>
                   </RouteErrorBoundary>
                 }
               />

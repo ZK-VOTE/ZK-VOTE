@@ -10,7 +10,7 @@
  */
 export type ServiceTier = "critical" | "important" | "non_critical" | "background";
 export type ServiceState = "healthy" | "degraded" | "unavailable";
-export type ServiceName = "soroban_rpc" | "sqlite" | "ipfs" | "comments" | "indexer" | "dao_sync" | "ttl_renewal" | "sbt_transfer_watch";
+export type ServiceName = "soroban_rpc" | "sqlite" | "ipfs" | "comments" | "indexer" | "dao_sync" | "membership_sync" | "ttl_renewal" | "sbt_transfer_watch";
 export interface ServiceHealthEntry {
     name: ServiceName;
     tier: ServiceTier;

@@ -10,13 +10,14 @@
  */
 import { Router } from "express";
 import { log } from "../services/logger.js";
-import { authGuard, auditLog, bodyLimit } from "../middleware/index.js";
+import { authGuard, auditLog, bodyLimit, validateBody, validateParams, } from "../middleware/index.js";
 import * as coordinator from "../services/threshold-coordinator.js";
+import { thresholdInitSchema, thresholdAuthorityRegisterSchema, thresholdFinalizeSchema, thresholdEncryptSchema, thresholdTallyComputeSchema, thresholdDecryptShareSchema, thresholdTallyDecryptSchema, thresholdStateParamsSchema, } from "../validation/schemas.js";
 const router = Router();
 /**
  * POST /threshold/init - Initialize threshold decryption for an election
  */
-router.post("/threshold/init", bodyLimit("100kb"), authGuard, auditLog("threshold_init"), (async (req, res) => {
+router.post("/threshold/init", bodyLimit("100kb"), authGuard, auditLog("threshold_init"), validateBody(thresholdInitSchema), (async (req, res) => {
     const { daoId, proposalId, thresholdN, thresholdT } = req.body;
     try {
         const round = await coordinator.initializeDKG(Number(daoId), Number(proposalId), Number(thresholdN), Number(thresholdT), req.body.creator || "");
@@ -37,7 +38,7 @@ router.post("/threshold/init", bodyLimit("100kb"), authGuard, auditLog("threshol
 /**
  * POST /threshold/authority/register - Register a tally authority
  */
-router.post("/threshold/authority/register", bodyLimit("100kb"), authGuard, auditLog("threshold_authority_register"), (async (req, res) => {
+router.post("/threshold/authority/register", bodyLimit("100kb"), authGuard, auditLog("threshold_authority_register"), validateBody(thresholdAuthorityRegisterSchema), (async (req, res) => {
     const { daoId, proposalId, authorityAddress, authorityName, verifierId } = req.body;
     try {
         const result = await coordinator.registerAuthority(Number(daoId), Number(proposalId), authorityAddress, authorityName, verifierId);
@@ -61,7 +62,7 @@ router.post("/threshold/authority/register", bodyLimit("100kb"), authGuard, audi
 /**
  * POST /threshold/dkg/finalize - Finalize DKG and compute joint public key
  */
-router.post("/threshold/dkg/finalize", bodyLimit("100kb"), authGuard, auditLog("threshold_dkg_finalize"), (async (req, res) => {
+router.post("/threshold/dkg/finalize", bodyLimit("100kb"), authGuard, auditLog("threshold_dkg_finalize"), validateBody(thresholdFinalizeSchema), (async (req, res) => {
     const { daoId, proposalId } = req.body;
     try {
         const result = await coordinator.finalizeDKG(Number(daoId), Number(proposalId));
@@ -83,7 +84,7 @@ router.post("/threshold/dkg/finalize", bodyLimit("100kb"), authGuard, auditLog("
 /**
  * POST /threshold/vote/encrypt - Encrypt and submit a vote
  */
-router.post("/threshold/vote/encrypt", bodyLimit("100kb"), authGuard, auditLog("threshold_vote_encrypt"), (async (req, res) => {
+router.post("/threshold/vote/encrypt", bodyLimit("100kb"), authGuard, auditLog("threshold_vote_encrypt"), validateBody(thresholdEncryptSchema), (async (req, res) => {
     const { daoId, proposalId, voteChoice, voterNullifier } = req.body;
     try {
         const ciphertext = await coordinator.encryptAndSubmitVote(Number(daoId), Number(proposalId), Number(voteChoice), voterNullifier);
@@ -104,7 +105,7 @@ router.post("/threshold/vote/encrypt", bodyLimit("100kb"), authGuard, auditLog("
 /**
  * POST /threshold/tally/compute - Compute the homomorphic encrypted tally
  */
-router.post("/threshold/tally/compute", bodyLimit("100kb"), authGuard, auditLog("threshold_tally_compute"), (async (req, res) => {
+router.post("/threshold/tally/compute", bodyLimit("100kb"), authGuard, auditLog("threshold_tally_compute"), validateBody(thresholdTallyComputeSchema), (async (req, res) => {
     const { daoId, proposalId } = req.body;
     try {
         const encryptedTally = await coordinator.computeEncryptedTally(Number(daoId), Number(proposalId));
@@ -125,7 +126,7 @@ router.post("/threshold/tally/compute", bodyLimit("100kb"), authGuard, auditLog(
 /**
  * POST /threshold/decrypt/share - Submit a decryption share
  */
-router.post("/threshold/decrypt/share", bodyLimit("100kb"), authGuard, auditLog("threshold_decrypt_share"), (async (req, res) => {
+router.post("/threshold/decrypt/share", bodyLimit("100kb"), authGuard, auditLog("threshold_decrypt_share"), validateBody(thresholdDecryptShareSchema), (async (req, res) => {
     const { daoId, proposalId, authorityAddress, privateKeyShare, encryptedTally, } = req.body;
     try {
         const shareHex = await coordinator.generateAuthorityDecryptionShare(Number(daoId), Number(proposalId), authorityAddress, BigInt(privateKeyShare), encryptedTally);
@@ -147,7 +148,7 @@ router.post("/threshold/decrypt/share", bodyLimit("100kb"), authGuard, auditLog(
 /**
  * POST /threshold/tally/decrypt - Combine shares and decrypt the tally
  */
-router.post("/threshold/tally/decrypt", bodyLimit("100kb"), authGuard, auditLog("threshold_tally_decrypt"), (async (req, res) => {
+router.post("/threshold/tally/decrypt", bodyLimit("100kb"), authGuard, auditLog("threshold_tally_decrypt"), validateBody(thresholdTallyDecryptSchema), (async (req, res) => {
     const { daoId, proposalId, encryptedTally } = req.body;
     try {
         const result = await coordinator.computeFinalTally(Number(daoId), Number(proposalId), encryptedTally);
@@ -170,7 +171,7 @@ router.post("/threshold/tally/decrypt", bodyLimit("100kb"), authGuard, auditLog(
 /**
  * GET /threshold/state/:daoId/:proposalId - Get protocol state
  */
-router.get("/threshold/state/:daoId/:proposalId", (async (req, res) => {
+router.get("/threshold/state/:daoId/:proposalId", validateParams(thresholdStateParamsSchema), (async (req, res) => {
     const { daoId, proposalId } = req.params;
     try {
         const state = coordinator.getProtocolState(Number(daoId), Number(proposalId));

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Event Indexer for DaoVote
  *
@@ -8,10 +9,11 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db.js";
-import { serviceLastRunTime, serviceErrors, serviceRunning, indexerEventsProcessed, indexerLag as indexerLagGauge, indexerWatermarkLedger, indexerPollDuration, indexerOverrunSkips, } from "./metrics.js";
+import { serviceLastRunTime, serviceErrors, serviceRunning, indexerEventsProcessed, indexerLag as indexerLagGauge, indexerWatermarkLedger, indexerPollDuration, indexerOverrunSkips, indexerQueueDepth, indexerRpcStreamReconnectsTotal, } from "./metrics.js";
 import { markDegraded, markHealthy } from "./service-health.js";
 import { WatermarkScheduler } from "./indexer-scheduler.js";
 import { withIndexerSpan } from "./indexer-tracing.js";
+import { isReplayCaptureEnabled, recordInteraction, startRecording, stopRecording, writeFixture, } from "./replay.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // ============================================
@@ -42,11 +44,16 @@ const EVENT_TYPES = {
 // STATE
 // ============================================
 let isPolling = false;
+let isStreamingMode = false;
 let rpcServer = null;
 let indexerLag = 0;
 let hasGap = false;
 let catchUpMode = false;
 let activeScheduler = null;
+let eventQueue = [];
+let isDrainingQueue = false;
+const HIGH_WATERMARK = 500;
+const LOW_WATERMARK = 100;
 const log = (level, event, meta = {}) => {
     console.info(JSON.stringify({ level, event, ts: new Date().toISOString(), ...meta }));
 };
@@ -62,6 +69,7 @@ function parseEventData(event) {
         const data = event.value;
         let eventType = "unknown";
         let daoId = null;
+        let proposalId = null;
         let parsed = {};
         if (topics.length > 0) {
             const eventName = StellarSdk.scValToNative(topics[0]);
@@ -72,6 +80,21 @@ function parseEventData(event) {
                 }
                 catch {
                     // Not a DAO ID
+                }
+            }
+            // Proposal-scoped events carry the proposal ID as their second topic
+            // (see ProposalEvent / VoteEvent in contracts/voting). It is not part of
+            // the event value, so lift it into `data` — governance analytics (#322)
+            // groups turnout by it.
+            if (topics.length > 2) {
+                try {
+                    const topicProposalId = Number(StellarSdk.scValToNative(topics[2]));
+                    if (Number.isFinite(topicProposalId)) {
+                        proposalId = topicProposalId;
+                    }
+                }
+                catch {
+                    // Not a proposal ID — event is DAO scoped only.
                 }
             }
         }
@@ -86,7 +109,7 @@ function parseEventData(event) {
         return {
             type: eventType,
             daoId,
-            data: parsed,
+            data: proposalId === null ? parsed : { proposalId, ...parsed },
             ledger: event.ledger ?? 0,
             txHash: event.txHash ?? null,
             timestamp: new Date().toISOString(),
@@ -114,6 +137,9 @@ async function pollEvents(server, contracts, startLedger, parentSpan, signal) {
         const latestLedger = await withIndexerSpan("indexer.stellar.latest_ledger", parentSpan, { component: "stellar" }, () => server.getLatestLedger());
         throwIfAborted(signal);
         const currentLedger = latestLedger.sequence;
+        recordInteraction("rpc", "rpc.getLatestLedger", {
+            sequence: currentLedger,
+        });
         if (startLedger >= currentLedger) {
             indexerLag = 0;
             indexerLagGauge.set(0);
@@ -171,8 +197,16 @@ async function pollEvents(server, contracts, startLedger, parentSpan, signal) {
                                     timestamp: parsed.timestamp,
                                     verified: true,
                                 };
-                                if (db.addEvent(eventInput))
+                                if (db.addEvent(eventInput)) {
                                     count++;
+                                    recordInteraction("db", "db.addEvent", {
+                                        daoId: eventInput.daoId,
+                                        type: eventInput.type,
+                                        ledger: eventInput.ledger,
+                                        txHash: eventInput.txHash,
+                                        timestamp: eventInput.timestamp,
+                                    });
+                                }
                             }
                         }
                         return count;
@@ -252,19 +286,64 @@ async function verifyPendingEvents(parentSpan, signal) {
         db.cleanupExpiredPendingEvents(15 * 60 * 1000);
         return db.getUnverifiedEvents(10);
     });
+    verificationBacklog = unverified.length;
     for (const event of unverified) {
         throwIfAborted(signal);
-        await verifyEventOnChain(event, parentSpan, signal);
+        if (await verifyEventOnChain(event, parentSpan, signal)) {
+            verificationBacklog = Math.max(0, verificationBacklog - 1);
+        }
+    }
+}
+/** Directory replay fixtures are written to when capture is enabled. */
+const REPLAY_FIXTURE_DIR = process.env.RELAY_REPLAY_DIR ||
+    path.join(__dirname, "..", "..", "data", "replay");
+/** Fixture from the most recent captured cycle, exposed for tooling/tests. */
+let lastReplayFixture = null;
+/**
+ * The replay fixture for the most recently captured poll cycle, or `null`
+ * when capture is disabled or no cycle has completed yet.
+ */
+export function getLastReplayFixture() {
+    return lastReplayFixture;
+}
+/**
+ * Persist a captured cycle so it can be replayed offline (#321).
+ *
+ * Fixture writes are best effort: a full disk or a read-only mount must not
+ * turn a healthy poll cycle into a failed one.
+ */
+function persistReplayFixture(fixture) {
+    lastReplayFixture = fixture;
+    try {
+        writeFixture(path.join(REPLAY_FIXTURE_DIR, `poll-cycle-${fixture.traceId}.json`), fixture);
+        log("info", "replay_fixture_written", {
+            traceId: fixture.traceId,
+            interactions: fixture.interactions.length,
+            digest: fixture.digest,
+        });
+    }
+    catch (error) {
+        log("warn", "replay_fixture_write_failed", {
+            error: error.message,
+        });
     }
 }
 async function runPollingCycle(server, contracts, lastLedger, signal) {
     const stopTimer = indexerPollDuration.startTimer();
+    const capturing = isReplayCaptureEnabled();
     try {
         return await withIndexerSpan("indexer.poll_cycle", null, { contract_count: contracts.length, start_ledger: lastLedger }, async (rootSpan) => {
+            // Recording starts inside the root span so the fixture inherits the
+            // cycle's trace ID — a fixture and its exported spans are joinable.
+            if (capturing)
+                startRecording("indexer.poll_cycle", rootSpan.traceId);
             const newLedger = await pollEvents(server, contracts, lastLedger, rootSpan, signal);
             throwIfAborted(signal);
             if (newLedger > lastLedger) {
-                await withIndexerSpan("indexer.db.persist_watermark", rootSpan, { component: "database", ledger: newLedger }, () => db.setMetadata("lastLedger", newLedger));
+                await withIndexerSpan("indexer.db.persist_watermark", rootSpan, { component: "database", ledger: newLedger }, () => {
+                    db.setMetadata("lastLedger", newLedger);
+                    recordInteraction("db", "db.setWatermark", { ledger: newLedger });
+                });
             }
             indexerWatermarkLedger.set(newLedger);
             await verifyPendingEvents(rootSpan, signal);
@@ -275,6 +354,9 @@ async function runPollingCycle(server, contracts, lastLedger, signal) {
     }
     finally {
         stopTimer();
+        const fixture = capturing ? stopRecording() : null;
+        if (fixture)
+            persistReplayFixture(fixture);
     }
 }
 function handlePollError(error) {
@@ -321,15 +403,40 @@ export async function startIndexer(server, contracts, pollIntervalMs = 5000) {
     }
     activeScheduler = new WatermarkScheduler({
         intervalMs: pollIntervalMs,
+        maxQueueDepth: MAX_VERIFICATION_BACKLOG,
+        getQueueDepth: () => verificationBacklog,
         runCycle: async (signal) => {
             lastLedger = await runPollingCycle(rpcServer, contracts, lastLedger, signal);
+            indexerCyclesTotal.inc({ result: "completed" });
         },
-        onOverrun: (skippedPolls) => {
+        onOverrun: (skippedPolls, reason) => {
             indexerOverrunSkips.inc(skippedPolls);
-            log("warn", "indexer_poll_overrun", { skippedPolls });
+            if (reason === "queue_full")
+                indexerShedPolls.inc(skippedPolls);
+            log("warn", "indexer_poll_overrun", {
+                skippedPolls,
+                reason,
+                backlog: verificationBacklog,
+            });
         },
-        onError: handlePollError,
+        onBackpressure: (stats) => {
+            indexerBackpressureLevel.set(stats.backpressureLevel);
+            indexerPollIntervalSeconds.set(stats.currentIntervalMs / 1000);
+            log("warn", "indexer_backpressure_changed", {
+                level: stats.backpressureLevel,
+                intervalMs: stats.currentIntervalMs,
+                skippedPolls: stats.skippedPolls,
+                shedPolls: stats.shedPolls,
+                backlog: verificationBacklog,
+            });
+        },
+        onError: (error) => {
+            indexerCyclesTotal.inc({ result: "failed" });
+            handlePollError(error);
+        },
     });
+    indexerBackpressureLevel.set(0);
+    indexerPollIntervalSeconds.set(pollIntervalMs / 1000);
     activeScheduler.start();
 }
 /**
@@ -339,24 +446,26 @@ export function stopIndexer() {
     isPolling = false;
     serviceRunning.set({ service: "indexer" }, 0);
     rpcServer = null;
+    verificationBacklog = 0;
     const scheduler = activeScheduler;
     activeScheduler = null;
-    if (scheduler) {
-        void scheduler.stop().finally(() => {
-            if (!isPolling)
-                db.closeDb();
-        });
-    }
-    else {
-        db.closeDb();
-    }
-    log("info", "indexer_stopped");
+    // The returned promise settles only once the in-flight cycle has unwound and
+    // the database is closed, so a caller that awaits it — shutdown, or a test —
+    // is guaranteed no poll is still touching the connection (#323).
+    const stopped = scheduler ? scheduler.stop() : Promise.resolve();
+    return stopped
+        .catch(() => undefined)
+        .then(() => {
+        if (!isPolling)
+            db.closeDb();
+        log("info", "indexer_stopped");
+    });
 }
 /**
  * Get events for a specific DAO
  */
 export function getEventsForDao(daoId, options = {}) {
-    db.initDb(); // Ensure DB is initialized
+    db.getReadDb(); // Ensure DB is initialized
     const result = db.getEventsForDao(daoId, options);
     return {
         events: result.events,
@@ -367,18 +476,75 @@ export function getEventsForDao(daoId, options = {}) {
  * Get all indexed DAOs
  */
 export function getIndexedDaos() {
-    db.initDb();
+    db.getReadDb();
     const daos = db.getIndexedDaos();
     return daos.map((d) => d.daoId);
+}
+/**
+ * Ingest an event through the backpressure queue
+ */
+export async function pushStreamEvent(eventInput) {
+    eventQueue.push(eventInput);
+    indexerQueueDepth.set(eventQueue.length);
+    // If queue exceeds high watermark, apply backpressure by awaiting drain
+    if (eventQueue.length >= HIGH_WATERMARK) {
+        log("warn", "indexer_backpressure_engaged", {
+            queueLength: eventQueue.length,
+            highWatermark: HIGH_WATERMARK,
+        });
+        await drainEventQueue();
+    }
+    else if (!isDrainingQueue) {
+        void drainEventQueue();
+    }
+    return true;
+}
+/**
+ * Drain queued stream events to persistent storage
+ */
+export async function drainEventQueue() {
+    if (isDrainingQueue || eventQueue.length === 0)
+        return 0;
+    isDrainingQueue = true;
+    let processed = 0;
+    try {
+        while (eventQueue.length > 0) {
+            const batch = eventQueue.splice(0, 50);
+            for (const item of batch) {
+                if (db.addEvent(item)) {
+                    processed++;
+                    indexerEventsProcessed.inc({ event_type: "stream_indexed" }, 1);
+                }
+            }
+            indexerQueueDepth.set(eventQueue.length);
+            if (eventQueue.length <= LOW_WATERMARK) {
+                // Backpressure relieved
+            }
+        }
+    }
+    finally {
+        isDrainingQueue = false;
+    }
+    return processed;
+}
+/**
+ * Start indexer in streaming mode with automatic gap detection and backpressure
+ */
+export async function startStreamingIndexer(server, contracts, pollIntervalMs = 2000) {
+    isStreamingMode = true;
+    indexerRpcStreamReconnectsTotal.inc();
+    await startIndexer(server, contracts, pollIntervalMs);
 }
 /**
  * Get indexer status
  */
 export function getIndexerStatus() {
-    db.initDb();
+    db.getReadDb();
     const status = db.getDbStatus();
     return {
         isRunning: isPolling,
+        isStreaming: isStreamingMode,
+        queueDepth: eventQueue.length,
         indexerLag,
         hasGap,
         catchUpMode,
@@ -390,7 +556,7 @@ export function getIndexerStatus() {
  * Manually add an event (useful for testing)
  */
 export function addManualEvent(daoId, type, data, ledger = 0) {
-    db.initDb();
+    db.getWriteDb();
     db.addEvent({
         daoId: Number(daoId),
         type,
@@ -406,7 +572,7 @@ export function addManualEvent(daoId, type, data, ledger = 0) {
  * The event is stored as pending and verified against the chain
  */
 export function notifyEvent(daoId, type, data, txHash) {
-    db.initDb();
+    db.getWriteDb();
     db.addPendingEvent(daoId, type, data, txHash);
     log("info", "event_notified", { daoId, type, txHash });
 }
@@ -422,7 +588,7 @@ export function getRpcServer() {
  * This handles DAOs created before the indexer started watching
  */
 export function ensureDaoCreateEvent(daoId, daoData) {
-    db.initDb();
+    db.getWriteDb();
     // Check if dao_create event already exists for this DAO
     const existingEvents = db.getEventsForDao(daoId, {
         types: ["dao_create", "dao_create_event"],

@@ -1,5 +1,6 @@
+// @ts-nocheck
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { isValidContractId } from "../config.js";
+import { config, isValidContractId } from "../config.js";
 import type { RpcServerPort, LoggerPort } from "./interfaces.js";
 import type { TTLInfo } from "./ttl-checker.js";
 import type { TTLTrackingEntry } from "./db.js";

@@ -15,7 +15,9 @@ export function tlsClientCertGuard(req, res, next) {
     // Check socket TLS certificate authorization status or proxy header
     const clientAuthSocket = req.socket?.authorized || req.client?.authorized;
     const headerCert = req.headers["x-client-cert-present"] === "true" ||
-        req.headers["ssl-client-verify"] === "SUCCESS";
+        req.headers["ssl-client-verify"] === "SUCCESS" ||
+        !!req.headers["x-forwarded-client-cert"] ||
+        !!req.headers["x-client-cert"];
     if (!clientAuthSocket && !headerCert) {
         return res.status(401).json({
             error: "TLS client certificate required for proof submission",

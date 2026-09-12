@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Encryption at Rest for Secrets
  *

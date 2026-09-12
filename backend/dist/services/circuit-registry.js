@@ -1,7 +1,20 @@
+// @ts-nocheck
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config } from "../config.js";
-import { logger } from "./logger.js";
-import { server, relayerKeypair, callWithTimeout } from "./stellar.js";
+let deps = null;
+/**
+ * Explicitly wire the circuit-registry service's dependencies. Must be called
+ * once at startup by the composition root before any request reaches the
+ * /circuits routes.
+ */
+export function initCircuitRegistry(d) {
+    deps = d;
+}
+function getDeps() {
+    if (!deps) {
+        throw new Error("circuit-registry: initCircuitRegistry() must be called before use");
+    }
+    return deps;
+}
 class CircuitRegistryCache {
     circuits = new Map();
     lastFetch = 0;
@@ -70,8 +83,9 @@ export function invalidateVersionCache(circuitId) {
         versionCache.delete(circuitId);
 }
 async function simulateContractCall(method, args) {
+    const { server, relayerKeypair, callWithTimeout, circuitRegistryContractId, networkPassphrase, logger } = getDeps();
     const rpcServer = server;
-    const contractId = config.circuitRegistryContractId;
+    const contractId = circuitRegistryContractId;
     if (!contractId) {
         logger.error("circuit_registry_not_configured");
         return null;
@@ -81,7 +95,7 @@ async function simulateContractCall(method, args) {
         const contract = new StellarSdk.Contract(contractId);
         const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
             fee: "100000",
-            networkPassphrase: config.networkPassphrase,
+            networkPassphrase,
         })
             .addOperation(contract.call(method, ...args))
             .setTimeout(30)
@@ -232,5 +246,163 @@ export async function getDaoCurrentCircuit(daoId, circuitType) {
     if (!response?.result)
         return null;
     return response.result.retval.str()?.toString() ?? null;
+}
+export async function proposeVkUpgrade(args) {
+    const { circuitId, circuitType, newVk, newWasmHash, timelockDuration, requiredApprovals, daoId, proposer, } = args;
+    const vkArgs = [
+        StellarSdk.nativeToScVal(circuitId, { type: "string" }),
+        StellarSdk.nativeToScVal(circuitType, { type: "symbol" }),
+        StellarSdk.nativeToScVal({
+            alpha: newVk.alpha,
+            beta: newVk.beta,
+            gamma: newVk.gamma,
+            delta: newVk.delta,
+            ic: newVk.ic,
+        }, { type: "map" }),
+        StellarSdk.nativeToScVal(Buffer.from(newWasmHash, "hex"), { type: "bytes" }),
+        StellarSdk.nativeToScVal(timelockDuration, { type: "u64" }),
+        StellarSdk.nativeToScVal(requiredApprovals, { type: "u32" }),
+        StellarSdk.nativeToScVal(daoId ?? null, { type: "u64" }),
+        StellarSdk.nativeToScVal(proposer, { type: "address" }),
+    ];
+    const response = await simulateContractCall("propose_vk_upgrade", vkArgs);
+    if (!response?.result) {
+        throw new Error("Failed to propose VK upgrade");
+    }
+    return Number(response.result.retval.u32?.toString() ?? response.result.retval.i32?.toString() ?? 0);
+}
+export async function approveVkUpgrade(proposalId, approver) {
+    const args = [
+        StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
+        StellarSdk.nativeToScVal(approver, { type: "address" }),
+    ];
+    const response = await simulateContractCall("approve_vk_upgrade", args);
+    if (StellarSdk.rpc.Api.isSimulationError(response)) {
+        throw new Error(response.error);
+    }
+}
+export async function executeVkUpgrade(proposalId, executor) {
+    const args = [
+        StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
+        StellarSdk.nativeToScVal(executor, { type: "address" }),
+    ];
+    const response = await simulateContractCall("execute_vk_upgrade", args);
+    if (StellarSdk.rpc.Api.isSimulationError(response)) {
+        throw new Error(response.error);
+    }
+}
+export async function cancelVkUpgrade(proposalId, canceller) {
+    const args = [
+        StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
+        StellarSdk.nativeToScVal(canceller, { type: "address" }),
+    ];
+    const response = await simulateContractCall("cancel_vk_upgrade", args);
+    if (StellarSdk.rpc.Api.isSimulationError(response)) {
+        throw new Error(response.error);
+    }
+}
+export async function getVkProposal(proposalId) {
+    const args = [StellarSdk.nativeToScVal(proposalId, { type: "u32" })];
+    const response = await simulateContractCall("get_vk_proposal", args);
+    if (!response?.result)
+        return null;
+    const scVal = response.result.retval;
+    const mapEntries = scVal.map() ?? [];
+    const parsed = {};
+    for (const entry of mapEntries) {
+        const key = entry.key().sym()?.toString() ?? "";
+        const val = entry.val();
+        switch (key) {
+            case "id":
+                parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+                break;
+            case "circuit_id":
+                parsed[key] = val.str()?.toString() ?? val.sym()?.toString() ?? "";
+                break;
+            case "circuit_type":
+                parsed[key] = val.sym()?.toString() ?? "";
+                break;
+            case "proposed_by":
+                parsed[key] = val.addr()?.toString() ?? "";
+                break;
+            case "proposed_at":
+            case "execute_after":
+                parsed[key] = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+                break;
+            case "required_approvals":
+            case "approvals":
+                parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+                break;
+            case "status":
+                parsed[key] = val.sym()?.toString() ?? "";
+                break;
+            case "dao_id":
+                parsed[key] = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+                break;
+        }
+    }
+    return {
+        id: parsed.id,
+        circuitId: parsed.circuit_id,
+        circuitType: parsed.circuit_type ?? "Vote",
+        proposedBy: parsed.proposed_by,
+        proposedAt: parsed.proposed_at,
+        executeAfter: parsed.execute_after,
+        requiredApprovals: parsed.required_approvals,
+        approvals: parsed.approvals,
+        status: parsed.status,
+        daoId: parsed.dao_id,
+    };
+}
+export async function getDaoVkProposal(daoId) {
+    const args = [StellarSdk.nativeToScVal(daoId, { type: "u64" })];
+    const response = await simulateContractCall("get_dao_vk_proposal", args);
+    if (!response?.result)
+        return null;
+    const scVal = response.result.retval;
+    if (!scVal.map())
+        return null;
+    const mapEntries = scVal.map() ?? [];
+    const parsed = {};
+    for (const entry of mapEntries) {
+        const key = entry.key().sym()?.toString() ?? "";
+        const val = entry.val();
+        switch (key) {
+            case "id":
+                parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+                break;
+            case "circuit_id":
+                parsed[key] = val.str()?.toString() ?? val.sym()?.toString() ?? "";
+                break;
+            case "circuit_type":
+                parsed[key] = val.sym()?.toString() ?? "";
+                break;
+            case "proposed_by":
+                parsed[key] = val.addr()?.toString() ?? "";
+                break;
+            case "proposed_at":
+            case "execute_after":
+                parsed[key] = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+                break;
+            case "required_approvals":
+            case "approvals":
+                parsed[key] = Number(val.u32()?.toString() ?? val.i32()?.toString() ?? 0);
+                break;
+            case "status":
+                parsed[key] = val.sym()?.toString() ?? "";
+                break;
+        }
+    }
+    return {
+        id: parsed.id,
+        circuitId: parsed.circuit_id,
+        circuitType: parsed.circuit_type ?? "Vote",
+        proposedBy: parsed.proposed_by,
+        proposedAt: parsed.proposed_at,
+        executeAfter: parsed.execute_after,
+        requiredApprovals: parsed.required_approvals,
+        approvals: parsed.approvals,
+        status: parsed.status,
+    };
 }
 //# sourceMappingURL=circuit-registry.js.map

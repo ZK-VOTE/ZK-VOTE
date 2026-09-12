@@ -43,7 +43,7 @@ async function prove(req: ProofRequest): Promise<ProofResponse> {
     const wasm = req.wasm instanceof ArrayBuffer ? new Uint8Array(req.wasm) : req.wasm;
     const zkey = req.zkey instanceof ArrayBuffer ? new Uint8Array(req.zkey) : req.zkey;
 
-    const { proof, publicSignals } = await groth16.fullProve(req.input, wasm, zkey);
+    const { proof, publicSignals } = await groth16.fullProve(req.input as unknown as import("snarkjs").CircuitSignals, wasm as string, zkey as string);
     return { id: req.id, ok: true, proof, publicSignals };
   } catch (err) {
     // Report only that proving failed. The message from snarkjs can name the

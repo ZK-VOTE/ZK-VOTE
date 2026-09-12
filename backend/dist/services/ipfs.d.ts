@@ -34,6 +34,8 @@ export interface MetadataValidationResult {
 }
 export declare const MAX_JSON_SIZE: number;
 export declare const MAX_RAW_SIZE: number;
+export declare const MAX_IMAGE_UPLOAD_BYTES: number;
+export declare const MAX_IMAGE_DIMENSION = 4096;
 export declare const PROPOSAL_METADATA_SCHEMA: MetadataSchema;
 export declare const COMMENT_METADATA_SCHEMA: MetadataSchema;
 /**
@@ -108,10 +110,11 @@ export declare function initPinata(jwt: string, gateway?: string): void;
  * Pin JSON data to public IPFS (SDK v2.x)
  */
 export declare function pinJSON(data: Record<string, unknown>, name?: string): Promise<PinResult>;
+export declare function validateAndSanitizeImage(buffer: Buffer, claimedMime: string, uploader?: string): Promise<Buffer>;
 /**
  * Pin a file (image) to public IPFS (SDK v2.x)
  */
-export declare function pinFile(buffer: Buffer, filename: string, mimeType: string): Promise<PinResult>;
+export declare function pinFile(buffer: Buffer, filename: string, mimeType: string, uploader?: string): Promise<PinResult>;
 /**
  * Validate CID format (CIDv0 or CIDv1) strictly
  */
@@ -120,6 +123,40 @@ export declare function isValidCid(cid: string): boolean;
  * Sanitize CID before URL construction (reject path separators, query strings, etc.)
  */
 export declare function sanitizeCid(cid: string): string;
+/**
+ * Verify that the raw `content` buffer matches the hash encoded in `cid`.
+ *
+ * Supports:
+ *   - CIDv0 (Qm…): SHA2-256 multihash inside a base58btc-encoded CIDv1-dag-pb wrapper.
+ *     Multihash layout: [0x12][0x20][32 bytes SHA-256 digest]
+ *   - CIDv1 bafy… / bafk…: base32-encoded CIDv1.  The raw bytes after
+ *     stripping the CID version (0x01) and codec varint are a multihash.
+ *     This function handles the common SHA2-256 codec variant (multihash
+ *     function code 0x12).
+ *
+ * Returns `true` when the hash of `content` matches the CID digest,
+ * `false` when it does not match or the format is unrecognised.
+ */
+export declare function verifyCidContent(cid: string, content: Buffer): boolean;
+export interface EnsurePinnedResult {
+    cid: string;
+    alreadyPinned: boolean;
+    pinned: boolean;
+    services: string[];
+    error?: string;
+}
+/**
+ * Ensure a CID is pinned to at least `minPinCount` services.
+ *
+ * Checks the local pin registry first; if the CID is already tracked with
+ * enough services, returns immediately.  Otherwise pins to Pinata (which
+ * counts as one service), optionally supplemented by secondary services
+ * via the pin-manager's `pinToSecondary`.
+ *
+ * @param cid          The IPFS CID to pin
+ * @param minPinCount  Minimum number of pinning services required (default 1)
+ */
+export declare function ensurePinned(cid: string, minPinCount?: number): Promise<EnsurePinnedResult>;
 /**
  * Check if a host or IP is in a private/internal network range
  */

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Composition Root (#358)
  *

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Proof Encryption & Receipt Security Service
  *

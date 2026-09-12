@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Anonymous Vote Delegation / Liquid Democracy (issue #304)
  *

@@ -7,6 +7,67 @@
  * and hit/miss metrics.
  */
 import { EventEmitter } from "events";
+import * as StellarSdk from "@stellar/stellar-sdk";
+import type { DaoInput } from "./db.js";
+import type { DaoData } from "./indexer.js";
+import type { RpcServerPort, LoggerPort } from "./interfaces.js";
+import type { Dao } from "../types/index.js";
+/**
+ * Persistence surface needed by the sync service (#358). Structurally typed
+ * so unit tests can inject an in-memory fake.
+ */
+export interface SyncDbPort {
+    getAllCachedDaos(): Array<Pick<Dao, "id" | "creator">>;
+    upsertDaos(daos: DaoInput[]): void;
+    setDaosSyncTime(timestamp: string): void;
+}
+/**
+ * Dependencies of the sync service, injected explicitly via `initSyncService`
+ * (called by the composition root) so this module never imports the
+ * `stellar.js`/`db.js`/`logger.js`/`service-health.js`/`indexer.js` module
+ * singletons to get what it needs (#358). Prometheus metrics (`metrics.js`)
+ * are intentionally still module-scoped — they are process-global counters
+ * by design and outside #358's scope.
+ */
+export interface SyncDeps {
+    /** Active RPC server (pool-backed proxy in production). */
+    server: RpcServerPort;
+    /** Relayer keypair used for read calls to the contracts. */
+    relayerKeypair: {
+        publicKey(): string;
+    } & Partial<StellarSdk.Keypair>;
+    /** Run `fn` with a timeout, labelled for logs/metrics. */
+    callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
+    /** Simulate a transaction with retry/backoff. */
+    simulateWithBackoff<T>(fn: () => Promise<T>, attempts?: number): Promise<T>;
+    /** Sequence manager used to flush state at shutdown. */
+    sequenceManager: {
+        forceResync(server: StellarSdk.rpc.Server): Promise<void>;
+    };
+    /** Config: max entries per snapshot cache (FIFO eviction, #191). */
+    maxCachedDaos: number;
+    /** Config: DAO registry contract id. */
+    daoRegistryContractId?: string;
+    /** Config: membership SBT contract id. */
+    membershipSbtContractId?: string;
+    /** Config: Stellar network passphrase. */
+    networkPassphrase: string;
+    /** Config: DAO sync interval (ms). */
+    daoSyncIntervalMs: number;
+    /** Config: membership sync interval (ms). */
+    membershipSyncIntervalMs: number;
+    /** DAO/metadata persistence (events store). */
+    dbService: SyncDbPort;
+    /** Backfill the dao_create event for a freshly synced DAO. */
+    ensureDaoCreateEvent(daoId: number, daoData: DaoData): boolean;
+    /** Health reporting for the background sync loops. */
+    markHealthy(service: "dao_sync"): void;
+    markDegraded(service: "dao_sync", reason?: string): void;
+    /** Structured logger (called as `deps.log(level, event, meta)`). */
+    log: LoggerPort["log"];
+}
+/** Explicitly wire the sync service (composition root only). */
+export declare function initSyncService(d: SyncDeps): void;
 export interface CacheSnapshot {
     daoMembers: Map<number, Set<string>>;
     daoAdmins: Map<number, string>;
@@ -20,7 +81,7 @@ export interface CacheMetrics {
     version: number;
     daoCount: number;
 }
-export declare const cacheEmitter: EventEmitter<[never]>;
+export declare const cacheEmitter: EventEmitter;
 /**
  * Get current immutable cache snapshot
  */

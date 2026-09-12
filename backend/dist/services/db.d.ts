@@ -90,10 +90,27 @@ export interface IndexedDao {
     daoId: number;
     eventCount: number;
 }
+export interface ProposalLifecycleSubscription {
+    id: number;
+    daoId: number;
+    walletAddressHash: string;
+    active: boolean;
+    createdAt: string;
+    updatedAt: string;
+}
+export interface ProposalLifecycleNotification {
+    id: number;
+    daoId: number;
+    proposalId: number;
+    eventType: string;
+    walletAddressHash: string;
+    delivered: boolean;
+    createdAt: string;
+}
 export declare class WriteConnectionUnavailableError extends Error {
     constructor(message: string);
 }
-export declare function getWalSizeBytes(dbFile?: string): number;
+export declare function getWalSizeBytes(dbFile?: string | null): number;
 /**
  * Estimate how far the read connection lags the writer.
  * Same-file WAL readers typically see lag ≈ 0 once the write commits;
@@ -114,6 +131,12 @@ export declare function getWriteFailureReason(): string | null;
  * On connection-level failure, attempts one reconnect (failover).
  * Does not switch away from an already-open custom dbPath.
  */
+/**
+ * Whether the write connection has been initialized already (without
+ * forcing initialization). Used by best-effort audit writers (e.g. backup
+ * key rotation metadata) that should never trigger a DB bootstrap.
+ */
+export declare function isDbInitialized(): boolean;
 export declare function getWriteDb(): DatabaseType;
 /**
  * Return the readonly connection for API queries.
@@ -164,6 +187,23 @@ export declare function addEvent(event: EventInput): boolean;
  * Add a pending (unverified) event from frontend notification.
  */
 export declare function addPendingEvent(daoId: number, type: string, data: Record<string, unknown> | null, txHash: string): boolean;
+export declare function subscribeToDaoProposalLifecycle(daoId: number, walletAddress: string): {
+    success: boolean;
+    active: boolean;
+    walletAddressHash: string;
+};
+export declare function unsubscribeFromDaoProposalLifecycle(daoId: number, walletAddress: string): {
+    success: boolean;
+    active: boolean;
+    walletAddressHash: string;
+};
+export declare function listDaoProposalLifecycleSubscriptions(daoId: number, options?: {
+    includeInactive?: boolean;
+}): ProposalLifecycleSubscription[];
+export declare function getDaoProposalLifecycleNotifications(daoId: number, options?: {
+    eventType?: string;
+}): ProposalLifecycleNotification[];
+export declare function emitProposalLifecycleNotifications(daoId: number, proposalId: number, eventType: string): number;
 /**
  * Mark an event as verified.
  * Searches across the DAO's partition table.
@@ -224,6 +264,20 @@ export interface VoteSubmissionRow {
     created_at: number;
     updated_at: number;
 }
+export interface VoteJobRow {
+    id: string;
+    nullifier_hash: string;
+    dao_id: number;
+    proposal_id: number;
+    payload: string;
+    status: "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "DEAD_LETTER";
+    attempts: number;
+    max_attempts: number;
+    tx_hash: string | null;
+    error_message: string | null;
+    created_at: number;
+    updated_at: number;
+}
 /**
  * Look up an existing vote submission by nullifier hash.
  */
@@ -240,6 +294,14 @@ export declare function updateVoteSubmission(nullifierHash: string, status: "con
  * Delete vote submissions older than ttlMs whose status is not confirmed.
  */
 export declare function cleanupExpiredVoteSubmissions(ttlMs: number): number;
+export declare function createVoteJob(jobId: string, nullifierHash: string, daoId: number, proposalId: number, payload: string): VoteJobRow;
+export declare function getVoteJobById(jobId: string): VoteJobRow | null;
+export declare function updateVoteJobStatus(jobId: string, status: VoteJobRow["status"], update?: {
+    txHash?: string;
+    errorMessage?: string;
+    attempts?: number;
+}): VoteJobRow | null;
+export declare function getVoteQueueDepth(): number;
 export interface AuditLogInput {
     timestamp: string;
     action: string;
@@ -452,6 +514,12 @@ export declare function getActiveAuthTokens(): AuthToken[];
 export declare function getValidAuthTokens(transitionMs: number): AuthToken[];
 export declare function updateAuthTokenStatus(id: string, status: AuthToken["status"]): void;
 export declare function revokeAuthToken(id: string): void;
+/**
+ * Refresh a token record's hash (used by the legacy-token migration when the
+ * RELAYER_AUTH_TOKEN env var changes: the env var is the source of truth, so
+ * the stored hash must track it or the new value would never validate).
+ */
+export declare function updateAuthTokenHash(id: string, tokenHash: string, expiresAt: string): void;
 export declare function markTokenRotated(oldId: string, newId: string): void;
 export declare function recordTokenUsage(id: string, ipHash: string | null): void;
 export declare function expireAuthTokens(): number;
@@ -467,9 +535,22 @@ export interface ProofCommitmentRecord {
     timestamp: number;
     status: "COMMITTED" | "REVEALED" | "EXPIRED";
     createdAt: string;
+    /** Malleability-safe dedup key (NULL for legacy rows). */
+    canonicalProofHash: string | null;
 }
-export declare function recordProofCommitment(commitmentHash: string, nullifier: string, daoId: number, proposalId: number, timestamp: number, walletAddress?: string | null): void;
+export declare function recordProofCommitment(commitmentHash: string, nullifier: string, daoId: number, proposalId: number, timestamp: number, walletAddress?: string | null, canonicalProofHash?: string | null): void;
 export declare function getProofCommitment(commitmentHash: string): ProofCommitmentRecord | null;
+/**
+ * Look up a proof commitment by its canonical proof hash.
+ *
+ * Both malleable forms of a Groth16 proof ((A,B,C) and (-A,-B,C)) produce the
+ * same canonical hash after canonicalizeProof(), so this lookup correctly
+ * deduplicates retries that arrive with the negated proof form.
+ *
+ * Returns null for records written before migration 004 (canonical_proof_hash
+ * is NULL on those rows).
+ */
+export declare function getProofCommitmentByCanonicalHash(canonicalHash: string): ProofCommitmentRecord | null;
 export declare function recordAuthAudit(entry: {
     tokenId?: string | null;
     clientId?: string | null;

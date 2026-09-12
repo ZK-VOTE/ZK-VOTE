@@ -7,6 +7,7 @@
  * endpoints or under-permits large ones.
  */
 import express from "express";
+import multer from "multer";
 import { log } from "../services/logger.js";
 /**
  * Returns an `express.json()` middleware capped at `limit` (e.g. "5kb").
@@ -19,6 +20,31 @@ export function bodyLimit(limit) {
         parser(req, res, (err) => {
             if (err) {
                 log("warn", "request_body_rejected", {
+                    path: req.path,
+                    limit,
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            }
+            next(err);
+        });
+    };
+}
+/**
+ * Per-Upload Memory Limit
+ *
+ * Wraps Multer with memory storage and a fixed per-route file size limit (in
+ * bytes) to prevent memory exhaustion. The in-memory buffer also enables
+ * downstream magic-byte, dimension, EXIF, and malware validation.
+ */
+export function uploadLimit(limit) {
+    const upload = multer({
+        storage: multer.memoryStorage(),
+        limits: { fileSize: limit, files: 1 },
+    });
+    return (req, res, next) => {
+        upload.single("file")(req, res, (err) => {
+            if (err) {
+                log("warn", "upload_rejected", {
                     path: req.path,
                     limit,
                     error: err instanceof Error ? err.message : String(err),

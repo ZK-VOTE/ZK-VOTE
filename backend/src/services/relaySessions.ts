@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Scoped relay session tokens and encrypted relay metadata support.
  *

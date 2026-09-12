@@ -9,7 +9,7 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
 import { server, relayerKeypair, callWithTimeout, simulateWithBackoff, waitForTransaction, withSequenceLock, u256ToScVal, proofToScVal, } from "../services/stellar.js";
-import { authGuard, claimLimiter, queryLimiter, validateBody, } from "../middleware/index.js";
+import { authGuard, bodyLimit, claimLimiter, queryLimiter, validateBody, } from "../middleware/index.js";
 import { claimSchema } from "../validation/schemas.js";
 const router = Router();
 /**
@@ -17,7 +17,7 @@ const router = Router();
  * Body: { daoId, proposalId, voteNullifier, claimNullifier, root, proof }
  * Anonymity: relayer pays fee, no require_auth on claimer; commitment private.
  */
-router.post("/api/v1/claim", authGuard, claimLimiter, validateBody(claimSchema), (async (req, res) => {
+router.post("/api/v1/claim", bodyLimit("100kb"), authGuard, claimLimiter, validateBody(claimSchema), (async (req, res) => {
     const { daoId, proposalId, voteNullifier, claimNullifier, root, proof } = config.stripRequestBodies ? {} : req.body;
     try {
         log("info", "claim_request", { daoId, proposalId });
@@ -186,7 +186,7 @@ router.post("/api/v1/claim", authGuard, claimLimiter, validateBody(claimSchema),
     }
 }));
 // Also support POST /claim alias for backwards compat (query tests may hit /claim)
-router.post("/claim", authGuard, claimLimiter, validateBody(claimSchema), (async (req, res) => {
+router.post("/claim", bodyLimit("100kb"), authGuard, claimLimiter, validateBody(claimSchema), (async (req, res) => {
     // Re-use same logic via internal redirect – duplicate handler for simplicity
     // We call the same implementation by forwarding to /api/v1/claim logic
     // To avoid duplication we just throw 308? Instead implement inline.

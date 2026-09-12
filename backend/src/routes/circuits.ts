@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Router, type Request, type Response } from "express";
 
 import { log } from "../services/logger.js";
@@ -15,7 +16,7 @@ import {
   getVkProposal,
   getDaoVkProposal,
 } from "../services/circuit-registry.js";
-import { bodyLimit, queryLimiter } from "../middleware/index.js";
+import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();

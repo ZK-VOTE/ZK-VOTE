@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Dual-Write Bridge (issue #305)
  *

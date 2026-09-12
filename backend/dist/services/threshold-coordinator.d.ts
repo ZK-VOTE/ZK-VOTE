@@ -34,6 +34,31 @@ export interface EncryptedVote {
     ciphertext: tc.Ciphertext;
     voteProof?: string;
 }
+export interface RelayNode {
+    id: string;
+    address: string;
+    publicKey: string;
+    weight: number;
+    healthy: boolean;
+}
+export interface RelaySubmission {
+    electionId: string;
+    encryptedVote: EncryptedVote;
+    receivedAt: number;
+    viaRelay: string[];
+}
+export interface CoverTrafficConfig {
+    enabled: boolean;
+    minIntervalMs: number;
+    maxIntervalMs: number;
+    paddingVotesPerInterval: number;
+}
+export interface MissingVoteAlert {
+    electionId: string;
+    nullifier: string;
+    detectedAt: number;
+    reason: string;
+}
 export type ProtocolEvent = {
     type: "authority_registered";
     authority: string;
@@ -53,9 +78,26 @@ export type ProtocolEvent = {
 } | {
     type: "tally_decrypted";
     tally: string;
+} | {
+    type: "relay_registered";
+    relay: string;
+} | {
+    type: "relay_quorum_reached";
+    relayPath: string[];
+} | {
+    type: "cover_traffic_sent";
+    count: number;
+} | {
+    type: "missing_vote_detected";
+    nullifier: string;
 };
 type EventHandler = (event: ProtocolEvent) => void;
 export declare function onEvent(handler: EventHandler): void;
+export declare function registerRelayNode(daoId: number, proposalId: number, node: Omit<RelayNode, "healthy">): Promise<void>;
+export declare function submitVoteViaRelayQuorum(daoId: number, proposalId: number, encryptedVote: EncryptedVote, relayPath: string[]): Promise<void>;
+export declare function startCoverTrafficScheduler(daoId: number, proposalId: number, config: CoverTrafficConfig): void;
+export declare function stopCoverTrafficScheduler(): void;
+export declare function monitorMissingVotes(daoId: number, proposalId: number, expectedNullifiers: string[]): Promise<MissingVoteAlert[]>;
 /**
  * Initialize a DKG ceremony for a new election.
  */
@@ -81,7 +123,7 @@ export declare function finalizeDKG(daoId: number, proposalId: number): Promise<
 /**
  * Encrypt a vote using the joint public key.
  */
-export declare function encryptAndSubmitVote(daoId: number, proposalId: number, voteChoice: number, voterNullifier: string): Promise<tc.Ciphertext>;
+export declare function encryptAndSubmitVote(daoId: number, proposalId: number, voteChoice: number, voterNullifier: string, relayPath?: string[]): Promise<tc.Ciphertext>;
 /**
  * Compute the encrypted tally from all encrypted votes.
  */
@@ -103,6 +145,7 @@ export declare function getProtocolState(daoId: number, proposalId: number): {
     encryptedVoteCount: number;
     decryptionShareCount: number;
     isTallyDecrypted: boolean;
+    decryptedTally: string | null;
 };
 export {};
 //# sourceMappingURL=threshold-coordinator.d.ts.map

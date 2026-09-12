@@ -428,6 +428,126 @@ export function trackAlert(type, value, threshold) {
 export function getRecentAlerts() {
     return [...alertHistory];
 }
+const relayVoteRecords = [];
+const lastRelaySubmissionAt = new Map();
+const MAX_RELAY_VOTE_RECORDS = 10_000;
+const RELAY_QUORUM_SIZE = Number(process.env.RELAY_QUORUM_SIZE) || 3;
+const MISSING_VOTE_ALERT_THRESHOLD_MS = Number(process.env.MISSING_VOTE_ALERT_THRESHOLD_MS) || 60_000;
+/**
+ * Record a relay submission. Cover traffic is tracked only for relay liveness;
+ * it is never included in real vote tally checks.
+ */
+export function recordRelaySubmission(relayId, daoId, coverTraffic = false) {
+    const submittedAt = Date.now();
+    relayVoteRecords.push({ relayId, daoId, submittedAt, coverTraffic });
+    if (relayVoteRecords.length > MAX_RELAY_VOTE_RECORDS) {
+        relayVoteRecords.shift();
+    }
+    lastRelaySubmissionAt.set(relayId, submittedAt);
+}
+/**
+ * Check all known relays for missing submissions and alert when a relay has
+ * not submitted a vote within the configured threshold.
+ */
+export function checkMissingRelayVotes() {
+    const now = Date.now();
+    let activeRelays = 0;
+    for (const [relayId, lastSeenAt] of lastRelaySubmissionAt) {
+        const elapsedMs = now - lastSeenAt;
+        if (elapsedMs > MISSING_VOTE_ALERT_THRESHOLD_MS) {
+            trackAlert("missing_vote_drop", elapsedMs, MISSING_VOTE_ALERT_THRESHOLD_MS);
+            log("error", "missing_vote_drop", {
+                relayId,
+                elapsedMs: Math.round(elapsedMs),
+                thresholdMs: MISSING_VOTE_ALERT_THRESHOLD_MS,
+            });
+        }
+        else {
+            activeRelays++;
+        }
+    }
+    if (activeRelays < RELAY_QUORUM_SIZE) {
+        trackAlert("relay_quorum_below_minimum", activeRelays, RELAY_QUORUM_SIZE);
+        log("error", "relay_quorum_below_minimum", {
+            activeRelays,
+            quorum: RELAY_QUORUM_SIZE,
+        });
+    }
+}
+/**
+ * Verify that the stored vote count for a DAO matches the expected tally.
+ * Cover traffic is excluded by only counting `vote_cast` events.
+ */
+export function verifyVoteTally(database, daoId, expectedVotes) {
+    try {
+        const tableName = `events_${daoId}`;
+        const tableExists = database
+            .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
+            .get(tableName);
+        if (!tableExists) {
+            trackAlert("vote_tally_missing_table", 0, 1);
+            log("error", "vote_tally_missing_table", { daoId });
+            return false;
+        }
+        const countRow = database
+            .prepare(`SELECT COUNT(*) AS cnt FROM "${tableName}" WHERE type = 'vote_cast'`)
+            .get();
+        const actualVotes = countRow.cnt;
+        if (actualVotes !== expectedVotes) {
+            trackAlert("vote_tally_mismatch", Math.abs(actualVotes - expectedVotes), 1);
+            log("error", "vote_tally_mismatch", {
+                daoId,
+                expectedVotes,
+                actualVotes,
+                difference: actualVotes - expectedVotes,
+            });
+            return false;
+        }
+        return true;
+    }
+    catch (err) {
+        log("warn", "vote_tally_check_failed", {
+            daoId,
+            error: err.message,
+        });
+        return false;
+    }
+}
+/**
+ * Get relay network monitoring stats.
+ */
+export function getRelayNetworkStats() {
+    const now = Date.now();
+    let realVotes = 0;
+    let coverTraffic = 0;
+    let activeRelays = 0;
+    for (const record of relayVoteRecords) {
+        if (record.coverTraffic) {
+            coverTraffic++;
+        }
+        else {
+            realVotes++;
+        }
+    }
+    for (const lastSeenAt of lastRelaySubmissionAt.values()) {
+        if (now - lastSeenAt <= MISSING_VOTE_ALERT_THRESHOLD_MS) {
+            activeRelays++;
+        }
+    }
+    return {
+        totalSubmissions: relayVoteRecords.length,
+        realVotes,
+        coverTraffic,
+        activeRelays,
+    };
+}
+/**
+ * Reset relay monitor state (for testing).
+ */
+export function resetRelayMonitor() {
+    relayVoteRecords.length = 0;
+    lastRelaySubmissionAt.clear();
+}
 /**
  * Reset all metrics (for testing).
  */

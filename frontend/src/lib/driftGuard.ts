@@ -65,7 +65,7 @@ export function assertNoDrift(report: DriftReport): void {
 }
 
 // CLI helper for CI: run with `npx tsx frontend/src/lib/driftGuard.ts` or via node script
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (typeof process !== "undefined" && typeof process.argv !== "undefined" && import.meta.url === `file://${process.argv[1]}`) {
   checkContractDrift().then((r) => {
     if (r.driftDetected) {
       console.error("Drift detected:", r.mismatches);

@@ -39,6 +39,12 @@ export const httpRequestSize = new Histogram({
     buckets: [100, 500, 1000, 5000, 10000, 50000, 100000],
     registers: [register],
 });
+export const httpRequestsInFlight = new Gauge({
+    name: "zkvote_http_requests_in_flight",
+    help: "HTTP requests currently being served (concurrency / backpressure signal)",
+    labelNames: ["method", "route"],
+    registers: [register],
+});
 export const httpResponseSize = new Histogram({
     name: "zkvote_http_response_size_bytes",
     help: "HTTP response body size in bytes",
@@ -66,6 +72,21 @@ export const coalescingWaitTime = new Histogram({
     help: "Time spent waiting for coalesced requests in seconds",
     labelNames: ["key"],
     buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+    registers: [register],
+});
+// ============================================
+// MEMBERSHIP REGISTRATION METRICS (#371)
+// ============================================
+export const membershipRegistrationTotal = new Counter({
+    name: "zkvote_membership_registration_requests_total",
+    help: "Total commitment registration requests served by the membership route",
+    labelNames: ["dao_id"],
+    registers: [register],
+});
+export const membershipRegistrationLimited = new Counter({
+    name: "zkvote_membership_registration_limited_total",
+    help: "Commitment registration requests blocked by rate limiting or the on-chain registration cooldown",
+    labelNames: ["reason"],
     registers: [register],
 });
 // ============================================
@@ -274,6 +295,21 @@ export const indexerOverrunSkips = new Counter({
     help: "Polling cycles skipped because the prior indexer cycle was still active",
     registers: [register],
 });
+export const indexerQueueDepth = new Gauge({
+    name: "zkvote_indexer_queue_depth",
+    help: "Current number of buffered events in the indexer backpressure queue",
+    registers: [register],
+});
+export const indexerRpcStreamReconnectsTotal = new Counter({
+    name: "zkvote_indexer_rpc_stream_reconnects_total",
+    help: "Total number of indexer RPC streaming reconnections",
+    registers: [register],
+});
+export const indexerGapRecoveriesTotal = new Counter({
+    name: "zkvote_indexer_gap_recoveries_total",
+    help: "Total number of ledger gap replay recoveries initiated by the indexer",
+    registers: [register],
+});
 // ============================================
 // CIRCUIT BREAKER METRICS
 // ============================================
@@ -290,6 +326,31 @@ export const circuitBreakerTripsTotal = new Counter({
     registers: [register],
 });
 // ============================================
+// SEQUENCE NUMBER METRICS
+// ============================================
+export const sequenceRecoveriesTotal = new Counter({
+    name: "zkvote_sequence_recoveries_total",
+    help: "Total number of sequence number recovery attempts",
+    labelNames: ["status"],
+    registers: [register],
+});
+export const sequenceMismatchesTotal = new Counter({
+    name: "zkvote_sequence_mismatches_total",
+    help: "Total number of sequence number mismatches detected",
+    registers: [register],
+});
+export const sequenceRecoveryDuration = new Histogram({
+    name: "zkvote_sequence_recovery_duration_seconds",
+    help: "Duration of sequence number recovery operations in seconds",
+    buckets: [0.1, 0.25, 0.5, 1, 2, 5],
+    registers: [register],
+});
+export const sequenceHealthStatus = new Gauge({
+    name: "zkvote_sequence_health_status",
+    help: "Sequence number health status (1=healthy, 0=unhealthy)",
+    registers: [register],
+});
+// ============================================
 // MEMORY MONITORING METRICS
 // ============================================
 export const memoryUsageRatio = new Gauge({
@@ -301,6 +362,84 @@ export const memoryThresholdBreachesTotal = new Counter({
     name: "zkvote_memory_threshold_breaches_total",
     help: "Total number of times memory usage crossed the warn/critical threshold",
     labelNames: ["level"],
+    registers: [register],
+});
+// ============================================
+// TRANSACTION CONFIRMATION METRICS (#172)
+// ============================================
+export const txConfirmationsTotal = new Counter({
+    name: "zkvote_tx_confirmations_total",
+    help: "Total transaction confirmations resolved by the confirmation queue",
+    labelNames: ["status"],
+    registers: [register],
+});
+export const txConfirmationDuration = new Histogram({
+    name: "zkvote_tx_confirmation_duration_seconds",
+    help: "Time from enqueue to confirmation resolution in seconds",
+    labelNames: ["status"],
+    buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120],
+    registers: [register],
+});
+export const txConfirmationAttempts = new Histogram({
+    name: "zkvote_tx_confirmation_attempts",
+    help: "Number of getTransaction polls performed per confirmation",
+    labelNames: ["status"],
+    buckets: [1, 2, 3, 4, 5, 8, 12, 16, 24, 32],
+    registers: [register],
+});
+export const txConfirmationQueueDepth = new Gauge({
+    name: "zkvote_tx_confirmation_queue_depth",
+    help: "Number of transactions currently pending confirmation",
+    registers: [register],
+});
+export const txConfirmationCacheSize = new Gauge({
+    name: "zkvote_tx_confirmation_cache_size",
+    help: "Number of transaction confirmation results currently cached",
+    registers: [register],
+});
+export const txConfirmationPollTotal = new Counter({
+    name: "zkvote_tx_confirmation_polls_total",
+    help: "Total getTransaction polls performed by the confirmation worker",
+    registers: [register],
+});
+// ============================================
+// WEBSOCKET METRICS (#172)
+// ============================================
+export const wsConnections = new Gauge({
+    name: "zkvote_ws_connections",
+    help: "Number of currently connected WebSocket clients",
+    registers: [register],
+});
+export const wsMessagesSent = new Counter({
+    name: "zkvote_ws_messages_sent_total",
+    help: "Total WebSocket messages sent to connected clients",
+    registers: [register],
+});
+// ============================================
+// RELAYER KEY ROTATION METRICS (#177)
+// ============================================
+export const relayerKeyBalance = new Gauge({
+    name: "zkvote_relayer_key_balance_xlm",
+    help: "Current balance of relayer keys in XLM",
+    labelNames: ["key_id", "public_key", "role"],
+    registers: [register],
+});
+export const relayerKeyRotationsTotal = new Counter({
+    name: "zkvote_relayer_key_rotations_total",
+    help: "Total number of relayer key rotations",
+    labelNames: ["trigger", "status"],
+    registers: [register],
+});
+export const relayerKeyAgeSeconds = new Gauge({
+    name: "zkvote_relayer_key_age_seconds",
+    help: "Age of relayer key in seconds since activation",
+    labelNames: ["key_id", "public_key"],
+    registers: [register],
+});
+export const relayerKeyTransactionsTotal = new Counter({
+    name: "zkvote_relayer_key_transactions_total",
+    help: "Total transactions signed by relayer key",
+    labelNames: ["key_id", "public_key"],
     registers: [register],
 });
 // ============================================

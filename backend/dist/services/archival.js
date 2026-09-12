@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Event Data Archival Service
  *
@@ -19,10 +20,12 @@ import { fileURLToPath } from "url";
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import { config } from "../config.js";
+import { WatermarkScheduler } from "./indexer-scheduler.js";
+import { archivalRunsTotal, archivalDuration } from "./metrics.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ARCHIVE_DIR = path.join(__dirname, "..", "..", "data", "archives");
-let archivalTimer = null;
+let archivalScheduler = null;
 /**
  * Ensure archive storage directory exists
  */
@@ -81,16 +84,28 @@ export async function runArchivalJob(options = {}) {
     const cutoffDate = new Date(Date.now() - ageDays * 24 * 60 * 60 * 1000).toISOString();
     const targetDir = options.archiveDir || ensureArchiveDir();
     const batchSize = options.batchSize || 100;
+    const signal = options.signal;
+    /** Abort at a point where the database is in a consistent state. */
+    const throwIfAborted = () => {
+        if (!signal?.aborted)
+            return;
+        throw signal.reason instanceof Error
+            ? signal.reason
+            : new Error("Archival job cancelled");
+    };
     log("info", "archival_job_start", { ageDays, cutoffDate, dbSizeBytesBefore });
+    // Declared outside the try so a cancellation can still report how much work
+    // was durably completed before the abort.
+    let totalArchivedCount = 0;
+    const createdRecords = [];
     try {
         // Step 1: Discover ended elections (proposals with proposal_closed or proposal_archived events)
         const partitionRows = db
             .prepare("SELECT dao_id FROM partition_registry")
             .all();
         const registeredDaos = partitionRows.map((r) => r.dao_id);
-        let totalArchivedCount = 0;
-        const createdRecords = [];
         for (const daoId of registeredDaos) {
+            throwIfAborted();
             const tableName = `events_${daoId}`;
             const tableExists = db
                 .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
@@ -165,6 +180,7 @@ export async function runArchivalJob(options = {}) {
             // Step 3: Batch deletion of archived events from SQLite database
             const eventIds = eventsToArchive.map((e) => e.id);
             for (let i = 0; i < eventIds.length; i += batchSize) {
+                throwIfAborted();
                 const batch = eventIds.slice(i, i + batchSize);
                 const placeholders = batch.map(() => "?").join(",");
                 db.prepare(`DELETE FROM ${tableName} WHERE id IN (${placeholders})`).run(...batch);
@@ -196,15 +212,19 @@ export async function runArchivalJob(options = {}) {
     }
     catch (err) {
         const errorMsg = err.message;
-        log("error", "archival_job_failed", { error: errorMsg });
+        const cancelled = signal?.aborted === true;
+        log(cancelled ? "info" : "error", cancelled ? "archival_job_cancelled" : "archival_job_failed", {
+            error: errorMsg,
+            archivedEventsCount: totalArchivedCount,
+        });
         return {
             success: false,
-            archivedEventsCount: 0,
-            archivesCreatedCount: 0,
+            archivedEventsCount: totalArchivedCount,
+            archivesCreatedCount: createdRecords.length,
             dbSizeBytesBefore,
             dbSizeBytesAfter: dbSizeBytesBefore,
             savedSizeBytes: 0,
-            records: [],
+            records: createdRecords,
             error: errorMsg,
         };
     }
@@ -257,29 +277,61 @@ export function readArchivedEvents(archiveId) {
     }
 }
 /**
- * Start background periodic archival task
+ * Start the background periodic archival task.
+ *
+ * Uses the same single-flight, cancellable scheduler as the indexer (#323)
+ * rather than a bare `setInterval`. Two properties matter here: an archival run
+ * that outlives its interval must not have a second run start on top of it —
+ * both would be deleting rows from the same partition — and a shutdown must be
+ * able to abort a run mid-flight instead of waiting out a multi-minute job.
  */
 export function startArchivalTask(intervalMs = config.archivalIntervalMs || 86400000) {
-    if (archivalTimer) {
-        clearInterval(archivalTimer);
-    }
-    archivalTimer = setInterval(() => {
-        runArchivalJob().catch((err) => {
-            log("error", "periodic_archival_failed", {
-                error: err.message,
-            });
-        });
-    }, intervalMs);
+    void stopArchivalTask();
+    archivalScheduler = new WatermarkScheduler({
+        intervalMs,
+        runCycle: async (signal) => {
+            const stopTimer = archivalDuration.startTimer();
+            try {
+                const result = await runArchivalJob({ signal });
+                archivalRunsTotal.inc({
+                    result: result.success
+                        ? "success"
+                        : signal.aborted
+                            ? "cancelled"
+                            : "failed",
+                });
+            }
+            finally {
+                stopTimer();
+            }
+        },
+        onOverrun: (skippedRuns, reason) => {
+            log("warn", "archival_run_skipped", { skippedRuns, reason });
+        },
+        onError: (error) => {
+            archivalRunsTotal.inc({ result: "failed" });
+            log("error", "periodic_archival_failed", { error: error.message });
+        },
+    });
+    archivalScheduler.start();
     log("info", "archival_task_started", { intervalMs });
 }
 /**
- * Stop background archival task
+ * Stop the background archival task, aborting any run in flight.
+ *
+ * Resolves only once that run has unwound, so callers can rely on no archival
+ * write still being in progress when the promise settles.
  */
-export function stopArchivalTask() {
-    if (archivalTimer) {
-        clearInterval(archivalTimer);
-        archivalTimer = null;
-        log("info", "archival_task_stopped");
-    }
+export async function stopArchivalTask() {
+    const scheduler = archivalScheduler;
+    if (!scheduler)
+        return;
+    archivalScheduler = null;
+    await scheduler.stop();
+    log("info", "archival_task_stopped");
+}
+/** Scheduler stats for the archival loop, or `null` when it is not running. */
+export function getArchivalSchedulerStats() {
+    return archivalScheduler ? archivalScheduler.stats() : null;
 }
 //# sourceMappingURL=archival.js.map

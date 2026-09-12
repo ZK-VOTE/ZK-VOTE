@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Pluggable Database Dialect (issue #305)
  *

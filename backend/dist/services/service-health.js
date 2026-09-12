@@ -49,6 +49,10 @@ const SERVICE_META = {
         tier: "background",
         description: "Membership SBT transfer-attempt monitor",
     },
+    membership_sync: {
+        tier: "background",
+        description: "Membership sync from SBT contract",
+    },
 };
 const health = new Map();
 function initEntry(name) {

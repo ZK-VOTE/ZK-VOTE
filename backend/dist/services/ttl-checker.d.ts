@@ -1,4 +1,26 @@
-import { type TTLTrackingEntry } from "./db.js";
+import type { TTLTrackingEntry } from "./db.js";
+import type { LoggerPort, StellarContext } from "./interfaces.js";
+/**
+ * Dependencies injected via `initTtlChecker` (#358) so this module never
+ * imports the `stellar.js`/`config.js`/`logger.js`/`db.js` module singletons
+ * directly (the `db.js` import above is type-only).
+ */
+export interface TtlCheckerDeps {
+    /** Soroban RPC surface for on-chain TTL queries. */
+    server: StellarContext["server"];
+    /** Config: TTL urgency thresholds (ms). */
+    ttlGracePeriodMs: number;
+    ttlRenewalThresholdMs: number;
+    /** Config: relayer test mode (skips on-chain queries). */
+    testMode: boolean;
+    /** TTL tracking persistence (events store). */
+    getTTLTracking(entryId: string): TTLTrackingEntry | null;
+    upsertTTLTracking(entry: TTLTrackingEntry): void;
+    /** Structured logger (called as `deps.log(level, event, meta)`). */
+    log: LoggerPort["log"];
+}
+/** Explicitly wire the TTL checker (composition root only). */
+export declare function initTtlChecker(d: TtlCheckerDeps): void;
 export type Urgency = "grace" | "warning" | "healthy" | "unknown";
 export interface TTLInfo {
     entryId: string;

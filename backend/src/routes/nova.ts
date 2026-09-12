@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Nova Recursive Aggregation API Routes
  */

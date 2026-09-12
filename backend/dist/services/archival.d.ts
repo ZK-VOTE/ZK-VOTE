@@ -12,6 +12,7 @@
  * - Monitors database file size before and after archival
  */
 import { type Database as DatabaseType } from "better-sqlite3";
+import { WatermarkScheduler } from "./indexer-scheduler.js";
 export interface ArchiveRecord {
     archive_id: string;
     dao_id: number;
@@ -52,6 +53,12 @@ export declare function runArchivalJob(options?: {
     ageDays?: number;
     archiveDir?: string;
     batchSize?: number;
+    /**
+     * Aborts the job between DAO partitions and between delete batches (#323).
+     * Archival can run for minutes over a large database; without this a
+     * shutdown would either block on it or leave a half-deleted partition.
+     */
+    signal?: AbortSignal;
 }): Promise<ArchivalJobResult>;
 /**
  * Get archive records index from database
@@ -62,11 +69,22 @@ export declare function getArchiveIndex(daoId?: number): ArchiveRecord[];
  */
 export declare function readArchivedEvents(archiveId: string): any[];
 /**
- * Start background periodic archival task
+ * Start the background periodic archival task.
+ *
+ * Uses the same single-flight, cancellable scheduler as the indexer (#323)
+ * rather than a bare `setInterval`. Two properties matter here: an archival run
+ * that outlives its interval must not have a second run start on top of it —
+ * both would be deleting rows from the same partition — and a shutdown must be
+ * able to abort a run mid-flight instead of waiting out a multi-minute job.
  */
 export declare function startArchivalTask(intervalMs?: number): void;
 /**
- * Stop background archival task
+ * Stop the background archival task, aborting any run in flight.
+ *
+ * Resolves only once that run has unwound, so callers can rely on no archival
+ * write still being in progress when the promise settles.
  */
-export declare function stopArchivalTask(): void;
+export declare function stopArchivalTask(): Promise<void>;
+/** Scheduler stats for the archival loop, or `null` when it is not running. */
+export declare function getArchivalSchedulerStats(): ReturnType<WatermarkScheduler["stats"]> | null;
 //# sourceMappingURL=archival.d.ts.map

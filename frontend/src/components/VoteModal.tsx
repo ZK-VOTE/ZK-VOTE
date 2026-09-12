@@ -11,6 +11,7 @@ import {
   calculateNullifier,
   type ProofInput,
 } from "../lib/zkproof";
+import { assertValidNullifier, assertValidFieldElement } from "../types/index";
 import { fetchWithProgress } from "../lib/fetchWithProgress";
 import { getMerklePath } from "../lib/merkletree";
 import { useOptimisticVote } from "../queries/proposalQueries";
@@ -20,7 +21,7 @@ import {
   getZKCredentials,
   storeZKCredentials,
 } from "../lib/zk";
-import { submissionQueue } from "../store/submissionQueue";
+import { submissionQueue, type VotePayload } from "../store/submissionQueue";
 import { processEntry } from "../lib/queueProcessor";
 import { CheckCircle, XCircle, AlertTriangle, Loader2, X, WifiOff } from "lucide-react";
 import { useReceipts } from "../hooks/useReceipts";
@@ -61,6 +62,7 @@ export default function VoteModal({
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
   const [isOfflineQueued, setIsOfflineQueued] = useState(false);
+  const [panicMode, setPanicMode] = useState(false);
   const { addReceipt } = useReceipts();
   const { setOptimisticVote, clearPendingVote } = useOptimisticVote();
 
@@ -222,6 +224,7 @@ export default function VoteModal({
         daoId: daoId.toString(),
         proposalId: proposalId.toString(),
         voteChoice: choice ? "1" : "0",
+        relayerAddress: "0",
         commitment: commitment.toString(), // Private input - computed in circuit, not exposed publicly
         // Note: vkVersion is NOT a circuit signal - it's checked on-chain only
         // Private signals
@@ -277,7 +280,7 @@ export default function VoteModal({
         return bigInt.toString(16).padStart(64, "0");
       };
 
-      const votePayload = {
+      let votePayload: VotePayload & { redundantProof?: unknown } = {
         daoId: Number(daoId),
         proposalId: Number(proposalId),
         choice: choice,
@@ -298,7 +301,7 @@ export default function VoteModal({
             }
           : {}),
         timestamp: Date.now(),
-      };
+      } as VotePayload & { redundantProof?: unknown };
 
       // Sign the vote payload with the voter's Stellar keypair
       let voterSignature: string | undefined;
@@ -336,18 +339,8 @@ export default function VoteModal({
         // Continue without signature - backend will still accept it with relayer auth token
       }
 
-      const votePayload = {
-        daoId: Number(daoId),
-        proposalId: Number(proposalId),
-        choice: choice,
-        nullifier: toHexBE(nullifier),
-        root: toHexBE(root),
-        proof: {
-          a: proof_a,
-          b: proof_b,
-          c: proof_c,
-        },
-        timestamp: Date.now(),
+      votePayload = {
+        ...votePayload,
         voterPublicKey: publicKey,
         voterSignature,
       };
@@ -523,7 +516,7 @@ export default function VoteModal({
                     aria-label={
                       panicMode ? "Disable panic mode" : "Enable panic mode"
                     }
-                    onClick={() => setPanicMode((prev) => !prev)}
+                    onClick={() => setPanicMode((prev: boolean) => !prev)}
                     className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-500 ${
                       panicMode ? "bg-yellow-500" : "bg-muted"
                     }`}

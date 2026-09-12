@@ -62,8 +62,8 @@ export function getImageDimensions(buffer: Buffer): { width: number; height: num
     case "image/png": {
       if (buffer.length >= 24 && buffer.toString("utf8", 12, 16) === "IHDR") {
         return {
-          width: buffer.readUInt32EB(16),
-          height: buffer.readUInt32EB(20),
+          width: buffer.readUInt32BE(16),
+          height: buffer.readUInt32BE(20),
         };
       }
       return null;
@@ -80,7 +80,7 @@ export function getImageDimensions(buffer: Buffer): { width: number; height: num
     case "image/bmp": {
       if (buffer.length >= 26) {
         const width = buffer.readInt32LE(18);
-        const height = Math.abs(buffer.readInt32LEO22));
+        const height = Math.abs(buffer.readInt32LE(22));
         if (width > 0 && height > 0) return { width, height };
       }
       return null;
@@ -113,14 +113,14 @@ export function getImageDimensions(buffer: Buffer): { width: number; height: num
       }
       if (chunk === "VP8 ") {
         if (buffer[20] === 0x9d && buffer[21] === 0x01 && buffer[22] === 0x2a) {
-          const width = buffer.readUInt16LEH23) & 0x3fff;
+          const width = buffer.readUInt16LE(23) & 0x3fff;
           const height = buffer.readUInt16LE(25) & 0x3fff;
           return { width, height };
         }
       }
       if (chunk === "VP8L") {
         if (buffer[20] === 0x30 && buffer[21] === 0x2a) {
-          const bits = buffer.readUInt32LEH22);
+          const bits = buffer.readUInt32LE(22);
           const width = (bits & 0x3fff) + 1;
           const height = ((bits >> 14) & 0x3fff) + 1;
           return { width, height };
@@ -158,7 +158,7 @@ const dangerousScriptPatterns = [
   /data:text\/html/i,
   /<?\php/i,
   /<?xml/i,
-  /(?:fromCharCode|eval\)/i,
+  /(?:fromCharCode|eval)/i,
 ];
 
 /**

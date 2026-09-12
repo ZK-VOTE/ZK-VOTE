@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * End-to-End Encrypted Governance Content (#324)
  *

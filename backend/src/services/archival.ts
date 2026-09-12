@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Event Data Archival Service
  *

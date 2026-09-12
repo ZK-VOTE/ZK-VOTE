@@ -26,6 +26,12 @@ interface VoteExecutionResult {
     };
 }
 type VoteExecutor = (input: VoteExecutionInput) => Promise<VoteExecutionResult>;
+export declare function subscribeVoteJobStatus(listener: (event: {
+    jobId: string;
+    status: string;
+    txHash?: string;
+    error?: string;
+}) => void): () => void;
 /**
  * Replace only the external Stellar submission boundary in test mode.
  */

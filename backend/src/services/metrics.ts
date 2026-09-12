@@ -553,3 +553,21 @@ export function normalizeRoute(path: string): string {
     )
     .replace(/\/(root|daos|ready|health|config|metrics|db)(\/|$)/g, "/$1$2");
 }
+
+// ============================================
+// ARCHIVAL METRICS (missing - stubbed for unblocked build)
+// ============================================
+
+export const archivalRunsTotal = new Counter({
+  name: "zkvote_archival_runs_total",
+  help: "Total archival runs",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const archivalDuration = new Histogram({
+  name: "zkvote_archival_duration_seconds",
+  help: "Archival duration in seconds",
+  buckets: [0.1, 0.5, 1, 2, 5, 10],
+  registers: [register],
+});

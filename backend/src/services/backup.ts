@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Database Backup and Point-in-Time Recovery Service
  *

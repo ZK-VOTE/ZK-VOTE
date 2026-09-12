@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * IPFS/Pinata Integration Module (SDK v2.5.1)
  *
@@ -5,7 +6,10 @@
  * Also propagates content to public IPFS gateways for redundancy.
  * Integrates with the Pin Manager for backup, redundancy, and verification.
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
+import { fileTypeFromBuffer } from "file-type";
+import sharp from "sharp";
 import { PinataSDK } from "pinata";
 import * as pinManager from "./ipfs-pin-manager.js";
 import { getMonitorStatus } from "./ipfs-monitor.js";
@@ -47,6 +51,9 @@ const PUBLIC_GATEWAYS = [
 // Content size limits (DoS protection)
 export const MAX_JSON_SIZE = 1024 * 1024; // 1MB for JSON metadata
 export const MAX_RAW_SIZE = 10 * 1024 * 1024; // 10MB for raw content (images)
+export const MAX_IMAGE_UPLOAD_BYTES = MAX_RAW_SIZE; // 10MB Multer memory limit per upload
+export const MAX_IMAGE_DIMENSION = 4096;
+const MAX_IMAGE_PIXELS = MAX_IMAGE_DIMENSION * MAX_IMAGE_DIMENSION;
 // Metadata schema validation
 export const PROPOSAL_METADATA_SCHEMA = {
     requiredFields: ["version", "body"],
@@ -483,17 +490,103 @@ export async function pinJSON(data, name = "zkvote-metadata") {
         publicUrl: `https://ipfs.io/ipfs/${result.cid}`,
     };
 }
+// ============================================
+// UPLOAD SECURITY HARDENING
+// ============================================
+const ALLOWED_IMAGE_MIME_SET = new Set(config.ALLOWED_IMAGE_MIMES);
+const MALWARE_SIGNATURES = [
+    { name: "eicar", pattern: /X5O!P%@AP\[4\\PZX54\(P\^\)7CC\)7\}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H\+H\*/i },
+    { name: "zip", pattern: /PK\x03\x04/ },
+    { name: "rar", pattern: /Rar!\x1A\x07/ },
+    { name: "sevenzip", pattern: /7z\xBC\xAF\x27\x1C/ },
+    { name: "pdf", pattern: /%PDF/ },
+    { name: "javascript", pattern: /<script[\s>]/i },
+    { name: "svg", pattern: /<svg[\s>]/i },
+    { name: "php", pattern: /<\?php/i },
+];
+function scanBufferForMalware(buffer) {
+    const haystack = buffer.toString("latin1");
+    for (const signature of MALWARE_SIGNATURES) {
+        if (signature.pattern.test(haystack)) {
+            log("warn", "upload_malware_blocked", {
+                signature: signature.name,
+                size: buffer.length,
+            });
+            throw new Error(`Upload blocked by malware/polyglot signature: ${signature.name}`);
+        }
+    }
+}
+export async function validateAndSanitizeImage(buffer, claimedMime, uploader = "anonymous") {
+    if (buffer.length === 0) {
+        throw new Error("Uploaded file is empty");
+    }
+    if (buffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+        throw new Error(`Uploaded image exceeds maximum size of ${MAX_IMAGE_UPLOAD_BYTES} bytes`);
+    }
+    const detected = await fileTypeFromBuffer(buffer);
+    const detectedMime = detected?.mime;
+    if (!detectedMime) {
+        throw new Error("Unable to detect file magic bytes");
+    }
+    if (detectedMime !== claimedMime) {
+        throw new Error(`Image MIME mismatch: claimed ${claimedMime}, detected ${detectedMime}`);
+    }
+    if (!ALLOWED_IMAGE_MIME_SET.has(detectedMime)) {
+        throw new Error(`Image MIME type not allowed: ${detectedMime}`);
+    }
+    if (detectedMime === "image/svg+xml" ||
+        /<svg[\s>]|<script[\s>]|<\?xml/i.test(buffer.subarray(0, 2048).toString("latin1"))) {
+        throw new Error("SVG/XML and script-bearing image uploads are not allowed");
+    }
+    scanBufferForMalware(buffer);
+    const metadata = await sharp(buffer, {
+        animated: detectedMime === "image/gif",
+        limitInputPixels: MAX_IMAGE_PIXELS,
+        failOn: "error",
+    }).metadata();
+    if (metadata.width === undefined ||
+        metadata.height === undefined ||
+        metadata.width <= 0 ||
+        metadata.height <= 0) {
+        throw new Error("Unable to determine image dimensions");
+    }
+    if (metadata.width > MAX_IMAGE_DIMENSION ||
+        metadata.height > MAX_IMAGE_DIMENSION) {
+        throw new Error(`Image dimensions ${metadata.width}x${metadata.height} exceed maximum ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}`);
+    }
+    const sanitizedBuffer = await sharp(buffer, {
+        animated: detectedMime === "image/gif",
+        limitInputPixels: MAX_IMAGE_PIXELS,
+        failOn: "error",
+    })
+        .rotate()
+        .toBuffer();
+    if (sanitizedBuffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+        throw new Error("Sanitized image exceeds upload size limit");
+    }
+    return sanitizedBuffer;
+}
 /**
  * Pin a file (image) to public IPFS (SDK v2.x)
  */
-export async function pinFile(buffer, filename, mimeType) {
+export async function pinFile(buffer, filename, mimeType, uploader = "anonymous") {
     if (!pinata) {
         throw new Error("Pinata client not initialized");
     }
+    // Validate and sanitize the upload before it is backed up or pinned.
+    const safeBuffer = await validateAndSanitizeImage(buffer, mimeType, uploader);
+    const sha256 = crypto.createHash("sha256").update(safeBuffer).digest("hex");
+    log("info", "ipfs_upload_audit", {
+        filename,
+        size: safeBuffer.length,
+        mimeType,
+        uploader,
+        sha256,
+    });
     // 1. Backup to local disk before uploading (recovery safety net)
     let backupPath;
     try {
-        backupPath = pinManager.backupFile(buffer, filename);
+        backupPath = pinManager.backupFile(safeBuffer, filename);
     }
     catch (err) {
         log("warn", "local_backup_failed", {
@@ -504,7 +597,7 @@ export async function pinFile(buffer, filename, mimeType) {
     // 2. Upload to Pinata (primary)
     // Create a File object from the buffer
     // Cast buffer to BlobPart to satisfy strict TypeScript checks
-    const file = new File([buffer], filename, {
+    const file = new File([safeBuffer], filename, {
         type: mimeType,
     });
     // SDK v2.x: pinata.upload.public.file() with chainable methods
@@ -512,7 +605,7 @@ export async function pinFile(buffer, filename, mimeType) {
         app: "zkvote",
         type: "proposal-image",
     }));
-    const sizeBytes = result.size || buffer.length;
+    const sizeBytes = result.size || safeBuffer.length;
     // 3. Register in pin tracker
     try {
         pinManager.registerPin(result.cid, "file", filename, sizeBytes, mimeType, backupPath);
@@ -572,6 +665,248 @@ export function sanitizeCid(cid) {
         throw new Error("Invalid CID format");
     }
     return trimmed;
+}
+// ============================================
+// CID CONTENT INTEGRITY
+// ============================================
+/**
+ * Base32 alphabet used by CIDv1 (RFC 4648 variant without padding,
+ * lowercase: "a"=0 … "z"=25, "2"=26 … "7"=31).
+ */
+const BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+/**
+ * Decode a base32-encoded string (RFC 4648, no padding, lowercase) to a Buffer.
+ * Returns null if the input contains characters outside the alphabet.
+ */
+function decodeBase32(input) {
+    const lower = input.toLowerCase();
+    let bits = 0;
+    let value = 0;
+    const output = [];
+    for (const char of lower) {
+        const idx = BASE32_ALPHABET.indexOf(char);
+        if (idx === -1)
+            return null;
+        value = (value << 5) | idx;
+        bits += 5;
+        if (bits >= 8) {
+            output.push((value >>> (bits - 8)) & 0xff);
+            bits -= 8;
+        }
+    }
+    return Buffer.from(output);
+}
+/**
+ * Verify that the raw `content` buffer matches the hash encoded in `cid`.
+ *
+ * Supports:
+ *   - CIDv0 (Qm…): SHA2-256 multihash inside a base58btc-encoded CIDv1-dag-pb wrapper.
+ *     Multihash layout: [0x12][0x20][32 bytes SHA-256 digest]
+ *   - CIDv1 bafy… / bafk…: base32-encoded CIDv1.  The raw bytes after
+ *     stripping the CID version (0x01) and codec varint are a multihash.
+ *     This function handles the common SHA2-256 codec variant (multihash
+ *     function code 0x12).
+ *
+ * Returns `true` when the hash of `content` matches the CID digest,
+ * `false` when it does not match or the format is unrecognised.
+ */
+export function verifyCidContent(cid, content) {
+    if (!cid || !Buffer.isBuffer(content))
+        return false;
+    const trimmed = cid.trim();
+    // ── CIDv0 (Base58BTC, starts with "Qm") ──────────────────────────────────
+    if (trimmed.startsWith("Qm")) {
+        // CIDv0 is raw base58btc-encoded multihash with SHA2-256.
+        // We don't ship a base58 decoder, so we decode by computing the expected
+        // multihash bytes ourselves and comparing them after re-encoding — instead
+        // we simply compute the SHA-256 of content and construct the expected
+        // multihash, then encode it with base58btc and compare strings.
+        //
+        // base58btc alphabet: "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        const digest = crypto.createHash("sha256").update(content).digest();
+        // Multihash: [0x12 = sha2-256][0x20 = 32 bytes length][32-byte digest]
+        const multihash = Buffer.concat([
+            Buffer.from([0x12, 0x20]),
+            digest,
+        ]);
+        // Encode multihash as base58btc
+        let num = BigInt("0x" + multihash.toString("hex"));
+        let encoded = "";
+        const BIGINT58 = BigInt(58);
+        while (num > 0n) {
+            const remainder = num % BIGINT58;
+            num = num / BIGINT58;
+            encoded = BASE58_ALPHABET[Number(remainder)] + encoded;
+        }
+        // Leading zero bytes → leading '1' chars
+        for (let i = 0; i < multihash.length && multihash[i] === 0; i++) {
+            encoded = "1" + encoded;
+        }
+        const expectedCid = encoded;
+        const match = expectedCid === trimmed;
+        if (!match) {
+            log("warn", "cid_content_mismatch", {
+                cid: trimmed,
+                cidVersion: "v0",
+                expected: expectedCid,
+            });
+        }
+        return match;
+    }
+    // ── CIDv1 (base32, starts with "baf") ────────────────────────────────────
+    if (trimmed.toLowerCase().startsWith("baf")) {
+        // CIDv1 base32 layout (after stripping the 'b' multibase prefix):
+        //   [version varint = 0x01]
+        //   [codec varint   = e.g. 0x55 raw, 0x70 dag-pb, 0x71 dag-cbor …]
+        //   [multihash …]
+        //     [hash-fn varint = 0x12 for sha2-256]
+        //     [digest-length varint = 0x20 = 32]
+        //     [32-byte digest]
+        //
+        // For content stored as raw bytes (codec 0x55) or dag-pb (0x70) the
+        // hash function is almost always sha2-256 (0x12).  We read the varints
+        // dynamically so we handle any codec, but only verify sha2-256 digests.
+        // The first character is the multibase prefix 'b' (base32lower).
+        const b32body = trimmed.slice(1);
+        const cidBytes = decodeBase32(b32body);
+        if (!cidBytes || cidBytes.length < 4)
+            return false;
+        // Read version varint (typically single byte 0x01 for CIDv1)
+        let offset = 0;
+        let version = 0;
+        let shift = 0;
+        while (offset < cidBytes.length) {
+            const byte = cidBytes[offset++];
+            version |= (byte & 0x7f) << shift;
+            if ((byte & 0x80) === 0)
+                break;
+            shift += 7;
+        }
+        if (version !== 1)
+            return false; // Only CIDv1 handled
+        // Read codec varint (skip it — we don't restrict by codec)
+        shift = 0;
+        while (offset < cidBytes.length) {
+            const byte = cidBytes[offset++];
+            if ((byte & 0x80) === 0)
+                break;
+            shift += 7; // unused but kept for symmetry
+        }
+        // Now at the multihash
+        if (offset >= cidBytes.length)
+            return false;
+        const hashFn = cidBytes[offset++];
+        if (offset >= cidBytes.length)
+            return false;
+        const digestLen = cidBytes[offset++];
+        if (hashFn !== 0x12 || digestLen !== 0x20) {
+            // We only verify SHA2-256 (0x12) with 32-byte digest (0x20).
+            // Return false conservatively for unrecognised hash functions rather
+            // than silently skipping verification.
+            log("warn", "cid_unsupported_hash_function", {
+                cid: trimmed,
+                hashFn: `0x${hashFn.toString(16)}`,
+                digestLen,
+            });
+            return false;
+        }
+        if (cidBytes.length < offset + 32)
+            return false;
+        const cidDigest = cidBytes.slice(offset, offset + 32);
+        const contentDigest = crypto.createHash("sha256").update(content).digest();
+        const match = cidDigest.equals(contentDigest);
+        if (!match) {
+            log("warn", "cid_content_mismatch", {
+                cid: trimmed,
+                cidVersion: "v1",
+                expected: cidDigest.toString("hex"),
+                actual: contentDigest.toString("hex"),
+            });
+        }
+        return match;
+    }
+    // Unsupported CID format
+    return false;
+}
+/**
+ * Ensure a CID is pinned to at least `minPinCount` services.
+ *
+ * Checks the local pin registry first; if the CID is already tracked with
+ * enough services, returns immediately.  Otherwise pins to Pinata (which
+ * counts as one service), optionally supplemented by secondary services
+ * via the pin-manager's `pinToSecondary`.
+ *
+ * @param cid          The IPFS CID to pin
+ * @param minPinCount  Minimum number of pinning services required (default 1)
+ */
+export async function ensurePinned(cid, minPinCount = 1) {
+    let cleanCid;
+    try {
+        cleanCid = sanitizeCid(cid);
+    }
+    catch (err) {
+        return {
+            cid,
+            alreadyPinned: false,
+            pinned: false,
+            services: [],
+            error: err.message,
+        };
+    }
+    // Check the local registry first
+    const existing = pinManager.getPinRecord(cleanCid);
+    if (existing && existing.pinnedOn.length >= minPinCount) {
+        log("debug", "ipfs_already_pinned", {
+            cid: cleanCid,
+            services: existing.pinnedOn,
+            minPinCount,
+        });
+        return {
+            cid: cleanCid,
+            alreadyPinned: true,
+            pinned: true,
+            services: existing.pinnedOn,
+        };
+    }
+    if (!pinata) {
+        const services = existing?.pinnedOn ?? [];
+        return {
+            cid: cleanCid,
+            alreadyPinned: false,
+            pinned: false,
+            services,
+            error: "Pinata client not initialized",
+        };
+    }
+    // Pin via Pinata by re-pinning the CID by hash (pin by CID endpoint)
+    try {
+        await pinataBreaker.execute(async () => pinata.upload.public
+            .json({ _rePinCid: cleanCid })
+            .name(`repin-${cleanCid}`)
+            .keyvalues({ app: "zkvote", type: "repin" }));
+        const services = ["pinata"];
+        log("info", "ipfs_ensure_pinned", { cid: cleanCid, services });
+        return {
+            cid: cleanCid,
+            alreadyPinned: false,
+            pinned: true,
+            services,
+        };
+    }
+    catch (err) {
+        log("error", "ipfs_ensure_pinned_failed", {
+            cid: cleanCid,
+            error: err.message,
+        });
+        return {
+            cid: cleanCid,
+            alreadyPinned: false,
+            pinned: false,
+            services: existing?.pinnedOn ?? [],
+            error: err.message,
+        };
+    }
 }
 /**
  * Check if a host or IP is in a private/internal network range
@@ -788,15 +1123,21 @@ export async function fetchContent(cid) {
             contentType.includes("text/javascript")) {
             throw new Error(`Forbidden response content-type: ${contentType}`);
         }
+        // Read the raw bytes first so we can verify the CID digest (issue #344)
+        const rawBytes = Buffer.from(await response.arrayBuffer());
+        if (!verifyCidContent(cleanCid, rawBytes)) {
+            throw new Error(`CID content integrity check failed: fetched content does not match CID ${cleanCid}`);
+        }
         let data;
         if (contentType.includes("application/json")) {
-            data = await response.json();
+            data = JSON.parse(rawBytes.toString("utf-8"));
             ipfsCacheHits.inc();
         }
         else {
-            data = await response.text();
+            data = rawBytes.toString("utf-8");
             ipfsCacheHits.inc();
         }
+        log("debug", "ipfs_primary_gateway_succeeded", { cid: cleanCid, url });
         return {
             data,
             contentType,
@@ -815,9 +1156,14 @@ export async function fetchContent(cid) {
                     cause: err,
                 });
             }
+            // Verify CID integrity from fallback gateway too (issue #344)
+            const rawBytes = Buffer.from(await fallbackRes.arrayBuffer());
+            if (!verifyCidContent(cleanCid, rawBytes)) {
+                throw new Error(`CID content integrity check failed on fallback: fetched content does not match CID ${cleanCid}`, { cause: err });
+            }
             const data = contentType.includes("application/json")
-                ? await fallbackRes.json()
-                : await fallbackRes.text();
+                ? JSON.parse(rawBytes.toString("utf-8"))
+                : rawBytes.toString("utf-8");
             ipfsCacheHits.inc();
             log("info", "ipfs_fallback_gateway_succeeded", { cid: cleanCid });
             return { data, contentType };
@@ -889,7 +1235,12 @@ export async function fetchRawContent(cid) {
         }
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
+        // Verify CID integrity (issue #344)
+        if (!verifyCidContent(cleanCid, buffer)) {
+            throw new Error(`CID content integrity check failed: fetched content does not match CID ${cleanCid}`);
+        }
         ipfsCacheHits.inc();
+        log("debug", "ipfs_primary_gateway_succeeded", { cid: cleanCid, url });
         return {
             buffer,
             contentType,
@@ -910,6 +1261,10 @@ export async function fetchRawContent(cid) {
             }
             const arrayBuffer = await fallbackRes.arrayBuffer();
             const buffer = Buffer.from(arrayBuffer);
+            // Verify CID integrity from fallback gateway too (issue #344)
+            if (!verifyCidContent(cleanCid, buffer)) {
+                throw new Error(`CID content integrity check failed on fallback: fetched content does not match CID ${cleanCid}`, { cause: err });
+            }
             ipfsCacheHits.inc();
             log("info", "ipfs_fallback_gateway_succeeded", { cid: cleanCid });
             return { buffer, contentType };

@@ -13,6 +13,8 @@ interface PublicProtocolStats {
 export function Homepage() {
   const navigate = useNavigate();
   const { t } = useTranslation();
+  const [protocolStats] = useState<PublicProtocolStats | null>(null);
+  const [statsLoading] = useState(false);
 
   return (
     <div className="animate-fade-in">

@@ -1,52 +1,38 @@
-/** Lightweight W3C-compatible tracing for one complete indexer cycle. */
-import { randomBytes } from "node:crypto";
-const noopExporter = { export: () => undefined };
-let activeExporter = noopExporter;
+/**
+ * Indexer-facing view of the shared relay tracing pipeline (#321).
+ *
+ * The indexer used to own a private span implementation. It now delegates to
+ * `services/tracing.ts` so a poll cycle, the database writes it drives and the
+ * Soroban RPC calls underneath all land in one trace with a single exporter
+ * registry. The original surface is kept intact for existing call sites.
+ */
+import { registerSpanExporter, clearSpanExporters, withSpan, } from "./tracing.js";
+let disposeCurrent = null;
+/**
+ * Install a single indexer exporter, replacing any previous one.
+ *
+ * Retained for compatibility with the indexer's original one-exporter model.
+ * New code should call `registerSpanExporter` directly, which composes.
+ */
 export function setIndexerSpanExporter(exporter) {
-    activeExporter = exporter ?? noopExporter;
+    disposeCurrent?.();
+    disposeCurrent = null;
+    if (exporter)
+        disposeCurrent = registerSpanExporter(exporter);
 }
-function randomHex(bytes) {
-    return randomBytes(bytes).toString("hex");
+/** Remove every exporter, including ones registered outside this module. */
+export function resetIndexerSpanExporters() {
+    disposeCurrent = null;
+    clearSpanExporters();
 }
-async function exportSpan(span) {
-    try {
-        await activeExporter.export(span);
-    }
-    catch {
-        // Telemetry must never make the indexer fail or replay a ledger range.
-    }
-}
+/**
+ * Open a span for one step of an indexer cycle.
+ *
+ * `parent` is explicit here — the indexer builds its span tree from a root
+ * cycle span it holds directly — but a `null` parent still inherits any
+ * ambient context, so a poll triggered from an HTTP request joins that trace.
+ */
 export async function withIndexerSpan(name, parent, attributes, operation) {
-    const context = {
-        traceId: parent?.traceId ?? randomHex(16),
-        spanId: randomHex(8),
-        traceFlags: "01",
-    };
-    const startedAt = new Date();
-    const startedNs = process.hrtime.bigint();
-    let status = "ok";
-    let errorMessage;
-    try {
-        return await operation(context);
-    }
-    catch (error) {
-        status = "error";
-        errorMessage = error instanceof Error ? error.message : String(error);
-        throw error;
-    }
-    finally {
-        const durationMs = Number(process.hrtime.bigint() - startedNs) / 1_000_000;
-        await exportSpan({
-            ...context,
-            name,
-            parentSpanId: parent?.spanId,
-            traceparent: `00-${context.traceId}-${context.spanId}-${context.traceFlags}`,
-            startedAt: startedAt.toISOString(),
-            durationMs,
-            status,
-            attributes,
-            ...(errorMessage ? { error: errorMessage } : {}),
-        });
-    }
+    return withSpan(name, attributes, operation, parent ? { parent } : {});
 }
 //# sourceMappingURL=indexer-tracing.js.map
