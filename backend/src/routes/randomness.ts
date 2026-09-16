@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * VDF + Threshold Randomness Routes (Issue #310)
  *

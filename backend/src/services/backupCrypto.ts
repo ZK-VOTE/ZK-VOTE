@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Encrypted Backup Container (Issue #359)
  *

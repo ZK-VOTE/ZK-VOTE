@@ -3,17 +3,19 @@
  *
  * Append-only, hash-chained record of privileged/administrative actions,
  * separate from the general request/response logging in middleware/logging.ts.
- * Each row's hash covers its fields plus the previous row's hash, so tampering
- * with or removing a past entry breaks the chain — detectable via
- * verifyAuditChain().
+ * Each row's hash covers its fields
+ * previous row's hash. Tampering with
+ * or removing a chain breaks the chain - detectable
+ * via verifyAuditChain().
  */
 import { type AuditLogInput, type AuditLogRow, type AuditLogQueryOptions } from "./db.js";
 export type { AuditLogRow, AuditLogQueryOptions };
 /**
  * Hash an auth token to a short, non-reversible identifier for audit records.
  * The relayer currently has a single shared token (no per-user identity), so
- * this identifies "the caller presented a valid token", not a specific user —
- * documented in API.md.
+ * this identifies "the caller presented a valid token", not a specific user -
+ * documented in API.
+md.
  */
 export declare function hashAuthToken(token: string | undefined): string | null;
 export declare function hashClientIp(ip: string | undefined): string | null;
@@ -31,6 +33,23 @@ export interface RecordAuditLogInput {
  * list as the general logger, then size-capped to keep rows small.
  */
 export declare function recordAuditLog(entry: RecordAuditLogInput): AuditLogRow;
+/**
+ * Record an audit log entry for a file upload (e.g. /ipfs/image).
+ * Includes file metadata (size, MIME type, SHA-256) plus the uploader's
+ * authenticated token id (hashed) and source IP hash.
+ */
+export interface UploadAuditInfo {
+    fileName?: string;
+    mimeType: string;
+    size: number;
+    sha256: string;
+    uploaderAuthTokenId: string | null;
+    ipHash: string | null;
+    requestId: string | null;
+    endpoint: string;
+    statusCode: number;
+}
+export declare function recordUploadAuditLog(upload: UploadAuditInfo): AuditLogRow;
 export declare function getAuditLogs(options?: AuditLogQueryOptions): {
     logs: AuditLogRow[];
     total: number;
@@ -59,9 +78,9 @@ export interface AuditRotationResult {
 }
 /**
  * Rotation/archival: export unarchived rows older than the retention window
- * to a compressed, timestamped JSONL file, mark them archived_at, then delete
- * them from the hot table (the append-only trigger only permits deleting rows
- * that have already been archived — see db.ts).
+ * to a compressed, timestamped JSONL file, mark them archived_at, then
+ * delete them from the hot table (the append-only trigger only permits
+ * deleting rows that have already been archived - see db.ts).
  */
 export declare function archiveOldAuditLogs(retentionDays?: number, archiveDir?: string): AuditRotationResult;
 export declare function startAuditLogRotation(intervalMs?: number): void;

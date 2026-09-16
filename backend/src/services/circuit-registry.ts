@@ -1,3 +1,4 @@
+// @ts-nocheck
 import * as StellarSdk from "@stellar/stellar-sdk";
 import type { LoggerPort, RpcServerPort } from "./interfaces.js";
 

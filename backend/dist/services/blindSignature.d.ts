@@ -37,8 +37,8 @@
  *
  * This module implements the cryptographic primitive (key generation,
  * blind/sign/unblind/verify) with real modular-exponentiation arithmetic.
- * Wiring it into the existing registration HTTP routes/DB schema is a
- * larger, separate change and is out of scope here (see PR description).
+ * It also provides the issuer-side one-credential-per-voter and
+ * anti-farming coordination needed by the registration HTTP routes.
  */
 /** RSA public parameters used to blind-sign credentials. */
 export interface RsaBlindPublicKey {
@@ -116,4 +116,61 @@ export interface DidAttributeProofSeed {
 }
 export declare function validateDidSignedClaim(claim: DidSignedClaim, now?: number): void;
 export declare function buildDidAttributeProofSeed(claim: DidSignedClaim, minAttributeValue: number): DidAttributeProofSeed;
+/**
+ * Issued-credential table DDL for an anonymous credential issuance store.
+ * Only `voter_id` is retained. The blinded commitment and final RSA
+ * signature are intentionally not persisted; storing either would create
+ * a link between the voter and the later anonymous ZK proof.
+ */
+export declare const CREDENTIAL_ISSUANCE_TABLE_DDL = "\nCREATE TABLE IF NOT EXISTS issued_credentials (\n  voter_id TEXT PRIMARY KEY,\n  issued_at INTEGER NOT NULL\n);\n";
+/** Persistence contract used by the end-to-end credential issuer. */
+export interface CredentialIssuerStore {
+    hasCredential(voterId: string): boolean;
+    markCredentialIssued(voterId: string, issuedAt: number): void;
+}
+/** In-memory implementation of [[CredentialIssuerStore]] for tests/dev. */
+export declare class InMemoryCredentialIssuerStore implements CredentialIssuerStore {
+    private readonly issued;
+    hasCredential(voterId: string): boolean;
+    markCredentialIssued(voterId: string, _issuedAt: number): void;
+}
+/** Sliding-window rate limiter for anti-farming of blind signatures. */
+export declare class SignatureFarmingRateLimiter {
+    private readonly maxRequests;
+    private readonly windowMs;
+    private readonly requests;
+    constructor(maxRequests: number, windowMs: number);
+    /** Returns true if the request is allowed, false if it should be rejected. */
+    isAllowed(key: string, now?: number): boolean;
+}
+/**
+ * Issuer-side coordinator that signs blinded credentials while enforcing
+ * one credential per voter and optional anti-farming limits.
+ *
+ * The store keeps only the fact that a voter already received a credential.
+ * The blinded commitment is passed to [[signBlinded]] but is never recorded,
+ * so the issuer cannot later link `(message, signature)` to a voter id.
+ */
+export declare class BlindSignatureIssuer {
+    private readonly key;
+    private readonly store;
+    private readonly rateLimiter?;
+    constructor(key: RsaBlindKeyPair, store: CredentialIssuerStore, rateLimiter?: SignatureFarmingRateLimiter | undefined);
+    hasCredential(voterId: string): boolean;
+    issue(voterId: string, blinded: bigint, rateLimitKey?: string): bigint;
+}
+/**
+ * Server-side helper for a registration HTTP handler that has already
+ * received a blinded commitment from the voter.
+ */
+export declare function issueVoterCredential(voterId: string, blinded: bigint, key: RsaBlindKeyPair, store: CredentialIssuerStore, rateLimiter?: SignatureFarmingRateLimiter, rateLimitKey?: string): bigint;
+/**
+ * End-to-end registration helper for tests and local development. It
+ * blinds, obtains the issuer signature, and unblinds while enforcing the
+ * one-credential-per-voter store.
+ */
+export declare function issueCredentialForVoter(voterId: string, message: bigint, pub: RsaBlindPublicKey, key: RsaBlindKeyPair, store: CredentialIssuerStore, rateLimiter?: SignatureFarmingRateLimiter, rateLimitKey?: string): {
+    signature: bigint;
+    blindedSentToIssuer: bigint;
+};
 //# sourceMappingURL=blindSignature.d.ts.map

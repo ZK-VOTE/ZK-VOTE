@@ -11,7 +11,7 @@
  */
 import { Router } from "express";
 import { authGuard, queryLimiter } from "../middleware/index.js";
-import { queryAuditLogs, exportAuditLogs, getAllAuditLogs } from "../middleware/audit.js";
+import { queryAuditLogs, exportAuditLogs, getAllAuditLogs, } from "../middleware/audit.js";
 const router = Router();
 /**
  * GET /audit/logs - Query audit logs
@@ -37,7 +37,8 @@ router.get("/audit/logs", authGuard, queryLimiter, (req, res) => {
     if (offset)
         q.offset = parseInt(String(offset), 10);
     // Validate limit/offset
-    if (q.limit !== undefined && (isNaN(q.limit) || q.limit < 1 || q.limit > 100)) {
+    if (q.limit !== undefined &&
+        (isNaN(q.limit) || q.limit < 1 || q.limit > 100)) {
         return res.status(400).json({ error: "limit must be between 1 and 100" });
     }
     if (q.offset !== undefined && (isNaN(q.offset) || q.offset < 0)) {

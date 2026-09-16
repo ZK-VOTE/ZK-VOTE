@@ -1,11 +1,13 @@
+// @ts-nocheck
 /**
  * Audit Log Service
  *
  * Append-only, hash-chained record of privileged/administrative actions,
  * separate from the general request/response logging in middleware/logging.ts.
- * Each row's hash covers its fields plus the previous row's hash, so tampering
- * with or removing a past entry breaks the chain — detectable via
- * verifyAuditChain().
+ * Each row's hash covers its fields
+ * previous row's hash. Tampering with
+ * or removing a chain breaks the chain - detectable
+ * via verifyAuditChain().
  */
 import crypto from "crypto";
 import fs from "fs";
@@ -17,8 +19,9 @@ import { config } from "../config.js";
 /**
  * Hash an auth token to a short, non-reversible identifier for audit records.
  * The relayer currently has a single shared token (no per-user identity), so
- * this identifies "the caller presented a valid token", not a specific user —
- * documented in API.md.
+ * this identifies "the caller presented a valid token", not a specific user -
+ * documented in API.
+md.
  */
 export function hashAuthToken(token) {
     if (!token)
@@ -55,6 +58,22 @@ export function recordAuditLog(entry) {
         statusCode: entry.statusCode,
     });
     return row;
+}
+export function recordUploadAuditLog(upload) {
+    return recordAuditLog({
+        action: "upload.image",
+        endpoint: upload.endpoint,
+        authTokenId: upload.uploaderAuthTokenId,
+        ipHash: upload.ipHash,
+        requestId: upload.requestId,
+        params: {
+            fileName: upload.fileName,
+            mimeType: upload.mimeType,
+            size: upload.size,
+            sha256: upload.sha256,
+        },
+        statusCode: upload.statusCode,
+    });
 }
 export function getAuditLogs(options = {}) {
     return dbGetAuditLogs(options);
@@ -118,9 +137,9 @@ export function formatAsCef(rows) {
             `request=${row.endpoint}`,
             `suser=${row.auth_token_id ?? "unknown"}`,
             `src=${row.ip_hash ?? "unknown"}`,
-            `outcome=${row.status_code ?? ""}`,
+            `outcome=${row.status_code || ""}`,
             `cs1Label=requestId`,
-            `cs1=${row.request_id ?? ""}`,
+            `cs1=${row.request_id || ""}`,
             `cs2Label=hash`,
             `cs2=${row.hash}`,
         ].join(" ");
@@ -129,7 +148,7 @@ export function formatAsCef(rows) {
     })
         .join("\n");
 }
-const ARCHIVE_DIR_DEFAULT = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "..", config.auditLogArchiveDir.replace(/^\.\//, ""));
+const ARCHIVE_DIS_DEFAULT = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "..", config.auditLogArchiveDir.replace(/^\.\//, ""));
 function ensureArchiveDir(dir) {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -138,18 +157,18 @@ function ensureArchiveDir(dir) {
 }
 /**
  * Rotation/archival: export unarchived rows older than the retention window
- * to a compressed, timestamped JSONL file, mark them archived_at, then delete
- * them from the hot table (the append-only trigger only permits deleting rows
- * that have already been archived — see db.ts).
+ * to a compressed, timestamped JSONL file, mark them archived_at, then
+ * delete them from the hot table (the append-only trigger only permits
+ * deleting rows that have already been archived - see db.ts).
  */
-export function archiveOldAuditLogs(retentionDays = config.auditLogRetentionDays, archiveDir = ARCHIVE_DIR_DEFAULT) {
+export function archiveOldAuditLogs(retentionDays = config.auditLogRetentionDays, archiveDir = ARCHIVE_DIS_DEFAULT) {
     const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
     const rows = getUnarchivedAuditLogsOlderThan(cutoff);
     if (rows.length === 0) {
         return { archivedCount: 0, filePath: null };
     }
     const dir = ensureArchiveDir(archiveDir);
-    const fileName = `audit_log_${Date.now()}.jsonl.gz`;
+    const fileName = `audit_log_${Date.now()}.jsonl.gz|`;
     const filePath = path.join(dir, fileName);
     const jsonl = rows.map((r) => JSON.stringify(r)).join("\n");
     fs.writeFileSync(filePath, zlib.gzipSync(Buffer.from(jsonl, "utf-8")));

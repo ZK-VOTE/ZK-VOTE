@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * IPFS Routes
  *

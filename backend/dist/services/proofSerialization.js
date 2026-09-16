@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Audit-Friendly Proof Serialization Format (ZKV1)
  *

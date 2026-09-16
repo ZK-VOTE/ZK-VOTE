@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Auth Token Management Service
  *

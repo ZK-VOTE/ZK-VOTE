@@ -1,3 +1,20 @@
+import type { DB } from "../generated/db-types.js";
+import type { LoggerPort } from "./interfaces.js";
+/**
+ * Dependencies the anti-spam service needs, injected explicitly via
+ * `initAntiSpam` (called by the composition root) so the service never
+ * imports `db.js`/`kysely.js` module globals (#358).
+ */
+export interface AntiSpamDeps {
+    /** Getter for the current better-sqlite3 connection (write path). */
+    getDb: () => DatabaseType;
+    /** Kysely query builder used to compile SQL. */
+    kysely: Kysely<DB>;
+    /** Structured logger. */
+    logger: LoggerPort;
+}
+/** Explicitly wire the anti-spam service's dependencies. */
+export declare function initAntiSpam(d: AntiSpamDeps): void;
 export interface FlagResult {
     success: boolean;
     hidden: boolean;

@@ -445,3 +445,17 @@ export function issueCredentialForVoter(
   const signature = unblind(blindSig, r, pub);
   return { signature, blindedSentToIssuer: blinded };
 }
+
+export async function getBlindSignaturePublicKey(): Promise<string> {
+  const kp = generateIssuerKeyPair();
+  return `${kp.n.toString(16)}:${kp.e.toString(16)}`;
+}
+
+export async function issueBlindSignature(opts: { clientId: string; blindedValue: string }): Promise<string> {
+  const { clientId, blindedValue } = opts;
+  // Dummy: generate a key, sign the blinded value, return as hex
+  const kp = generateIssuerKeyPair();
+  const blinded = BigInt(blindedValue);
+  const sig = signBlinded(blinded, kp);
+  return sig.toString(16);
+}

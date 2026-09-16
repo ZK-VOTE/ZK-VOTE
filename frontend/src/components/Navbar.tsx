@@ -14,8 +14,8 @@ interface NavbarProps {
   connecting: boolean;
   theme: "light" | "dark";
   onToggleTheme: () => void;
-  currentView: "home" | "browse" | "votes" | "docs" | "profile";
-  onNavigate: (view: "home" | "browse" | "votes" | "docs" | "profile") => void;
+  currentView: "home" | "browse" | "votes" | "docs" | "profile" | "pay";
+  onNavigate: (view: "home" | "browse" | "votes" | "docs" | "profile" | "pay") => void;
   relayerStatus?: string | null;
   relayerErrors?: string[];
 }
@@ -38,7 +38,7 @@ export default function Navbar({
   const { t } = useTranslation();
 
   const handleNavigate = (
-    view: "home" | "browse" | "votes" | "docs" | "profile",
+    view: "home" | "browse" | "votes" | "docs" | "profile" | "pay",
   ) => {
     onNavigate(view);
     setMobileMenuOpen(false);
@@ -116,6 +116,14 @@ export default function Navbar({
             }`}
           >
             Receipts
+          </button>
+          <button
+            onClick={() => handleNavigate("pay")}
+            className={`transition-colors hover:text-foreground/80 ${
+              currentView === "pay" ? "text-foreground" : "text-foreground/60"
+            }`}
+          >
+            Pay
           </button>
         </nav>
 
@@ -230,6 +238,16 @@ export default function Navbar({
               }`}
             >
               Receipts
+            </button>
+            <button
+              onClick={() => handleNavigate("pay")}
+              className={`block w-full text-left px-3 py-2 rounded-md transition-colors ${
+                currentView === "pay"
+                  ? "bg-muted text-foreground"
+                  : "text-foreground/60 hover:bg-muted/50"
+              }`}
+            >
+              Pay
             </button>
           </div>
         </div>

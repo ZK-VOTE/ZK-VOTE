@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Health Check Routes
  *
@@ -10,18 +11,48 @@ import { getRateLimitMetrics } from "../middleware/rateLimit.js";
 import { bodyLimit } from "../middleware/index.js";
 import { getMembershipVerificationMetrics } from "../services/sync.js";
 import { log } from "../services/logger.js";
-import { getDbDiagnostics, getDbStatus, getDb } from "../services/db.js";
+import { getDbDiagnostics, getDbStatus, getDb, getCachedDaoCount, } from "../services/db.js";
 import { getBackupStatus } from "../services/backup.js";
+import { getLogMetrics } from "../middleware/logging.js";
 import { getWalHealth } from "../services/walResilience.js";
-import { rpcPoolManager } from "../services/stellar.js";
+import { relayerKeyManager } from "../services/relayerKeyManager.js";
+import { rpcPoolManager, sequenceManager } from "../services/stellar.js";
 import { getAllCircuitBreakerMetrics } from "../services/circuit-breaker.js";
 import { getMemorySnapshot } from "../services/memory-monitor.js";
 import { getOverallHealth, markDegraded, markHealthy, markUnavailable, } from "../services/service-health.js";
+import { getSupervisor } from "../services/supervisor.js";
 import v8 from "node:v8";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 const router = Router();
+const PUBLIC_STATS_CACHE_TTL_MS = 60_000;
+let publicStatsCache = null;
+function getPublicProtocolStats() {
+    const now = Date.now();
+    if (!publicStatsCache || now >= publicStatsCache.expiresAt) {
+        let totalEvents = 0;
+        let lastLedger = 0;
+        try {
+            const dbStatus = getDbStatus();
+            totalEvents = Number(dbStatus.totalEvents ?? 0);
+            lastLedger = Number(dbStatus.lastLedger ?? 0);
+        }
+        catch {
+            // Database may not be initialized yet in early startup or test bootstrap.
+        }
+        publicStatsCache = {
+            expiresAt: now + PUBLIC_STATS_CACHE_TTL_MS,
+            stats: {
+                totalDaos: getCachedDaoCount(),
+                totalEvents,
+                lastLedger,
+                lastUpdated: new Date().toISOString(),
+            },
+        };
+    }
+    return publicStatsCache.stats;
+}
 // Dependencies injected during setup
 let server = null;
 let relayerPublicKey = "";
@@ -85,6 +116,22 @@ router.get("/healthz", async (req, res) => {
  * GET /health
  * Basic health check
  */
+router.get("/public-stats", async (_req, res) => {
+    try {
+        const data = getPublicProtocolStats();
+        return res.json({
+            status: "ok",
+            data,
+            cached: true,
+        });
+    }
+    catch (err) {
+        return res.status(500).json({
+            status: "error",
+            message: err.message,
+        });
+    }
+});
 router.get("/health", async (req, res) => {
     const rpc = config.healthcheckPing ? await rpcHealth() : { ok: true };
     if (rpc.ok) {
@@ -117,7 +164,8 @@ router.get("/health", async (req, res) => {
     if (config.healthExposeDetails) {
         const token = extractAuthToken(req);
         if (token === config.relayerAuthToken) {
-            base.relayer = relayerPublicKey;
+            base.relayer = relayerKeyManager.getPublicKey() || relayerPublicKey;
+            base.relayerKeys = relayerKeyManager.getKeyHealth();
             base.votingContract = config.votingContractId;
             base.treeContract = config.treeContractId;
             base.vkVersion = config.staticVkVersion;
@@ -231,6 +279,28 @@ router.get("/ready", async (req, res) => {
     }
 });
 /**
+ * GET /services
+ * Supervisor status for all background services (admin only)
+ * Exposes per-service health, failure counts, and restart history
+ */
+router.get("/services", async (req, res) => {
+    if (config.healthExposeDetails) {
+        const token = extractAuthToken(req);
+        if (token !== config.relayerAuthToken) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+    }
+    try {
+        const supervisor = getSupervisor();
+        const status = supervisor.getStatus();
+        res.json(status);
+    }
+    catch (err) {
+        log("error", "supervisor_status_failed", { error: err.message });
+        res.status(500).json({ error: "Failed to get supervisor status" });
+    }
+});
+/**
  * GET /config
  * Returns public configuration (for frontend)
  */
@@ -245,6 +315,29 @@ router.get("/config", (_req, res) => {
         rpcUrl: config.rpcUrl,
         ipfsEnabled: config.ipfsEnabled,
         pinataGateway: config.pinataGateway,
+    });
+});
+/**
+ * GET /log/metrics
+ * Log volume and sampling metrics (admin only)
+ */
+router.get("/log/metrics", async (req, res) => {
+    if (config.healthExposeDetails) {
+        const token = extractAuthToken(req);
+        if (token !== config.relayerAuthToken) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+    }
+    res.json({
+        metrics: getLogMetrics(),
+        config: {
+            samplingRate: config.logSamplingRate,
+            errorRate: config.logSamplingErrorRate,
+            slowRate: config.logSamplingSlowRate,
+            slowThresholdMs: config.logSlowThresholdMs,
+            bodyMaxChars: config.logBodyMaxChars,
+            logRequestBody: config.logRequestBody,
+        },
     });
 });
 /**
@@ -430,6 +523,18 @@ router.get("/relay-test", async (req, res) => {
                 metrics: poolMetrics,
             },
         };
+        // Test 6: Sequence Number Health
+        const sequenceHealth = sequenceManager.getHealthStatus();
+        results.tests = {
+            ...results.tests,
+            sequence_number: {
+                passed: sequenceHealth.healthy,
+                message: sequenceHealth.healthy
+                    ? "Sequence number tracking is healthy"
+                    : `Sequence tracking degraded: ${sequenceHealth.consecutiveErrors} consecutive errors`,
+                ...sequenceHealth,
+            },
+        };
         // Overall result
         const allTests = Object.values(results.tests);
         const passedCount = allTests.filter((t) => t.passed).length;
@@ -464,6 +569,41 @@ router.get("/relay-test", async (req, res) => {
             },
             tests: results.tests,
         });
+    }
+});
+/**
+ * GET /sequence/health
+ * Sequence number health check endpoint
+ * Returns detailed status of the relayer sequence number tracking
+ */
+router.get("/sequence/health", async (req, res) => {
+    try {
+        const health = sequenceManager.getHealthStatus();
+        const statusCode = health.healthy ? 200 : 503;
+        const response = {
+            timestamp: new Date().toISOString(),
+            healthy: health.healthy,
+            consecutiveErrors: health.consecutiveErrors,
+            dirty: health.dirty,
+        };
+        // Include detailed info if authenticated
+        if (config.healthExposeDetails) {
+            const token = extractAuthToken(req);
+            if (token === config.relayerAuthToken) {
+                Object.assign(response, {
+                    lastKnownSequence: health.lastKnownSequence,
+                });
+            }
+        }
+        return res.status(statusCode).json(response);
+    }
+    catch (err) {
+        log("error", "sequence_health_check_failed", {
+            error: err.message,
+        });
+        return res
+            .status(500)
+            .json({ error: "Failed to check sequence health" });
     }
 });
 export default router;

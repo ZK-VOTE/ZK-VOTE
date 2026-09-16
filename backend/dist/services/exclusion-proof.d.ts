@@ -5,7 +5,22 @@
  * cannot vote in future proposals. Coordinates with the membership tree contract
  * to check revocation status.
  */
-import { Proof } from "./proof-system.js";
+/** Base shape of a Groth16 proof with arbitrary public inputs. */
+export interface Proof {
+    proof: {
+        a: string;
+        b: string;
+        c: string;
+    };
+    publicInputs: Record<string, unknown>;
+}
+export interface Proof {
+    pi_a: string[];
+    pi_b: string[][];
+    pi_c: string[];
+    protocol?: string;
+    curve?: string;
+}
 export interface ExclusionProof extends Proof {
     publicInputs: {
         historicalRoot: string;
@@ -21,20 +36,10 @@ export interface RevocationStatus {
     reinstatedAt?: number;
     commitment: string;
 }
-/**
- * Verify that a member has been revoked and cannot vote
- * Checks both ZK exclusion proof and contract revocation status
- */
-export declare function verifyExclusionProof(proof: ExclusionProof, treeContractId: string): Promise<{
+export declare function verifyExclusionProof(proof: ExclusionProof, _treeContractId: string): Promise<{
     valid: boolean;
     reason?: string;
 }>;
-/**
- * Record a revocation in the database for audit trail
- */
 export declare function recordRevocation(commitment: string, daoId: number, timestamp: number): Promise<void>;
-/**
- * Reinstate a revoked member
- */
 export declare function recordReinstatement(commitment: string, daoId: number, timestamp: number): Promise<void>;
 //# sourceMappingURL=exclusion-proof.d.ts.map

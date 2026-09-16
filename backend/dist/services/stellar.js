@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Stellar/Soroban Service
  *
@@ -8,39 +9,92 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { config, BN254_SCALAR_FIELD } from "../config.js";
 import { log, logger } from "./logger.js";
 import { getMetadata, setMetadata } from "./db.js";
-import { rpcCallsTotal, rpcCallDuration, rpcErrors, rpcPoolHealthyEndpoints, rpcPoolTotalEndpoints, rpcEndpointLatency, } from "./metrics.js";
+import { rpcCallsTotal, rpcCallDuration, rpcErrors, rpcPoolHealthyEndpoints, rpcPoolTotalEndpoints, rpcEndpointLatency, sequenceRecoveriesTotal, sequenceMismatchesTotal, sequenceRecoveryDuration, sequenceHealthStatus, } from "./metrics.js";
 import { registerCircuitBreaker, CircuitBreakerOpenError, } from "./circuit-breaker.js";
+import { withSpan } from "./tracing.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
 import nodeCluster from "node:cluster";
 import { acquireClusterSequenceLock, releaseClusterSequenceLock, } from "./cluster.js";
-// ============================================
-// RELAYER KEYPAIR
-// ============================================
-let _relayerKeypair;
-try {
-    if (config.testMode) {
-        _relayerKeypair = {
+import { withRpcConcurrency } from "./rpc-concurrency.js";
+import { relayerKeyManager, LocalKeypairSigner, KmsSigner, HsmSigner, MockTestSigner, } from "./relayerKeyManager.js";
+export { relayerKeyManager, LocalKeypairSigner, KmsSigner, HsmSigner, MockTestSigner, };
+/**
+ * Construct the relayer keypair from config. Extracted from the module so the
+ * composition root (and tests) can build keypairs explicitly instead of the
+ * module grabbing config at import time (#358).
+ */
+export function createRelayerKeypair(relayerSecretKey, testMode) {
+    if (testMode) {
+        return {
             publicKey: () => "GTESTRELAYERADDRESS000000000000000000000000000000000000",
         };
-        logger.info("relayer_loaded", {
-            relayer: _relayerKeypair.publicKey(),
-            testMode: true,
-        });
     }
-    else {
-        if (!config.relayerSecretKey) {
-            throw new Error("RELAYER_SECRET_KEY is not set");
-        }
-        _relayerKeypair = StellarSdk.Keypair.fromSecret(config.relayerSecretKey);
-        logger.info("relayer_loaded", { relayer: _relayerKeypair.publicKey() });
+    if (config.relayerSignerType === "aws_kms" && config.kmsKeyId && config.relayerPublicKey) {
+        return {
+            publicKey: () => config.relayerPublicKey,
+        };
     }
+    if (!relayerSecretKey) {
+        throw new Error("RELAYER_SECRET_KEY is not set");
+    }
+    return StellarSdk.Keypair.fromSecret(relayerSecretKey);
+}
+// Initialize the relayer key manager
+try {
+    relayerKeyManager.initialize();
+    logger.info("relayer_loaded", {
+        relayer: relayerKeyManager.getPublicKey(),
+        testMode: config.testMode,
+    });
 }
 catch (err) {
     log("error", "invalid_relayer_key", { message: err.message });
     console.error("Run ./scripts/init-local.sh to generate a secure key");
     process.exit(1);
 }
-export const relayerKeypair = _relayerKeypair;
+/**
+ * Dynamic relayerKeypair proxy that delegates to the active key in relayerKeyManager.
+ * Ensures zero-downtime hot swapping across all existing routes and callers.
+ */
+export const relayerKeypair = {
+    publicKey: () => relayerKeyManager.getPublicKey(),
+    sign: (tx) => {
+        const kp = relayerKeyManager.getActiveKeypair();
+        if ("sign" in kp && typeof kp.sign === "function") {
+            kp.sign(tx);
+        }
+    },
+    rawPublicKey: () => {
+        const kp = relayerKeyManager.getActiveKeypair();
+        if ("rawPublicKey" in kp && typeof kp.rawPublicKey === "function") {
+            return kp.rawPublicKey();
+        }
+        return StellarSdk.StrKey.decodeEd25519PublicKey(relayerKeyManager.getPublicKey());
+    },
+    secret: () => {
+        const active = relayerKeyManager.getActiveKey();
+        if (active?.secretKey)
+            return active.secretKey;
+        const kp = relayerKeyManager.getActiveKeypair();
+        if ("secret" in kp && typeof kp.secret === "function") {
+            return kp.secret();
+        }
+        throw new Error("Secret key is not exportable for this relayer signer");
+    },
+};
+/**
+ * Dynamic activeSigner proxy that delegates to the active signer in relayerKeyManager.
+ */
+export const activeSigner = {
+    getPublicKey: () => relayerKeyManager.getPublicKey(),
+    signTransaction: (tx) => relayerKeyManager.signTransaction(tx),
+    signHash: (hash) => {
+        const s = relayerKeyManager.getActiveSigner();
+        if (s.signHash)
+            return s.signHash(hash);
+        return Buffer.alloc(64);
+    },
+};
 // ============================================
 // SEQUENCE LOCK (TRANSACTION NONCE MUTEX)
 // ============================================
@@ -87,11 +141,17 @@ export async function waitForSequenceLockIdle(timeoutMs) {
 export class SequenceManager {
     dirty = false;
     lastKnownSequence = null;
+    consecutiveErrors = 0;
+    lastRecoveryTime = 0;
+    MAX_CONSECUTIVE_ERRORS = 5;
+    RECOVERY_COOLDOWN_MS = 5000; // 5 seconds
     constructor() {
         const persisted = this.loadPersisted();
         if (persisted) {
             this.lastKnownSequence = persisted;
         }
+        // Initialize health status as healthy
+        sequenceHealthStatus.set(1);
     }
     loadPersisted() {
         try {
@@ -136,12 +196,68 @@ export class SequenceManager {
     handleTxError(errorResult) {
         if (errorResult && errorResult.includes("tx_bad_seq")) {
             this.markDirty();
+            sequenceMismatchesTotal.inc();
+            this.consecutiveErrors++;
+            // Update health status based on consecutive errors
+            if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS) {
+                sequenceHealthStatus.set(0);
+                log("error", "sequence_health_degraded", {
+                    consecutiveErrors: this.consecutiveErrors,
+                });
+            }
             return true;
         }
         return false;
     }
+    /**
+     * Reset error counter and restore health status on successful transaction
+     */
+    markSuccess() {
+        if (this.consecutiveErrors > 0) {
+            this.consecutiveErrors = 0;
+            sequenceHealthStatus.set(1);
+        }
+    }
+    /**
+     * Check if recovery should be rate limited
+     */
+    shouldRateLimitRecovery() {
+        const now = Date.now();
+        if (this.consecutiveErrors >= this.MAX_CONSECUTIVE_ERRORS &&
+            now - this.lastRecoveryTime < this.RECOVERY_COOLDOWN_MS) {
+            return true;
+        }
+        return false;
+    }
+    /**
+     * Update last recovery timestamp
+     */
+    markRecoveryAttempt() {
+        this.lastRecoveryTime = Date.now();
+    }
+    /**
+     * Get current health status for monitoring
+     */
+    getHealthStatus() {
+        return {
+            healthy: this.consecutiveErrors < this.MAX_CONSECUTIVE_ERRORS,
+            consecutiveErrors: this.consecutiveErrors,
+            lastKnownSequence: this.lastKnownSequence,
+            dirty: this.dirty,
+        };
+    }
 }
 export const sequenceManager = new SequenceManager();
+// Automatically invalidate and resync sequence numbers on hot key swap
+relayerKeyManager.onRotate(async (newKey, oldKey, trigger) => {
+    sequenceManager.markDirty();
+    log("info", "relayer_key_swapped_hot", {
+        trigger,
+        newPublicKey: newKey.publicKey,
+        oldPublicKey: oldKey?.publicKey,
+        role: newKey.role,
+    });
+});
 export async function withSequenceLock(fn) {
     if (config.clusterEnabled && nodeCluster.isWorker) {
         await acquireClusterSequenceLock();
@@ -168,13 +284,17 @@ export async function withSequenceLock(fn) {
     }
 }
 export class RpcPoolManager {
+    fallbackUrl;
+    serverFactory;
     endpoints = [];
     currentIndex = 0;
-    constructor(urls) {
-        const uniqueUrls = Array.from(new Set(urls.length > 0 ? urls : [config.rpcUrl]));
+    constructor(urls, fallbackUrl, serverFactory = (url) => new StellarSdk.rpc.Server(url, { allowHttp: true })) {
+        this.fallbackUrl = fallbackUrl;
+        this.serverFactory = serverFactory;
+        const uniqueUrls = Array.from(new Set(urls.length > 0 ? urls : [this.fallbackUrl || config.rpcUrl]));
         this.endpoints = uniqueUrls.map((url) => ({
             url,
-            server: new StellarSdk.rpc.Server(url, { allowHttp: true }),
+            server: this.serverFactory(url),
             healthy: true,
             latencyMs: 0,
             errorCount: 0,
@@ -183,7 +303,7 @@ export class RpcPoolManager {
     }
     getActiveServer() {
         if (this.endpoints.length === 0) {
-            return new StellarSdk.rpc.Server(config.rpcUrl, { allowHttp: true });
+            return this.serverFactory(this.fallbackUrl || config.rpcUrl);
         }
         for (let i = 0; i < this.endpoints.length; i++) {
             const idx = (this.currentIndex + i) % this.endpoints.length;
@@ -249,7 +369,36 @@ export class RpcPoolManager {
         };
     }
 }
-export const rpcPoolManager = new RpcPoolManager(config.rpcUrls || [config.rpcUrl]);
+export function createRpcPool(urls, options) {
+    return new RpcPoolManager(urls, options?.fallbackUrl, options?.serverFactory);
+}
+export const rpcPoolManager = createRpcPool(config.rpcUrls || [config.rpcUrl]);
+/**
+ * Submit a raw transaction XDR to all healthy RPC endpoints and return the
+ * first non-error response. This provides a relay quorum — no single RPC
+ * endpoint can censor a vote by silently dropping it.
+ */
+export async function submitToRelayQuorum(tx) {
+    const servers = rpcPoolManager.endpoints
+        .filter((e) => e.healthy)
+        .map((e) => e.server);
+    if (servers.length === 0) {
+        throw new Error("No healthy relay endpoints available");
+    }
+    let lastError;
+    for (const srv of servers) {
+        try {
+            const result = await srv.sendTransaction(tx);
+            if (result.status !== "ERROR")
+                return result;
+            lastError = new Error(result.errorResult);
+        }
+        catch (err) {
+            lastError = err;
+        }
+    }
+    throw lastError;
+}
 // Circuit breaker for Soroban RPC calls — trips when the RPC pool is
 // degraded across the board, so requests fail fast instead of each one
 // running its own retry/timeout against a service that is known to be down.
@@ -257,22 +406,24 @@ export const sorobanRpcBreaker = registerCircuitBreaker("soroban_rpc", {
     failureThreshold: config.circuitBreakerRpcFailureThreshold,
     resetTimeoutMs: config.circuitBreakerRpcResetMs,
 });
-export const server = config.testMode
-    ? {
-        getHealth: async () => ({ status: "online" }),
-        simulateTransaction: async () => {
-            throw new Error("simulate disabled in RELAYER_TEST_MODE");
-        },
-        sendTransaction: async () => ({
-            status: "ERROR",
-            errorResult: "disabled",
-        }),
-        getTransaction: async () => ({ status: "NOT_FOUND" }),
-        getAccount: async () => ({ accountId: "GTEST", sequence: "0" }),
+export function createSorobanServer(options) {
+    if (options.testMode) {
+        return {
+            getHealth: async () => ({ status: "online" }),
+            simulateTransaction: async () => {
+                throw new Error("simulate disabled in RELAYER_TEST_MODE");
+            },
+            sendTransaction: async () => ({
+                status: "ERROR",
+                errorResult: "disabled",
+            }),
+            getTransaction: async () => ({ status: "NOT_FOUND" }),
+            getAccount: async () => ({ accountId: "GTEST", sequence: "0" }),
+        };
     }
-    : new Proxy({}, {
+    return new Proxy({}, {
         get(_target, prop) {
-            const activeServer = rpcPoolManager.getActiveServer();
+            const activeServer = options.pool.getActiveServer();
             const value = activeServer[prop];
             if (typeof value !== "function")
                 return value;
@@ -280,7 +431,7 @@ export const server = config.testMode
                 const method = String(prop);
                 const start = process.hrtime.bigint();
                 try {
-                    const result = await sorobanRpcBreaker.execute(() => value.apply(activeServer, args));
+                    const result = await options.breaker.execute(() => withRpcConcurrency(() => value.apply(activeServer, args)));
                     const duration = Number(process.hrtime.bigint() - start) / 1e9;
                     rpcCallsTotal.inc({ method, status: "success" });
                     rpcCallDuration.observe({ method, status: "success" }, duration);
@@ -301,47 +452,62 @@ export const server = config.testMode
             };
         },
     });
+}
+export const server = createSorobanServer({
+    testMode: config.testMode,
+    pool: rpcPoolManager,
+    breaker: sorobanRpcBreaker,
+});
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
 /**
- * Call RPC with timeout
+ * Call RPC with timeout.
+ *
+ * Every RPC hop opens a child span under whatever is ambient (#321) — an HTTP
+ * request or an indexer poll cycle — so a single trace covers poll -> db -> rpc
+ * without the caller passing a context. The span records only the operation
+ * label and the deadline; request payloads stay out of telemetry because they
+ * carry proofs and nullifiers.
  */
 export async function callWithTimeout(fn, label) {
-    let timeoutId;
-    const timeout = new Promise((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)), config.rpcTimeoutMs);
-    });
-    try {
-        return await Promise.race([fn(), timeout]);
-    }
-    finally {
-        if (timeoutId !== undefined) {
-            clearTimeout(timeoutId);
+    return withSpan("relay.rpc.call", {
+        component: "stellar",
+        "rpc.operation": label,
+        "rpc.timeout_ms": config.rpcTimeoutMs,
+    }, async () => {
+        let timeoutId;
+        const timeout = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error(`Timeout: ${label} (${config.rpcTimeoutMs}ms)`)), config.rpcTimeoutMs);
+        });
+        try {
+            return await Promise.race([fn(), timeout]);
         }
-    }
+        finally {
+            if (timeoutId !== undefined) {
+                clearTimeout(timeoutId);
+            }
+        }
+    });
 }
 /**
- * Wait for transaction confirmation.
+ * Wait for transaction confirmation (#172).
  *
- * Polls getTransaction up to maxAttempts times (1 second apart).
- * Note: callers may also wrap this in callWithTimeout for an outer
- * deadline -- the two timeouts are intentionally independent: this
- * loop controls polling cadence while callWithTimeout enforces a
- * hard wall-clock limit.
+ * Delegates to the shared confirmation queue: a single background worker polls
+ * `getTransaction` with exponential backoff + jitter (starting at ~2s), with a
+ * configurable wall-clock deadline. Concurrent waiters for the same hash are
+ * coalesced, resolutions are broadcast to connected frontends over WebSocket,
+ * and confirmation times are tracked in Prometheus metrics.
+ *
+ * Backward compatible: `waitForTransaction(hash, maxAttempts)` treats the
+ * numeric argument as a cap on the number of polls; callers may also pass a
+ * `WaitForTransactionOptions` object (see services/confirmation-queue.ts).
+ *
+ * Note: callers may still wrap this in callWithTimeout for an outer deadline
+ * -- the queue enforces its own wall-clock budget while callWithTimeout
+ * provides a hard per-request limit.
  */
-export async function waitForTransaction(hash, maxAttempts = 30) {
-    let attempts = 0;
-    while (attempts < maxAttempts) {
-        const result = await server.getTransaction(hash);
-        if (result.status !== "NOT_FOUND") {
-            return result;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        attempts++;
-    }
-    throw new Error("Transaction not found after timeout");
-}
+export { waitForTransaction, getConfirmationStatus, getConfirmationQueueStats, startConfirmationWorker, stopConfirmationWorker, TransactionConfirmationTimeoutError, } from "./confirmation-queue.js";
 /**
  * Simulate with backoff/retry
  */
@@ -480,6 +646,32 @@ export function canonicalizeProof(aBytes, bBytes) {
     return { a: newA, b: newB };
 }
 /**
+ * Convert a Groth16 proof into the canonical hex form used for redundancy
+ * checks. This mirrors proofToScVal's validation and A/B malleability
+ * normalization, but returns plain bytes-as-hex so two independently supplied
+ * proofs can be compared before any on-chain submission is attempted.
+ */
+export function canonicalProofFingerprint(proof) {
+    if (!proof || typeof proof !== "object") {
+        throw new Error("Invalid proof: must be an object");
+    }
+    if (!proof.a || !proof.b || !proof.c) {
+        throw new Error("Invalid proof: missing a, b, or c fields");
+    }
+    let aBytes = hexToBytes(proof.a, 64);
+    let bBytes = hexToBytes(proof.b, 128);
+    const cBytes = hexToBytes(proof.c, 64);
+    if (isAllZeros(aBytes) || isAllZeros(bBytes) || isAllZeros(cBytes)) {
+        throw new Error("Invalid proof: proof components cannot be point at infinity (all zeros)");
+    }
+    ({ a: aBytes, b: bBytes } = canonicalizeProof(aBytes, bBytes));
+    return [
+        aBytes.toString("hex"),
+        bBytes.toString("hex"),
+        cBytes.toString("hex"),
+    ].join(":");
+}
+/**
  * Convert Groth16 proof to ScVal
  */
 export function proofToScVal(proof) {
@@ -516,6 +708,34 @@ export function proofToScVal(proof) {
     ]);
 }
 /**
+ * Encodes one entry of the voting contract's `cast_votes` batch (#90).
+ *
+ * A `#[contracttype]` struct crosses the boundary as an `ScMap` whose keys are
+ * the field symbols in sorted order — the host rejects a map that is not
+ * sorted — so the entries below are ordered `nullifier`, `proof`, `root`,
+ * `vote_choice` to match `BatchVote`, not the order the fields are declared in.
+ */
+export function batchVoteToScVal(vote) {
+    return StellarSdk.xdr.ScVal.scvMap([
+        new StellarSdk.xdr.ScMapEntry({
+            key: StellarSdk.xdr.ScVal.scvSymbol("nullifier"),
+            val: u256ToScVal(vote.nullifier),
+        }),
+        new StellarSdk.xdr.ScMapEntry({
+            key: StellarSdk.xdr.ScVal.scvSymbol("proof"),
+            val: proofToScVal(vote.proof),
+        }),
+        new StellarSdk.xdr.ScMapEntry({
+            key: StellarSdk.xdr.ScVal.scvSymbol("root"),
+            val: u256ToScVal(vote.root),
+        }),
+        new StellarSdk.xdr.ScMapEntry({
+            key: StellarSdk.xdr.ScVal.scvSymbol("vote_choice"),
+            val: StellarSdk.xdr.ScVal.scvBool(vote.choice),
+        }),
+    ]);
+}
+/**
  * Get relayer account from server
  */
 export async function getRelayerAccount() {
@@ -534,9 +754,105 @@ export function buildTransaction(account, operation) {
         .build();
 }
 /**
- * Sign a transaction with the relayer keypair
+ * Sign a transaction with the active signer (Local, KMS, or HSM)
  */
-export function signTransaction(tx) {
-    tx.sign(relayerKeypair);
+export async function signTransaction(tx) {
+    if (activeSigner && typeof activeSigner.signTransaction === "function") {
+        await activeSigner.signTransaction(tx);
+    }
+    else if ("sign" in relayerKeypair && typeof relayerKeypair.sign === "function") {
+        tx.sign(relayerKeypair);
+    }
+}
+/**
+ * Submit a transaction with automatic sequence number recovery.
+ *
+ * Automatically detects tx_bad_seq errors and retries with corrected
+ * sequence numbers. Implements rate limiting to prevent recovery storms.
+ *
+ * @param preparedTx - The prepared and signed transaction
+ * @param operation - A function that rebuilds, simulates, and signs the transaction
+ * @param maxRetries - Maximum number of retry attempts (default: 3)
+ * @param label - Label for logging and timeout tracking
+ * @returns Transaction submission result
+ */
+export async function submitTransactionWithRecovery(preparedTx, operation, maxRetries = 3, label = "transaction") {
+    let attempts = 0;
+    let lastError = null;
+    const recoveryStart = Date.now();
+    while (attempts < maxRetries) {
+        try {
+            // Check if recovery should be rate limited
+            if (attempts > 0 && sequenceManager.shouldRateLimitRecovery()) {
+                log("warn", "sequence_recovery_rate_limited", {
+                    consecutiveErrors: sequenceManager.getHealthStatus().consecutiveErrors,
+                    attempt: attempts + 1,
+                    maxRetries,
+                });
+                throw new Error("SEQUENCE_RECOVERY_RATE_LIMITED");
+            }
+            // Submit transaction (use the original preparedTx on first attempt)
+            const txToSubmit = attempts === 0 ? preparedTx : await operation();
+            const sr = await callWithTimeout(() => server.sendTransaction(txToSubmit), `send_${label}`);
+            // Check for sequence error
+            if (sr.status === "ERROR") {
+                const errorResult = typeof sr.errorResult === "string"
+                    ? sr.errorResult
+                    : JSON.stringify(sr.errorResult ?? "");
+                const isBadSeq = sequenceManager.handleTxError(errorResult);
+                if (isBadSeq && attempts < maxRetries - 1) {
+                    attempts++;
+                    sequenceManager.markRecoveryAttempt();
+                    log("warn", "sequence_recovery_retry", {
+                        attempt: attempts,
+                        maxRetries,
+                        label,
+                        errorResult,
+                    });
+                    // Re-fetch sequence and retry
+                    await sequenceManager.forceResync(server);
+                    sequenceRecoveriesTotal.inc({ status: "retry" });
+                    continue;
+                }
+                // Non-recoverable error or max retries reached
+                if (isBadSeq) {
+                    sequenceRecoveriesTotal.inc({ status: "failed" });
+                    log("error", "sequence_recovery_exhausted", {
+                        attempts,
+                        maxRetries,
+                        label,
+                    });
+                }
+                return sr;
+            }
+            // Success!
+            sequenceManager.markSuccess();
+            if (attempts > 0) {
+                const duration = (Date.now() - recoveryStart) / 1000;
+                sequenceRecoveryDuration.observe(duration);
+                sequenceRecoveriesTotal.inc({ status: "success" });
+                log("info", "sequence_recovery_success", {
+                    attempts,
+                    durationMs: Date.now() - recoveryStart,
+                    label,
+                });
+            }
+            return sr;
+        }
+        catch (err) {
+            lastError = err;
+            // Don't retry on non-sequence errors
+            if (!err.message?.includes("tx_bad_seq")) {
+                throw err;
+            }
+            attempts++;
+            if (attempts >= maxRetries) {
+                break;
+            }
+        }
+    }
+    // All retries exhausted
+    sequenceRecoveriesTotal.inc({ status: "failed" });
+    throw lastError || new Error("Transaction submission failed after retries");
 }
 //# sourceMappingURL=stellar.js.map

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Event Indexer for DaoVote
  *

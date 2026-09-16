@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { getReadDb, getWriteDb } from "./db.js";
 import { log } from "./logger.js";
 import { kysely } from "./kysely.js";

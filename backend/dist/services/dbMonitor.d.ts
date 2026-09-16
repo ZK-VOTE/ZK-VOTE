@@ -106,6 +106,40 @@ export declare function trackAlert(type: string, value: number, threshold: numbe
  * Get recent alerts.
  */
 export declare function getRecentAlerts(): typeof alertHistory;
+export interface RelayVoteRecord {
+    relayId: string;
+    daoId: number;
+    submittedAt: number;
+    coverTraffic: boolean;
+}
+/**
+ * Record a relay submission. Cover traffic is tracked only for relay liveness;
+ * it is never included in real vote tally checks.
+ */
+export declare function recordRelaySubmission(relayId: string, daoId: number, coverTraffic?: boolean): void;
+/**
+ * Check all known relays for missing submissions and alert when a relay has
+ * not submitted a vote within the configured threshold.
+ */
+export declare function checkMissingRelayVotes(): void;
+/**
+ * Verify that the stored vote count for a DAO matches the expected tally.
+ * Cover traffic is excluded by only counting `vote_cast` events.
+ */
+export declare function verifyVoteTally(database: DatabaseType, daoId: number, expectedVotes: number): boolean;
+/**
+ * Get relay network monitoring stats.
+ */
+export declare function getRelayNetworkStats(): {
+    totalSubmissions: number;
+    realVotes: number;
+    coverTraffic: number;
+    activeRelays: number;
+};
+/**
+ * Reset relay monitor state (for testing).
+ */
+export declare function resetRelayMonitor(): void;
 /**
  * Reset all metrics (for testing).
  */

@@ -9,6 +9,8 @@ import type { CircuitSignals, Groth16Proof } from "snarkjs";
 // Shared BN254 field/nullifier validation helpers (#370, #88)
 import { assertValidFieldElement, assertValidNullifier } from "../types/index";
 import { validateCircuitInputs } from "../services/proofService";
+import { workerAvailable, proveInWorker } from "./proveInWorker";
+import { withMaskedTiming } from "./proofTiming";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -166,7 +168,6 @@ export interface WeightedVoteProofInput extends VoteProofInput {
   weight: string; // voting weight (must equal balance commitment)
   maxWeight: string; // inclusive upper bound
   domainTag?: string; // domain separation tag (default: DOMAIN_TAG_WEIGHTED)
-  blindingFactor?: string;
 }
 
 export interface BridgeProofInput {
@@ -225,6 +226,7 @@ export interface GeneratedProof {
   publicSignals: string[];
   redundantProof?: Groth16Proof;
 }
+
 
 
 // ============================================
@@ -376,7 +378,7 @@ export function getCachedVK(
   version: number,
 ): VersionedVK | null {
   const key = vkCacheKey(circuitId, version);
-  let entry = vkMemoryCache.get(key);
+  let entry: VersionedVK | null | undefined = vkMemoryCache.get(key);
   if (!entry) entry = loadVKFromStorage(circuitId, version);
   if (!entry) return null;
   if (Date.now() - entry.fetchedAt >= VK_CACHE_TTL_MS) {
@@ -724,9 +726,9 @@ export async function generateTallyProof(
 
     const { groth16 } = await import("snarkjs");
     const { proof, publicSignals } = await groth16.fullProve(
-      circuitInput,
-      wasmPath,
-      zkeyPath,
+      circuitInput as unknown as CircuitSignals,
+      wasmPath as string,
+      zkeyPath as string,
     );
     return { proof, publicSignals };
   } catch (error) {
@@ -780,8 +782,8 @@ export async function generateBridgeProof(
  */
 export async function generateCommentProof(
   input: CommentProofInput,
-  wasmPath: string = "/circuits/comment/comment.wasm",
-  zkeyPath: string = "/circuits/comment/comment_final.zkey",
+  wasmPath: string | Uint8Array = "/circuits/comment/comment.wasm",
+  zkeyPath: string | Uint8Array = "/circuits/comment/comment_final.zkey",
 ): Promise<GeneratedProof> {
   try {
     const circuitVersion = input.circuitVersion ?? "v1";
@@ -854,6 +856,44 @@ export async function generateCommentProofV2(
     wasmPath,
     zkeyPath,
   );
+}
+
+/**
+ * Generate a Groth16 proof for claim circuit (vote-to-earn)
+ */
+export async function generateClaimProof(
+  input: ClaimProofInput,
+  wasmPath: string | Uint8Array = "/circuits/claim.wasm",
+  zkeyPath: string | Uint8Array = "/circuits/claim_final.zkey",
+): Promise<GeneratedProof> {
+  try {
+    const circuitInput: Record<string, unknown> = {
+      root: input.root,
+      voteNullifier: input.voteNullifier,
+      claimNullifier: input.claimNullifier,
+      daoId: input.daoId,
+      proposalId: input.proposalId,
+      secret: input.secret,
+      salt: input.salt,
+      pathElements: input.pathElements,
+      pathIndices: input.pathIndices,
+    };
+    if (input.blindingFactor) circuitInput.blindingFactor = input.blindingFactor;
+
+    if (USE_RUST_PROVER) {
+      try {
+        return await proveWithRust(circuitInput, wasmPath, zkeyPath);
+      } catch (e) {
+        console.warn("Rust claim prover failed; falling back to snarkjs.", e);
+      }
+    }
+    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
+  } catch (error) {
+    console.error("Failed to generate claim proof:", error);
+    throw new Error(
+      `Claim proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+    );
+  }
 }
 
 /**
@@ -950,7 +990,7 @@ export async function calculateNullifierV2(
   proposalId: string,
   chainId: string,
 ): Promise<string> {
-  return calculateNullifier(secret, daoId, proposalId, "v2", chainId);
+  return calculateNullifier(secret, daoId, proposalId, chainId);
 }
 
 /**
@@ -1070,6 +1110,7 @@ export async function verifyProofWithVersionedVK(
 ): Promise<boolean> {
   const vkEntry = await fetchVersionedVK(circuitId, version);
   try {
+    const { groth16 } = await import("snarkjs");
     const result = await groth16.verify(
       vkEntry.verificationKey as never,
       publicSignals,

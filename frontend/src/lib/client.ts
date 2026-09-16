@@ -20,6 +20,7 @@ import {
   type VoteProofInput,
   type WeightedVoteProofInput,
   type BridgeProofInput,
+  type GeneratedProof,
 } from "./zkproof";
 import {
   getZKCredentials,
@@ -164,7 +165,7 @@ export class ZkVoteClient {
     }
 
     // 3. Load or regenerate credentials
-    let secret: string, salt: string, commitment: string, leafIndex: number;
+    let secret: string, salt: string, blindingFactor: string, commitment: string, leafIndex: number;
     const cached = getZKCredentials(params.daoId, this.publicKey);
     if (!cached) {
       if (!params.kit)
@@ -180,11 +181,13 @@ export class ZkVoteClient {
       leafIndex = Number((leafRes as unknown as { result: bigint }).result);
       secret = creds.secret;
       salt = creds.salt;
+      blindingFactor = (creds as unknown as { blindingFactor: string }).blindingFactor ?? "0";
       commitment = creds.commitment;
       storeZKCredentials(params.daoId, this.publicKey, creds, leafIndex);
     } else {
       secret = cached.secret;
       salt = cached.salt;
+      blindingFactor = (cached as unknown as { blindingFactor: string }).blindingFactor ?? "0";
       commitment = cached.commitment;
       leafIndex = cached.leafIndex;
     }
@@ -223,11 +226,13 @@ export class ZkVoteClient {
     const proofInput: VoteProofInput = {
       secret,
       salt,
+      blindingFactor,
       root: root.toString(),
       nullifier,
       daoId: params.daoId.toString(),
       proposalId: params.proposalId.toString(),
       voteChoice: params.choice ? "1" : "0",
+      relayerAddress: "0",
       commitment,
       pathElements,
       pathIndices,

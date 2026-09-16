@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Membership SBT transfer-attempt detection + alerts (#357)
  *

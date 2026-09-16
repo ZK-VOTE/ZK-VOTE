@@ -76,6 +76,11 @@ export declare function printMigrationStatus(database: DatabaseType): void;
  *   down --all  Rollback all migrations
  *   status      Show migration status
  *   dry-run     Show what would be applied without running
+ *   parity      Report SQLite/Postgres migration parity (issue #305)
+ *
+ * The backend is chosen by DB_BACKEND (sqlite | postgres). On `postgres` the
+ * commands are routed to the async runner in `migratePg.ts`, which reads
+ * `migrations/postgres/` and uses a Postgres advisory lock.
  */
 declare function cli(): Promise<void>;
 export { cli as runMigrationCli };

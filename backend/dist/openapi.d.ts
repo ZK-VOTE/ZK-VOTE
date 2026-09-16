@@ -1,8 +1,170 @@
 /**
- * OpenAPI Specification for ZKVote Backend
- * Documents all routes including audit and remediation for accountability.
- * Scope: middleware/audit.ts, routes/*, openapi.ts
+ * OpenAPI 3.1 Specification for ZKVote Backend (Task #339)
+ *
+ * Builds the API's OpenAPI document from the same Zod schemas used to
+ * validate requests at runtime (validation/schemas.ts and a couple of
+ * route-local schemas), plus a compact per-endpoint metadata table below.
+ * That table is also the source `scripts/generate-openapi.ts` uses to check
+ * API.md doesn't drift from the implemented routes — see that script for how
+ * the two stay in sync.
+ *
+ * The static `openApiSpec` export (served at GET /openapi.json) carries the
+ * audit/remediation accountability annotations (x-audited, x-append-only,
+ * x-replay-safe) on top of the generated document (GET /api-docs).
  */
+import { z, type ZodTypeAny } from "zod";
+export declare const errorResponseSchema: z.ZodObject<{
+    error: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    error: string;
+}, {
+    error: string;
+}>;
+export declare const successResponseSchema: z.ZodObject<{
+    success: z.ZodBoolean;
+    txHash: z.ZodOptional<z.ZodString>;
+}, "strip", z.ZodTypeAny, {
+    success: boolean;
+    txHash?: string | undefined;
+}, {
+    success: boolean;
+    txHash?: string | undefined;
+}>;
+/**
+ * A handful of read-endpoint response shapes, reused both to build the spec
+ * and (in test/openapi-validation.test.js) to validate live responses
+ * against it — the same pattern the issue's `zod-to-openapi` suggestion is
+ * about, applied to responses instead of just requests.
+ */
+export declare const readyResponseSchema: z.ZodObject<{
+    status: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    status: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    status: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+export declare const configResponseSchema: z.ZodObject<{
+    networkPassphrase: z.ZodString;
+    rpcUrl: z.ZodString;
+    ipfsEnabled: z.ZodBoolean;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    networkPassphrase: z.ZodString;
+    rpcUrl: z.ZodString;
+    ipfsEnabled: z.ZodBoolean;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    networkPassphrase: z.ZodString;
+    rpcUrl: z.ZodString;
+    ipfsEnabled: z.ZodBoolean;
+}, z.ZodTypeAny, "passthrough">>;
+export declare const paginatedResponseSchema: z.ZodObject<{
+    data: z.ZodArray<z.ZodRecord<z.ZodString, z.ZodUnknown>, "many">;
+    pagination: z.ZodObject<{
+        cursor: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+        hasMore: z.ZodBoolean;
+        total: z.ZodNumber;
+    }, "strip", z.ZodTypeAny, {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    }, {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    }>;
+}, "strip", z.ZodTypeAny, {
+    data: Record<string, unknown>[];
+    pagination: {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    };
+}, {
+    data: Record<string, unknown>[];
+    pagination: {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    };
+}>;
+export declare const daosListResponseSchema: z.ZodObject<{
+    data: z.ZodArray<z.ZodRecord<z.ZodString, z.ZodUnknown>, "many">;
+    pagination: z.ZodObject<{
+        cursor: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+        hasMore: z.ZodBoolean;
+        total: z.ZodNumber;
+    }, "strip", z.ZodTypeAny, {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    }, {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    }>;
+    lastSync: z.ZodNullable<z.ZodString>;
+    cached: z.ZodBoolean;
+}, "strip", z.ZodTypeAny, {
+    data: Record<string, unknown>[];
+    pagination: {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    };
+    lastSync: string | null;
+    cached: boolean;
+}, {
+    data: Record<string, unknown>[];
+    pagination: {
+        total: number;
+        hasMore: boolean;
+        cursor?: string | null | undefined;
+    };
+    lastSync: string | null;
+    cached: boolean;
+}>;
+export declare const txStatusResponseSchema: z.ZodObject<{
+    hash: z.ZodString;
+    state: z.ZodEnum<["PENDING", "CONFIRMED", "FAILED", "EXPIRED", "UNKNOWN"]>;
+    status: z.ZodOptional<z.ZodString>;
+    attempts: z.ZodNumber;
+    elapsedMs: z.ZodNumber;
+    error: z.ZodOptional<z.ZodString>;
+    enqueuedAt: z.ZodOptional<z.ZodString>;
+    confirmedAt: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, "strip", z.ZodTypeAny, {
+    hash: string;
+    elapsedMs: number;
+    attempts: number;
+    state: "PENDING" | "FAILED" | "EXPIRED" | "CONFIRMED" | "UNKNOWN";
+    error?: string | undefined;
+    status?: string | undefined;
+    enqueuedAt?: string | undefined;
+    confirmedAt?: string | null | undefined;
+}, {
+    hash: string;
+    elapsedMs: number;
+    attempts: number;
+    state: "PENDING" | "FAILED" | "EXPIRED" | "CONFIRMED" | "UNKNOWN";
+    error?: string | undefined;
+    status?: string | undefined;
+    enqueuedAt?: string | undefined;
+    confirmedAt?: string | null | undefined;
+}>;
+export interface EndpointDef {
+    method: "get" | "post";
+    path: string;
+    tag: string;
+    summary: string;
+    auth: boolean;
+    rateLimit: string | null;
+    params?: Record<string, ZodTypeAny>;
+    query?: Record<string, ZodTypeAny>;
+    body?: ZodTypeAny;
+    responseExample: unknown;
+    responseSchema?: ZodTypeAny;
+    errorStatuses?: number[];
+}
+export declare const ENDPOINTS: EndpointDef[];
 export declare const openApiSpec: {
     readonly openapi: "3.0.3";
     readonly info: {
@@ -421,5 +583,9 @@ export declare const openApiSpec: {
         readonly replaySafe: "remediation uses idempotencyKey; duplicates return 409";
     };
 };
+export declare const ENDPOINTS: {
+    method: string;
+    path: string;
+}[];
 export default openApiSpec;
 //# sourceMappingURL=openapi.d.ts.map

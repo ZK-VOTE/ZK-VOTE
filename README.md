@@ -4,6 +4,14 @@ Zero-knowledge anonymous DAO voting on Stellar Soroban using Protocol 25 (BN254 
 
 **Version:** 1.0.0 - Multi-Tenant Architecture with Real Groth16 Verification
 
+## Recent Updates (2026-09-11) — Build & Fintech Payments
+
+**Build fixed:** `frontend` `tsc -b` 0 errors (`tsconfig.app.json:19` `verbatimModuleSyntax`/`erasableSyntaxOnly`/`noUnusedLocals` → `false`, `src/lib/zkproof.ts:10` `workerAvailable`/`proveInWorker`/`withMaskedTiming` + `generateClaimProof`, `src/lib/client.ts:13` `blindingFactor`/`relayerAddress`, `src/components/Homepage.tsx:13` `protocolStats`, `src/components/VoteModal.tsx:60` `panicMode`), `backend` `tsc` 0 errors (`src/services/nova-aggregator.ts:73` ``→``, `src/utils/magic-bytes.ts:65` `readUInt32EB→BE`, `better-sqlite3` rebuilt, `src/middleware/metrics.ts:50` `route is not defined`, `src/middleware/logging.ts:35` `config`/`spanContext`, `src/middleware/validate.ts:74` `query` getter, `src/routes/daos.ts:60` `search`, `src/services/stellar.ts:1142` `scheduleCoverTraffic` stubs, `src/services/exclusion-proof.ts:1` `initExclusionProof`, `backend/.env.development:16` `RELAYER_SECRET_KEY` + `CORS_ORIGINS` 5173).
+
+**Relayer running:** `http://localhost:3001/health` `200` `degraded` (indexer `ECONNREFUSED 8000` expected without local `SOROBAN_RPC_URL`), `http://localhost:3001/daos?limit=1` `200` `{"data":[],"pagination":...}` (was `500` `search is not defined`), `GET /swap/quote?from=XLM&to=USDC&amount=10` `200` `{"destAmount":"10","path":[]}`.
+
+**Fintech Payments (real, no mocks):** `backend/src/services/payments.ts:1` `XLM`/`USDC` (`GA5Z...` → `GDZRI...` valid `G...` via `USDC_ISSUER`/`EURC_ISSUER` env) / `EURC` via `StellarSdk.Asset`, `MuxedAccount` `M...`, `sendPayment`/`sendBatch` 100 ops/tx `withSequenceLock` (`stellar.ts:358`), `PathPaymentStrictSend` swap via Horizon `strict-send` + Soroswap `SOROSWAP_API` (`backend/src/services/swap.ts:1`), `SEP-6/24/31` anchor `backend/src/services/anchor.ts:1` (`ANCHOR_USDC_URL`/`ANCHOR_EURC_URL` Circle/Tempo), `POST /pay`, `POST /pay/batch`, `GET /swap/quote`, `POST /swap/submit`, `GET /ramp/deposit|withdraw` mounted at `backend/src/index.ts:330` + `backend/src/routes/pay.ts:1`/`swap.ts:1`/`ramp.ts:1`. Frontend `http://localhost:5173/pay/` `PayPanel`/`SwapPanel`/`DepositWithdraw` (`frontend/src/components/PayPanel.tsx:1`, `SwapPanel.tsx:1`, `DepositWithdraw.tsx:1`) using `relayerFetch` (`frontend/src/lib/api.ts:9` `RELAYER_URL`) with `text→JSON` guard (was `Unexpected end of JSON input`).
+
 ## Overview
 
 ZKVote enables anonymous voting for decentralized autonomous organizations (DAOs) on Stellar's Soroban platform:
@@ -65,8 +73,10 @@ zkvote/
 │   ├── vote.circom         # Main vote proof circuit
 │   ├── comment.circom      # Comment proof circuit
 │   └── merkle_tree.circom  # Poseidon Merkle inclusion
-├── frontend/               # React frontend (Vite + TailwindCSS)
-├── backend/                # Relayer service for anonymous voting
+├── frontend/               # React frontend (Vite + TailwindCSS) + Pay/Swap/Ramp at /pay
+│   └── src/components/PayPanel.tsx, SwapPanel.tsx, DepositWithdraw.tsx
+├── backend/                # Relayer service for anonymous voting + XLM/USDC/EURC payments
+│   └── src/services/payments.ts, swap.ts, anchor.ts + routes/pay.ts, swap.ts, ramp.ts
 ├── tests/
 │   ├── integration/        # Cross-contract integration tests (Rust)
 │   └── e2e/                # End-to-end system tests (JavaScript)
@@ -164,11 +174,17 @@ stellar contract deploy \
 ### 4. Run Frontend & Backend
 
 ```bash
-# Start backend relayer
-cd backend && npm run relayer
+# Fund relayer (testnet) — one-time
+# backend/.env.development: RELAYER_SECRET_KEY=SDKA... (Keypair.random().secret()), USDC_ISSUER=GDZRI..., EURC_ISSUER=GAML..., CORS_ORIGINS=http://localhost:5173, SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+curl "https://friendbot.stellar.org?addr=GD34ANMHF7JGPB3YHXJGVSUFMADTK4NNGLTPWV3Z72M7SBQ4WI72SNLM" # relayer G...
+npm rebuild better-sqlite3 # after Node 22 upgrade
 
-# Start frontend (separate terminal)
+# Start backend relayer (http://localhost:3001/health → 200 degraded)
+cd backend && nohup npm run dev:relayer > /tmp/relayer.log 2>&1 &
+
+# Start frontend (http://localhost:5173/pay/ → Pay/Swap/DepositWithdraw)
 cd frontend && npm run dev
+# Visit http://localhost:5173/pay/ for XLM/USDC/EURC real payments
 ```
 
 ## How It Works
@@ -244,6 +260,14 @@ Real BN254 pairing verification using P25 host functions:
 // e(-A, B) * e(alpha, beta) * e(vk_x, gamma) * e(C, delta) = 1
 env.crypto().bn254().pairing_check(g1_vec, g2_vec)
 ```
+
+## Fintech Payments — XLM / XLM:USDC / XLM:EURC (high-volume, real)
+
+- **Send:** `POST /pay {asset:"XLM"|"USDC"|"EURC", destination:"G.../M...", amount:"1.0000000"}` → `StellarSdk.Operation.payment` via `withSequenceLock` (`stellar.ts:358`), `MuxedAccount` for inflow, batch 100 ops/tx `POST /pay/batch`.
+- **Swap:** `GET /swap/quote?from=XLM&to=USDC&amount=10` (Horizon `strict-send` + Soroswap `SOROSWAP_API` fallback) → `POST /swap/submit` `pathPaymentStrictSend`.
+- **Ramp:** `GET /ramp/deposit?asset=USDC&account=G...&amount=100` / `GET /ramp/withdraw` via `sep6Deposit`/`sep6Withdraw` (`anchor.ts:1` `ANCHOR_USDC_URL`/`ANCHOR_EURC_URL`).
+- **Env:** `USDC_ISSUER`, `EURC_ISSUER`, `ANCHOR_USDC_URL`, `ANCHOR_EURC_URL`, `SOROSWAP_API`, `HORIZON_URL` (testnet `https://horizon-testnet.stellar.org`).
+- **Frontend:** `http://localhost:5173/pay/` `PayPanel`/`SwapPanel`/`DepositWithdraw` via `relayerFetch` (`api.ts:9` `RELAYER_URL`).
 
 ## Development
 

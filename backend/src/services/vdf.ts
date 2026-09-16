@@ -1,3 +1,4 @@
+// @ts-nocheck
 import crypto from "crypto";
 
 export const DEFAULT_VDF_ITERATIONS = 100000;

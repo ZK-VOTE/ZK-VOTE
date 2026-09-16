@@ -16,6 +16,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { timeQuery, invalidateCachePrefix, getDbStats as getMonitorDbStats, profileEventQueries, } from "./dbMonitor.js";
 import { migrateUp } from "./migrate.js";
+import { assertBackendConfigured } from "./dbDialect.js";
 import { kysely } from "./kysely.js";
 import { sql } from "kysely";
 import { initWalResilience, configureWalResilience, incrementTransactionCounter, } from "./walResilience.js";
@@ -277,6 +278,65 @@ const EXPECTED_SCHEMA = {
             { name: "idx_vote_submissions_nullifier", columns: ["nullifier_hash"] },
         ],
     },
+    proposal_lifecycle_subscriptions: {
+        columns: [
+            { name: "id", type: "INTEGER", notNull: true, primaryKey: true },
+            { name: "dao_id", type: "INTEGER", notNull: true, primaryKey: false },
+            {
+                name: "wallet_address_hash",
+                type: "TEXT",
+                notNull: true,
+                primaryKey: false,
+            },
+            { name: "active", type: "INTEGER", notNull: true, primaryKey: false },
+            { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+            { name: "updated_at", type: "TEXT", notNull: true, primaryKey: false },
+        ],
+        indexes: [
+            {
+                name: "idx_proposal_lifecycle_subscriptions_dao",
+                columns: ["dao_id"],
+            },
+            {
+                name: "idx_proposal_lifecycle_subscriptions_active",
+                columns: ["dao_id", "active"],
+            },
+            {
+                name: "idx_proposal_lifecycle_subscriptions_unique",
+                columns: ["dao_id", "wallet_address_hash"],
+            },
+        ],
+    },
+    proposal_lifecycle_notifications: {
+        columns: [
+            { name: "id", type: "INTEGER", notNull: true, primaryKey: true },
+            { name: "dao_id", type: "INTEGER", notNull: true, primaryKey: false },
+            { name: "proposal_id", type: "INTEGER", notNull: true, primaryKey: false },
+            { name: "event_type", type: "TEXT", notNull: true, primaryKey: false },
+            {
+                name: "wallet_address_hash",
+                type: "TEXT",
+                notNull: true,
+                primaryKey: false,
+            },
+            { name: "delivered", type: "INTEGER", notNull: true, primaryKey: false },
+            { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+        ],
+        indexes: [
+            {
+                name: "idx_proposal_lifecycle_notifications_dao",
+                columns: ["dao_id"],
+            },
+            {
+                name: "idx_proposal_lifecycle_notifications_event",
+                columns: ["dao_id", "event_type"],
+            },
+            {
+                name: "idx_proposal_lifecycle_notifications_unique",
+                columns: ["dao_id", "proposal_id", "event_type", "wallet_address_hash"],
+            },
+        ],
+    },
     proof_commitments: {
         columns: [
             {
@@ -302,10 +362,21 @@ const EXPECTED_SCHEMA = {
             { name: "timestamp", type: "INTEGER", notNull: true, primaryKey: false },
             { name: "status", type: "TEXT", notNull: true, primaryKey: false },
             { name: "created_at", type: "TEXT", notNull: true, primaryKey: false },
+            // Added by migration 004: malleability-safe dedup key (nullable for legacy rows)
+            {
+                name: "canonical_proof_hash",
+                type: "TEXT",
+                notNull: false,
+                primaryKey: false,
+            },
         ],
         indexes: [
             { name: "idx_commitments_nullifier", columns: ["nullifier"] },
             { name: "idx_commitments_wallet", columns: ["wallet_address"] },
+            {
+                name: "idx_proof_commitments_canonical",
+                columns: ["canonical_proof_hash"],
+            },
         ],
     },
 };
@@ -454,13 +525,15 @@ function updateConnectionGauges() {
     try {
         sink.setConnectionsActive(countActiveConnections());
         sink.setWriteHealthy(writeHealthy && Boolean(writeDb));
-        sink.setWalSizeBytes(getWalSizeBytes(activeDbFile));
+        sink.setWalSizeBytes(getWalSizeBytes(activeDbFile ?? DB_FILE));
     }
     catch {
         // Metrics sink may throw if registry is torn down in tests
     }
 }
 export function getWalSizeBytes(dbFile = activeDbFile) {
+    if (!dbFile)
+        return 0;
     const walPath = `${dbFile}-wal`;
     try {
         if (fs.existsSync(walPath))
@@ -641,6 +714,14 @@ export function getWriteFailureReason() {
  * On connection-level failure, attempts one reconnect (failover).
  * Does not switch away from an already-open custom dbPath.
  */
+/**
+ * Whether the write connection has been initialized already (without
+ * forcing initialization). Used by best-effort audit writers (e.g. backup
+ * key rotation metadata) that should never trigger a DB bootstrap.
+ */
+export function isDbInitialized() {
+    return writeDb !== null;
+}
 export function getWriteDb() {
     if (writeDb) {
         try {
@@ -791,6 +872,10 @@ function getAllPartitionDaoIds(database) {
  * @returns The write connection (backward compatible with prior callers).
  */
 export function initDb(dbPath) {
+    // Fail fast on a misconfigured backend (issue #305) before any handle is
+    // opened, so DB_BACKEND=postgres without DATABASE_URL is a boot error rather
+    // than a silent fallback to the embedded SQLite file.
+    assertBackendConfigured();
     const dbFile = dbPath ?? DB_FILE;
     // Reuse open handles for the same file
     if (writeDb && activeDbFile === dbFile) {
@@ -923,6 +1008,16 @@ export function initDb(dbPath) {
       PRIMARY KEY (comment_id, dao_id, proposal_id)
     );
 
+    CREATE TABLE IF NOT EXISTS member_revocations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      commitment TEXT NOT NULL,
+      dao_id INTEGER NOT NULL,
+      revoked_at INTEGER NOT NULL,
+      reinstated_at INTEGER,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(commitment, dao_id)
+    );
+
     CREATE TABLE IF NOT EXISTS ttl_tracking (
       entry_id TEXT PRIMARY KEY,
       contract_id TEXT NOT NULL,
@@ -967,6 +1062,23 @@ export function initDb(dbPath) {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_vote_submissions_nullifier ON vote_submissions(nullifier_hash);
+
+    CREATE TABLE IF NOT EXISTS vote_jobs (
+      id TEXT PRIMARY KEY,
+      nullifier_hash TEXT NOT NULL,
+      dao_id INTEGER NOT NULL,
+      proposal_id INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      tx_hash TEXT,
+      error_message TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_vote_jobs_status ON vote_jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_vote_jobs_nullifier ON vote_jobs(nullifier_hash);
 
     -- Auth tokens table: stores hashed authentication tokens with expiration and metadata
     CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -1015,11 +1127,40 @@ export function initDb(dbPath) {
       wallet_address TEXT,
       timestamp INTEGER NOT NULL,
       status TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      canonical_proof_hash TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_commitments_nullifier ON proof_commitments(nullifier);
     CREATE INDEX IF NOT EXISTS idx_commitments_wallet ON proof_commitments(wallet_address);
+
+    CREATE TABLE IF NOT EXISTS proposal_lifecycle_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dao_id INTEGER NOT NULL,
+      wallet_address_hash TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(dao_id, wallet_address_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_subscriptions_dao ON proposal_lifecycle_subscriptions(dao_id);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_subscriptions_active ON proposal_lifecycle_subscriptions(dao_id, active);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_subscriptions_unique ON proposal_lifecycle_subscriptions(dao_id, wallet_address_hash);
+
+    CREATE TABLE IF NOT EXISTS proposal_lifecycle_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dao_id INTEGER NOT NULL,
+      proposal_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      wallet_address_hash TEXT NOT NULL,
+      delivered INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(dao_id, proposal_id, event_type, wallet_address_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_notifications_dao ON proposal_lifecycle_notifications(dao_id);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_notifications_event ON proposal_lifecycle_notifications(dao_id, event_type);
+    CREATE INDEX IF NOT EXISTS idx_proposal_lifecycle_notifications_unique ON proposal_lifecycle_notifications(dao_id, proposal_id, event_type, wallet_address_hash);
+
     -- Append-only, tamper-evident audit trail for privileged/administrative
     -- actions. Each row's hash covers its own fields plus the previous row's
     -- hash (hash chain), so any edit or reordering breaks verifyAuditChain().
@@ -1216,7 +1357,11 @@ export function closeDb() {
         knownPartitions.clear();
         writeHealthy = true;
         writeFailureReason = null;
+        activeDbFile = null;
         log("info", "db_closed");
+    }
+    else {
+        activeDbFile = null;
     }
     updateConnectionGauges();
 }
@@ -1409,6 +1554,13 @@ export function addEvent(event) {
         invalidateCachePrefix(`indexedDaos`);
         invalidateCachePrefix(`dbStatus`);
         incrementTransactionCounter();
+        const proposalLifecycleEvent = event.type === "proposal_created" || event.type === "proposal_closed";
+        if (proposalLifecycleEvent) {
+            const proposalId = extractProposalId(event.data);
+            if (proposalId !== null) {
+                emitProposalLifecycleNotifications(event.daoId, proposalId, event.type);
+            }
+        }
     }
     return result;
 }
@@ -1425,6 +1577,158 @@ export function addPendingEvent(daoId, type, data, txHash) {
         timestamp: new Date().toISOString(),
         verified: false,
     });
+}
+function normalizeWalletAddress(walletAddress) {
+    const value = walletAddress.trim();
+    if (!value) {
+        throw new Error("Wallet address is required");
+    }
+    return value;
+}
+function hashWalletAddress(walletAddress) {
+    return crypto
+        .createHash("sha256")
+        .update(normalizeWalletAddress(walletAddress).toLowerCase())
+        .digest("hex");
+}
+function extractProposalId(data) {
+    if (!data || typeof data !== "object")
+        return null;
+    const rawProposalId = data.proposalId ?? data.proposal_id ?? data.id ?? data.proposal ?? null;
+    if (typeof rawProposalId === "number" && Number.isFinite(rawProposalId)) {
+        return rawProposalId > 0 ? rawProposalId : null;
+    }
+    if (typeof rawProposalId === "string") {
+        const parsed = Number(rawProposalId);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    }
+    return null;
+}
+export function subscribeToDaoProposalLifecycle(daoId, walletAddress) {
+    validateDaoId(daoId);
+    const hash = hashWalletAddress(walletAddress);
+    const database = getWriteDb();
+    const now = new Date().toISOString();
+    const row = database
+        .prepare(`
+        INSERT INTO proposal_lifecycle_subscriptions (dao_id, wallet_address_hash, active, created_at, updated_at)
+        VALUES (?, ?, 1, ?, ?)
+        ON CONFLICT(dao_id, wallet_address_hash)
+        DO UPDATE SET active = 1, updated_at = excluded.updated_at
+      `)
+        .run(daoId, hash, now, now);
+    if (row.changes !== 0 || row.lastInsertRowid !== undefined) {
+        return { success: true, active: true, walletAddressHash: hash };
+    }
+    const existing = database
+        .prepare(`SELECT active FROM proposal_lifecycle_subscriptions WHERE dao_id = ? AND wallet_address_hash = ?`)
+        .get(daoId, hash);
+    return {
+        success: true,
+        active: existing ? Boolean(existing.active) : true,
+        walletAddressHash: hash,
+    };
+}
+export function unsubscribeFromDaoProposalLifecycle(daoId, walletAddress) {
+    validateDaoId(daoId);
+    const hash = hashWalletAddress(walletAddress);
+    const database = getWriteDb();
+    const row = database
+        .prepare(`UPDATE proposal_lifecycle_subscriptions
+       SET active = 0, updated_at = ?
+       WHERE dao_id = ? AND wallet_address_hash = ?`)
+        .run(new Date().toISOString(), daoId, hash);
+    return {
+        success: row.changes > 0 || row.lastInsertRowid !== undefined,
+        active: false,
+        walletAddressHash: hash,
+    };
+}
+export function listDaoProposalLifecycleSubscriptions(daoId, options = {}) {
+    validateDaoId(daoId);
+    const database = getReadDb();
+    const includeInactive = options.includeInactive ?? false;
+    const rows = database
+        .prepare(`
+        SELECT
+          id,
+          dao_id AS daoId,
+          wallet_address_hash AS walletAddressHash,
+          active,
+          created_at AS createdAt,
+          updated_at AS updatedAt
+        FROM proposal_lifecycle_subscriptions
+        WHERE dao_id = ? ${includeInactive ? "" : "AND active = 1"}
+        ORDER BY created_at ASC
+      `)
+        .all(daoId);
+    return rows.map((row) => ({
+        id: row.id,
+        daoId: row.daoId,
+        walletAddressHash: row.walletAddressHash,
+        active: Boolean(row.active),
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+    }));
+}
+export function getDaoProposalLifecycleNotifications(daoId, options = {}) {
+    validateDaoId(daoId);
+    const database = getReadDb();
+    const eventType = options.eventType;
+    const query = `
+        SELECT
+          id,
+          dao_id AS daoId,
+          proposal_id AS proposalId,
+          event_type AS eventType,
+          wallet_address_hash AS walletAddressHash,
+          delivered,
+          created_at AS createdAt
+        FROM proposal_lifecycle_notifications
+        WHERE dao_id = ? ${eventType ? "AND event_type = ?" : ""}
+        ORDER BY created_at ASC
+      `;
+    const rows = eventType
+        ? database.prepare(query).all(daoId, eventType)
+        : database.prepare(query).all(daoId);
+    return rows.map((row) => ({
+        id: row.id,
+        daoId: row.daoId,
+        proposalId: row.proposalId,
+        eventType: row.eventType,
+        walletAddressHash: row.walletAddressHash,
+        delivered: Boolean(row.delivered),
+        createdAt: row.createdAt,
+    }));
+}
+function addProposalLifecycleNotification(daoId, proposalId, eventType, walletAddressHash) {
+    const database = getWriteDb();
+    const now = new Date().toISOString();
+    database
+        .prepare(`
+        INSERT OR IGNORE INTO proposal_lifecycle_notifications (
+          dao_id,
+          proposal_id,
+          event_type,
+          wallet_address_hash,
+          delivered,
+          created_at
+        ) VALUES (?, ?, ?, ?, 0, ?)
+      `)
+        .run(daoId, proposalId, eventType, walletAddressHash, now);
+}
+export function emitProposalLifecycleNotifications(daoId, proposalId, eventType) {
+    const allowedEvents = new Set(["proposal_created", "proposal_closed"]);
+    if (!allowedEvents.has(eventType)) {
+        return 0;
+    }
+    const subscribers = listDaoProposalLifecycleSubscriptions(daoId, {
+        includeInactive: false,
+    });
+    for (const subscription of subscribers) {
+        addProposalLifecycleNotification(daoId, proposalId, eventType, subscription.walletAddressHash);
+    }
+    return subscribers.length;
 }
 /**
  * Mark an event as verified.
@@ -1468,21 +1772,23 @@ export function verifyEvent(txHash, ledger) {
 export function getEventsForDao(daoId, options = {}) {
     const database = getReadDb();
     const tableName = partitionTableName(daoId); // Validates daoId
+    const { limit = 100, offset = 0, types = null, verifiedOnly = false, orderBy = "timestamp", orderDirection = "DESC", cursor, cursorField = "id", } = options;
+    // SECURITY: Validate ORDER BY and event-type filters up front, before any
+    // early return, so malicious input is rejected even when the partition does
+    // not exist yet (input validation must not depend on data state).
+    const { column: orderColumn, direction } = validateOrderBy(orderBy, orderDirection);
+    const validatedTypes = types && types.length > 0 ? validateEventTypes(types) : null;
+    // SECURITY: Validate limit and offset
+    const validLimit = Math.max(1, Math.min(limit, 1000));
+    const validOffset = Math.max(0, offset);
     // Reads must not run DDL — missing partitions return empty results.
     if (!partitionTableExists(database, daoId)) {
         return { events: [], total: 0, daoId };
     }
-    const { limit = 100, offset = 0, types = null, verifiedOnly = false, orderBy = "timestamp", orderDirection = "DESC", cursor, cursorField = "id", } = options;
-    // SECURITY: Validate limit and offset
-    const validLimit = Math.max(1, Math.min(limit, 1000));
-    const validOffset = Math.max(0, offset);
-    // SECURITY: Validate ORDER BY parameters
-    const { column: orderColumn, direction } = validateOrderBy(orderBy, orderDirection);
     let query = kysely
         .selectFrom(sql `${sql.raw(tableName)}`.as("events"))
         .selectAll();
-    if (types && types.length > 0) {
-        const validatedTypes = validateEventTypes(types);
+    if (validatedTypes) {
         query = query.where("type", "in", validatedTypes);
     }
     if (verifiedOnly) {
@@ -1518,8 +1824,8 @@ export function getEventsForDao(daoId, options = {}) {
     let countQuery = kysely
         .selectFrom(sql `${sql.raw(tableName)}`.as("events"))
         .select(sql `COUNT(*)`.as("total"));
-    if (types && types.length > 0) {
-        countQuery = countQuery.where("type", "in", validateEventTypes(types));
+    if (validatedTypes) {
+        countQuery = countQuery.where("type", "in", validatedTypes);
     }
     if (verifiedOnly) {
         countQuery = countQuery.where("verified", "=", 1);
@@ -1726,6 +2032,56 @@ export function cleanupExpiredVoteSubmissions(ttlMs) {
         .prepare("DELETE FROM vote_submissions WHERE status != 'confirmed' AND created_at < ?")
         .run(cutoff);
     return result.changes;
+}
+export function createVoteJob(jobId, nullifierHash, daoId, proposalId, payload) {
+    const database = getWriteDb();
+    const now = Date.now();
+    database
+        .prepare(`INSERT INTO vote_jobs (id, nullifier_hash, dao_id, proposal_id, payload, status, attempts, max_attempts, tx_hash, error_message, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'QUEUED', 0, 3, NULL, NULL, ?, ?)`)
+        .run(jobId, nullifierHash, daoId, proposalId, payload, now, now);
+    return (getVoteJobById(jobId) ?? {
+        id: jobId,
+        nullifier_hash: nullifierHash,
+        dao_id: daoId,
+        proposal_id: proposalId,
+        payload,
+        status: "QUEUED",
+        attempts: 0,
+        max_attempts: 3,
+        tx_hash: null,
+        error_message: null,
+        created_at: now,
+        updated_at: now,
+    });
+}
+export function getVoteJobById(jobId) {
+    const database = getReadDb();
+    const row = database
+        .prepare("SELECT * FROM vote_jobs WHERE id = ?")
+        .get(jobId);
+    return row ?? null;
+}
+export function updateVoteJobStatus(jobId, status, update = {}) {
+    const database = getWriteDb();
+    const now = Date.now();
+    const existing = getVoteJobById(jobId);
+    const currentAttempts = update.attempts ?? existing?.attempts ?? 0;
+    const txHash = update.txHash ?? existing?.tx_hash ?? null;
+    const errorMessage = update.errorMessage ?? existing?.error_message ?? null;
+    database
+        .prepare(`UPDATE vote_jobs
+       SET status = ?, attempts = ?, tx_hash = ?, error_message = ?, updated_at = ?
+       WHERE id = ?`)
+        .run(status, currentAttempts, txHash, errorMessage, now, jobId);
+    return getVoteJobById(jobId);
+}
+export function getVoteQueueDepth() {
+    const database = getReadDb();
+    const row = database
+        .prepare("SELECT COUNT(*) AS count FROM vote_jobs WHERE status IN ('QUEUED', 'PROCESSING')")
+        .get();
+    return row?.count ?? 0;
 }
 /**
  * Insert an audit log entry, chaining its hash to the previous entry's hash.
@@ -2376,7 +2732,7 @@ function rowToAuthToken(row) {
     };
 }
 export function createAuthToken(token) {
-    const database = initDb();
+    const database = getWriteDb();
     const query = `
     INSERT INTO auth_tokens (id, token_hash, client_id, description, expires_at, rotation_group_id, is_legacy)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2394,21 +2750,21 @@ export function createAuthToken(token) {
     database.prepare(query).run(...params);
 }
 export function getAuthTokenByHash(tokenHash) {
-    const database = initDb();
+    const database = getReadDb();
     const row = database
         .prepare("SELECT * FROM auth_tokens WHERE token_hash = ?")
         .get(tokenHash);
     return row ? rowToAuthToken(row) : null;
 }
 export function getAuthTokenById(id) {
-    const database = initDb();
+    const database = getReadDb();
     const row = database
         .prepare("SELECT * FROM auth_tokens WHERE id = ?")
         .get(id);
     return row ? rowToAuthToken(row) : null;
 }
 export function getAllAuthTokens() {
-    const database = initDb();
+    const database = getReadDb();
     const rows = database
         .prepare("SELECT * FROM auth_tokens ORDER BY created_at DESC")
         .all();
@@ -2416,7 +2772,7 @@ export function getAllAuthTokens() {
 }
 export function getActiveAuthTokens() {
     const now = new Date().toISOString();
-    const database = initDb();
+    const database = getReadDb();
     const rows = database
         .prepare(`SELECT * FROM auth_tokens 
        WHERE status = 'active' 
@@ -2428,7 +2784,7 @@ export function getActiveAuthTokens() {
 export function getValidAuthTokens(transitionMs) {
     const now = new Date().toISOString();
     const transitionCutoff = new Date(Date.now() - transitionMs).toISOString();
-    const database = initDb();
+    const database = getReadDb();
     const rows = database
         .prepare(`SELECT * FROM auth_tokens 
        WHERE (
@@ -2444,19 +2800,30 @@ export function getValidAuthTokens(transitionMs) {
     return rows.map(rowToAuthToken);
 }
 export function updateAuthTokenStatus(id, status) {
-    const database = initDb();
+    const database = getWriteDb();
     const query = "UPDATE auth_tokens SET status = ? WHERE id = ?";
     logQuery(query, [status, id], "update_auth_token_status");
     database.prepare(query).run(status, id);
 }
 export function revokeAuthToken(id) {
-    const database = initDb();
+    const database = getWriteDb();
     const query = "UPDATE auth_tokens SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP WHERE id = ?";
     logQuery(query, [id], "revoke_auth_token");
     database.prepare(query).run(id);
 }
+/**
+ * Refresh a token record's hash (used by the legacy-token migration when the
+ * RELAYER_AUTH_TOKEN env var changes: the env var is the source of truth, so
+ * the stored hash must track it or the new value would never validate).
+ */
+export function updateAuthTokenHash(id, tokenHash, expiresAt) {
+    const database = getWriteDb();
+    const query = "UPDATE auth_tokens SET token_hash = ?, status = 'active', expires_at = ?, revoked_at = NULL WHERE id = ?";
+    logQuery(query, [tokenHash, expiresAt, id], "update_auth_token_hash");
+    database.prepare(query).run(tokenHash, expiresAt, id);
+}
 export function markTokenRotated(oldId, newId) {
-    const database = initDb();
+    const database = getWriteDb();
     database.transaction(() => {
         // Mark old token as rotating
         database
@@ -2466,14 +2833,14 @@ export function markTokenRotated(oldId, newId) {
     })();
 }
 export function recordTokenUsage(id, ipHash) {
-    const database = initDb();
+    const database = getWriteDb();
     const query = "UPDATE auth_tokens SET last_used_at = CURRENT_TIMESTAMP, use_count = use_count + 1 WHERE id = ?";
     logQuery(query, [id], "record_token_usage");
     database.prepare(query).run(id);
 }
 export function expireAuthTokens() {
     const now = new Date().toISOString();
-    const database = initDb();
+    const database = getWriteDb();
     const query = `
     UPDATE auth_tokens SET status = 'expired' 
     WHERE status = 'active' 
@@ -2486,7 +2853,7 @@ export function expireAuthTokens() {
 }
 export function cleanupRevokedTokens(maxAgeMs = 7_776_000_000) {
     const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    const database = initDb();
+    const database = getWriteDb();
     const query = `
     DELETE FROM auth_tokens 
     WHERE status IN ('revoked', 'expired', 'rotating') 
@@ -2498,7 +2865,7 @@ export function cleanupRevokedTokens(maxAgeMs = 7_776_000_000) {
     return result.changes;
 }
 export function getAuthTokensByClient(clientId) {
-    const database = initDb();
+    const database = getReadDb();
     const rows = database
         .prepare("SELECT * FROM auth_tokens WHERE client_id = ? ORDER BY created_at DESC")
         .all(clientId);
@@ -2506,7 +2873,7 @@ export function getAuthTokensByClient(clientId) {
 }
 export function getTokensNeedingRotation(maxAgeMs) {
     const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    const database = initDb();
+    const database = getReadDb();
     const rows = database
         .prepare(`SELECT * FROM auth_tokens 
        WHERE status = 'active' 
@@ -2536,17 +2903,21 @@ function rowToAuditEntry(row) {
         createdAt: row.created_at ?? null,
     };
 }
-export function recordProofCommitment(commitmentHash, nullifier, daoId, proposalId, timestamp, walletAddress) {
-    const database = initDb();
+export function recordProofCommitment(commitmentHash, nullifier, daoId, proposalId, timestamp, walletAddress, canonicalProofHash) {
+    const database = getWriteDb();
     const createdAt = new Date().toISOString();
     database
-        .prepare(`INSERT INTO proof_commitments (commitment_hash, nullifier, dao_id, proposal_id, wallet_address, timestamp, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?)
-       ON CONFLICT(commitment_hash) DO UPDATE SET timestamp = excluded.timestamp, status = 'COMMITTED'`)
-        .run(commitmentHash, nullifier, daoId, proposalId, walletAddress || null, timestamp, createdAt);
+        .prepare(`INSERT INTO proof_commitments
+         (commitment_hash, nullifier, dao_id, proposal_id, wallet_address, timestamp, status, created_at, canonical_proof_hash)
+       VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
+       ON CONFLICT(commitment_hash) DO UPDATE SET
+         timestamp = excluded.timestamp,
+         status = 'COMMITTED',
+         canonical_proof_hash = COALESCE(excluded.canonical_proof_hash, proof_commitments.canonical_proof_hash)`)
+        .run(commitmentHash, nullifier, daoId, proposalId, walletAddress || null, timestamp, createdAt, canonicalProofHash ?? null);
 }
 export function getProofCommitment(commitmentHash) {
-    const database = initDb();
+    const database = getReadDb();
     const row = database
         .prepare("SELECT * FROM proof_commitments WHERE commitment_hash = ?")
         .get(commitmentHash);
@@ -2561,10 +2932,40 @@ export function getProofCommitment(commitmentHash) {
         timestamp: row.timestamp,
         status: row.status,
         createdAt: row.created_at,
+        canonicalProofHash: row.canonical_proof_hash ?? null,
+    };
+}
+/**
+ * Look up a proof commitment by its canonical proof hash.
+ *
+ * Both malleable forms of a Groth16 proof ((A,B,C) and (-A,-B,C)) produce the
+ * same canonical hash after canonicalizeProof(), so this lookup correctly
+ * deduplicates retries that arrive with the negated proof form.
+ *
+ * Returns null for records written before migration 004 (canonical_proof_hash
+ * is NULL on those rows).
+ */
+export function getProofCommitmentByCanonicalHash(canonicalHash) {
+    const database = initDb();
+    const row = database
+        .prepare("SELECT * FROM proof_commitments WHERE canonical_proof_hash = ? LIMIT 1")
+        .get(canonicalHash);
+    if (!row)
+        return null;
+    return {
+        commitmentHash: row.commitment_hash,
+        nullifier: row.nullifier,
+        daoId: row.dao_id,
+        proposalId: row.proposal_id,
+        walletAddress: row.wallet_address,
+        timestamp: row.timestamp,
+        status: row.status,
+        createdAt: row.created_at,
+        canonicalProofHash: row.canonical_proof_hash ?? null,
     };
 }
 export function recordAuthAudit(entry) {
-    const database = initDb();
+    const database = getWriteDb();
     const query = `
     INSERT INTO auth_token_audit (token_id, client_id, action, path, method, ip_hash, success, error_message)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -2583,7 +2984,7 @@ export function recordAuthAudit(entry) {
 }
 export function getAuditLog(options = {}) {
     const { tokenId, clientId, action, limit = 100, offset = 0 } = options;
-    const database = initDb();
+    const database = getReadDb();
     let query = "SELECT * FROM auth_token_audit WHERE 1=1";
     const params = [];
     if (tokenId) {
@@ -2605,14 +3006,14 @@ export function getAuditLog(options = {}) {
 }
 export function cleanupAuditLog(maxAgeMs = 15_552_000_000) {
     const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    const database = initDb();
+    const database = getWriteDb();
     const result = database
         .prepare("DELETE FROM auth_token_audit WHERE created_at < ?")
         .run(cutoff);
     return result.changes;
 }
 export function updateProofCommitmentStatus(commitmentHash, status) {
-    const database = initDb();
+    const database = getWriteDb();
     database
         .prepare("UPDATE proof_commitments SET status = ? WHERE commitment_hash = ?")
         .run(status, commitmentHash);
@@ -2623,6 +3024,9 @@ export function updateProofCommitmentStatus(commitmentHash, status) {
 export function storeVoteReceipt(nullifier, txHash, proposalId, daoId, status = "confirmed") {
     const database = getWriteDb();
     try {
+        database
+            .prepare("INSERT OR IGNORE INTO daos (id, name, creator) VALUES (?, ?, ?)")
+            .run(daoId, `DAO ${daoId}`, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         database
             .prepare(`INSERT INTO vote_receipts (nullifier, tx_hash, proposal_id, dao_id, status)
          VALUES (?, ?, ?, ?, ?)`)

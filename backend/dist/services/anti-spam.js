@@ -1,9 +1,20 @@
-import { initDb } from "./db.js";
-import { log } from "./logger.js";
+// @ts-nocheck
+import { getReadDb, getWriteDb } from "./db.js";
 import { kysely } from "./kysely.js";
 import { sql } from "kysely";
+let deps = null;
+/** Explicitly wire the anti-spam service's dependencies. */
+export function initAntiSpam(d) {
+    deps = d;
+}
+function getDeps() {
+    if (!deps) {
+        throw new Error("anti-spam: initAntiSpam() must be called before use");
+    }
+    return deps;
+}
 export function checkCommitmentRateLimit(commitment, daoId, proposalId, maxPerWindow, windowMs) {
-    const database = initDb();
+    const database = getReadDb();
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
     const query = kysely
         .selectFrom("comment_submissions")
@@ -15,7 +26,7 @@ export function checkCommitmentRateLimit(commitment, daoId, proposalId, maxPerWi
         .compile();
     const row = database.prepare(query.sql).get(...query.parameters);
     if (row && row.count >= maxPerWindow) {
-        log("warn", "commitment_rate_limit_exceeded", {
+        logger.warn("commitment_rate_limit_exceeded", {
             commitment: commitment.slice(0, 16),
             daoId,
             proposalId,
@@ -27,7 +38,7 @@ export function checkCommitmentRateLimit(commitment, daoId, proposalId, maxPerWi
     return true;
 }
 export function recordCommentSubmission(commitment, daoId, proposalId, windowMs) {
-    const database = initDb();
+    const database = getWriteDb();
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
     const query = kysely
         .insertInto("comment_submissions")
@@ -45,7 +56,7 @@ export function recordCommentSubmission(commitment, daoId, proposalId, windowMs)
     database.prepare(query.sql).run(...query.parameters);
 }
 export function flagComment(commentId, daoId, proposalId, flaggerCommitment, flaggerNullifier, threshold) {
-    const database = initDb();
+    const database = getWriteDb();
     const existingQuery = kysely
         .selectFrom("comment_flags")
         .select("id")
@@ -68,7 +79,7 @@ export function flagComment(commentId, daoId, proposalId, flaggerCommitment, fla
         const countRow = database
             .prepare(countQuery.sql)
             .get(...countQuery.parameters);
-        log("info", "comment_flag_duplicate", { commentId, daoId, proposalId });
+        logger.info("comment_flag_duplicate", { commentId, daoId, proposalId });
         return {
             success: false,
             hidden: countRow.cnt >= threshold,
@@ -116,7 +127,7 @@ export function flagComment(commentId, daoId, proposalId, flaggerCommitment, fla
         database
             .prepare(insertHiddenQuery.sql)
             .run(...insertHiddenQuery.parameters);
-        log("info", "comment_auto_hidden", {
+        logger.info("comment_auto_hidden", {
             commentId,
             daoId,
             proposalId,
@@ -124,7 +135,7 @@ export function flagComment(commentId, daoId, proposalId, flaggerCommitment, fla
             threshold,
         });
     }
-    log("info", "comment_flagged", {
+    logger.info("comment_flagged", {
         commentId,
         daoId,
         proposalId,
@@ -135,7 +146,7 @@ export function flagComment(commentId, daoId, proposalId, flaggerCommitment, fla
     return { success: true, hidden, flagCount: countRow.cnt, threshold };
 }
 export function getFlagStatus(commentId, daoId, proposalId) {
-    const database = initDb();
+    const database = getReadDb();
     const flagCountQuery = kysely
         .selectFrom("comment_flags")
         .select(sql `COUNT(*)`.as("cnt"))
@@ -163,7 +174,7 @@ export function getFlagStatus(commentId, daoId, proposalId) {
     };
 }
 export function getHiddenCommentIds(daoId, proposalId) {
-    const database = initDb();
+    const database = getReadDb();
     const query = kysely
         .selectFrom("hidden_comments")
         .select("comment_id")

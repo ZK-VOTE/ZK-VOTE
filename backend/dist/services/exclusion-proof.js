@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Exclusion Proof Verification Service
  *
@@ -8,13 +9,27 @@
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 /**
- * Verify that a member has been revoked and cannot vote
- * Checks both ZK exclusion proof and contract revocation status
+ * The `member_revocations` table is created lazily so the revocation-tracking
+ * feature works on fresh databases (including test databases) without
+ * requiring a migration to have run first. Idempotent and cheap after the
+ * first call.
  */
-export async function verifyExclusionProof(proof, treeContractId) {
+const REVOCATIONS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS member_revocations (
+  commitment TEXT NOT NULL,
+  dao_id INTEGER NOT NULL,
+  revoked_at INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  reinstated_at INTEGER,
+  PRIMARY KEY (commitment, dao_id)
+)`;
+function ensureRevocationsTable(db) {
+    db.exec(REVOCATIONS_TABLE_SQL);
+}
+export async function verifyExclusionProof(proof, _treeContractId) {
     try {
         const { commitment, daoId, historicalRoot, currentRoot } = proof.publicInputs;
-        log("info", "exclusion_proof_verification_started", {
+        deps().log("info", "exclusion_proof_verification_started", {
             commitment: commitment.slice(0, 10),
             daoId: Number(daoId),
         });
@@ -34,7 +49,7 @@ export async function verifyExclusionProof(proof, treeContractId) {
         }
         // 3. Check that roots are actually different or proof requires historical data
         if (historicalRoot === currentRoot) {
-            log("warn", "exclusion_proof_same_root", {
+            deps().log("warn", "exclusion_proof_same_root", {
                 commitment: commitment.slice(0, 10),
                 root: currentRoot.slice(0, 10),
             });
@@ -55,7 +70,7 @@ export async function verifyExclusionProof(proof, treeContractId) {
                     reason: "Member has not been revoked",
                 };
             }
-            log("info", "exclusion_proof_verified", {
+            deps().log("info", "exclusion_proof_verified", {
                 commitment: commitment.slice(0, 10),
                 daoId: Number(daoId),
                 revokedAt: revocationStatus.revokedAt,
@@ -63,7 +78,7 @@ export async function verifyExclusionProof(proof, treeContractId) {
             return { valid: true };
         }
         catch (err) {
-            log("error", "revocation_status_check_failed", {
+            deps().log("error", "revocation_status_check_failed", {
                 commitment: commitment.slice(0, 10),
                 error: err.message,
             });
@@ -72,15 +87,13 @@ export async function verifyExclusionProof(proof, treeContractId) {
                 reason: "Could not verify revocation status",
             };
         }
+        return { valid: true };
     }
     catch (err) {
-        log("error", "exclusion_proof_verification_error", {
+        deps().log("error", "exclusion_proof_verification_error", {
             error: err.message,
         });
-        return {
-            valid: false,
-            reason: "Proof verification failed",
-        };
+        return { valid: false, reason: "Proof verification failed" };
     }
 }
 /**
@@ -88,13 +101,13 @@ export async function verifyExclusionProof(proof, treeContractId) {
  */
 async function checkRevocationStatus(commitment, daoId, _treeContractId) {
     const db = getDb();
-    const revocationRecord = db
-        .selectFrom("member_revocations")
-        .where("commitment", "==", commitment)
-        .where("dao_id", "==", daoId)
-        .selectAll()
-        .executeTakeFirst();
-    if (!revocationRecord) {
+    ensureRevocationsTable(db);
+    const row = db
+        .prepare(`SELECT revoked_at, reinstated_at
+       FROM member_revocations
+       WHERE commitment = ? AND dao_id = ?`)
+        .get(commitment, daoId);
+    if (!row) {
         return {
             isRevoked: false,
             commitment,
@@ -102,60 +115,49 @@ async function checkRevocationStatus(commitment, daoId, _treeContractId) {
     }
     return {
         isRevoked: true,
-        revokedAt: revocationRecord.revoked_at,
-        reinstatedAt: revocationRecord.reinstated_at || undefined,
+        revokedAt: row.revoked_at,
+        reinstatedAt: row.reinstated_at ?? undefined,
         commitment,
     };
 }
-/**
- * Validate that a value is a valid field element
- * BN254 prime: 21888242871839275222246405745257275088548364400416034343698204186575808495617
- */
 function isValidFieldElement(value) {
     try {
-        const BN254_PRIME = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+        const prime = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
         const num = BigInt(value);
-        return num < BN254_PRIME && num >= 0n;
+        return num >= 0n && num < prime;
     }
     catch {
         return false;
     }
 }
-/**
- * Record a revocation in the database for audit trail
- */
 export async function recordRevocation(commitment, daoId, timestamp) {
     const db = getDb();
-    db.insertInto("member_revocations")
-        .values({
-        commitment,
-        dao_id: daoId,
-        revoked_at: timestamp,
-        created_at: new Date().toISOString(),
-    })
-        .executeTakeFirst()
-        .catch((err) => {
+    ensureRevocationsTable(db);
+    try {
+        db.prepare(`INSERT OR IGNORE INTO member_revocations
+         (commitment, dao_id, revoked_at, created_at)
+       VALUES (?, ?, ?, ?)`).run(commitment, daoId, timestamp, new Date().toISOString());
+    }
+    catch (err) {
         log("error", "revocation_record_failed", {
             commitment: commitment.slice(0, 10),
             error: err.message,
         });
-    });
+    }
 }
-/**
- * Reinstate a revoked member
- */
 export async function recordReinstatement(commitment, daoId, timestamp) {
     const db = getDb();
-    db.updateTable("member_revocations")
-        .set({ reinstated_at: timestamp })
-        .where("commitment", "==", commitment)
-        .where("dao_id", "==", daoId)
-        .executeTakeFirst()
-        .catch((err) => {
+    ensureRevocationsTable(db);
+    try {
+        db.prepare(`UPDATE member_revocations
+       SET reinstated_at = ?
+       WHERE commitment = ? AND dao_id = ?`).run(timestamp, commitment, daoId);
+    }
+    catch (err) {
         log("error", "reinstatement_record_failed", {
             commitment: commitment.slice(0, 10),
             error: err.message,
         });
-    });
+    }
 }
 //# sourceMappingURL=exclusion-proof.js.map

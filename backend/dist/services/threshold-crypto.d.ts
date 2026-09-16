@@ -1,7 +1,7 @@
 export declare const BN254_FR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
-declare const G1: import("@noble/curves/abstract/weierstrass").WeierstrassPointCons<bigint>;
+declare const G1: import("@noble/curves/abstract/weierstrass").ProjConstructor<bigint>;
 type G1Point = typeof G1.prototype;
-export declare const G1_GENERATOR: import("@noble/curves/abstract/weierstrass").WeierstrassPoint<bigint>;
+export declare const G1_GENERATOR: import("@noble/curves/abstract/weierstrass").ProjPointType<bigint>;
 export interface Ciphertext {
     c1: string;
     c2: string;

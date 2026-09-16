@@ -13,7 +13,7 @@
  *   rotate_vk, quarantine_proposal
  */
 import { Router } from "express";
-import { authGuard, queryLimiter } from "../middleware/index.js";
+import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import { appendAudit, isIdempotencyKeyUsed, markIdempotencyKey, deriveActor, redactPii, } from "../middleware/audit.js";
 import { hashIp } from "../services/logger.js";
 import { log } from "../services/logger.js";
@@ -55,16 +55,26 @@ function validateRemediationBody(body) {
         return { valid: false, error: "action is required" };
     if (!VALID_ACTIONS.has(body.action))
         return { valid: false, error: `invalid action: ${body.action}` };
-    if (body.target === undefined || body.target === null || String(body.target).trim() === "") {
+    if (body.target === undefined ||
+        body.target === null ||
+        String(body.target).trim() === "") {
         return { valid: false, error: "target is required" };
     }
-    if (!body.reason || typeof body.reason !== "string" || body.reason.trim().length < 5) {
+    if (!body.reason ||
+        typeof body.reason !== "string" ||
+        body.reason.trim().length < 5) {
         return { valid: false, error: "reason must be at least 5 characters" };
     }
-    if (!body.idempotencyKey || typeof body.idempotencyKey !== "string" || body.idempotencyKey.length < 8) {
-        return { valid: false, error: "idempotencyKey must be at least 8 characters" };
+    if (!body.idempotencyKey ||
+        typeof body.idempotencyKey !== "string" ||
+        body.idempotencyKey.length < 8) {
+        return {
+            valid: false,
+            error: "idempotencyKey must be at least 8 characters",
+        };
     }
-    if (body.metadata !== undefined && (typeof body.metadata !== "object" || Array.isArray(body.metadata))) {
+    if (body.metadata !== undefined &&
+        (typeof body.metadata !== "object" || Array.isArray(body.metadata))) {
         return { valid: false, error: "metadata must be an object" };
     }
     return { valid: true };
@@ -76,7 +86,7 @@ function validateRemediationBody(body) {
  * POST /remediation/action - Submit structured remediation action
  * Requires auth (authz), append-only, replay-safe
  */
-router.post("/remediation/action", authGuard, (async (req, res) => {
+router.post("/remediation/action", bodyLimit("100kb"), authGuard, (async (req, res) => {
     const validation = validateRemediationBody(req.body);
     if (!validation.valid) {
         return res.status(400).json({ error: validation.error });
@@ -84,7 +94,11 @@ router.post("/remediation/action", authGuard, (async (req, res) => {
     const { action, target, reason, idempotencyKey, metadata } = req.body;
     // Replay-safe: check idempotencyKey
     if (isIdempotencyKeyUsed(idempotencyKey)) {
-        log("warn", "remediation_replay_blocked", { action, target, idempotencyKey: idempotencyKey.slice(0, 8) + "..." });
+        log("warn", "remediation_replay_blocked", {
+            action,
+            target,
+            idempotencyKey: idempotencyKey.slice(0, 8) + "...",
+        });
         // Audit the blocked replay attempt as well (append-only)
         appendAudit({
             requestId: req.ctx || "unknown",
@@ -93,10 +107,18 @@ router.post("/remediation/action", authGuard, (async (req, res) => {
             action: "remediation_replay_blocked",
             actor: deriveActor(req),
             actorIpHash: hashIp(req.ip),
-            requestBody: redactPii({ action, target, reason: reason.slice(0, 50), idempotencyKey: "[REDACTED]" }),
+            requestBody: redactPii({
+                action,
+                target,
+                reason: reason.slice(0, 50),
+                idempotencyKey: "[REDACTED]",
+            }),
             statusCode: 409,
         });
-        return res.status(409).json({ error: "Duplicate idempotencyKey - action already processed", remediationId: null });
+        return res.status(409).json({
+            error: "Duplicate idempotencyKey - action already processed",
+            remediationId: null,
+        });
     }
     // Mark key as used BEFORE processing to prevent race conditions
     markIdempotencyKey(idempotencyKey);
@@ -113,7 +135,9 @@ router.post("/remediation/action", authGuard, (async (req, res) => {
         actor,
         actorIpHash: ipHash,
         idempotencyKey,
-        metadata: metadata ? redactPii(metadata) : undefined,
+        metadata: metadata
+            ? redactPii(metadata)
+            : undefined,
         txHash: null,
         immutable: true,
     };
@@ -127,10 +151,21 @@ router.post("/remediation/action", authGuard, (async (req, res) => {
         action: `remediation:${action}`,
         actor,
         actorIpHash: ipHash,
-        requestBody: redactPii({ action, target, reason, idempotencyKey: "[REDACTED]", metadata }),
+        requestBody: redactPii({
+            action,
+            target,
+            reason,
+            idempotencyKey: "[REDACTED]",
+            metadata,
+        }),
         statusCode: 201,
     });
-    log("info", "remediation_action_recorded", { id, action, target, actor: actor.slice(0, 12) + "..." });
+    log("info", "remediation_action_recorded", {
+        id,
+        action,
+        target,
+        actor: actor.slice(0, 12) + "...",
+    });
     // In production this would interact with contracts (e.g., pause, freeze). Here we simulate success.
     res.status(201).json({
         success: true,
@@ -215,17 +250,28 @@ router.get("/remediation/:id", authGuard, queryLimiter, (req, res) => {
  * POST /remediation/verify - Verify remediation log integrity (immutable check)
  * Returns hash chain to prove append-only
  */
-router.post("/remediation/verify", authGuard, (req, res) => {
+router.post("/remediation/verify", bodyLimit("100kb"), authGuard, (req, res) => {
     // Compute simple hash chain of remediation log to prove no tampering
     let prevHash = "0".repeat(64);
     const chain = [];
     for (const rec of remediationLog) {
-        const payload = JSON.stringify({ id: rec.id, timestamp: rec.timestamp, action: rec.action, target: rec.target, prevHash });
+        const payload = JSON.stringify({
+            id: rec.id,
+            timestamp: rec.timestamp,
+            action: rec.action,
+            target: rec.target,
+            prevHash,
+        });
         const hash = crypto.createHash("sha256").update(payload).digest("hex");
         chain.push({ id: rec.id, hash, prevHash });
         prevHash = hash;
     }
-    res.json({ valid: true, length: remediationLog.length, chain, latestHash: prevHash });
+    res.json({
+        valid: true,
+        length: remediationLog.length,
+        chain,
+        latestHash: prevHash,
+    });
 });
 export default router;
 //# sourceMappingURL=remediation.js.map

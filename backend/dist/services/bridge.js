@@ -5,9 +5,17 @@
  * relays votes to the Soroban bridge contract.
  */
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config } from "../config.js";
-import { log } from "./logger.js";
-import { server, relayerKeypair, callWithTimeout, simulateWithBackoff, waitForTransaction, withSequenceLock, u256ToScVal, } from "./stellar.js";
+let bridgeDeps = null;
+/** Explicitly wire the bridge relay service (composition root only). */
+export function initBridgeRelay(d) {
+    bridgeDeps = d;
+}
+function deps() {
+    if (!bridgeDeps) {
+        throw new Error("bridge: initBridgeRelay() must be called before use");
+    }
+    return bridgeDeps;
+}
 // ============================================
 // RELAY STATE
 // ============================================
@@ -29,7 +37,7 @@ export async function pollEVMEvents() {
     // 3. Parse VoteForwarded events
     //
     // For now, return empty array (placeholder)
-    log("info", "evm_poll", { lastBlock: lastProcessedBlock });
+    deps().log("info", "evm_poll", { lastBlock: lastProcessedBlock });
     return [];
 }
 /**
@@ -37,19 +45,19 @@ export async function pollEVMEvents() {
  */
 export async function relayVote(event) {
     try {
-        log("info", "relay_vote_start", {
+        deps().log("info", "relay_vote_start", {
             daoId: event.daoId,
             proposalId: event.proposalId,
             nullifier: event.nullifier,
         });
         // Convert inputs to Soroban types
-        const scNullifier = u256ToScVal(event.nullifier);
-        const scVoteRoot = u256ToScVal(event.voteRoot);
-        if (config.testMode) {
+        const scNullifier = deps().u256ToScVal(event.nullifier);
+        const scVoteRoot = deps().u256ToScVal(event.voteRoot);
+        if (deps().testMode) {
             return { success: false, error: "Simulation failed (test mode)" };
         }
         // Build contract call to Soroban bridge
-        const contract = new StellarSdk.Contract(config.bridgeContractId);
+        const contract = new StellarSdk.Contract(deps().bridgeContractId);
         const args = [
             StellarSdk.nativeToScVal(event.daoId, { type: "u64" }),
             StellarSdk.nativeToScVal(event.proposalId, { type: "u64" }),
@@ -59,17 +67,17 @@ export async function relayVote(event) {
         ];
         const operation = contract.call("relay_vote", ...args);
         // Submit under sequence lock
-        const { sendResult } = await withSequenceLock(async () => {
-            const account = await server.getAccount(relayerKeypair.publicKey());
+        const { sendResult } = await deps().withSequenceLock(async () => {
+            const account = await deps().server.getAccount(deps().relayerKeypair.publicKey());
             const tx = new StellarSdk.TransactionBuilder(account, {
                 fee: "100000",
-                networkPassphrase: config.networkPassphrase,
+                networkPassphrase: deps().networkPassphrase,
             })
                 .addOperation(operation)
                 .setTimeout(30)
                 .build();
             // Simulate
-            const simResult = await callWithTimeout(() => simulateWithBackoff(() => server.simulateTransaction(tx)), "simulate_relay");
+            const simResult = await deps().callWithTimeout(() => deps().simulateWithBackoff(() => deps().server.simulateTransaction(tx)), "simulate_relay");
             if (!StellarSdk.rpc.Api.isSimulationSuccess(simResult)) {
                 throw new Error(`SIMULATION_FAILED:${simResult.error}`);
             }
@@ -77,17 +85,17 @@ export async function relayVote(event) {
             const preparedTx = StellarSdk.rpc
                 .assembleTransaction(tx, simResult)
                 .build();
-            preparedTx.sign(relayerKeypair);
+            preparedTx.sign(deps().relayerKeypair);
             // Submit
-            const sr = await callWithTimeout(() => server.sendTransaction(preparedTx), "send_relay");
+            const sr = await deps().callWithTimeout(() => deps().server.sendTransaction(preparedTx), "send_relay");
             if (sr.status === "ERROR") {
                 throw new Error("SUBMIT_FAILED");
             }
             // Wait for confirmation
-            const r = await callWithTimeout(() => waitForTransaction(sr.hash), "wait_relay");
+            const r = await deps().callWithTimeout(() => deps().waitForTransaction(sr.hash), "wait_relay");
             return { sendResult: sr, result: r };
         });
-        log("info", "relay_vote_success", {
+        deps().log("info", "relay_vote_success", {
             stellarTxHash: sendResult.hash,
             daoId: event.daoId,
             proposalId: event.proposalId,
@@ -96,7 +104,7 @@ export async function relayVote(event) {
     }
     catch (err) {
         const errMsg = err.message || "";
-        log("error", "relay_vote_failed", {
+        deps().log("error", "relay_vote_failed", {
             daoId: event.daoId,
             proposalId: event.proposalId,
             error: errMsg,
@@ -126,7 +134,7 @@ async function processEvents() {
         for (const event of events) {
             const result = await relayVote(event);
             if (!result.success) {
-                log("warn", "relay_event_failed", {
+                deps().log("warn", "relay_event_failed", {
                     txHash: event.txHash,
                     error: result.error,
                 });
@@ -135,7 +143,7 @@ async function processEvents() {
         }
     }
     catch (err) {
-        log("error", "relay_loop_error", { error: err.message });
+        deps().log("error", "relay_loop_error", { error: err.message });
     }
     finally {
         relayRunning = false;
@@ -147,7 +155,7 @@ async function processEvents() {
 export function startRelay(intervalMs = 10000) {
     if (relayInterval)
         return;
-    log("info", "relay_started", { intervalMs });
+    deps().log("info", "relay_started", { intervalMs });
     relayInterval = setInterval(processEvents, intervalMs);
     // Process immediately
     processEvents();
@@ -159,7 +167,7 @@ export function stopRelay() {
     if (relayInterval) {
         clearInterval(relayInterval);
         relayInterval = null;
-        log("info", "relay_stopped");
+        deps().log("info", "relay_stopped");
     }
 }
 //# sourceMappingURL=bridge.js.map

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Membership SBT transfer-attempt detection + alerts (#357)
  *
@@ -15,11 +16,19 @@
  * detect every attempt, without needing a dedicated on-chain event.
  */
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { config, isValidContractId } from "../config.js";
-import { server } from "./stellar.js";
-import { log } from "./logger.js";
-import * as dbService from "./db.js";
-import { markDegraded, markHealthy } from "./service-health.js";
+import { isValidContractId } from "../config.js";
+let sbtDeps = null;
+/** Explicitly wire the SBT guard's dependencies (composition root only). */
+export function initSbtGuard(d) {
+    sbtDeps = d;
+}
+/** Internal accessor — throws if the composition root has not wired deps. */
+function deps() {
+    if (!sbtDeps) {
+        throw new Error("sbt-guard: initSbtGuard() must be called before use");
+    }
+    return sbtDeps;
+}
 /** The three SEP-41-shaped entrypoints the contract stubs out and always rejects. */
 export const SBT_GUARDED_FUNCTIONS = new Set([
     "transfer",
@@ -57,7 +66,7 @@ export function extractInvokedFunctionNames(envelope, contractId) {
         }
     }
     catch (err) {
-        log("debug", "sbt_guard_envelope_parse_failed", {
+        deps().log("debug", "sbt_guard_envelope_parse_failed", {
             error: err.message,
         });
         return [];
@@ -106,7 +115,7 @@ export function extractDaoId(envelope, contractId) {
         }
     }
     catch (err) {
-        log("debug", "sbt_guard_dao_id_decode_failed", {
+        deps().log("debug", "sbt_guard_dao_id_decode_failed", {
             error: err.message,
         });
     }
@@ -124,11 +133,12 @@ export function isTransferAttempt(functionNames) {
  * than surfacing to the poll loop.
  */
 export async function alertAdmin(payload) {
-    log("error", "sbt_transfer_attempt_detected", payload);
-    if (!config.adminAlertWebhookUrl)
+    deps().log("error", "sbt_transfer_attempt_detected", payload);
+    const webhookUrl = deps().adminAlertWebhookUrl;
+    if (!webhookUrl)
         return;
     try {
-        const res = await fetch(config.adminAlertWebhookUrl, {
+        const res = await fetch(webhookUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ event: "sbt_transfer_attempt", ...payload }),
@@ -136,11 +146,11 @@ export async function alertAdmin(payload) {
         if (!res.ok) {
             throw new Error(`webhook responded ${res.status}`);
         }
-        markHealthy("sbt_transfer_watch");
+        deps().health.markHealthy("sbt_transfer_watch");
     }
     catch (err) {
-        markDegraded("sbt_transfer_watch", err.message);
-        log("warn", "sbt_alert_webhook_failed", {
+        deps().health.markDegraded("sbt_transfer_watch", err.message);
+        deps().log("warn", "sbt_alert_webhook_failed", {
             error: err.message,
         });
     }
@@ -159,7 +169,7 @@ export function recordTransferAttempt(attempt, txHash, ledger, successful) {
     // never executes far enough to validate it), so an out-of-range value must
     // not be allowed to throw out of the poll loop.
     try {
-        return dbService.addEvent({
+        return deps().addEvent({
             daoId: attempt.daoId,
             type: "sbt_transfer_attempt",
             data: {
@@ -172,7 +182,7 @@ export function recordTransferAttempt(attempt, txHash, ledger, successful) {
         });
     }
     catch (err) {
-        log("debug", "sbt_guard_record_failed", {
+        deps().log("debug", "sbt_guard_record_failed", {
             daoId: attempt.daoId,
             error: err.message,
         });
@@ -209,14 +219,14 @@ export function resetSbtWatchCursor() {
     cursor = null;
 }
 export async function checkForTransferAttempts() {
-    if (config.testMode)
+    if (deps().testMode)
         return { checked: 0, flagged: 0 };
-    const contractId = config.membershipSbtContractId;
+    const contractId = deps().membershipSbtContractId;
     if (!contractId || !isValidContractId(contractId)) {
         return { checked: 0, flagged: 0 };
     }
     try {
-        const rpcServer = server;
+        const rpcServer = deps().server;
         const request = cursor
             ? { pagination: { cursor, limit: 50 } }
             : { startLedger: 0, pagination: { limit: 50 } };
@@ -235,32 +245,32 @@ export async function checkForTransferAttempts() {
                 flagged++;
         }
         cursor = response.cursor;
-        markHealthy("sbt_transfer_watch");
+        deps().health.markHealthy("sbt_transfer_watch");
         return { checked: response.transactions.length, flagged };
     }
     catch (err) {
-        markDegraded("sbt_transfer_watch", err.message);
-        log("error", "sbt_transfer_watch_check_failed", {
+        deps().health.markDegraded("sbt_transfer_watch", err.message);
+        deps().log("error", "sbt_transfer_watch_check_failed", {
             error: err.message,
         });
         return { checked: 0, flagged: 0 };
     }
 }
 export function startSbtTransferWatch(intervalMs) {
-    if (config.testMode)
+    if (deps().testMode)
         return;
-    const interval = intervalMs ?? config.sbtTransferWatchIntervalMs;
+    const interval = intervalMs ?? deps().sbtTransferWatchIntervalMs;
     void checkForTransferAttempts();
     watchTimerId = setInterval(() => {
         void checkForTransferAttempts();
     }, interval);
-    log("info", "sbt_transfer_watch_started", { intervalMs: interval });
+    deps().log("info", "sbt_transfer_watch_started", { intervalMs: interval });
 }
 export function stopSbtTransferWatch() {
     if (watchTimerId) {
         clearInterval(watchTimerId);
         watchTimerId = null;
-        log("info", "sbt_transfer_watch_stopped");
+        deps().log("info", "sbt_transfer_watch_stopped");
     }
 }
 //# sourceMappingURL=sbt-guard.js.map

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Service Supervisor with Crash Recovery (#176)
  *

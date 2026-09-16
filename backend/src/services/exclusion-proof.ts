@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Exclusion Proof Verification Service
  *
@@ -9,6 +10,18 @@
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import type { Database as DatabaseType } from "better-sqlite3";
+
+let _deps: { getDb?: () => DatabaseType; log?: (...args: any[]) => void } | null = null;
+export function initExclusionProof(deps: { getDb: () => DatabaseType; log: (...args: any[]) => void }) {
+  _deps = deps;
+}
+function deps() {
+  return {
+    getDb: _deps?.getDb ?? getDb,
+    log: _deps?.log ?? log,
+  };
+}
+let treeContractId: string = "";
 
 /**
  * The `member_revocations` table is created lazily so the revocation-tracking

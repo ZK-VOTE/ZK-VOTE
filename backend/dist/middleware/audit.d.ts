@@ -10,6 +10,18 @@
  * Used for both general audit (Task 2) and remediation accountability (Task 3)
  */
 import type { Request, Response, NextFunction } from "express";
+export declare const CORS_ALLOWED_METHODS: string[];
+export declare const CORS_ALLOWED_HEADERS: string[];
+export declare const CORS_MAX_AGE = 3600;
+export declare function parseCorsOrigins(raw: string | undefined): string[];
+export declare function isCorsOriginAllowed(origin: string | undefined, allowedOrigins: string[]): boolean;
+export declare function createCorsOptions(rawOrigins: string | undefined): {
+    origin: (origin: string | undefined, callback: (error: Error | null, allow?: boolean) => void) => void;
+    methods: string[];
+    allowedHeaders: string[];
+    credentials: boolean;
+    maxAge: number;
+};
 export declare const REDACTED = "[REDACTED]";
 /**
  * Fields that contain PII or sensitive cryptographic material.
@@ -86,6 +98,14 @@ export declare function clearAuditLog(): void;
 export declare function isIdempotencyKeyUsed(key: string): boolean;
 export declare function markIdempotencyKey(key: string): void;
 export declare function clearIdempotencyKeys(): void;
+/**
+ * Build audit-logging middleware for a named action.
+ *
+ * Compatibility layer for the pre-rewrite `auditLog(action)` API used by
+ * route handlers that want a per-action audit entry on a specific route
+ * (e.g. `/daos/sync`) in addition to the global mutating-route audit.
+ */
+export declare function auditLog(action: string): (req: Request, res: Response, next: NextFunction) => void;
 /**
  * Audit middleware - should be mounted early but after body parsing.
  * Audits every mutating request (POST/PUT/PATCH/DELETE).

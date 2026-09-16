@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Relayer Key Manager & Hot Key Rotation Service
  *

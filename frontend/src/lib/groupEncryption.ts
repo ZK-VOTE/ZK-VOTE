@@ -133,7 +133,7 @@ export function generateGroupKey(): Uint8Array {
 export async function keyCommitment(groupKey: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    concat(textEncoder.encode("zkvote/e2e/v1/key-commitment"), groupKey),
+    concat(textEncoder.encode("zkvote/e2e/v1/key-commitment"), groupKey) as BufferSource,
   );
   return toHex(new Uint8Array(digest));
 }

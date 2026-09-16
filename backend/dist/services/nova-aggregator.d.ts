@@ -28,13 +28,20 @@ export interface RecursiveProofPayload {
     proof_bytes: string;
     timestamp: number;
 }
+export interface TallyProofPayload {
+    nullifier_root: string;
+    yes_votes: number;
+    no_votes: number;
+    proof_a: string;
+    proof_b: string;
+    proof_c: string;
+}
 export declare class NovaAggregatorService {
     private tempDir;
+    private _exec;
     constructor(tempDir?: string);
-    /**
-     * Aggregates a batch of vote witnesses off-chain into a single Nova recursive proof payload
-     */
     aggregateVotes(daoId: number, proposalId: number, root: string, witnesses: VoteWitnessPayload[]): Promise<RecursiveProofPayload>;
+    generateTallyProof(doId: number, proposalId: number, root: string, witnesses: VoteWitnessPayload[]): Promise<TallyProofPayload>;
 }
 export declare const novaAggregatorService: NovaAggregatorService;
 //# sourceMappingURL=nova-aggregator.d.ts.map

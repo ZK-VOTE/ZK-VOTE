@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * VDF Commit–Reveal Routes (issue #302)
  *

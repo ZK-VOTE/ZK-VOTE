@@ -18,9 +18,9 @@
  * These endpoints are pure computation (no chain writes) so they can be unit
  * tested and reused by the tally service and the frontend.
  */
+import { QV_MAX_BUDGET, QV_MAX_CREDITS } from "../validation/schemas.js";
+export { QV_MAX_BUDGET, QV_MAX_CREDITS };
 declare const router: import("express-serve-static-core").Router;
-export declare const QV_MAX_BUDGET = 100;
-export declare const QV_MAX_CREDITS = 10;
 export interface QvAllocation {
     proposalId: number;
     voiceCredits: number;
