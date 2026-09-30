@@ -120,6 +120,7 @@ const envSchema = z.object({
   ANCHOR_USDC_URL: z.string().url().optional(),
   ANCHOR_EURC_URL: z.string().url().optional(),
   SOROSWAP_API: z.string().url().optional(),
+  SOROSWAP_CONTRACT_ID: z.string().regex(/^C[A-Z2-7]{55}$/).optional(),
   VOTING_VK_VERSION: z.coerce.number().int().optional(),
 
   CORS_ORIGIN: z.string().optional(),
@@ -589,6 +590,7 @@ export const config = {
   anchorUsdcUrl: validatedEnv.ANCHOR_USDC_URL || "https://anchor.circle.com",
   anchorEurcUrl: validatedEnv.ANCHOR_EURC_URL || "https://anchor.eurc.circle.com",
   soroswapApi: validatedEnv.SOROSWAP_API || "https://api.soroswap.finance/quote",
+  soroswapContractId: validatedEnv.SOROSWAP_CONTRACT_ID,
 
   // VK Version
   staticVkVersion: validatedEnv.VOTING_VK_VERSION,

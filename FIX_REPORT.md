@@ -178,6 +178,16 @@ The blast radius of this vulnerability spanned across five operational surfaces:
 - **`circuits/ceremony/test-ceremony.js`**: Automated test suite asserting honest 3-party ceremony passes and single-party retained-tau / tampered zkey is detected and rejected.
 
 ### 3. Backend Hardening
+
+### Payment, Asset Precision, Swap, and Pairing Security Follow-up
+
+- Horizon payment amounts are canonicalized to seven decimals. Soroban atomic amounts are converted from twelve decimals before entering Horizon operations.
+- Payments preflight destination trustlines and return `TRUSTLINE_REQUIRED`; the destination must sign the generated `changeTrust` transaction.
+- Soroswap fallback quotes require an explicitly configured contract ID and reject mismatched quote responses.
+- Groth16 pairing vectors are bounded before Soroban host calls; the verifier rejects oversized or mismatched vectors without invoking cryptography.
+- Prometheus counters and alerts cover missing trustlines, precision conversion rejects, and Soroswap contract mismatches.
+
+The remaining operational limitation is intentional: a relayer cannot create a trustline for another account because Stellar requires the destination account's signature.
 - **Migrations**: `006_add_blind_credential_schemas` and `007_tenant_isolation_and_audit` with full SQLite ↔ Postgres parity.
 - **Scheduler**: `backend/src/services/job-scheduler.ts` running scheduled tasks (`cleanup_stale_sessions`, `token:maintenance`, `reconciliation:check`, metrics gauge updates).
 - **Metrics**: Added Prometheus counters and gauges for security rejections, tenant denials, reconciliation mismatches, and store sizes.

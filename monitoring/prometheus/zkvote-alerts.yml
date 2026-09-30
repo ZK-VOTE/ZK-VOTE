@@ -109,4 +109,31 @@ groups:
         annotations:
           summary: Metric label cardinality elevated
           description: More than 500 distinct http_requests_total metric series detected, indicating potential route label cardinality leak.
+      - alert: ZKVoteRelayerTrustlineFailures
+        expr: sum(rate(zkvote_payment_trustline_required_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: Payments are being rejected for missing trustlines
+          description: One or more destinations lack the issuer trustline required to receive USDC or EURC.
+      - alert: ZKVoteRelayerAssetPrecisionRejects
+        expr: sum(rate(zkvote_asset_decimal_conversion_rejection_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: Asset decimal conversion rejected
+          description: A Soroban or Horizon amount could not be represented exactly at the target precision.
+      - alert: ZKVoteRelayerSoroswapContractRejects
+        expr: sum(rate(zkvote_soroswap_phishing_rejection_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: Soroswap quote contract mismatch detected
+          description: A quote was rejected because its returned contract ID did not match the pinned configuration.
 

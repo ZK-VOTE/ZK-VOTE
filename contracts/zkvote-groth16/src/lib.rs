@@ -14,6 +14,15 @@ pub mod proof_canonicalization;
 // Audit-friendly, versioned proof serialization format (ZKV1)
 pub mod serialization;
 
+/// Maximum number of pairings that this crate can submit to a Soroban host
+/// call. Batch verification submits at most `MAX_BATCH_SIZE + 3` pairings.
+pub const MAX_PAIRING_INPUTS: u32 = batch::MAX_BATCH_SIZE + 3;
+
+#[inline]
+pub fn pairing_inputs_are_bounded(g1_len: u32, g2_len: u32) -> bool {
+    g1_len > 0 && g1_len == g2_len && g1_len <= MAX_PAIRING_INPUTS
+}
+
 pub const BN254_FR_MODULUS: [u8; 32] = [
     0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
     0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
@@ -149,6 +158,9 @@ impl Groth16Curve for Bn254Curve {
         -point.clone()
     }
     fn pairing_check(env: &Env, g1: Vec<Self::G1>, g2: Vec<Self::G2>) -> bool {
+        if !pairing_inputs_are_bounded(g1.len(), g2.len()) {
+            return false;
+        }
         env.crypto().bn254().pairing_check(g1, g2)
     }
 }
@@ -220,6 +232,9 @@ impl Groth16Curve for Bls12381Curve {
         -point.clone()
     }
     fn pairing_check(env: &Env, g1: Vec<Self::G1>, g2: Vec<Self::G2>) -> bool {
+        if !pairing_inputs_are_bounded(g1.len(), g2.len()) {
+            return false;
+        }
         env.crypto().bls12_381().pairing_check(g1, g2)
     }
 }
@@ -467,6 +482,15 @@ mod tests {
         let env = Env::default();
         let value = U256::from_u32(&env, 12345);
         assert!(is_in_field(&env, &value));
+    }
+
+    #[test]
+    fn pairing_inputs_are_bounded_before_host_call() {
+        assert!(pairing_inputs_are_bounded(4, 4));
+        assert!(pairing_inputs_are_bounded(MAX_PAIRING_INPUTS, MAX_PAIRING_INPUTS));
+        assert!(!pairing_inputs_are_bounded(0, 0));
+        assert!(!pairing_inputs_are_bounded(4, 3));
+        assert!(!pairing_inputs_are_bounded(100, 100));
     }
 
     #[test]
