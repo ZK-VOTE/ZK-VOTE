@@ -42,9 +42,9 @@ use soroban_sdk::{contractimpl, panic_with_error, Address, Env, U256};
 
 use crate::PathContext;
 use crate::{
-    DataKey, ElectionConfig, Proof, ProposalInfo, ProposalState, SybilWeightCapSetEvent,
-    VerificationKey, Voting, VotingArgs, VotingClient, VotingError, WeightedTally,
-    WeightedVoteEvent, MAX_IC_LENGTH,
+    candidate_signal, DataKey, ElectionConfig, Proof, ProposalInfo, ProposalState,
+    SybilWeightCapSetEvent, VerificationKey, Voting, VotingArgs, VotingClient, VotingError,
+    WeightedTally, WeightedVoteEvent, MAX_IC_LENGTH,
 };
 
 /// Hard ceiling on any per-election cap, mirroring `MAX_SYBIL_WEIGHT` in
@@ -189,6 +189,14 @@ impl Voting {
     ///
     /// The nullifier is the same one `vote` consumes, so a member cannot cast
     /// both a weighted and an unweighted ballot in the same election.
+    ///
+    /// SECURITY (#audit-H2): that claim was false. `vote` marked nullifiers in
+    /// Temporary storage while this path marked them in Persistent, and this
+    /// path only ever looked in Persistent — so a member could spend one
+    /// nullifier through `vote` and the same nullifier here, getting two
+    /// head-count votes *and* two weighted tallies from one identity. Both
+    /// sides now go through the same single check/spend pair, which is what
+    /// makes the claim in this comment true.
     pub fn vote_sybil_weighted(
         env: Env,
         dao_id: u64,
@@ -226,9 +234,9 @@ impl Voting {
         }
 
         // Shared nullifier namespace with `vote` — one ballot per member per
-        // election, whichever circuit produced it.
-        let null_key = crate::storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().persistent().has(&null_key) {
+        // election, whichever circuit produced it. Both paths now resolve the
+        // namespace through the same helper and the same storage class.
+        if Self::nullifier_is_used(&env, dao_id, proposal_id, nullifier.clone()) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
 
@@ -246,13 +254,24 @@ impl Voting {
         if proposal.end_time != 0 && now > proposal.end_time {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
-        if root != proposal.eligible_root {
-            panic_with_error!(&env, VotingError::RootMismatch);
-        }
+        // Weighted ballots are a Fixed-snapshot mechanism: the attestation root
+        // the proof commits to is captured alongside `eligible_root`, so there is
+        // no trailing-root equivalent to validate against. Even so the root goes
+        // through the shared eligibility helper rather than a bare equality
+        // check, which is what makes two things hold that did not before
+        // (#audit-H2, #audit-H3):
+        //
+        //   * this path performed no `vote_mode` check at all, so a Quadratic
+        //     proposal — which `vote`, `vote_bls381`, `cast_votes` and
+        //     `vote_with_circuit` all hard-refuse, and which ballots in its own
+        //     disjoint `QvBallot` namespace — was reachable here, letting one
+        //     member take both a QV ballot and a weighted tally in one round;
+        //   * a bare `root != eligible_root` skips `min_root`, so a member
+        //     removed after the snapshot could still land a *weighted* ballot.
+        Self::assert_root_eligible(&env, PathContext::Anonymous, dao_id, &proposal, &root);
 
         // Checks-effects-interactions: burn the nullifier before verifying.
-        env.storage().persistent().set(&null_key, &true);
-        Self::bump_persistent(&env, &null_key);
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
 
         let vk: VerificationKey = env
             .storage()
@@ -296,7 +315,11 @@ impl Voting {
             U256::from_u128(&env, dao_id as u128),
             U256::from_u128(&env, proposal_id as u128),
             U256::from_u32(&env, vote_choice_index),
-            U256::from_u32(&env, election_config.num_candidates),
+            // Same sentinel mapping as `vote`: the weighted circuit enforces
+            // `LessThan(32)(voteChoice, numCandidates) === 1` too, so a literal
+            // 0 would make the witness unsatisfiable and no weighted ballot
+            // generatable (#audit-C1).
+            U256::from_u32(&env, candidate_signal(election_config.num_candidates)),
             U256::from_u128(&env, snapshot_time as u128),
             attestation_commitment,
             U256::from_u32(&env, vote_weight),

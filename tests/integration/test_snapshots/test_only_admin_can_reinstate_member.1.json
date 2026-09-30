@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 8,
+    "address": 9,
     "nonce": 0,
     "mux_id": 0
   },
@@ -9,9 +9,12 @@
     [],
     [],
     [],
+    [],
+    [],
+    [],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
         {
           "function": {
             "contract_fn": {
@@ -22,7 +25,7 @@
                   "string": "Test DAO"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                 },
                 {
                   "bool": false
@@ -40,7 +43,7 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
         {
           "function": {
             "contract_fn": {
@@ -57,7 +60,7 @@
                   "symbol": "BN254"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                 }
               ]
             }
@@ -68,7 +71,7 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
         {
           "function": {
             "contract_fn": {
@@ -79,10 +82,10 @@
                   "u64": "1"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                 },
                 "void"
               ]
@@ -94,7 +97,7 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON",
         {
           "function": {
             "contract_fn": {
@@ -108,7 +111,7 @@
                   "u256": "12345"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                 }
               ]
             }
@@ -119,7 +122,7 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
         {
           "function": {
             "contract_fn": {
@@ -130,10 +133,10 @@
                   "u64": "1"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                 }
               ]
             }
@@ -149,10 +152,10 @@
                       "u64": "1"
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                     }
                   ]
                 }
@@ -200,7 +203,7 @@
                       "symbol": "admin"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
                     }
                   },
                   {
@@ -255,7 +258,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -295,7 +298,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -313,7 +316,7 @@
                     "u64": "1"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                   }
                 ]
               },
@@ -325,7 +328,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -349,13 +352,13 @@
               },
               "durability": "persistent",
               "val": {
-                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
               }
             }
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -382,7 +385,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -400,7 +403,7 @@
                     "u64": "1"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                   }
                 ]
               },
@@ -412,7 +415,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -430,7 +433,7 @@
                     "u64": "1"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                   }
                 ]
               },
@@ -442,7 +445,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -482,7 +485,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -542,7 +545,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1408,7 +1411,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1438,7 +1441,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1520,7 +1523,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1538,7 +1541,7 @@
                     "u64": "1"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                   }
                 ]
               },
@@ -1550,7 +1553,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1580,7 +1583,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1610,7 +1613,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1628,7 +1631,7 @@
                     "u64": "1"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
                   }
                 ]
               },
@@ -1640,7 +1643,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1667,7 +1670,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1694,7 +1697,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1721,7 +1724,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1754,7 +1757,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1787,7 +1790,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1820,7 +1823,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1853,7 +1856,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1886,7 +1889,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1919,7 +1922,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1952,7 +1955,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -1985,7 +1988,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2018,7 +2021,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2051,7 +2054,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2084,7 +2087,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2117,7 +2120,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2150,7 +2153,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2183,7 +2186,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2216,7 +2219,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2249,7 +2252,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2282,7 +2285,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2315,7 +2318,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2342,7 +2345,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2372,7 +2375,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2402,7 +2405,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2439,7 +2442,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2466,7 +2469,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2580,7 +2583,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -2611,6 +2614,14 @@
                       },
                       "val": {
                         "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "tr_reg"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                       }
                     },
                     {
@@ -2658,6 +2669,56 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
               "key": {
+                "vec": [
+                  {
+                    "symbol": "AttestAll"
+                  },
+                  {
+                    "bool": true
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bool": true
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": "ledger_key_contract_instance",
+              "durability": "persistent",
+              "val": {
+                "contract_instance": {
+                  "executable": {
+                    "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  },
+                  "storage": null
+                }
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+              "key": {
                 "ledger_key_nonce": {
                   "nonce": "801925984706572462"
                 }
@@ -2676,7 +2737,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "1033654523790656264"
@@ -2696,7 +2757,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "2032731177588607455"
@@ -2716,7 +2777,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "5541220902715666415"
@@ -2736,7 +2797,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "4837995959683129791"
@@ -2762,7 +2823,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 535680
+        "live_until": 6311999
       }
     ]
   },

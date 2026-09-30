@@ -84,6 +84,8 @@ fn setup_dao_with_options(
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(env, &voting_id);
 
     // Attestation source for `set_vk` (see test_support module docs).
     attach_transcript_registry(env.clone(), &voting_id);
@@ -180,6 +182,8 @@ fn stress_many_daos() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(&env, &voting_id);
 
     let registry = DaoRegistryClient::new(&env, &registry_id);
     let sbt = MembershipSbtClient::new(&env, &sbt_id);
@@ -342,6 +346,8 @@ fn stress_mixed_operations() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(&env, &voting_id);
 
     let registry = DaoRegistryClient::new(&env, &registry_id);
     let sbt = MembershipSbtClient::new(&env, &sbt_id);

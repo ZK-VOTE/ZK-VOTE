@@ -63,6 +63,23 @@ mod mock_tree {
                 .get(&DataKey::MinRoot(dao_id))
                 .unwrap_or(0)
         }
+        /// Single-hop form, matching the real tree: 0 = eligible,
+        /// 1 = not in history, 2 = predates the election, 3 = predates a member
+        /// removal.
+        pub fn root_eligibility(env: Env, dao_id: u64, root: U256, earliest: u32) -> u32 {
+            if !Self::root_ok(env.clone(), dao_id, root.clone()) {
+                return 1;
+            }
+            let idx = Self::root_idx(env.clone(), dao_id, root);
+            if idx < earliest {
+                return 2;
+            }
+            if idx < Self::min_root(env, dao_id) {
+                return 3;
+            }
+            0
+        }
+
         pub fn set_root_idx(env: Env, dao_id: u64, root: U256, idx: u32) {
             env.storage()
                 .persistent()

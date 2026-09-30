@@ -7,6 +7,10 @@ edition = "2021"
 crate-type = ["rlib"]
 doctest = false
 
+# `src/lib.rs` exposes a `testkit` module used by the binaries under `tests/`.
+# Those link this crate as a normal dependency, so the crates that module needs
+# have to be real dependencies rather than dev-dependencies — a `#[cfg(test)]`
+# item would not be compiled for them.
 [dependencies]
 # The crate's `test_support` module (see src/lib.rs) is compiled into the *lib*
 # target so every test binary under tests/ can share one mock transcript

@@ -14,10 +14,29 @@ const VERSION: u32 = 2;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
 // TTL management: bump on every interaction to keep contract alive
+//
+// SECURITY (#audit-H1): `DaoInfo` was on the old 535_680-ledger (~31 day)
+// window, refreshed only when that specific DAO was read or written. A DAO
+// nobody touched for a month lost its `DaoInfo` entry, and because *every*
+// admin path resolves authority through `get_admin(dao_id)` — in this contract
+// and in membership-sbt, membership-tree, voting and comments alike — the
+// result was a DAO that had lost not just its settings but its ability to have
+// any: `get_admin` returned "missing", every admin entrypoint raised
+// `DaoNotFound`, and nothing could restore it because the entry that would
+// identify the admin no longer existed. A DAO's unadministrability is
+// unrecoverable by design here, so the record that decides it must not be
+// allowed to lapse silently.
+//
+// The window is now the protocol ceiling (`maxEntryTTL` = 6_312_000 ledgers,
+// ~365 days at 5s/ledger). `sweep_dao` tops up a DAO that is otherwise idle.
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
-const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
+const INSTANCE_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
-const PERSISTENT_TTL_EXTEND: u32 = 535_680;
+const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
+/// Upper bound on how many DAOs one `sweep_dao` call refreshes, so a registry
+/// with many DAOs cannot push the call past the transaction budget. Callers
+/// paginate by advancing `start`.
+pub const SWEEP_MAX_DAOS: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -766,6 +785,50 @@ impl DaoRegistry {
     pub fn dao_count(env: Env) -> u64 {
         Self::bump_instance(&env);
         env.storage().instance().get(&DAO_COUNT).unwrap_or(0)
+    }
+
+    // ── Keepalive (#audit-H1) ───────────────────────────────────────────────
+    //
+    // A `DaoInfo` entry is the one record in this contract whose loss is
+    // unrecoverable: every admin path in the whole system resolves authority
+    // through `get_admin`, so once `DaoInfo` is archived the DAO has no
+    // identifiable admin, every admin entrypoint in every contract raises
+    // `DaoNotFound`, and there is no call left that could put the entry back.
+    //
+    // The window is already the protocol ceiling, so this only has to cover the
+    // case the ceiling cannot: a DAO nobody touches for a full year. It is
+    // permissionless on purpose — gating a keepalive behind the very admin
+    // record that might be the thing at risk is how a DAO ends up unadministrable
+    // in the first place. It only extends TTLs and never creates, mutates or
+    // deletes a DAO, so there is nothing for a caller to gain.
+
+    /// Refresh one page of `DaoInfo` records back to the protocol ceiling.
+    ///
+    /// Walks `dao_id` from `start` and refreshes every record that still
+    /// exists; returns how many were refreshed. Callers repeat with
+    /// `start += SWEEP_MAX_DAOS` until it returns 0. Gaps left by deleted DAOs
+    /// are skipped rather than treated as failures.
+    pub fn sweep_dao(env: Env, start: u64, limit: u32) -> u32 {
+        Self::bump_instance(&env);
+        let limit = if limit == 0 || limit > SWEEP_MAX_DAOS {
+            SWEEP_MAX_DAOS
+        } else {
+            limit
+        };
+        let total = env.storage().instance().get(&DAO_COUNT).unwrap_or(0);
+        let end = total.min(start.saturating_add(limit as u64));
+
+        let mut swept = 0u32;
+        let mut id = start;
+        while id < end {
+            let key = Self::dao_key(id);
+            if env.storage().persistent().has(&key) {
+                Self::bump_persistent(&env, &key);
+                swept += 1;
+            }
+            id += 1;
+        }
+        swept
     }
 
     /// Check if a DAO has open membership

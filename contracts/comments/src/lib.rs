@@ -359,39 +359,70 @@ impl Comments {
                 if root != &eligible_root {
                     panic_coarse(env, ctx, CommentsError::RootMismatch);
                 }
+                // SECURITY (#audit-H3): and the snapshot must still be a valid
+                // proof of *current* membership. A member removed after the
+                // snapshot keeps a proof against the pre-removal root, and
+                // because the voting contract pins an Active Fixed snapshot
+                // against root eviction, that root never ages out — so without
+                // this check a Fixed-mode comment thread stays permanently
+                // open to a removed member. This mirrors the identical
+                // `min_root` check the Trailing arm below already performs.
+                Self::assert_root_not_revoked(env, ctx, dao_id, root);
             }
             VoteMode::Trailing => {
-                // Trailing mode: check root is in valid history
-                let root_valid: bool = env.invoke_contract(
+                // Trailing mode: any root in the tree's history is eligible, so
+                // long as it is neither older than the proposal nor older than
+                // the last removal. The tree answers all three conditions in one
+                // call, so this is a single hop.
+                let code: u32 = env.invoke_contract(
                     &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
+                    &Symbol::new(env, "root_eligibility"),
+                    soroban_sdk::vec![
+                        env,
+                        dao_id.into_val(env),
+                        root.clone().into_val(env),
+                        earliest_root_index.into_val(env),
+                    ],
                 );
-                if !root_valid {
-                    panic_coarse(env, ctx, CommentsError::RootNotInHistory);
-                }
-
-                // Check root index >= earliest_root_index
-                let root_index: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_idx"),
-                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
-                );
-                if root_index < earliest_root_index {
-                    panic_coarse(env, ctx, CommentsError::RootPredatesProposal);
-                }
-
-                // SECURITY: Check root index >= min_valid_root_index
-                // This prevents revoked members from commenting using pre-revocation roots
-                let min_valid_root: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![env, dao_id.into_val(env)],
-                );
-                if root_index < min_valid_root {
-                    panic_coarse(env, ctx, CommentsError::RootPredatesRemoval);
+                match code {
+                    0 => {}
+                    1 => panic_coarse(env, ctx, CommentsError::RootNotInHistory),
+                    2 => panic_coarse(env, ctx, CommentsError::RootPredatesProposal),
+                    _ => panic_coarse(env, ctx, CommentsError::RootPredatesRemoval),
                 }
             }
+        }
+    }
+
+    /// Reject a root that a member removal has invalidated.
+    ///
+    /// `min_root` is the tree's monotonic revocation floor: `remove_member`
+    /// raises it to the index of the root it just produced, so every root below
+    /// it predates the removal. `remove_member` is its only writer and there is
+    /// no setter, so it can never be lowered. A DAO that removes nobody leaves
+    /// it at 0, where this is a no-op.
+    ///
+    /// Asked of the tree as one `root_eligibility` question rather than as three
+    /// separate lookups. All three facts live in the tree, and a caller that
+    /// remembers to ask for two of them is exactly how Fixed mode ended up with
+    /// no revocation check at all (#audit-H3).
+    fn assert_root_not_revoked(env: &Env, ctx: PathContext, dao_id: u64, root: &U256) {
+        let tree_contract: Address = Self::tree_contract(env.clone());
+        let code: u32 = env.invoke_contract(
+            &tree_contract,
+            &Symbol::new(env, "root_eligibility"),
+            soroban_sdk::vec![
+                env,
+                dao_id.into_val(env),
+                root.clone().into_val(env),
+                0u32.into_val(env),
+            ],
+        );
+        match code {
+            0 => {}
+            1 => panic_coarse(env, ctx, CommentsError::RootNotInHistory),
+            2 => panic_coarse(env, ctx, CommentsError::RootPredatesProposal),
+            _ => panic_coarse(env, ctx, CommentsError::RootPredatesRemoval),
         }
     }
 
@@ -1369,6 +1400,23 @@ mod test {
                     .persistent()
                     .get(&DataKey::MinRoot(dao_id))
                     .unwrap_or(0)
+            }
+
+            /// Single-hop form, matching the real tree: 0 = eligible,
+            /// 1 = not in history, 2 = predates the election, 3 = predates a
+            /// member removal.
+            pub fn root_eligibility(env: Env, dao_id: u64, root: U256, earliest: u32) -> u32 {
+                if !Self::root_ok(env.clone(), dao_id, root.clone()) {
+                    return 1;
+                }
+                let idx = Self::root_idx(env.clone(), dao_id, root);
+                if idx < earliest {
+                    return 2;
+                }
+                if idx < Self::min_root(env, dao_id) {
+                    return 3;
+                }
+                0
             }
         }
     }

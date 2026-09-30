@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Events as _, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Events as _, testutils::Ledger as _, Env};
 
 // Mock registry contract for testing
 mod mock_registry {

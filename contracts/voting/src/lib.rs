@@ -75,16 +75,51 @@ const STORAGE_VERSION: u32 = 1;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 const STORAGE_VERSION_KEY: Symbol = symbol_short!("stor_ver");
 
+/// The `num_candidates` value placed in the proof's public signals when the
+/// election is unbounded.
+///
+/// SECURITY (#audit-C1): the vote circuit constrains
+/// `LessThan(32)(voteChoice, numCandidates) === 1` (circuits/vote_template.circom).
+/// With `numCandidates == 0` that is unsatisfiable for *every* `voteChoice`, so
+/// no witness exists and no proof can be generated — the election accepts
+/// nothing. `0` is both the documented "unbounded" sentinel and the value an
+/// election gets by *default*, since `ElectionConfig` is absent until someone
+/// calls `set_election_config`. So the default state of every election was
+/// unvotable, and the on-chain guard `if num_candidates > 0 && ..` treated the
+/// same 0 as "no bound" — the two halves of the system disagreed about what 0
+/// means, and the circuit was the stricter one.
+///
+/// Mapping the sentinel to `u32::MAX` at the point the public signal is built
+/// keeps "0 means unbounded" true everywhere while making the value something a
+/// prover can actually satisfy. It cannot weaken the bound: 2^32-1 is above any
+/// candidate index a `u32` can express, so a bounded election is unaffected and
+/// an unbounded one is genuinely unbounded.
+const UNBOUNDED_CANDIDATE_SIGNAL: u32 = u32::MAX;
+
+/// The value to place in the proof's public `num_candidates` signal.
+#[inline(always)]
+fn candidate_signal(num_candidates: u32) -> u32 {
+    if num_candidates == 0 {
+        UNBOUNDED_CANDIDATE_SIGNAL
+    } else {
+        num_candidates
+    }
+}
+
 // TTL management: bump on every interaction to keep contract alive
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
-const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
+const INSTANCE_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
-const PERSISTENT_TTL_EXTEND: u32 = 535_680;
-// Nullifiers are Temporary: auto-expire after proposal.end_time + grace period
-// 259_200 ledgers @ ~5s/ledger = 72 hours grace for late-arriving txns
+const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
+                                              // Nullifiers are Persistent and live until `proposal.end_time + NULLIFIER_GRACE_LEDGERS`.
+                                              // 259_200 ledgers @ ~5s/ledger = 15 days of grace for late-arriving txns.
 const NULLIFIER_GRACE_LEDGERS: u32 = 259_200;
 const TEMPORARY_TTL_THRESHOLD: u32 = 51_840; // ~3 days
-const TEMPORARY_TTL_EXTEND_BASE: u32 = 259_200; // 72h base, + end_time offset
+                                             // 259_200 ledgers @ ~5s/ledger = 15 days. (This used to be documented as
+                                             // "72 hours", which understated it by 5x — the value was always correct, the
+                                             // comment was not. See `bump_nullifier_ttl` for why nullifiers no longer live
+                                             // in Temporary storage at all.)
+const TEMPORARY_TTL_EXTEND_BASE: u32 = 259_200;
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -1164,9 +1199,27 @@ impl Voting {
         );
     }
 
-    /// Bump nullifier TTL with proposal-end-time-aware extend amount.
-    /// Temporary storage lives until `end_time + NULLIFIER_GRACE_LEDGERS`.
-    /// For proposals with no end_time (end_time=0) use the base 72h window.
+    /// Give a nullifier record a TTL that outlives the election it belongs to.
+    ///
+    /// The invariant is: *a nullifier must remain spent for exactly as long as
+    /// the election can still accept the vote that spent it.* Shorter and the
+    /// byte-identical `(nullifier, proof)` tuple re-verifies, so the member
+    /// votes again; longer and the record is state nobody can ever reclaim.
+    ///
+    /// For a bounded election that is `end_time + NULLIFIER_GRACE_LEDGERS`, so
+    /// the record becomes reclaimable once the election is definitively over.
+    /// For an open-ended election (`end_time == 0`, which `create_proposal`
+    /// explicitly permits — "voting never closes") there is no such bound, so
+    /// the record is pushed out to the protocol ceiling and refreshed on every
+    /// subsequent read and write. A never-closing election therefore cannot
+    /// forget a spent nullifier.
+    ///
+    /// SECURITY (#audit-H2): this used to extend a *Temporary* entry, on a
+    /// window that collapsed to `TEMPORARY_TTL_EXTEND_BASE` for exactly the
+    /// `end_time == 0` case, which is the one case where forgetting is
+    /// unrecoverable. Nullifiers now live in Persistent storage; the Temporary
+    /// read in `nullifier_is_used` exists only so records already written by
+    /// the previous build still block, without needing a migration.
     fn bump_nullifier_ttl<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
         env: &Env,
         key: &K,
@@ -1176,16 +1229,50 @@ impl Voting {
         let end_time = Self::get_proposal_end_time_internal(env, dao_id, proposal_id);
         let ledger_timestamp = env.ledger().timestamp();
         let ttl_extend: u32 = if end_time == 0 {
-            TEMPORARY_TTL_EXTEND_BASE
+            // Never closes: hold the record for as long as the protocol allows.
+            PERSISTENT_TTL_EXTEND
         } else {
             let remaining_secs = end_time.saturating_sub(ledger_timestamp);
             let remaining_ledgers: u32 = (remaining_secs / 5).try_into().unwrap_or(u32::MAX);
-            remaining_ledgers.saturating_add(NULLIFIER_GRACE_LEDGERS)
+            remaining_ledgers
+                .saturating_add(NULLIFIER_GRACE_LEDGERS)
+                .min(PERSISTENT_TTL_EXTEND)
         };
-        let ttl_extend = ttl_extend.max(TEMPORARY_TTL_EXTEND_BASE);
+        let ttl_extend = ttl_extend.max(NULLIFIER_GRACE_LEDGERS);
         env.storage()
-            .temporary()
-            .extend_ttl(key, TEMPORARY_TTL_THRESHOLD, ttl_extend);
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, ttl_extend);
+    }
+
+    /// Whether this election's nullifier has already been spent.
+    ///
+    /// Both storage classes are consulted. A record written by an older build
+    /// may sit in either one, and a spent nullifier that reads as unspent is
+    /// the double-vote this whole path exists to prevent, so the check errs
+    /// toward "used" whenever there is any record at all.
+    ///
+    /// SECURITY (#audit-H2): every vote entrypoint used to open-code its own
+    /// `has` against whichever storage class it happened to write to, and they
+    /// disagreed — `vote`/`vote_bls381`/`vote_with_circuit` wrote Temporary
+    /// while `cast_votes`/`vote_sybil_weighted`/`commit_vote` wrote Persistent,
+    /// and four of the seven readers looked in only one of the two. A member
+    /// could therefore spend one nullifier through `vote` and the same
+    /// nullifier through `vote_sybil_weighted`, getting two head-count votes
+    /// and two weighted tallies from one identity. This function is the single
+    /// choke point that makes that class of divergence impossible again;
+    /// callers must not open-code the lookup.
+    fn nullifier_is_used(env: &Env, dao_id: u64, proposal_id: u64, nullifier: U256) -> bool {
+        let key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
+        env.storage().persistent().has(&key) || env.storage().temporary().has(&key)
+    }
+
+    /// Spend a nullifier: mark it used and give it a window that outlives the
+    /// election. Call only after `nullifier_is_used` has returned false, and
+    /// before any proof verification that could re-enter.
+    fn consume_nullifier(env: &Env, dao_id: u64, proposal_id: u64, nullifier: U256) {
+        let key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
+        env.storage().persistent().set(&key, &true);
+        Self::bump_nullifier_ttl(env, &key, dao_id, proposal_id);
     }
 
     /// Constructor: Initialize contract with MembershipTree address
@@ -1922,7 +2009,51 @@ impl Voting {
             .unwrap_or_else(|| panic_with_error!(env, VotingError::VkVersionMismatch))
     }
 
+    /// Reject unless `admin` is the DAO's admin.
+    ///
+    /// SECURITY (#audit-C1): this compares and nothing more — it does *not* call
+    /// `admin.require_auth()`. An entrypoint that relies on `assert_admin` alone
+    /// is callable by anyone who can name the admin, and the admin address is
+    /// public via `get_admin`. Every admin entrypoint must therefore pair the
+    /// two; `set_vk_for_depth` did not, and was callable by anyone.
     fn assert_admin(env: &Env, dao_id: u64, admin: &Address) {
+        if !Self::is_dao_admin(env, dao_id, admin) {
+            panic_with_error!(env, VotingError::NotAdmin);
+        }
+    }
+
+    /// Who may rewrite an election's configuration: the DAO admin, or the
+    /// proposal's own creator.
+    ///
+    /// Both branches require the caller's own authorisation. The creator branch
+    /// exists so the documented "callable during proposal creation" flow still
+    /// works for a member who can propose but does not administer the DAO; it
+    /// is not a general write permission, because it is scoped to elections
+    /// that caller created.
+    fn assert_election_config_authority(
+        env: &Env,
+        dao_id: u64,
+        proposal_id: u64,
+        caller: &Address,
+    ) {
+        caller.require_auth();
+        if Self::is_dao_admin(env, dao_id, caller) {
+            return;
+        }
+        let proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(dao_id, proposal_id))
+            .unwrap_or_else(|| panic_with_error!(env, VotingError::InvalidState));
+        if proposal.created_by != *caller {
+            panic_with_error!(env, VotingError::NotAdmin);
+        }
+    }
+
+    /// Whether `who` administers `dao_id`, without requiring their auth and
+    /// without panicking. `assert_admin` is the panicking form; this is the
+    /// predicate, so callers that accept more than one role can try each.
+    fn is_dao_admin(env: &Env, dao_id: u64, who: &Address) -> bool {
         // Use cached registry address (set at constructor) - only 1 cross-contract call
         let registry: Address = env.storage().instance().get(&REGISTRY).unwrap();
 
@@ -1932,9 +2063,7 @@ impl Voting {
             soroban_sdk::vec![env, dao_id.into_val(env)],
         );
 
-        if &dao_admin != admin {
-            panic_with_error!(env, VotingError::NotAdmin);
-        }
+        &dao_admin == who
     }
 
     fn validate_vk(env: &Env, vk: &VerificationKey) {
@@ -2416,8 +2545,7 @@ impl Voting {
 
         // Check nullifier hasn't been used for THIS election (dao_id, proposal_id).
         // Election-scoped storage prevents cross-election DoS from a flat namespace (#64).
-        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().temporary().has(&null_key) || env.storage().persistent().has(&null_key) {
+        if Self::nullifier_is_used(&env, dao_id, proposal_id, nullifier.clone()) {
             panic_coarse(&env, ctx, VotingError::NullifierUsed);
         }
 
@@ -2447,8 +2575,7 @@ impl Voting {
         // ── cross-contract calls or proof verification. This prevents      ──
         // ── double-vote reentrancy attacks even if the execution model     ──
         // ── allows reentrant calls.                                       ──
-        env.storage().temporary().set(&null_key, &true);
-        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
 
         // Verify root based on vote mode. Shared with `cast_votes` so a batched
         // submission is held to exactly the same eligibility rules.
@@ -2980,8 +3107,7 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidNullifier);
         }
 
-        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().temporary().has(&null_key) {
+        if Self::nullifier_is_used(&env, dao_id, proposal_id, nullifier.clone()) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
 
@@ -3002,50 +3128,13 @@ impl Voting {
 
         // ── CHECKS-EFFECTS-INTERACTIONS: Mark nullifier as used BEFORE ──
         // ── cross-contract calls or proof verification.                   ──
-        env.storage().temporary().set(&null_key, &true);
-        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
 
-        match proposal.vote_mode {
-            VoteMode::Fixed => {
-                if root != proposal.eligible_root {
-                    panic_with_error!(&env, VotingError::RootMismatch);
-                }
-            }
-            VoteMode::Trailing => {
-                let tree_contract: Address = Self::tree_contract(env.clone());
-
-                let root_valid: bool = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if !root_valid {
-                    panic_with_error!(&env, VotingError::RootNotInHistory);
-                }
-
-                let root_index: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_idx"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if root_index < proposal.earliest_root_index {
-                    panic_with_error!(&env, VotingError::RootPredatesProposal);
-                }
-
-                let min_valid_root: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env)],
-                );
-                if root_index < min_valid_root {
-                    panic_with_error!(&env, VotingError::RootPredatesRemoval);
-                }
-            }
-            VoteMode::Quadratic => {
-                // Quadratic proposals must be voted on via `cast_qv_vote`.
-                panic_with_error!(&env, VotingError::NotQuadraticProposal);
-            }
-        }
+        // Same helper `vote` and `cast_votes` use, rather than a third copy of
+        // this match — the copies drifted, and the drift is what left the
+        // Fixed arm without its revocation check in one path and not another
+        // (#audit-H3).
+        Self::assert_root_eligible(&env, PathContext::Anonymous, dao_id, &proposal, &root);
 
         // Verify proposal was created for BLS12-381 curve
         let curve_key = DataKey::ProposalCurve(dao_id, proposal_id);
@@ -3176,6 +3265,16 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        // SECURITY (#audit-C1): `assert_admin` on its own only *compares* the
+        // argument against the registry's admin. It never requires that
+        // argument to authorise anything, so without this line the function was
+        // callable by anyone at all: the DAO's admin address is public via
+        // `get_admin`, so any address could pass it and register an arbitrary
+        // verification key for any depth. Every other admin entrypoint in this
+        // contract pairs the two calls — `set_vk`, `set_vk_bls381`,
+        // `set_tally_vk`, `set_vk_with_transcript` — so this one was the
+        // outlier rather than a deliberate design choice.
+        admin.require_auth();
         Self::assert_admin(&env, dao_id, &admin);
 
         if merkle_depth == 0 || merkle_depth > MAX_MERKLE_DEPTH {
@@ -3220,18 +3319,29 @@ impl Voting {
         twab_window: u64,
         num_candidates: u32,
         merkle_depth: u32,
+        admin: Address,
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        // SECURITY (#audit-C1): this forwarded to the unauthenticated
+        // `set_election_config` *and* then pinned `ProposalDepthVkHash` to
+        // whatever key was registered for `merkle_depth`. Combining that with
+        // the missing `require_auth` on `set_vk_for_depth` meant an arbitrary
+        // verification key could be registered for a depth and then pinned onto
+        // a live election, after which every vote on it would be checked
+        // against a key the attacker chose — an arbitrary nullifier, an
+        // arbitrary leaf and an arbitrary root, i.e. total vote forgery. Both
+        // halves of that chain now require the admin's own authorisation.
+        Self::assert_election_config_authority(&env, dao_id, proposal_id, &admin);
 
         if merkle_depth > MAX_MERKLE_DEPTH {
             panic_with_error!(&env, VotingError::InvalidMerkleDepth);
         }
 
-        // Reuse the existing setter for everything it already handles, then
+        // Reuse the setter's body for everything it already handles, then
         // layer the depth on top so the two paths cannot drift apart.
-        Self::set_election_config(
-            env.clone(),
+        Self::apply_election_config(
+            &env,
             dao_id,
             proposal_id,
             min_balance,
@@ -3428,10 +3538,7 @@ impl Voting {
             }
             seen.push_back(entry.nullifier.clone());
 
-            let null_key =
-                storage::nullifier_used_key(dao_id, proposal_id, entry.nullifier.clone());
-            if env.storage().temporary().has(&null_key) || env.storage().persistent().has(&null_key)
-            {
+            if Self::nullifier_is_used(&env, dao_id, proposal_id, entry.nullifier.clone()) {
                 panic_with_error!(&env, VotingError::NullifierUsed);
             }
 
@@ -3470,10 +3577,7 @@ impl Voting {
         // that were grouped with a bad one.
         for i in 0..count {
             let entry = votes.get(i).expect("vote missing");
-            let null_key =
-                storage::nullifier_used_key(dao_id, proposal_id, entry.nullifier.clone());
-            env.storage().persistent().set(&null_key, &true);
-            Self::bump_persistent(&env, &null_key);
+            Self::consume_nullifier(&env, dao_id, proposal_id, entry.nullifier.clone());
         }
 
         proposal.yes_votes = proposal
@@ -3511,11 +3615,30 @@ impl Voting {
         count
     }
 
-    /// Root eligibility for a proposal, shared by `vote` and `cast_votes`.
+    /// Root eligibility for a proposal.
+    ///
+    /// This is the *only* place a caller-supplied root is judged, and every
+    /// entrypoint that accepts one must route through it. It used to be
+    /// consulted by `vote` and `cast_votes` only, while `vote_bls381` and
+    /// `vote_with_circuit` each carried a hand-copied version of the same
+    /// match — which is precisely how the Fixed-mode gap below survived in one
+    /// copy and not the other.
     ///
     /// Fixed mode requires the exact snapshot root. Trailing mode accepts any
     /// root in the tree's history that neither predates the proposal nor a
     /// member removal, so late joiners can vote but revoked members cannot.
+    ///
+    /// SECURITY (#audit-H3): Fixed mode now also consults `min_root`, the
+    /// index `remove_member` advances to mark every earlier root as
+    /// pre-revocation. Without that check `min_root` was reachable *only* from
+    /// the Trailing arm, which made revocation completely inert for Fixed-mode
+    /// elections — the default mode. The mechanism is airtight once consulted:
+    /// `remove_member` is the only writer of `MinValidRootIdx` and there is no
+    /// setter, so it can never be lowered or reset by any admin path. And the
+    /// snapshot root is pinned in history for as long as the proposal is
+    /// Active (`root_pin`), so the removal can never be laundered by waiting for
+    /// the root to age out of the `Roots` window: a pre-removal Fixed election
+    /// is a *permanently* open vote for a removed member without this check.
     fn assert_root_eligible(
         env: &Env,
         ctx: PathContext,
@@ -3523,23 +3646,25 @@ impl Voting {
         proposal: &ProposalInfo,
         root: &U256,
     ) {
+        // A Quadratic election is cast through `cast_qv_vote`, which has its own
+        // root check against the round's snapshot. Refuse here rather than
+        // letting a root reach the branches below on a mode that ignores them.
+        if proposal.vote_mode == VoteMode::Quadratic {
+            panic_coarse(env, ctx, VotingError::NotQuadraticProposal);
+        }
+
         match proposal.vote_mode {
             VoteMode::Fixed => {
                 if root != &proposal.eligible_root {
                     panic_coarse(env, ctx, VotingError::RootMismatch);
                 }
+                // The snapshot root is only the *starting point* for eligibility,
+                // not a permanent grant. A removal after the snapshot
+                // invalidates it, exactly as it invalidates a Trailing root.
+                Self::assert_root_not_revoked(env, ctx, dao_id, root);
             }
             VoteMode::Trailing => {
                 let tree_contract: Address = Self::tree_contract(env.clone());
-
-                let root_valid: bool = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![env, dao_id.into_val(env), root.clone().into_val(env)],
-                );
-                if !root_valid {
-                    panic_coarse(env, ctx, VotingError::RootNotInHistory);
-                }
 
                 let root_index: u32 = env.invoke_contract(
                     &tree_contract,
@@ -3550,18 +3675,55 @@ impl Voting {
                     panic_coarse(env, ctx, VotingError::RootPredatesProposal);
                 }
 
-                let min_valid_root: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![env, dao_id.into_val(env)],
-                );
-                if root_index < min_valid_root {
-                    panic_coarse(env, ctx, VotingError::RootPredatesRemoval);
-                }
+                // `assert_root_not_revoked` re-derives `root_index` and checks
+                // `root_ok` itself, so the Trailing arm deliberately does not
+                // repeat that half here.
+                Self::assert_root_not_revoked(env, ctx, dao_id, root);
             }
+            // Handled above, before the match.
             VoteMode::Quadratic => {
                 panic_coarse(env, ctx, VotingError::NotQuadraticProposal);
             }
+        }
+    }
+
+    /// Reject a root that a member removal has invalidated.
+    ///
+    /// `min_root` is the tree's monotonic floor: `remove_member` sets it to the
+    /// index of the root it just produced, so every root below it predates the
+    /// removal and can no longer prove anything about the current membership.
+    /// A DAO that never removes anyone leaves it at 0, where this is a no-op.
+    ///
+    /// Asked of the tree as a single `root_eligibility` question rather than as
+    /// separate `root_ok` / `root_idx` / `min_root` lookups. All three facts
+    /// live in the tree, so one hop answers all of them: `vote` is the hot path
+    /// of the whole protocol and paying three cross-contract invocations there
+    /// showed up as a ~19% CPU increase in the integration budget test. It also
+    /// removes the possibility of a caller asking for two of the three — which
+    /// is exactly how Fixed mode ended up with no revocation check at all
+    /// (#audit-H3).
+    fn assert_root_not_revoked(env: &Env, ctx: PathContext, dao_id: u64, root: &U256) {
+        let tree_contract: Address = Self::tree_contract(env.clone());
+        let code: u32 = env.invoke_contract(
+            &tree_contract,
+            &Symbol::new(env, "root_eligibility"),
+            soroban_sdk::vec![
+                env,
+                dao_id.into_val(env),
+                root.clone().into_val(env),
+                0u32.into_val(env),
+            ],
+        );
+        match code {
+            0 => {}
+            // The root is no longer in the tree's retained window, or was never
+            // published. An evicted Fixed snapshot cannot happen while the
+            // proposal is Active — `root_pin` blocks that — so this is a root
+            // that was never ours.
+            1 => panic_coarse(env, ctx, VotingError::RootNotInHistory),
+            2 => panic_coarse(env, ctx, VotingError::RootPredatesProposal),
+            // The revocation floor. Reachable in Fixed mode now (#audit-H3).
+            _ => panic_coarse(env, ctx, VotingError::RootPredatesRemoval),
         }
     }
     /// Get proposal info
@@ -3685,8 +3847,7 @@ impl Voting {
     /// global nullifier namespace (issue #64).
     pub fn is_nullifier_used(env: Env, dao_id: u64, proposal_id: u64, nullifier: U256) -> bool {
         Self::bump_instance(&env);
-        let key = storage::nullifier_used_key(dao_id, proposal_id, nullifier);
-        env.storage().temporary().has(&key) || env.storage().persistent().has(&key)
+        Self::nullifier_is_used(&env, dao_id, proposal_id, nullifier)
     }
 
     /// Verify a voter receipt by checking if the nullifier was recorded
@@ -3731,9 +3892,7 @@ impl Voting {
             return false;
         }
 
-        let scoped_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        env.storage().persistent().set(&scoped_key, &true);
-        Self::bump_persistent(&env, &scoped_key);
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
         Self::accumulate_nullifier(&env, dao_id, proposal_id, &nullifier);
         env.storage().persistent().remove(&legacy_key);
         true
@@ -4208,8 +4367,7 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidNullifier);
         }
 
-        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().temporary().has(&null_key) {
+        if Self::nullifier_is_used(&env, dao_id, proposal_id, nullifier.clone()) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
 
@@ -4228,44 +4386,11 @@ impl Voting {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
 
-        match proposal.vote_mode {
-            VoteMode::Fixed => {
-                if root != proposal.eligible_root {
-                    panic_with_error!(&env, VotingError::RootMismatch);
-                }
-            }
-            VoteMode::Trailing => {
-                let tree_contract: Address = Self::tree_contract(env.clone());
-                let root_valid: bool = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if !root_valid {
-                    panic_with_error!(&env, VotingError::RootNotInHistory);
-                }
-                let root_index: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_idx"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if root_index < proposal.earliest_root_index {
-                    panic_with_error!(&env, VotingError::RootPredatesProposal);
-                }
-                let min_valid_root: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env)],
-                );
-                if root_index < min_valid_root {
-                    panic_with_error!(&env, VotingError::RootPredatesRemoval);
-                }
-            }
-            VoteMode::Quadratic => {
-                // Quadratic proposals must be voted on via `cast_qv_vote`.
-                panic_with_error!(&env, VotingError::NotQuadraticProposal);
-            }
-        }
+        // Same helper `vote` and `cast_votes` use, rather than a third copy of
+        // this match — the copies drifted, and the drift is what left the
+        // Fixed arm without its revocation check in one path and not another
+        // (#audit-H3).
+        Self::assert_root_eligible(&env, PathContext::Anonymous, dao_id, &proposal, &root);
 
         let vk: VerificationKey =
             Self::load_vk_from_registry(&env, &circuit_id, &CircuitType::Vote);
@@ -4358,8 +4483,7 @@ impl Voting {
             panic_with_error!(&env, VotingError::InvalidProof);
         }
 
-        env.storage().temporary().set(&null_key, &true);
-        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
 
         if vote_choice {
             proposal.yes_votes = proposal
@@ -4389,7 +4513,24 @@ impl Voting {
     /// Create or update election configuration with token-gating parameters.
     /// Sets the minimum balance required to vote, snapshot ledger, TWAB window,
     /// and the number of valid candidates (bound into the ZK proof).
-    /// Only callable during proposal creation or by DAO admin.
+    ///
+    /// Callable by the DAO admin or by the proposal's creator — the latter is
+    /// the "during proposal creation" case in the original contract, and it is
+    /// bounded by requiring that creator's own authorisation.
+    ///
+    /// SECURITY (#audit-C1): this function previously took no `admin` argument
+    /// at all, so it was an unauthenticated public mutator on a live election's
+    /// configuration. The DAO's admin address is public, and the parameters are
+    /// all attacker-chosen, which made this a one-call lever on a running vote:
+    /// setting `num_candidates` to 1 on a live two-candidate election makes
+    /// `vote_choice_index >= num_candidates` reject every YES ballot for the
+    /// remainder of the election, and the same call resets `snapshot_ledger` to
+    /// the current ledger and can zero `min_balance`/`twab_window`, undoing the
+    /// token gating. It is now gated on a real authorisation.
+    ///
+    /// Note that `snapshot_ledger` is refreshed on every call, so an admin who
+    /// re-saves a config mid-election also re-snapshots the balance gate. That
+    /// is now at least restricted to the two parties above.
     pub fn set_election_config(
         env: Env,
         dao_id: u64,
@@ -4397,9 +4538,35 @@ impl Voting {
         min_balance: i128,
         twab_window: u64,
         num_candidates: u32,
+        admin: Address,
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::assert_election_config_authority(&env, dao_id, proposal_id, &admin);
+        Self::apply_election_config(
+            &env,
+            dao_id,
+            proposal_id,
+            min_balance,
+            twab_window,
+            num_candidates,
+        );
+    }
+
+    /// The body of [`Self::set_election_config`], with authorisation already
+    /// done. Split out so `set_election_config_with_depth` can authorise once
+    /// and then reuse it: requiring auth in both would record the same
+    /// authorisation twice in one invocation, which the host rejects, and
+    /// authorising *after* the depth is validated would leak the depth check to
+    /// unauthenticated callers.
+    fn apply_election_config(
+        env: &Env,
+        dao_id: u64,
+        proposal_id: u64,
+        min_balance: i128,
+        twab_window: u64,
+        num_candidates: u32,
+    ) {
         let snapshot_ledger = env.ledger().sequence();
         let key = DataKey::ElectionConfig(dao_id, proposal_id);
         let existing = env.storage().persistent().get::<_, ElectionConfig>(&key);

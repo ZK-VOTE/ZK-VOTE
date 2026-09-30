@@ -31,10 +31,30 @@ const VERSION: u32 = 2;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
 // TTL management: bump on every interaction to keep contract alive
+//
+// SECURITY (#audit-H1): the previous persistent window was 535_680 ledgers
+// (~31 days), refreshed only on the individual record being read or written.
+// `MemberLeafIndex(dao, member)` is the guard that makes one address map to at
+// most one Merkle leaf, so a member inactive for a full window came back able
+// to pass the duplicate check in `register_with_caller` / `self_register` and
+// insert a *second* commitment into the tree. The original leaf is never zeroed
+// on that path, so both leaves stayed provable — two nullifiers, and therefore
+// two ballots, from one identity. `LastRegistrationAt` lapsing in the same
+// window silently reset the 1h registration cooldown that exists to slow the
+// same thing down.
+//
+// Soroban has no non-expiring storage, so the cure is the full window the
+// protocol allows plus an explicit keepalive: `maxEntryTTL` is 6_312_000
+// ledgers (~365 days at 5s/ledger), which is what we now extend to, and
+// `sweep_dao` tops up members who are not otherwise active.
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
-const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
+const INSTANCE_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
-const PERSISTENT_TTL_EXTEND: u32 = 535_680;
+const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
+/// Upper bound on how many leaf/member records one `sweep_dao` call refreshes,
+/// so a large DAO cannot push the call past the transaction budget. Callers
+/// paginate by advancing `start`.
+pub const SWEEP_MAX_RECORDS: u32 = 50;
 
 // Poseidon params cache keys (BN254 — stored in persistent storage)
 const POSEIDON_MDS: Symbol = symbol_short!("pos_mds");
@@ -533,7 +553,14 @@ impl MembershipTree {
     /// elapsed since their previous registration in this DAO.
     fn enforce_registration_cooldown(env: &Env, dao_id: u64, member: &Address) {
         let key = DataKey::LastRegistrationAt(dao_id, member.clone());
-        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+        // Read through a bumping helper: a cooldown check that silently failed to
+        // refresh the record it consults let the record lapse, at which point
+        // `if let Some(..)` fell through and the cooldown silently reset (#audit-H1).
+        let last: Option<u64> = env.storage().persistent().get(&key);
+        if last.is_some() {
+            Self::bump_persistent(env, &key);
+        }
+        if let Some(last) = last {
             if env.ledger().timestamp() < last.saturating_add(MIN_REGISTRATION_INTERVAL_SECS) {
                 panic_with_error!(env, TreeError::RateLimited);
             }
@@ -876,6 +903,50 @@ impl MembershipTree {
         false
     }
 
+    /// Is `root` an acceptable root to prove membership against, for an
+    /// election that will not accept roots older than `earliest_root_index`?
+    ///
+    /// Answers the whole question in one hop. The three facts it needs — is the
+    /// root still in the retained window, what index does it have, and where the
+    /// revocation floor sits — all live in this contract, so a caller that asks
+    /// for them separately pays three cross-contract invocations per vote and
+    /// has three chances to implement the rule slightly differently. The
+    /// revocation floor in particular is the whole of Fixed-mode revocation, so
+    /// a caller that forgets to ask for it silently accepts removed members
+    /// (#audit-H3).
+    ///
+    /// Returns a code rather than a bool so callers can still report *which*
+    /// condition failed:
+    ///   0 = eligible
+    ///   1 = not in root history (evicted, or never published)
+    ///   2 = index predates the election's `earliest_root_index`
+    ///   3 = index predates the last member removal (`min_root`)
+    pub fn root_eligibility(env: Env, dao_id: u64, root: U256, earliest_root_index: u32) -> u32 {
+        Self::bump_instance(&env);
+        let index_key = DataKey::RootIndex(dao_id, root);
+        // `RootIndex` presence *is* the history test, in O(1).
+        //
+        // `root_ok` answers the same question with a linear scan of the
+        // retained `Roots` vector, but eviction (`evict_oldest_root`) deletes
+        // exactly this `RootIndex` key when a root ages out, so the two agree by
+        // construction — and since this runs on the hot `vote` path, an O(30)
+        // scan per vote is real cost for no extra information. A root that was
+        // never published has no index key either, so it is rejected here too.
+        let root_index: Option<u32> = env.storage().persistent().get(&index_key);
+        let Some(root_index) = root_index else {
+            return 1;
+        };
+        Self::bump_persistent(&env, &index_key);
+
+        if root_index < earliest_root_index {
+            return 2;
+        }
+        if root_index < Self::min_root(env.clone(), dao_id) {
+            return 3;
+        }
+        0
+    }
+
     /// Get root index for a specific root (for vote mode validation)
     pub fn root_idx(env: Env, dao_id: u64, root: U256) -> u32 {
         Self::bump_instance(&env);
@@ -1216,6 +1287,140 @@ impl MembershipTree {
             Self::bump_persistent(&env, &key);
         }
         result
+    }
+
+    // ── Keepalive (#audit-H1) ───────────────────────────────────────────────
+    //
+    // The persistent window is now the protocol ceiling, but Soroban still
+    // archives any entry that goes a full `maxEntryTTL` without being touched,
+    // and the entries that lapse first are precisely the ones that carry the
+    // security invariants: `MemberLeafIndex` is what makes one address map to
+    // one leaf, `CommitmentUsed` is what makes a commitment unique, and the
+    // root history is what makes `root_ok` answer at all.
+    //
+    // This is permissionless by design. A keepalive gated behind the DAO admin
+    // is not a keepalive — the failure being defended against is a DAO whose
+    // admin has gone away, and putting the refresh behind that same key
+    // reproduces the outage. It only extends TTLs and never writes membership,
+    // so there is nothing for a caller to gain and nothing to roll back.
+
+    /// Refresh one page of a DAO's tree records back to the protocol ceiling.
+    ///
+    /// Walks leaf indices from `start`, refreshing each leaf's value, its
+    /// commitment reservation, and (via the SBT's member enumeration) the
+    /// per-member leaf binding and registration timestamp, then refreshes the
+    /// DAO's structural records and retained root history. Returns the number of
+    /// leaves refreshed; call again with `start += SWEEP_MAX_RECORDS` until it
+    /// returns 0.
+    ///
+    /// The member-keyed records are reached by asking the SBT contract for the
+    /// member at each index, because the tree keys those records by address and
+    /// only the SBT holds an address enumeration. Both enumerations are dense
+    /// over the same membership, so the same index window covers both.
+    pub fn sweep_dao(env: Env, dao_id: u64, start: u64, limit: u32) -> u32 {
+        Self::bump_instance(&env);
+        let limit = if limit == 0 || limit > SWEEP_MAX_RECORDS {
+            SWEEP_MAX_RECORDS
+        } else {
+            limit
+        };
+
+        // Structural records: small, fixed set, always refreshed.
+        for key in [
+            DataKey::TreeDepth(dao_id),
+            DataKey::NextLeafIndex(dao_id),
+            DataKey::NextRootIndex(dao_id),
+            DataKey::Roots(dao_id),
+            DataKey::MaxRoots(dao_id),
+            DataKey::MinValidRootIdx(dao_id),
+        ] {
+            if env.storage().persistent().has(&key) {
+                Self::bump_persistent(&env, &key);
+            }
+        }
+
+        // Retained root history, including the index map `root_idx` reads.
+        if let Some(roots) =
+            Self::read_persistent::<_, soroban_sdk::Vec<U256>>(&env, &DataKey::Roots(dao_id))
+        {
+            for i in 0..roots.len() {
+                if let Some(root) = roots.get(i) {
+                    let idx_key = DataKey::RootIndex(dao_id, root);
+                    if env.storage().persistent().has(&idx_key) {
+                        Self::bump_persistent(&env, &idx_key);
+                    }
+                }
+            }
+        }
+
+        let next_leaf: u32 =
+            Self::read_persistent(&env, &DataKey::NextLeafIndex(dao_id)).unwrap_or(0);
+        let end = (next_leaf as u64).min(start.saturating_add(limit as u64));
+
+        // Addresses for the whole window, fetched once. See the note below on
+        // why the tree has to borrow the SBT's enumeration.
+        let sbt_contract: Option<Address> = env.storage().instance().get(&SBT_CONTRACT);
+        let members: soroban_sdk::Vec<Address> = match &sbt_contract {
+            Some(sbt) => env.invoke_contract(
+                sbt,
+                &Symbol::new(&env, "get_members"),
+                soroban_sdk::vec![
+                    &env,
+                    dao_id.into_val(&env),
+                    start.into_val(&env),
+                    (end - start).into_val(&env),
+                ],
+            ),
+            None => soroban_sdk::Vec::new(&env),
+        };
+
+        let mut swept = 0u32;
+        let mut i = start;
+        while i < end {
+            let leaf_key = DataKey::LeafValue(dao_id, i as u32);
+            if let Some(commitment) = Self::read_persistent::<_, U256>(&env, &leaf_key) {
+                for key in [
+                    DataKey::CommitmentUsed(dao_id, commitment.clone()),
+                    DataKey::LeafIndex(dao_id, commitment.clone()),
+                ] {
+                    if env.storage().persistent().has(&key) {
+                        Self::bump_persistent(&env, &key);
+                    }
+                }
+            }
+
+            // Per-member records, walked alongside the leaf window. These are
+            // keyed by address and the tree keeps no address enumeration of its
+            // own, so the addresses are borrowed from the SBT contract; both
+            // enumerations are dense over the same membership, so one index
+            // window covers leaves and members together.
+            if let Some(member) = members.get((i - start) as u32) {
+                for key in [
+                    DataKey::MemberLeafIndex(dao_id, member.clone()),
+                    DataKey::LastRegistrationAt(dao_id, member),
+                ] {
+                    if env.storage().persistent().has(&key) {
+                        Self::bump_persistent(&env, &key);
+                    }
+                }
+            }
+            swept += 1;
+            i += 1;
+        }
+        swept
+    }
+
+    /// Read a record and, if it exists, refresh its TTL.
+    fn read_persistent<K, V>(env: &Env, key: &K) -> Option<V>
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+        V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        let value: Option<V> = env.storage().persistent().get(key);
+        if value.is_some() {
+            Self::bump_persistent(env, key);
+        }
+        value
     }
 
     /// Verify exclusion proof: check if a commitment is NOT in the current tree

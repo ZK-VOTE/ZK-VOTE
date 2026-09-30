@@ -290,10 +290,17 @@ impl Voting {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
 
-        // Quadratic rounds use snapshot (Fixed) semantics for eligibility.
+        // Quadratic rounds use snapshot (Fixed) semantics for eligibility. This
+        // cannot call `assert_root_eligible`, whose first act is to reject
+        // Quadratic elections outright — that rejection is what routes them
+        // here in the first place. It composes the same two primitives
+        // `assert_root_eligible` is built from instead, so the Fixed arm's
+        // revocation check applies here too and cannot drift away from it
+        // again (#audit-H3).
         if root != proposal.eligible_root {
             panic_with_error!(&env, VotingError::RootMismatch);
         }
+        Self::assert_root_not_revoked(&env, PathContext::Anonymous, dao_id, &root);
 
         // Verify the QV VK pinned at proposal creation is unchanged.
         let vk = Self::get_qv_vk_by_version(&env, dao_id, proposal.vk_version);

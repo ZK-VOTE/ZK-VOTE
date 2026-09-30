@@ -1,5 +1,60 @@
 #![no_std]
 
+/// Helpers shared by the integration test binaries in `tests/`.
+///
+/// These deliberately sit *outside* `#[cfg(test)]`. A `#[cfg(test)]` item is only
+/// compiled into this crate's own test build, and the binaries under `tests/`
+/// link this crate as an ordinary dependency — so a helper hidden behind
+/// `cfg(test)` would not exist for the very callers that need it most.
+pub mod testkit {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+    use voting::VotingClient;
+
+    #[contracttype]
+    pub enum DataKey {
+        AttestAll(bool),
+    }
+
+    /// A transcript registry that attests every key.
+    ///
+    /// `voting::set_vk` is fail-closed without a configured transcript registry
+    /// (#662): a missing registry is a hard error, not a bypass. That is the
+    /// right default for production, but it means any harness that registers a
+    /// verification key has to supply one. These tests are not testing
+    /// attestation — they are testing the voting flow the key exists to verify —
+    /// so they install a permissive registry rather than pre-attesting every key
+    /// they construct. The tests that *do* exercise the gate live in
+    /// `contracts/voting/src/test.rs` and install a strict registry instead.
+    #[contract]
+    pub struct PermissiveTranscriptRegistry;
+
+    #[contractimpl]
+    impl PermissiveTranscriptRegistry {
+        pub fn set_attest_all(env: Env, attest_all: bool) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AttestAll(attest_all), &attest_all);
+        }
+
+        pub fn is_vk_attested(env: Env, _vk_hash: BytesN<32>) -> bool {
+            env.storage()
+                .persistent()
+                .get(&DataKey::AttestAll(true))
+                .unwrap_or(false)
+        }
+    }
+
+    /// Give `voting` a permissive transcript registry so `set_vk` will run.
+    ///
+    /// Call this immediately after registering the voting contract and before
+    /// any `set_vk`.
+    pub fn install_permissive_transcript_registry(env: &Env, voting: &Address) {
+        let transcript = env.register(PermissiveTranscriptRegistry, ());
+        PermissiveTranscriptRegistryClient::new(env, &transcript).set_attest_all(&true);
+        VotingClient::new(env, voting).set_transcript_registry(&transcript);
+    }
+}
+
 // Integration test crate - all code is test-only
 
 /// Stand-in for the MPC ceremony transcript registry.
@@ -1200,8 +1255,28 @@ mod tests {
         let cpu_delta = cpu_after.saturating_sub(cpu_before);
         let mem_delta = mem_after.saturating_sub(mem_before);
         std::println!("[budget] vote cpu={} mem={}", cpu_delta, mem_delta);
-        assert!(cpu_delta <= 600_000, "vote cpu too high (test mode)");
-        assert!(mem_delta <= 200_000, "vote mem too high (test mode)");
+        // This ceiling is re-calibrated, not loosened, and the reason is worth
+        // recording. The old 600k/200k was measured against a Fixed-mode `vote`
+        // that made *zero* calls into the tree: the Fixed arm compared the root
+        // against the snapshot and stopped, which is exactly why member
+        // revocation was inert for Fixed-mode elections (#audit-H3). Closing
+        // that hole costs one `root_eligibility` hop per vote — measured at
+        // +131k CPU and +72k memory here, ~26% over the vulnerable path.
+        //
+        // That is the price of the check, and it is not avoidable by asking the
+        // tree for less: all three facts the check needs (is the root still in
+        // history, what index is it at, and where the revocation floor sits) live
+        // in the tree, so the floor cannot be consulted without a cross-contract
+        // call. A Trailing-mode vote already paid three such calls before this
+        // change, so Fixed mode is now no more expensive than Trailing.
+        //
+        // If this cost ever matters, the fix is architectural rather than a
+        // tighter constant: have `remove_member` *push* an invalidation onto the
+        // affected Active Fixed proposals once, instead of every vote pulling
+        // the floor. That moves the cost from per-vote to per-removal, at the
+        // price of a tree -> voting call on a path that currently has none.
+        assert!(cpu_delta <= 700_000, "vote cpu too high (test mode)");
+        assert!(mem_delta <= 260_000, "vote mem too high (test mode)");
     }
 
     #[test]
@@ -1375,7 +1450,7 @@ mod tests {
         // Set num_candidates=1: only candidate index 0 is valid
         system
             .voting_client()
-            .set_election_config(&dao_id, &proposal_id, &0, &0, &1u32);
+            .set_election_config(&dao_id, &proposal_id, &0, &0, &1u32, &admin);
 
         let proof = system.create_test_proof();
         let nullifier = U256::from_u32(&system.env, 77777);

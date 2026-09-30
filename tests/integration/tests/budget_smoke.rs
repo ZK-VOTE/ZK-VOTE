@@ -65,6 +65,8 @@ fn setup(
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(env, &voting_id);
 
     // Attestation source for `set_vk` (see test_support module docs).
     attach_transcript_registry(env.clone(), &voting_id);
@@ -145,6 +147,8 @@ fn budget_set_vk_within_limit() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(&env, &voting_id);
 
     // Attestation source for `set_vk` (see test_support module docs).
     attach_transcript_registry(env.clone(), &voting_id);
