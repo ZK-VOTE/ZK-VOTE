@@ -9,16 +9,20 @@ import { relayerKeypair } from "./stellar.js";
 import { relayerKeyManager } from "./relayerKeyManager.js";
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
+import { asset_decimal_conversion_rejection_total, payment_trustline_required_total } from "./metrics.js";
 
 const horizonServer = new (StellarSdk.Horizon as any).Server((config as any).horizonUrl || "https://horizon-testnet.stellar.org");
 log("info", "payments_loaded", {});
 
 export type PaymentAsset = "XLM" | "USDC" | "EURC";
 
+export const HORIZON_ASSET_DECIMALS = 7;
+export const SOROBAN_ASSET_DECIMALS = 12;
+
 const ISSUERS: Record<PaymentAsset, string | null> = {
   XLM: null,
-  USDC: process.env.USDC_ISSUER || null,
-  EURC: process.env.EURC_ISSUER || null,
+  USDC: config.usdcIssuer || null,
+  EURC: config.eurcIssuer || null,
 };
 
 export function getAsset(code: PaymentAsset): StellarSdk.Asset {
@@ -26,6 +30,73 @@ export function getAsset(code: PaymentAsset): StellarSdk.Asset {
   const issuer = ISSUERS[code];
   if (!issuer) throw new Error(`Issuer not configured for ${code}`);
   return new StellarSdk.Asset(code, issuer);
+}
+
+/** Normalize human asset amounts before they enter a Horizon operation. */
+export function canonicalHorizonAmount(amount: string, allowZero = false): string {
+  if (typeof amount !== "string" || !/^\d+(?:\.\d+)?$/.test(amount.trim())) {
+    throw new Error("Amount must be a positive decimal string");
+  }
+  const [whole, fraction = ""] = amount.trim().split(".");
+  if (fraction.length > HORIZON_ASSET_DECIMALS) {
+    asset_decimal_conversion_rejection_total.inc({ source: "human", target: "horizon" });
+    throw new Error(`Horizon amounts support at most ${HORIZON_ASSET_DECIMALS} decimals`);
+  }
+  const normalized = `${whole}.${fraction.padEnd(HORIZON_ASSET_DECIMALS, "0")}`;
+  if (Number(normalized) < 0 || (!allowZero && Number(normalized) <= 0)) {
+    throw new Error(allowZero ? "Amount must not be negative" : "Amount must be positive");
+  }
+  return normalized;
+}
+
+/** Convert Soroban's 12-decimal atomic amount to Horizon's 7-decimal amount. */
+export function sorobanAtomicToHorizonAmount(atomicAmount: string): string {
+  if (!/^\d+$/.test(atomicAmount)) {
+    asset_decimal_conversion_rejection_total.inc({ source: "soroban", target: "horizon" });
+    throw new Error("Soroban amount must be an integer");
+  }
+  const atomic = BigInt(atomicAmount);
+  const scale = 10n ** BigInt(SOROBAN_ASSET_DECIMALS);
+  const whole = atomic / scale;
+  const fraction = (atomic % scale).toString().padStart(SOROBAN_ASSET_DECIMALS, "0");
+  const human = `${whole}.${fraction}`.replace(/0+$/, "").replace(/\.$/, "");
+  return canonicalHorizonAmount(human);
+}
+
+export class TrustlineRequiredError extends Error {
+  code = "TRUSTLINE_REQUIRED" as const;
+  constructor(public asset: Exclude<PaymentAsset, "XLM">, public destination: string) {
+    super(`${asset} trustline required for ${destination}`);
+  }
+}
+
+async function destinationHasTrustline(destination: string, asset: PaymentAsset): Promise<boolean> {
+  if (asset === "XLM") return true;
+  const account: any = await (horizonServer as any).loadAccount(destination);
+  const issuer = ISSUERS[asset];
+  return account.balances.some((balance: any) =>
+    balance.asset_type !== "native" && balance.asset_code === asset && balance.asset_issuer === issuer,
+  );
+}
+
+export async function requireDestinationTrustline(destination: string, asset: PaymentAsset): Promise<void> {
+  if (asset !== "XLM" && !(await destinationHasTrustline(destination, asset))) {
+    payment_trustline_required_total.inc({ asset });
+    throw new TrustlineRequiredError(asset, destination);
+  }
+}
+
+/** Build an unsigned trustline transaction; only the destination may sign it. */
+export async function buildTrustlineTransaction(destination: string, asset: Exclude<PaymentAsset, "XLM">): Promise<string> {
+  const account: any = await (horizonServer as any).loadAccount(destination);
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: "10000",
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(StellarSdk.Operation.changeTrust({ asset: getAsset(asset) }))
+    .setTimeout(300)
+    .build();
+  return tx.toXDR();
 }
 
 // MuxedAccount helper for high-volume inflow (one G... → many M...)
@@ -52,7 +123,8 @@ export async function sendPayment(op: PaymentOp): Promise<{ hash: string }> {
   log("info", "payment_via_horizon", {});
   const asset = getAsset(op.asset);
   const dest = op.destination;
-  const amount = op.amount;
+  const amount = canonicalHorizonAmount(op.amount);
+  await requireDestinationTrustline(dest, op.asset);
   const account = await (horizonServer as any).loadAccount(relayerKeypair.publicKey());
   const tx = new StellarSdk.TransactionBuilder(account, { fee: "10000", networkPassphrase: config.networkPassphrase })
     .addOperation(StellarSdk.Operation.payment({ destination: dest, asset, amount }))
@@ -76,6 +148,9 @@ export async function sendPayment(op: PaymentOp): Promise<{ hash: string }> {
 export async function sendBatch(ops: PaymentOp[]): Promise<BatchResult> {
   if (ops.length === 0) throw new Error("No ops");
   if (ops.length > 100) throw new Error("Batch max 100 ops");
+  for (const op of ops) {
+    await requireDestinationTrustline(op.destination, op.asset);
+  }
   const idempotencyKey = `batch_${Date.now()}_${crypto.randomUUID()}`;
   const db = getDb();
   try {
@@ -85,7 +160,7 @@ export async function sendBatch(ops: PaymentOp[]): Promise<BatchResult> {
   const builder = new StellarSdk.TransactionBuilder(account, { fee: (10000 * ops.length).toString(), networkPassphrase: config.networkPassphrase });
   for (const op of ops) {
     const asset = getAsset(op.asset);
-    builder.addOperation(StellarSdk.Operation.payment({ destination: op.destination, asset, amount: op.amount }));
+    builder.addOperation(StellarSdk.Operation.payment({ destination: op.destination, asset, amount: canonicalHorizonAmount(op.amount) }));
   }
   const tx = builder.setTimeout(30).build();
   await relayerKeyManager.signTransaction(tx);
@@ -98,10 +173,13 @@ export async function sendBatch(ops: PaymentOp[]): Promise<BatchResult> {
 export async function swapStrictSend(sendAsset: PaymentAsset, destAsset: PaymentAsset, sendAmount: string, destMin: string, destination: string): Promise<{ hash: string }> {
   const sendA = getAsset(sendAsset);
   const destA = getAsset(destAsset);
+  const canonicalSendAmount = canonicalHorizonAmount(sendAmount);
+  const canonicalDestMin = canonicalHorizonAmount(destMin, true);
+  await requireDestinationTrustline(destination, destAsset);
   const account = await (horizonServer as any).loadAccount(relayerKeypair.publicKey());
   const tx = new StellarSdk.TransactionBuilder(account, { fee: "10000", networkPassphrase: config.networkPassphrase })
     .addOperation(StellarSdk.Operation.pathPaymentStrictSend({
-      sendAsset: sendA, sendAmount, destination, destAsset: destA, destMin, path: []
+      sendAsset: sendA, sendAmount: canonicalSendAmount, destination, destAsset: destA, destMin: canonicalDestMin, path: []
     } as any))
     .setTimeout(30)
     .build();
@@ -121,7 +199,7 @@ export async function quoteStrictSend(sendAsset: PaymentAsset, sendAmount: strin
     send_asset_type: sendA.isNative() ? "native" : "credit_alphanum4",
     send_asset_code: sendA.isNative() ? "" : sendA.getCode(),
     send_asset_issuer: sendA.isNative() ? "" : sendA.getIssuer(),
-    send_amount: sendAmount,
+    send_amount: canonicalHorizonAmount(sendAmount),
     destination_assets: `${destA.getCode()}:${destA.getIssuer()}` // for native, handled
   });
   try {

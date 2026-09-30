@@ -48,6 +48,10 @@ export default function SwapPanel() {
       let j: any = {};
       try { j = text ? JSON.parse(text) : {}; } catch { j = {}; }
       if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+      const expectedContractId = (import.meta as any).env?.VITE_SOROSWAP_CONTRACT_ID;
+      if (j.contractId && expectedContractId && j.contractId !== expectedContractId) {
+        throw new Error("Swap quote rejected: unrecognized Soroswap contract");
+      }
       setQuote(j.destAmount || j.quote || `${amount} ${to} (real Horizon)`);
     } catch (e: any) {
       setQuote(`${amount} ${from} → ${amount} ${to} (fallback 1:1) ${e.message ? "(" + e.message + ")" : ""}`);

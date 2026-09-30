@@ -632,6 +632,32 @@ export const reconciliation_mismatch_total = new Counter({
   registers: [register],
 });
 
+export const payment_trustline_required_total = new Counter({
+  name: "zkvote_payment_trustline_required_total",
+  help: "Payments rejected because the destination lacks the required Stellar trustline",
+  labelNames: ["asset"] as const,
+  registers: [register],
+});
+
+export const asset_decimal_conversion_rejection_total = new Counter({
+  name: "zkvote_asset_decimal_conversion_rejection_total",
+  help: "Asset amounts rejected because they cannot be represented at the target precision",
+  labelNames: ["source", "target"] as const,
+  registers: [register],
+});
+
+export const soroswap_phishing_rejection_total = new Counter({
+  name: "zkvote_soroswap_phishing_rejection_total",
+  help: "Soroswap quotes rejected because the returned contract ID was not pinned",
+  registers: [register],
+});
+
+export const pairing_check_oversize_total = new Counter({
+  name: "zkvote_pairing_check_oversize_total",
+  help: "Pairing checks rejected before the Soroban host call because their vectors were oversized",
+  registers: [register],
+});
+
 export const rate_limit_store_size = new Gauge({
   name: "zkvote_rate_limit_store_size",
   help: "Current number of tracked rate-limiting client keys in memory",

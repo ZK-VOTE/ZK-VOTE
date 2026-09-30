@@ -17,6 +17,7 @@
     "format:check": "prettier --check \"src/**/*.ts\"",
     "format": "prettier --write \"src/**/*.ts\"",
     "test": "RELAYER_TEST_MODE=true tsx --test --test-force-exit --test-concurrency=1 'test/*.test.js' 'test/*.test.ts' 'test/di/*.test.ts' 'tests/*.test.ts'",
+    "test:security-assets": "RELAYER_TEST_MODE=true tsx --test --test-force-exit test/payment-security.test.ts",
     "test:coverage": "RELAPER_TEST_MODE=true node --import tsx --test --test-force-exit --test-concurrency=1 --experimental-test-coverage --test-coverage-include='src/**/*.ts' --test-coverage-exclude='test/**' --test-coverage-lines=80 'test/*.test.js' 'test/*.test.ts' 'test/di/*.test.ts' 'tests/*.test.ts'",
     "validate-profiles": "tsx scripts/validate-profiles.ts",
     "audit:check": "npm audit --audit-level=high",

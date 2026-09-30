@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Button } from "./ui/Button";
 import { relayerFetch, generateIdempotencyKey } from "../lib/api";
 
@@ -17,6 +17,7 @@ export default function PayPanel() {
   const [memo, setMemo] = useState("");
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState<PendingPayment | null>(null);
+  const [trustlineRequired, setTrustlineRequired] = useState(false);
   const pendingPaymentRef = useRef<PendingPayment | null>(null);
 
   useEffect(() => {
@@ -79,7 +80,11 @@ export default function PayPanel() {
       const text = await res.text();
       let j: any = {};
       try { j = text ? JSON.parse(text) : {}; } catch { j = { raw: text }; }
-      if (!res.ok) throw new Error(j.error || `HTTP ${res.status}: ${text.slice(0, 200)}`);
+      if (!res.ok) {
+        const error: any = new Error(j.error || `HTTP ${res.status}: ${text.slice(0, 200)}`);
+        error.code = j.code;
+        throw error;
+      }
       
       // Update pending with hash
       const updatedPending = { ...pendingPayment, hash: j.hash };
@@ -87,8 +92,9 @@ export default function PayPanel() {
       pendingPaymentRef.current = updatedPending;
       
       alert(j.hash ? `Payment sent: ${j.hash}` : JSON.stringify(j));
-    } catch (e: any) { 
-      alert(e.message); 
+    } catch (e: any) {
+      if (e.code === "TRUSTLINE_REQUIRED" || e.message?.includes("trustline")) setTrustlineRequired(true);
+      alert(e.message);
     } finally { 
       setLoading(false);
       // Clear pending after a delay
@@ -151,6 +157,18 @@ export default function PayPanel() {
   return (
     <div className="rounded-xl border p-6 bg-card space-y-4">
       <h3 className="text-lg font-semibold">Pay XLM / USDC / EURC (real, high-volume)</h3>
+      {trustlineRequired && asset !== "XLM" && (
+        <div className="border border-amber-300 bg-amber-50 rounded p-3 text-sm">
+          <strong>{asset} trustline required.</strong> The destination account must sign a change-trust transaction before it can receive this asset.
+          <button type="button" className="underline ml-1" onClick={async () => {
+            const res = await relayerFetch("/pay/trustline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ asset, destination: dest }) });
+            const body = await res.json();
+            if (!res.ok) return alert(body.error || "Unable to prepare trustline");
+            await navigator.clipboard?.writeText(body.xdr);
+            alert("Unsigned trustline transaction XDR copied. The destination account must sign and submit it.");
+          }}>Prepare trustline transaction</button>
+        </div>
+      )}
       {pending && (
         <div className="bg-yellow-100 border border-yellow-300 rounded p-2 text-sm">
           <strong>Payment {pending.hash ? "confirmed" : "pending"}:</strong> {pending.idempotencyKey}

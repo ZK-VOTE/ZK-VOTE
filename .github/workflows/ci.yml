@@ -116,6 +116,13 @@ jobs:
           VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+      - name: Run payment, asset, and trustline security regression tests
+        run: npm run test:security-assets
+        env:
+          RELAYER_TEST_MODE: 'true'
+          SOROBAN_RPC_URL: 'http://localhost:8000/soroban/rpc'
+          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
+          RELAYER_AUTH_TOKEN: 'ci-test-token-placeholder-32-chars-min'
       - name: Report test counts
         if: always()
         run: |

@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { Router } from "express";
-import { sendPayment, sendBatch } from "../services/payments.js";
+import { sendPayment, sendBatch, buildTrustlineTransaction, TrustlineRequiredError } from "../services/payments.js";
 import { bodyLimit, queryLimiter, csrfOriginGuard, paymentBatchCostLimiter, masterKeyGuard } from "../middleware/index.js";
 import { log } from "../services/logger.js";
 import { batch_partial_failure_total, paymentOpsPerMinute } from "../services/metrics.js";
@@ -52,7 +52,23 @@ router.post("/pay", masterKeyGuard, csrfOriginGuard, bodyLimit("5kb"), async (re
     res.json(r);
   } catch (e: any) {
     log("error", "pay_error", { error: e.message });
+    if (e instanceof TrustlineRequiredError) {
+      return res.status(409).json({ error: e.message, code: e.code, asset: e.asset, destination: e.destination });
+    }
     res.status(500).json({ error: "Payment failed" });
+  }
+});
+
+router.post("/pay/trustline", masterKeyGuard, csrfOriginGuard, bodyLimit("2kb"), async (req, res) => {
+  try {
+    const { asset, destination } = req.body;
+    if (!["USDC", "EURC"].includes(asset) || typeof destination !== "string") {
+      return res.status(400).json({ error: "asset must be USDC or EURC and destination is required" });
+    }
+    const xdr = await buildTrustlineTransaction(destination, asset);
+    return res.json({ asset, destination, xdr, requiresDestinationSignature: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message || "Unable to prepare trustline" });
   }
 });
 
@@ -91,6 +107,9 @@ router.post("/pay/batch", masterKeyGuard, csrfOriginGuard, bodyLimit("256kb"), p
     res.json(r);
   } catch (e: any) {
     batch_partial_failure_total.inc({ batch_type: "payments", reason: String(e.message || "unknown") });
+    if (e instanceof TrustlineRequiredError) {
+      return res.status(409).json({ error: e.message, code: e.code, asset: e.asset, destination: e.destination });
+    }
     res.status(500).json({ error: e.message });
   }
 });
