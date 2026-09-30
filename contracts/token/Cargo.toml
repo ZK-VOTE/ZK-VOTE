@@ -11,7 +11,7 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 
 [features]
 testutils = ["soroban-sdk/testutils"]
