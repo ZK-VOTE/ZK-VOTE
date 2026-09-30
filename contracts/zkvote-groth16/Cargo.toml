@@ -13,7 +13,7 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 hex = "0.4"
 ark-bn254 = "0.4"
-ark-ec = "0.4"
+ark-ec = "0.6"
 ark-ff = "0.4"
 
 [features]
