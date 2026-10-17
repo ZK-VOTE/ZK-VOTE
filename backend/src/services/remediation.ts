@@ -19,6 +19,60 @@ export type ErrorType =
   | "SEQUENCE_MISMATCH"
   | "BACKGROUND_SERVICE_CRASH";
 
+// ── Payment failure taxonomy (SPIKE-097 / #763) ──────────────────────────
+//
+// Stellar payments are final.  The correct remedy depends on who caused the
+// failure — different parties have different options and obligations.  This
+// taxonomy is the authoritative classification used by support tooling and
+// the compensation-pool process.
+//
+// No-remedy cases are explicit: listing them prevents off-book ad-hoc
+// refunds that create double-spend and moral hazard.
+
+export type PaymentFailureClass =
+  /** User supplied a wrong address, bad memo, or wrong asset. */
+  | "USER_ERROR"
+  /** Relayer sequence desync, reserve drain, or duplicate fee burn. */
+  | "RELAYER_ERROR"
+  /** DEX/swap drift between quote and execution price. */
+  | "MARKET_DRIFT"
+  /** Anchor (Circle/Tempo/partner) failed to settle or process. */
+  | "ANCHOR_ERROR";
+
+export type PaymentRemedy =
+  /** An automated or support-initiated correction path exists. */
+  | "COMPENSABLE_VIA_POOL"
+  /** Anchor recall or contact-recipient process may recover funds. */
+  | "ESCALATE_TO_ANCHOR"
+  /**
+   * No recovery path exists on Stellar.  User is informed with full
+   * explanation; outcome is documented in the audit trail.  No off-book
+   * refund is permitted — doing so creates double-spend risk.
+   */
+  | "NO_REMEDY_FINAL"
+  /** DEX slippage within tolerance; within the quoted range; no action. */
+  | "WITHIN_QUOTED_TOLERANCE";
+
+/** Authoritative remedy per failure class.  Drives support tooling. */
+export const PAYMENT_REMEDY_MAP: Record<PaymentFailureClass, PaymentRemedy> = {
+  USER_ERROR:    "NO_REMEDY_FINAL",        // Stellar finality; user's mistake
+  RELAYER_ERROR: "COMPENSABLE_VIA_POOL",   // Relayer-caused → compensation pool
+  MARKET_DRIFT:  "WITHIN_QUOTED_TOLERANCE", // Covered by slippage tolerance
+  ANCHOR_ERROR:  "ESCALATE_TO_ANCHOR",      // Anchor SLA applies
+};
+
+export interface PaymentFailureRecord {
+  paymentId: string;
+  timestamp: string;
+  failureClass: PaymentFailureClass;
+  remedy: PaymentRemedy;
+  /** Stroop amount affected (string to avoid float64 loss). */
+  affectedAmountStroops: string;
+  /** Redacted destination (first 8 chars only). */
+  destinationPrefix: string;
+  notes?: string;
+}
+
 export type EscalationLevel = "AUTO_REMEDIATE" | "ALERT" | "PAGE";
 
 export interface RemediationRecord {

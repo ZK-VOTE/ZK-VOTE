@@ -100,3 +100,55 @@ groups:
         annotations:
           summary: Batch partial failure rate elevated
           description: Elevated partial failures observed in multi-item batch execution.
+
+      # ── Network-reset detection (SPIKE-100 / #766) ──────────────────────
+      #
+      # A Stellar network reset (testnet wipe, ledger-sequence rollback) looks
+      # identical to a prolonged outage from the relayer's perspective: ledger age
+      # grows beyond any reasonable block time.  The two events require completely
+      # different runbook responses — an outage waits for the RPC to recover,
+      # while a reset requires wiping the local SQLite cache and re-syncing from
+      # ledger 0.  The alerts below distinguish them by combining ledger-age with
+      # a ledger-sequence regression signal.
+      #
+      # Runbook:
+      #   - ZKVoteNetworkLedgerStale alone  → wait; page on-call after for:
+      #   - ZKVoteNetworkLedgerReset firing  → execute network-reset runbook:
+      #       1. Stop relayer
+      #       2. sqlite3 data/zkvote.db "DELETE FROM processed_events;"
+      #       3. Reset horizon cursor: rm data/horizon_cursor.txt
+      #       4. Restart relayer; confirm ledger_sequence_number rising in Grafana
+
+      - alert: ZKVoteNetworkLedgerStale
+        # Horizon reports a last_ledger_close_time; we derive age from current
+        # wall time minus that timestamp.  >120 s is two missed 5-s ledger slots.
+        expr: (time() - zkvote_horizon_last_ledger_close_time_seconds) > 120
+        for: 3m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: Stellar ledger has not advanced for >2 minutes
+          description: >
+            zkvote_horizon_last_ledger_close_time_seconds is stale.  Could be a
+            transient RPC outage or a network reset.  Monitor ZKVoteNetworkLedgerReset
+            to distinguish.  If only this alert fires, wait for recovery; if both
+            fire, follow the network-reset runbook.
+
+      - alert: ZKVoteNetworkLedgerReset
+        # A ledger-sequence regression (current sequence < previous recorded max)
+        # is the definitive signal for a network reset.  The relayer gauge
+        # zkvote_horizon_ledger_sequence tracks the latest sequence seen; a
+        # decrease_over_time indicates the ledger rolled back.
+        expr: decrease(zkvote_horizon_ledger_sequence[10m]) > 1000
+        for: 1m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: Stellar ledger sequence regression detected — possible network reset
+          description: >
+            zkvote_horizon_ledger_sequence decreased by >1 000 in the last 10 minutes.
+            This is the canonical signal for a testnet/network reset.  Execute the
+            network-reset runbook immediately: stop the relayer, wipe processed_events,
+            remove the horizon cursor file, then restart and verify sequence is climbing.

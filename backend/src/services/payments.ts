@@ -15,6 +15,61 @@ log("info", "payments_loaded", { url: (horizonServer as any).serverURL?.href || 
 
 export type PaymentAsset = "XLM" | "USDC" | "EURC";
 
+// ── Asset risk registry (SPIKE-099 / #765) ───────────────────────────────
+//
+// Classifies supported assets by liquidity depth and counterparty exposure so
+// the onboarding workflow can gate which assets appear for each risk tier and
+// the compliance layer can flag high-risk routes automatically.
+//
+// TIER_1 — liquid, natively supported; no extra friction.
+// TIER_2 — mid-depth DEX pool; warn user about slippage on large orders.
+// TIER_3 — illiquid or high-counterparty-risk; require explicit confirmation
+//           and block automated batch routes.
+
+export type AssetRiskTier = "TIER_1" | "TIER_2" | "TIER_3";
+
+export interface AssetRiskProfile {
+  code: string;
+  tier: AssetRiskTier;
+  /** Human-readable note shown to support and compliance tooling — never the user. */
+  internalNote: string;
+  /** True when the asset is enabled for the automated relayer path. */
+  relayerEnabled: boolean;
+}
+
+export const ASSET_RISK_REGISTRY: AssetRiskProfile[] = [
+  {
+    code: "XLM",
+    tier: "TIER_1",
+    internalNote: "Native asset; no counterparty risk; deepest liquidity.",
+    relayerEnabled: true,
+  },
+  {
+    code: "USDC",
+    tier: "TIER_1",
+    internalNote: "Circle-issued USDC on Stellar; high liquidity; stable.",
+    relayerEnabled: true,
+  },
+  {
+    code: "EURC",
+    tier: "TIER_2",
+    internalNote: "Circle-issued EURC; growing Stellar pool; slippage risk on >$50k orders.",
+    relayerEnabled: true,
+  },
+];
+
+export function getAssetRiskProfile(code: string): AssetRiskProfile | undefined {
+  return ASSET_RISK_REGISTRY.find((p) => p.code === code);
+}
+
+export function assertRelayerEnabled(code: string): void {
+  const profile = getAssetRiskProfile(code);
+  if (!profile) throw new Error(`Asset ${code} is not in the supported-asset registry.`);
+  if (!profile.relayerEnabled) {
+    throw new Error(`Asset ${code} (${profile.tier}) is not enabled for the automated relayer path.`);
+  }
+}
+
 const ISSUERS: Record<PaymentAsset, string | null> = {
   XLM: null,
   USDC: process.env.USDC_ISSUER || "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVV",
