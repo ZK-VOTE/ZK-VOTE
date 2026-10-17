@@ -338,3 +338,79 @@ fn test_transfer_panics_even_without_an_existing_membership() {
     let recipient = Address::generate(&env);
     client.transfer(&1u64, &stranger, &recipient, &1i128);
 }
+
+// ── Admin mint rate-limiting tests (#770) ─────────────────────────────────
+
+#[test]
+fn test_mint_up_to_epoch_cap_succeeds() {
+    let (env, sbt_id, _, admin, _) = setup_env();
+    let client = MembershipSbtClient::new(&env, &sbt_id);
+
+    // MAX_MINTS_PER_EPOCH mints in one epoch must all succeed.
+    for _ in 0..MAX_MINTS_PER_EPOCH {
+        let member = Address::generate(&env);
+        client.mint(&1u64, &member, &admin, &None);
+    }
+
+    let extra = Address::generate(&env);
+    assert!(!client.has(&1u64, &extra));
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_mint_exceeds_epoch_cap_panics() {
+    let (env, sbt_id, _, admin, _) = setup_env();
+    let client = MembershipSbtClient::new(&env, &sbt_id);
+
+    for _ in 0..MAX_MINTS_PER_EPOCH {
+        let member = Address::generate(&env);
+        client.mint(&1u64, &member, &admin, &None);
+    }
+
+    // The (MAX_MINTS_PER_EPOCH + 1)-th mint must panic with MintRateLimitExceeded.
+    let overflow = Address::generate(&env);
+    client.mint(&1u64, &overflow, &admin, &None);
+}
+
+#[test]
+fn test_mint_cap_resets_in_new_epoch() {
+    let (env, sbt_id, _, admin, _) = setup_env();
+    let client = MembershipSbtClient::new(&env, &sbt_id);
+
+    // Fill the cap in epoch 0.
+    for _ in 0..MAX_MINTS_PER_EPOCH {
+        let member = Address::generate(&env);
+        client.mint(&1u64, &member, &admin, &None);
+    }
+
+    // Advance into epoch 1 — the temporary counter key is gone, quota resets.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += EPOCH_LEDGERS;
+    });
+
+    let new_member = Address::generate(&env);
+    client.mint(&1u64, &new_member, &admin, &None);
+    assert!(client.has(&1u64, &new_member));
+}
+
+#[test]
+fn test_mint_cap_is_per_dao() {
+    let (env, sbt_id, registry_id, admin, _) = setup_env();
+    let client = MembershipSbtClient::new(&env, &sbt_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+
+    // Different admin for DAO 2.
+    let admin2 = Address::generate(&env);
+    registry_client.set_admin(&2u64, &admin2);
+
+    // Fill the cap for DAO 1.
+    for _ in 0..MAX_MINTS_PER_EPOCH {
+        let member = Address::generate(&env);
+        client.mint(&1u64, &member, &admin, &None);
+    }
+
+    // DAO 2 starts with a fresh counter — first mint must succeed.
+    let member_dao2 = Address::generate(&env);
+    client.mint(&2u64, &member_dao2, &admin2, &None);
+    assert!(client.has(&2u64, &member_dao2));
+}

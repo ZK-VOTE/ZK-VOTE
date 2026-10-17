@@ -51,6 +51,18 @@ pub const MAX_REPUTATION: u32 = 10_000;
 /// Seconds per day, for age bucketing.
 pub const SECONDS_PER_DAY: u64 = 86_400;
 
+// ── Admin mint rate-limiting (#770) ────────────────────────────────────────
+//
+// Without a cap an admin can flood the member list (and any open election)
+// with Sybil identities in a single transaction burst.  We bucket mints by
+// "epoch" — a window of EPOCH_LEDGERS ledgers (~24 h at 5 s/ledger) — and
+// reject any mint that would push the per-DAO count past MAX_MINTS_PER_EPOCH.
+// Temporary storage is the right choice: the epoch counter is only relevant
+// during the window; once the TTL expires the key is gone and the next epoch
+// starts at zero automatically, with no explicit reset needed.
+pub const MAX_MINTS_PER_EPOCH: u32 = 50;
+const EPOCH_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum SbtError {
@@ -69,6 +81,8 @@ pub enum SbtError {
     NotReputationAttestor = 9,
     /// Reputation weight parameters are not monotonically increasing (#301).
     InvalidWeightCurve = 10,
+    /// Admin has exceeded the per-epoch mint cap for this DAO (#770).
+    MintRateLimitExceeded = 11,
 }
 
 #[contracttype]
@@ -96,6 +110,11 @@ pub enum DataKey {
     /// Addresses permitted to accrue/slash reputation for a DAO (the voting
     /// contract, plus any DAO-nominated attestor).
     ReputationAttestor(u64, Address), // (dao_id, address) -> bool
+
+    // ── Rate-limiting (#770) ───────────────────────────────────────────────
+    /// Rolling mint counter per epoch window.  Key: (dao_id, epoch_number).
+    /// Stored in temporary storage; expires automatically when the epoch ends.
+    MintEpochCount(u64, u64), // (dao_id, epoch) -> u32
 }
 
 // Typed Events
@@ -245,6 +264,18 @@ impl MembershipSbt {
         if Self::has(env.clone(), dao_id, to.clone()) {
             panic_with_error!(&env, SbtError::AlreadyMinted);
         }
+
+        // Rate-limit: at most MAX_MINTS_PER_EPOCH mints per DAO per epoch (#770)
+        let epoch = (env.ledger().sequence() / EPOCH_LEDGERS) as u64;
+        let epoch_key = DataKey::MintEpochCount(dao_id, epoch);
+        let epoch_count: u32 = env.storage().temporary().get(&epoch_key).unwrap_or(0);
+        if epoch_count >= MAX_MINTS_PER_EPOCH {
+            panic_with_error!(&env, SbtError::MintRateLimitExceeded);
+        }
+        env.storage().temporary().set(&epoch_key, &(epoch_count + 1));
+        env.storage()
+            .temporary()
+            .extend_ttl(&epoch_key, EPOCH_LEDGERS, EPOCH_LEDGERS * 2);
 
         let member_key = DataKey::Member(dao_id, to.clone());
         let revoked_key = DataKey::Revoked(dao_id, to.clone());
