@@ -42,15 +42,25 @@ export function stringToFieldElement(str: string | number): bigint {
   return hash;
 }
 
-// Generate a random 256-bit master secret (in BN254 scalar field)
+/**
+ * Generate a random 256-bit master secret in the BN254 scalar field.
+ *
+ * Requires the Web Crypto API (`globalThis.crypto.getRandomValues`). Throws
+ * rather than falling back to `Math.random`, which is not a CSPRNG and would
+ * make derived election secrets and blinding factors guessable.
+ */
 export function generateMasterSecret(): bigint {
   const bytes = new Uint8Array(32);
-  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
-    crypto.getRandomValues(bytes);
+  if (
+    typeof globalThis.crypto !== "undefined" &&
+    typeof globalThis.crypto.getRandomValues === "function"
+  ) {
+    globalThis.crypto.getRandomValues(bytes);
   } else {
-    for (let i = 0; i < 32; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
+    throw new Error(
+      "generateMasterSecret: no cryptographically secure random source is available. " +
+        "Use Node.js ≥ 18 or a browser with the Web Crypto API.",
+    );
   }
   let hex = "0x";
   for (let i = 0; i < 32; i++) {

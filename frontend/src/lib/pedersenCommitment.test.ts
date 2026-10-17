@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   computePedersenCommitment,
   generateBlindingFactor,
@@ -102,6 +102,42 @@ describe("Pedersen Commitment", () => {
     // No collisions expected across 20 random samples.
     expect(new Set(results).size).toEqual(results.length);
   }, 30000);
+
+  // --- Entropy source: fail-safe when no CSPRNG ---
+  describe("generateBlindingFactor entropy", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("returns a value within the BN254 scalar field", () => {
+      const bf = generateBlindingFactor();
+      expect(bf >= 0n).toBe(true);
+      expect(bf < BN254_MODULUS).toBe(true);
+    });
+
+    it("returns distinct values on successive calls (not a constant)", () => {
+      const values = new Set(Array.from({ length: 8 }, () => generateBlindingFactor()));
+      expect(values.size).toBeGreaterThan(1);
+    });
+
+    it("throws when globalThis.crypto.getRandomValues is unavailable", () => {
+      const originalCrypto = globalThis.crypto;
+      Object.defineProperty(globalThis, "crypto", {
+        value: undefined,
+        configurable: true,
+      });
+      try {
+        expect(() => generateBlindingFactor()).toThrow(
+          "no cryptographically secure random source",
+        );
+      } finally {
+        Object.defineProperty(globalThis, "crypto", {
+          value: originalCrypto,
+          configurable: true,
+        });
+      }
+    });
+  });
 
   it("rejects out-of-field negative inputs", async () => {
     await expect(computePedersenCommitment(-1n, 1n)).rejects.toThrow();
