@@ -129,6 +129,9 @@ export function getLogSampleRate(): number {
  * dropped - keeping start/end spans and nested logs consistent.
  */
 function shouldEmit(event: string, meta: LogMeta): boolean {
+  // Drill-down records are the only per-DAO/per-client view behind a bounded
+  // metric (#749); sampling them would leave holes in investigations.
+  if (event === "metric_drilldown") return true;
   if (sampleRate >= 1) return true;
   if (sampleRate <= 0) return false;
 

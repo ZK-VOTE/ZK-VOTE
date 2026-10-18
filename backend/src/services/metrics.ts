@@ -12,6 +12,9 @@ import {
   Gauge,
   collectDefaultMetrics,
 } from "prom-client";
+// Imported first: patches prom-client so every metric below is budget-guarded
+// (#749). See metric-cardinality.ts for the label policy.
+import { installCardinalityGuard } from "./metric-cardinality.js";
 
 // ============================================
 // REGISTRY
@@ -76,21 +79,24 @@ export const httpResponseSize = new Histogram({
 export const coalescingHitsTotal = new Counter({
   name: "zkvote_coalescing_hits_total",
   help: "Total request coalescing hits",
-  labelNames: ["key"] as const,
+  // scope = key prefix ("root"), never the key itself: keys embed DAO ids.
+  labelNames: ["scope"] as const,
   registers: [register],
 });
 
 export const coalescingMissesTotal = new Counter({
   name: "zkvote_coalescing_misses_total",
   help: "Total request coalescing misses (original requests)",
-  labelNames: ["key"] as const,
+  // scope = key prefix ("root"), never the key itself: keys embed DAO ids.
+  labelNames: ["scope"] as const,
   registers: [register],
 });
 
 export const coalescingWaitTime = new Histogram({
   name: "zkvote_coalescing_wait_time_seconds",
   help: "Time spent waiting for coalesced requests in seconds",
-  labelNames: ["key"] as const,
+  // scope = key prefix ("root"), never the key itself: keys embed DAO ids.
+  labelNames: ["scope"] as const,
   buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
   registers: [register],
 });
@@ -154,7 +160,8 @@ export const rpcPoolTotalEndpoints = new Gauge({
 export const rpcEndpointLatency = new Gauge({
   name: "zkvote_rpc_endpoint_latency_seconds",
   help: "RPC endpoint latency in seconds",
-  labelNames: ["url"] as const,
+  // Origin only: full URLs can carry API keys and are not a bounded set.
+  labelNames: ["endpoint"] as const,
   registers: [register],
 });
 
@@ -525,7 +532,8 @@ export const wsMessageDuration = new Histogram({
 export const wsRateLimitTotal = new Counter({
   name: "zkvote_ws_rate_limit_total",
   help: "Total WebSocket connections blocked by rate limiting",
-  labelNames: ["ip"] as const,
+  // No ip label: attacker-mintable. The client (hashed) is on the
+  // metric_drilldown log record for this increment.
   registers: [register],
 });
 
@@ -535,8 +543,9 @@ export const wsRateLimitTotal = new Counter({
 
 export const relayerKeyBalance = new Gauge({
   name: "zkvote_relayer_key_balance_xlm",
-  help: "Current balance of relayer keys in XLM",
-  labelNames: ["key_id", "role"] as const,
+  help: "Lowest balance among relayer keys in each role, in XLM",
+  // Per role, not per key: key ids grow with every rotation/generation.
+  labelNames: ["role"] as const,
   registers: [register],
 });
 
@@ -549,15 +558,15 @@ export const relayerKeyRotationsTotal = new Counter({
 
 export const relayerKeyAgeSeconds = new Gauge({
   name: "zkvote_relayer_key_age_seconds",
-  help: "Age of relayer key in seconds since activation",
-  labelNames: ["key_id"] as const,
+  help: "Oldest activation age among relayer keys in each role, in seconds",
+  labelNames: ["role"] as const,
   registers: [register],
 });
 
 export const relayerKeyTransactionsTotal = new Counter({
   name: "zkvote_relayer_key_transactions_total",
-  help: "Total transactions signed by relayer key",
-  labelNames: ["key_id"] as const,
+  help: "Total transactions signed by relayer keys, by role",
+  labelNames: ["role"] as const,
   registers: [register],
 });
 
@@ -621,7 +630,8 @@ export const unauthenticated_rejection_total = new Counter({
 export const cross_tenant_denial_total = new Counter({
   name: "zkvote_cross_tenant_denial_total",
   help: "Total access attempts denied due to cross-tenant or cross-DAO resource isolation policies",
-  labelNames: ["tenant_id", "target_resource", "reason"] as const,
+  // tenant_id removed: caller-chosen. It is on the drill-down log instead.
+  labelNames: ["target_resource", "reason"] as const,
   registers: [register],
 });
 
@@ -631,6 +641,17 @@ export const reconciliation_mismatch_total = new Counter({
   labelNames: ["component", "mismatch_type"] as const,
   registers: [register],
 });
+
+export const rootFetchFailuresTotal = new Counter({
+  name: "zkvote_root_fetch_failures_total",
+  help: "GET /root/:daoId failures by reason (dao_id is on the metric_drilldown log, #749)",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+// camelCase aliases: registry-pin.ts imports these names.
+export const unauthenticatedRejectionTotal = unauthenticated_rejection_total;
+export const crossTenantDenialTotal = cross_tenant_denial_total;
 
 export const rate_limit_store_size = new Gauge({
   name: "zkvote_rate_limit_store_size",
@@ -776,3 +797,7 @@ export const outboxLagGauge = new Gauge({
   labelNames: ["channel"] as const,
   registers: [register],
 });
+
+// Bind the guard to this registry last, so it sees every metric above and
+// repairs any constructed before prom-client was patched (#749).
+installCardinalityGuard(register);

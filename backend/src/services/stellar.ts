@@ -463,6 +463,15 @@ export interface RpcEndpointStatus {
   lastChecked: string;
 }
 
+/** Metric label for an endpoint: its origin, never the full URL (#749). */
+function endpointOrigin(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "invalid-url";
+  }
+}
+
 export class RpcPoolManager {
   private endpoints: Array<{
     url: string;
@@ -527,8 +536,8 @@ export class RpcPoolManager {
       }
       ep.lastChecked = Date.now();
 
-      // Update Prometheus gauges per endpoint
-      rpcEndpointLatency.set({ url: ep.url }, ep.latencyMs / 1000);
+      // Update Prometheus gauges per endpoint (origin only, #749)
+      rpcEndpointLatency.set({ endpoint: endpointOrigin(ep.url) }, ep.latencyMs / 1000);
 
       results.push({
         url: ep.url,

@@ -450,10 +450,8 @@ export class RelayerKeyManager {
     await active.signer.signTransaction(tx);
     active.txCount++;
     active.lastUsedAt = new Date().toISOString();
-    relayerKeyTransactionsTotal.inc({
-      key_id: active.id,
-      public_key: active.publicKey,
-    });
+    // By role, not key id: ids grow with every rotation (#749).
+    relayerKeyTransactionsTotal.inc({ role: active.role });
   }
 
   /**
@@ -979,25 +977,29 @@ export class RelayerKeyManager {
     }
   }
 
+  /**
+   * Per-role aggregates instead of per-key series (#749): key ids grow with
+   * every rotation or generated key. Balance is the lowest in the role (the
+   * one that matters for failover); age is the oldest activation.
+   */
   private updateMetrics(): void {
+    const minBalance = new Map<KeyRole, number>();
+    const maxAge = new Map<KeyRole, number>();
     for (const key of this.keys.values()) {
       if (key.balanceXlm !== null) {
-        relayerKeyBalance.set(
-          { key_id: key.id, role: key.role },
-          key.balanceXlm,
-        );
+        const prev = minBalance.get(key.role);
+        minBalance.set(key.role, prev === undefined ? key.balanceXlm : Math.min(prev, key.balanceXlm));
       }
       if (key.activatedAt) {
         const ageSec = Math.max(
           0,
           Math.floor((Date.now() - new Date(key.activatedAt).getTime()) / 1000),
         );
-        relayerKeyAgeSeconds.set(
-          { key_id: key.id },
-          ageSec,
-        );
+        maxAge.set(key.role, Math.max(maxAge.get(key.role) ?? 0, ageSec));
       }
     }
+    for (const [role, balance] of minBalance) relayerKeyBalance.set({ role }, balance);
+    for (const [role, age] of maxAge) relayerKeyAgeSeconds.set({ role }, age);
   }
 
   /**

@@ -89,7 +89,9 @@ import {
   relayErrors,
   relayQueueDepth,
   offlineRetryTotal,
+  rootFetchFailuresTotal,
 } from "../services/metrics.js";
+import { incWithDrilldown } from "../services/metric-drilldown.js";
 import { sharedSingleFlight } from "../utils/singleflight.js";
 import type { Groth16Proof } from "../types/index.js";
 
@@ -1512,6 +1514,19 @@ router.get(
       if (err instanceof ApiError) return next(err);
 
       const errMsg = (err as Error).message;
+      // Aggregate by reason; which DAO lives on the drill-down record (#749).
+      const reason =
+        errMsg === "DAO_NOT_FOUND"
+          ? "dao_not_found"
+          : errMsg === "NO_RESULT_RETURNED"
+            ? "no_result"
+            : "rpc_error";
+      incWithDrilldown(
+        rootFetchFailuresTotal,
+        { reason },
+        { dao_id: daoId },
+        { level: reason === "rpc_error" ? "error" : "warn" },
+      );
       if (errMsg === "DAO_NOT_FOUND") {
         return next(
           new ApiError(

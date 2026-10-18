@@ -4,6 +4,14 @@ import {
   coalescingWaitTime,
 } from "../services/metrics.js";
 
+/** "root:42" → "root"; anything without a recognisable prefix → "other". */
+export function keyScope(key: string): string {
+  const prefix = key.split(":")[0];
+  return /^[a-z][a-z0-9_-]{0,31}$/i.test(prefix) && prefix !== key
+    ? prefix
+    : "other";
+}
+
 interface Call {
   promise: Promise<any>;
 }
@@ -27,10 +35,12 @@ export class SingleFlight {
     timeoutMs: number = 30000,
   ): Promise<T> {
     const existing = this.calls.get(key);
+    // Keys embed ids ("root:42"); the metric label is only the prefix (#749).
+    const scope = keyScope(key);
 
     if (existing) {
-      coalescingHitsTotal.inc({ key });
-      const timer = coalescingWaitTime.startTimer({ key });
+      coalescingHitsTotal.inc({ scope });
+      const timer = coalescingWaitTime.startTimer({ scope });
       try {
         return await existing.promise;
       } finally {
@@ -38,7 +48,7 @@ export class SingleFlight {
       }
     }
 
-    coalescingMissesTotal.inc({ key });
+    coalescingMissesTotal.inc({ scope });
 
     const promise = new Promise<T>((resolve, reject) => {
       // Execute the function
