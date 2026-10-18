@@ -1333,6 +1333,35 @@ export const adminRelayerRotateSchema = z.object({
   targetKeyId: z.string().optional(),
   targetPublicKey: z.string().optional(),
   reason: z.string().max(500).optional(),
+  actor: z.string().min(1).max(100).optional(),
+});
+
+// Relayer key lifecycle (#746)
+const operatorId = z.string().min(1).max(100);
+// `${cosignerId}.${expiresAtMs}.${hmacHex}` — see issueActionApproval.
+const cosignerApproval = z.string().regex(/^[\w-]{1,64}\.\d{10,16}\.[0-9a-f]{64}$/);
+
+export const adminRelayerRotationActionSchema = z.object({
+  actor: operatorId.optional(),
+  reason: z.string().max(500).optional(),
+});
+
+export const adminRelayerCompromiseSchema = z.object({
+  key: z.string().min(1).max(100),
+  declaredBy: operatorId,
+  reason: z.string().min(1).max(500),
+  confirmation: cosignerApproval.optional(),
+});
+
+export const adminRelayerSweepSchema = z.object({
+  key: z.string().min(1).max(100),
+  requestedBy: operatorId,
+  confirmation: cosignerApproval,
+});
+
+export const adminRelayerHaltSchema = z.object({
+  reason: z.string().min(1).max(500),
+  actor: operatorId.optional(),
 });
 
 export const adminRelayerRegisterKeySchema = z.object({

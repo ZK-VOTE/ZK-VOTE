@@ -31,9 +31,13 @@ import {
   adminRelayerRegisterKeySchema,
   adminRelayerGenerateKeySchema,
   adminRelayerFundKeySchema,
+  adminRelayerRotationActionSchema,
+  adminRelayerCompromiseSchema,
+  adminRelayerSweepSchema,
+  adminRelayerHaltSchema,
 } from "../validation/schemas.js";
 import { relayerKeyManager } from "../services/relayerKeyManager.js";
-import { server } from "../services/stellar.js";
+import { server, relayerRotation } from "../services/stellar.js";
 
 const router = Router();
 
@@ -602,8 +606,31 @@ router.get(
   }) as AsyncHandler,
 );
 
+/** Map orchestrator errors to HTTP: conflicts are 409, the rest 400. */
+function sendRotationError(res: Response, err: unknown, event: string): void {
+  const error = err as Error & { code?: string; record?: unknown };
+  log("error", event, { error: error.message, code: error.code });
+  const conflict = [
+    "rotation_in_progress",
+    "drain_in_progress",
+    "not_quiescent",
+    "cooldown_requires_confirmation",
+  ].includes(error.code ?? "");
+  res.status(conflict ? 409 : 400).json({
+    error: error.message,
+    code: error.code,
+    rotation: error.record,
+  });
+}
+
+function summarize(keyId: string | null) {
+  if (!keyId) return null;
+  return relayerKeyManager.getAllKeys().find((k) => k.id === keyId) ?? null;
+}
+
 /**
- * POST /admin/relayer/rotate - Hot key rotation without server restart (admin only).
+ * POST /admin/relayer/rotate - Planned rotation with a bounded dual-identity
+ * window (#746): funding preflight, fenced cutover, old identity drains.
  */
 router.post(
   "/admin/relayer/rotate",
@@ -613,24 +640,152 @@ router.post(
   validateBody(adminRelayerRotateSchema),
   (async (req: Request, res: Response) => {
     try {
-      const { targetKeyId, targetPublicKey, reason } = req.body || {};
+      const { targetKeyId, targetPublicKey, reason, actor } = req.body || {};
       const target = targetKeyId || targetPublicKey;
 
       log("info", "admin_relayer_rotate_requested", { target, reason });
 
-      const result = await relayerKeyManager.rotateActiveKey(target, "api");
+      const rotation = await relayerRotation.rotate({
+        target,
+        actor: actor || "admin-api",
+        reason,
+      });
       res.json({
         status: "success",
-        message: "Relayer key rotated successfully with zero downtime",
-        activeKey: result.activeKey,
-        previousKey: result.previousKey,
+        message:
+          rotation.phase === "draining"
+            ? "Relayer key rotated; previous identity is draining"
+            : "Relayer key rotated",
+        activeKey: summarize(rotation.toKeyId),
+        previousKey: summarize(rotation.fromKeyId),
+        rotation,
       });
     } catch (err) {
-      log("error", "admin_relayer_rotate_failed", {
-        error: (err as Error).message,
-      });
-      res.status(400).json({ error: (err as Error).message });
+      sendRotationError(res, err, "admin_relayer_rotate_failed");
     }
+  }) as AsyncHandler,
+);
+
+/** GET /admin/relayer/rotation - Current rotation, history, readiness. */
+router.get(
+  "/admin/relayer/rotation",
+  masterKeyGuard,
+  queryLimiter,
+  ((_req: Request, res: Response) => {
+    res.json({ status: "success", ...relayerRotation.getStatus() });
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/rotation/rollback - Return to the draining identity. */
+router.post(
+  "/admin/relayer/rotation/rollback",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotationActionSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const rotation = await relayerRotation.rollback({
+        actor: req.body.actor || "admin-api",
+        reason: req.body.reason,
+      });
+      res.json({ status: "success", rotation, activeKey: summarize(rotation.fromKeyId) });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_rollback_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/rotation/finalize - Close the drain window early. */
+router.post(
+  "/admin/relayer/rotation/finalize",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotationActionSchema),
+  ((req: Request, res: Response) => {
+    try {
+      const rotation = relayerRotation.finalize({ actor: req.body.actor || "admin-api" });
+      res.json({ status: "success", rotation });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_finalize_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/compromise - Incident response: revoke now, rotate to a
+ * funded standby (or halt), report invalidated signatures, time vs SLO.
+ */
+router.post(
+  "/admin/relayer/compromise",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerCompromiseSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const rotation = await relayerRotation.declareCompromise({
+        key: req.body.key,
+        declaredBy: req.body.declaredBy,
+        confirmation: req.body.confirmation,
+        reason: req.body.reason,
+      });
+      res.json({
+        status: rotation.halted ? "halted" : "success",
+        rotation,
+        activeKey: summarize(rotation.toKeyId),
+      });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_compromise_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/sweep - Two-person sweep of a compromised account. */
+router.post(
+  "/admin/relayer/sweep",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerSweepSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const result = await relayerRotation.sweep({
+        key: req.body.key,
+        requestedBy: req.body.requestedBy,
+        confirmation: req.body.confirmation,
+      });
+      res.json({ status: "success", ...result });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_sweep_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/halt - Co-signer stop signal: refuse all non-sweep signing. */
+router.post(
+  "/admin/relayer/halt",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerHaltSchema),
+  ((req: Request, res: Response) => {
+    relayerRotation.halt(req.body.reason, req.body.actor || "admin-api");
+    res.json({ status: "halted", reason: req.body.reason });
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/resume - Lift a signing halt. */
+router.post(
+  "/admin/relayer/resume",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotationActionSchema),
+  ((req: Request, res: Response) => {
+    relayerRotation.resume(req.body.actor || "admin-api");
+    res.json({ status: "resumed" });
   }) as AsyncHandler,
 );
 

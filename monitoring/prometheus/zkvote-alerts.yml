@@ -308,3 +308,107 @@ groups:
             Retries are being suppressed to avoid a retry storm, so transient
             failures now reach users. Runbook: treat as a dependency outage; see
             ZKVoteDependencyDegraded.
+
+  # ── Relayer key lifecycle (#746) ───────────────────────────────────────
+  # Runbook: backend/src/relayer-key-cli.ts (header) and
+  # GET /admin/relayer/rotation for current phase and readiness.
+  - name: zkvote-relayer-keys
+    rules:
+      - alert: ZKVoteRelayerKeyRotationOverdue
+        expr: zkvote_relayer_active_key_age_seconds > zkvote_relayer_key_max_age_seconds
+        for: 1h
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: Active relayer key is older than RELAYER_KEY_MAX_AGE_DAYS
+          description: >
+            The relayer has signed with the same identity past its maximum age.
+            Runbook: confirm a funded standby (relayer:status → fundedStandbyKeys),
+            then `npm run relayer:rotate`; the old identity drains automatically.
+
+      - alert: ZKVoteRelayerNoFundedStandby
+        expr: zkvote_relayer_funded_standby_keys < 1
+        for: 30m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: No funded standby relayer key
+          description: >
+            A compromise now halts signing instead of rotating. Runbook: generate a
+            standby (POST /admin/relayer/keys/generate), fund it above
+            RELAYER_ROTATION_MIN_FUNDING_XLM, and confirm fundedStandbyKeys >= 1.
+
+      - alert: ZKVoteRelayerDrainStuck
+        expr: zkvote_relayer_draining_keys > 0 and zkvote_relayer_rotation_phase{phase="draining"} == 1
+        for: 30m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: Relayer rotation has been draining for 30 minutes
+          description: >
+            The dual-identity window should close within
+            RELAYER_ROTATION_DRAIN_WINDOW_MS. Runbook: `relayer:key finalize` once
+            in-flight work is done, or `relayer:key rollback` if the new identity
+            is failing.
+
+      - alert: ZKVoteRelayerRotationRolledBack
+        expr: increase(zkvote_relayer_rotations_completed_total{outcome=~"rolled_back|failed"}[15m]) > 0
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: A relayer rotation failed or was rolled back
+          description: >
+            Signing continues on the previous identity. Runbook: read the rotation
+            error in /admin/relayer/rotation history (funding gap, resync failure).
+
+      - alert: ZKVoteRelayerCompromiseDeclared
+        expr: increase(zkvote_relayer_compromise_declarations_total{outcome=~"rotated|halted"}[10m]) > 0
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: Relayer key declared compromised
+          description: >
+            The key is revoked. Runbook: verify the successor is active (or the
+            halt reason), obtain a second co-signer's `approve --action sweep:<G>`
+            token and run `relayer:key sweep`, then reconstitute a funded standby.
+
+      - alert: ZKVoteRelayerCompromiseSloBreached
+        expr: increase(zkvote_relayer_compromise_slo_breaches_total[30m]) > 0
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: Compromise response exceeded RELAYER_COMPROMISE_SLO_SECONDS
+          description: >
+            Declaration-to-rotated time exceeded the SLO (see
+            zkvote_relayer_compromise_time_to_rotated_seconds), or
+            signing halted for lack of a funded standby. Review the drill record.
+
+      - alert: ZKVoteRelayerSigningHalted
+        expr: zkvote_relayer_signing_halted == 1
+        for: 1m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: Relayer signing is halted
+          description: >
+            Votes and payments are not being signed. Runbook: resolve the halt
+            reason in /admin/relayer/rotation readiness, then `relayer:key resume`.
+
+      - alert: ZKVoteRelayerSigningTierBypassAttempts
+        expr: sum(increase(zkvote_relayer_signing_refused_total{reason=~"tier_approval_missing|sweep_shape_invalid|sweep_unauthorized|identity_revoked"}[10m])) > 5
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: Repeated refused relayer signatures
+          description: >
+            Signatures were refused for missing co-signer approvals, a revoked
+            identity or a malformed sweep. Investigate the callers; this is the
+            signature of a tier-bypass or post-compromise reuse attempt.

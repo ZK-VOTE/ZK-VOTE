@@ -681,6 +681,100 @@ export const relayerKeyTransactionsTotal = new Counter({
   registers: [register],
 });
 
+// ── Relayer key lifecycle (#746) ────────────────────────────────────────────
+
+export const relayerActiveKeyAgeSeconds = new Gauge({
+  name: "zkvote_relayer_active_key_age_seconds",
+  help: "Seconds since the currently active relayer identity was activated",
+  registers: [register],
+});
+
+export const relayerKeyMaxAgeSeconds = new Gauge({
+  name: "zkvote_relayer_key_max_age_seconds",
+  help: "Configured maximum active-key age before rotation is overdue (RELAYER_KEY_MAX_AGE_DAYS)",
+  registers: [register],
+});
+
+export const relayerFundedStandbyKeys = new Gauge({
+  name: "zkvote_relayer_funded_standby_keys",
+  help: "Standby relayer keys with a verified balance at or above the minimum",
+  registers: [register],
+});
+
+export const relayerDrainingKeys = new Gauge({
+  name: "zkvote_relayer_draining_keys",
+  help: "Relayer identities currently inside a dual-identity drain window",
+  registers: [register],
+});
+
+export const relayerSigningRefusedTotal = new Counter({
+  name: "zkvote_relayer_signing_refused_total",
+  help: "Relayer signatures refused, by reason (identity fencing, tier policy, halt)",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const relayerSigningTierTotal = new Counter({
+  name: "zkvote_relayer_signing_tier_total",
+  help: "Relayer signatures by signing tier",
+  labelNames: ["tier"] as const,
+  registers: [register],
+});
+
+export const relayerSigningHalted = new Gauge({
+  name: "zkvote_relayer_signing_halted",
+  help: "1 while a co-signer halt is stopping all non-sweep relayer signing",
+  registers: [register],
+});
+
+export const relayerRotationPhase = new Gauge({
+  name: "zkvote_relayer_rotation_phase",
+  help: "1 for the current relayer rotation phase, 0 otherwise",
+  labelNames: ["phase"] as const,
+  registers: [register],
+});
+
+export const relayerRotationsCompletedTotal = new Counter({
+  name: "zkvote_relayer_rotations_completed_total",
+  help: "Relayer rotations by kind (planned, compromise) and outcome",
+  labelNames: ["kind", "outcome"] as const,
+  registers: [register],
+});
+
+export const relayerRotationDurationSeconds = new Histogram({
+  name: "zkvote_relayer_rotation_duration_seconds",
+  help: "Time from rotation start to cutover",
+  labelNames: ["kind"] as const,
+  buckets: [0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 600],
+  registers: [register],
+});
+
+export const relayerCompromiseTimeToRotatedSeconds = new Gauge({
+  name: "zkvote_relayer_compromise_time_to_rotated_seconds",
+  help: "Declaration-to-rotated time of the most recent compromise response",
+  registers: [register],
+});
+
+export const relayerCompromiseSloBreachesTotal = new Counter({
+  name: "zkvote_relayer_compromise_slo_breaches_total",
+  help: "Compromise responses slower than RELAYER_COMPROMISE_SLO_SECONDS",
+  registers: [register],
+});
+
+export const relayerCompromiseDeclarationsTotal = new Counter({
+  name: "zkvote_relayer_compromise_declarations_total",
+  help: "Relayer key compromise declarations by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [register],
+});
+
+export const relayerSweepsTotal = new Counter({
+  name: "zkvote_relayer_sweeps_total",
+  help: "Compromise sweeps of a relayer account to the safe account, by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [register],
+});
+
 // ============================================
 // HELPER: Normalise route labels
 // ============================================
