@@ -122,9 +122,22 @@ export const LABEL_POLICY: Readonly<Record<string, LabelBound>> = Object.freeze(
     has_excess_fields: { kind: "enum", values: ["true", "false"] },
     target_resource: capped(32, "protected resource kinds"),
     endpoint: capped(32, "configured endpoint origins or route templates"),
+    // Relayer key roles (#746) and trustline-preflight parties (#745).
     role: {
       kind: "enum",
-      values: ["primary", "secondary", "standby", "deprecated"],
+      values: [
+        "primary",
+        "secondary",
+        "standby",
+        "deprecated",
+        "relayer",
+        "destination",
+      ],
+    },
+    asset: {
+      kind: "enum",
+      values: ["XLM", "USDC", "EURC"],
+      note: "PaymentAsset",
     },
     scope: capped(
       32,
