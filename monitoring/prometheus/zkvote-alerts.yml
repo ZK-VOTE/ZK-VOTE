@@ -412,3 +412,84 @@ groups:
             Signatures were refused for missing co-signer approvals, a revoked
             identity or a malformed sweep. Investigate the callers; this is the
             signature of a tier-bypass or post-compromise reuse attempt.
+
+  # ── Bounded-label alerts with log drill-down (#749) ─────────────────────
+  # Metrics carry bounded labels only (backend/src/services/metric-cardinality.ts).
+  # Per-DAO / per-client detail is on `event="metric_drilldown"` log records
+  # with the same metric name and labels, joined to traces by traceId.
+  - name: zkvote-cardinality
+    rules:
+      - alert: ZKVoteMetricCardinalityOverflow
+        expr: sum by (metric, label) (increase(zkvote_metric_cardinality_overflow_total[10m])) > 0
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "{{ $labels.metric }} hit its cardinality budget ({{ $labels.label }})"
+          description: >
+            New label values for {{ $labels.metric }} are collapsing into
+            "__overflow__". Either a dimension is being minted (attack, scan) or
+            new code added an unbounded value. Runbook: check recent deploys for
+            new label values; if traffic-driven, find the source with
+            event="metric_drilldown" metric="{{ $labels.metric }}".
+
+      - alert: ZKVoteRootFetchFailures
+        expr: sum by (reason) (rate(zkvote_root_fetch_failures_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Merkle root reads failing ({{ $labels.reason }})"
+          description: >
+            Voters cannot fetch roots to build witnesses. Drill-down:
+            event="metric_drilldown" metric="zkvote_root_fetch_failures_total"
+            labels.reason="{{ $labels.reason }}" → group by dao_id to find the
+            affected DAOs → open a traceId for the failing RPC call.
+
+      - alert: ZKVoteWebSocketRateLimitSpike
+        expr: rate(zkvote_ws_rate_limit_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: WebSocket connections are being rate-limited at a high rate
+          description: >
+            Aggregate only (no per-IP series). Drill-down:
+            event="metric_drilldown" metric="zkvote_ws_rate_limit_total" →
+            group by client (hashed IP) to identify the sources.
+
+      - alert: ZKVoteCrossTenantDenials
+        expr: sum by (target_resource, reason) (increase(zkvote_cross_tenant_denial_total[10m])) > 10
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Cross-tenant denials on {{ $labels.target_resource }} ({{ $labels.reason }})"
+          description: >
+            Possible registry spoofing. Drill-down: event="metric_drilldown"
+            metric="zkvote_cross_tenant_denial_total" → group by dao_id and caller.
+
+      - alert: ZKVoteUnpinnedRegistryRejections
+        expr: sum by (endpoint, reason) (increase(zkvote_unauthenticated_rejection_total[10m])) > 10
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Unauthenticated rejections at {{ $labels.endpoint }} ({{ $labels.reason }})"
+          description: >
+            Drill-down: event="metric_drilldown"
+            metric="zkvote_unauthenticated_rejection_total" → group by dao_id.
+
+      - alert: ZKVoteRelayerStandbyBalanceLow
+        expr: min by (role) (zkvote_relayer_key_balance_xlm{role=~"secondary|standby"}) < 10
+        for: 30m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Lowest {{ $labels.role }} relayer key balance is {{ $value }} XLM"
+          description: >
+            Per-role aggregate (no per-key series). Runbook: GET
+            /admin/relayer/keys lists each key's balance; fund the low one.

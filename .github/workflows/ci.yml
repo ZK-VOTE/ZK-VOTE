@@ -175,8 +175,26 @@ jobs:
           VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+      - name: Metric cardinality gate (budgets + attack-mint drill)
+        # Fails on banned/undeclared labels, per-metric or global budget
+        # breaches, unbounded alert/dashboard selectors (#749).
+        run: npm run metrics:cardinality -- --report cardinality-report.md
+        env:
+          RELAYER_TEST_MODE: 'true'
+          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org'
+          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
+          RELAYER_SECRET_KEY: 'SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS'
+          RELAYER_AUTH_TOKEN: 'ci-test-token-placeholder-32-chars-min'
+      - name: Upload cardinality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metric-cardinality-report
+          path: backend/cardinality-report.md
+          if-no-files-found: ignore
       - name: Check config schema and .env.example are in sync
-        run: npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
+        run: |
+          npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
       - name: Check configuration security
         run: npm run config:security
       - name: Check migration parity with db-types

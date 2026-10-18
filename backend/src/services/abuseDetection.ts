@@ -9,7 +9,7 @@
  */
 
 import { log } from "./logger.js";
-import { getDb } from "../db.js";
+import { getDb } from "./db.js";
 
 /**
  * Abuse pattern types
