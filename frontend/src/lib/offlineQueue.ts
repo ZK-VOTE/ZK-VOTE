@@ -388,3 +388,22 @@ if (typeof window !== "undefined" && import.meta.env.MODE !== "test") {
     }
   }, 30_000);
 }
+
+/**
+ * ZV-132: offline title edits with exactly equal logical clocks are genuine
+ * concurrent edits, not a lexicographic tie-break the user never approved.
+ */
+export type OfflineTitleResolution =
+  | { kind: "merged"; value: ProposalTitleState }
+  | { kind: "conflict"; local: ProposalTitleState; remote: ProposalTitleState };
+
+export function resolveOfflineTitleEdit(
+  local: ProposalTitleState,
+  remote: ProposalTitleState,
+): OfflineTitleResolution {
+  if (local.timestamp === remote.timestamp &&
+      normalizeNFC(local.title) !== normalizeNFC(remote.title)) {
+    return { kind: "conflict", local, remote };
+  }
+  return { kind: "merged", value: mergeProposalTitleCRDT(local, remote) };
+}
