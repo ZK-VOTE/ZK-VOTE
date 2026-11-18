@@ -19,7 +19,7 @@ import {
   validatePopupOrigin,
   verifyPopupNonce,
 } from "../services/sep24-session-security.js";
-import originPolicy from "../../../frontend/src/config/message-origin-policy.json";
+import originPolicy from "../generated/message-origin-policy.json";
 
 const router = Router();
 
