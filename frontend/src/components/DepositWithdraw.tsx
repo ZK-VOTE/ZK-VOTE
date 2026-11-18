@@ -43,8 +43,10 @@ export default function DepositWithdraw() {
           iframeRef.current?.contentWindow ?? null,
           session,
         )
-      )
+      ) {
+        console.warn("Dropped SEP-24 message failing origin, nonce, or schema validation");
         return;
+      }
 
       // Server-side one-time nonce consumption closes the replay window even
       // if a browser handler is re-entered or the same message is resent.
