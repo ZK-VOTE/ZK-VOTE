@@ -21,6 +21,7 @@
 
 import { encryptData, decryptData } from "./secureStorage";
 import type { VoteBinding } from "../lib/walletSession";
+import { mergeVersioned } from "../lib/safeMerge";
 
 // ============================================================
 // Types
@@ -97,6 +98,11 @@ export interface QueueEntry {
   binding?: VoteBinding;
   /** Why the entry is waiting on the wallet, for the UI. Null when not held. */
   heldReason?: string | null;
+  /** Local monotonic sequence used to reject delayed state events. */
+  revision?: number;
+  updatedAt?: number;
+  /** A typed merge conflict requiring user action, never a silent overwrite. */
+  resolution?: { kind: "concurrent-edit"; detail: string };
 }
 
 /** Public-facing queue state */
@@ -124,6 +130,7 @@ let state: SubmissionQueueState = { entries: {} };
 const inFlightIds = new Set<string>();
 
 const listeners = new Set<() => void>();
+let lastCommitted: Record<string, QueueEntry> = {};
 
 function notify() {
   listeners.forEach((l) => l());
@@ -134,6 +141,16 @@ function notify() {
 // ============================================================
 
 function persist(s: SubmissionQueueState): void {
+  // Only changed entries advance the monotonic local sequence.
+  // This is applied before writing encrypted localStorage.
+  for (const [id, entry] of Object.entries(s.entries)) {
+    const previous = lastCommitted[id];
+    if (entry !== previous) {
+      entry.revision = Math.max(entry.revision ?? 0, previous?.revision ?? 0) + 1;
+      entry.updatedAt = Date.now();
+    }
+  }
+  lastCommitted = { ...s.entries };
   try {
     if (typeof window !== "undefined") {
       const encrypted = encryptData(s, "zkvote_queue_key");
@@ -277,8 +294,57 @@ export const submissionQueue = {
    * Should be called once at app startup.
    */
   initialize(): void {
-    state = loadPersisted();
-    notify();
+    const loaded = loadPersisted();
+    if (Object.keys(state.entries).length === 0) {
+      state = loaded;
+      lastCommitted = { ...loaded.entries };
+      notify();
+    } else {
+      this.mergeExternal(loaded);
+    }
+  },
+
+  /** Incorporates storage/refetch updates without regressing terminal state. */
+  mergeExternal(incoming: SubmissionQueueState): void {
+    const entries = { ...state.entries };
+    let changed = false;
+    for (const [id, other] of Object.entries(incoming.entries || {})) {
+      if (!isValidEntry(other)) continue;
+      const local = entries[id];
+      if (!local) {
+        entries[id] = other;
+        changed = true;
+        continue;
+      }
+      // Once a vote is confirmed, stale offline/cache snapshots cannot undo it.
+      if (local.status === "submitted" && other.status !== "submitted") continue;
+      const merged = mergeVersioned(
+        { value: local, sequence: local.revision ?? 0, updatedAt: local.updatedAt ?? local.enqueuedAt },
+        { value: other, sequence: other.revision ?? 0, updatedAt: other.updatedAt ?? other.enqueuedAt },
+      );
+      if (merged.kind === "conflict") {
+        entries[id] = {
+          ...local, status: "conflict",
+          conflictDetail: "Concurrent offline vote updates differ; review before retrying.",
+          resolution: { kind: "concurrent-edit", detail: "Same version with conflicting payload" },
+          retryAfter: null,
+        };
+        changed = true;
+      } else if (merged.kind === "accepted") {
+        entries[id] = other;
+        changed = true;
+      }
+    }
+    if (changed) {
+      state = { entries };
+      persist(state);
+      notify();
+    }
+  },
+
+  /** Called after the browser receives another tab's localStorage event. */
+  syncFromStorage(): void {
+    this.mergeExternal(loadPersisted());
   },
 
   getState(): SubmissionQueueState {
@@ -342,7 +408,7 @@ export const submissionQueue = {
   markSubmitting(id: string): boolean {
     if (inFlightIds.has(id)) return false;
     const entry = state.entries[id];
-    if (!entry || entry.status === "submitted") return false;
+    if (!entry || entry.status !== "pending") return false;
 
     inFlightIds.add(id);
     state = {
@@ -367,9 +433,9 @@ export const submissionQueue = {
    * Mark an entry as successfully submitted.
    */
   markSubmitted(id: string, txHash: string | null): void {
-    inFlightIds.delete(id);
     const entry = state.entries[id];
-    if (!entry) return;
+    if (!entry || entry.status !== "submitting") return;
+    inFlightIds.delete(id);
 
     state = {
       ...state,
@@ -392,9 +458,9 @@ export const submissionQueue = {
    * Schedules exponential backoff.
    */
   markRetryable(id: string, message: string): void {
-    inFlightIds.delete(id);
     const entry = state.entries[id];
-    if (!entry) return;
+    if (!entry || entry.status !== "submitting") return;
+    inFlightIds.delete(id);
 
     const isPermanentlyFailed = entry.attempts >= MAX_ATTEMPTS;
     const newStatus: SubmissionStatus = isPermanentlyFailed
@@ -423,9 +489,9 @@ export const submissionQueue = {
    * Mark an entry as permanently failed (non-retryable error).
    */
   markFailed(id: string, message: string): void {
-    inFlightIds.delete(id);
     const entry = state.entries[id];
-    if (!entry) return;
+    if (!entry || (entry.status !== "submitting" && entry.status !== "pending")) return;
+    inFlightIds.delete(id);
 
     state = {
       ...state,
@@ -448,9 +514,9 @@ export const submissionQueue = {
    * Conflict entries are NOT retried automatically.
    */
   markConflict(id: string, detail: string): void {
-    inFlightIds.delete(id);
     const entry = state.entries[id];
-    if (!entry) return;
+    if (!entry || (entry.status !== "submitting" && entry.status !== "pending")) return;
+    inFlightIds.delete(id);
 
     state = {
       ...state,
@@ -531,6 +597,7 @@ export const submissionQueue = {
   clearAll(): void {
     inFlightIds.clear();
     state = { entries: {} };
+    lastCommitted = {};
     try {
       if (typeof window !== "undefined") {
         localStorage.removeItem(STORAGE_KEY);
