@@ -22,6 +22,7 @@
  */
 
 import { groth16 } from "snarkjs";
+import { selectProvingPlan } from "../lib/devicePreflight";
 
 export interface ProofRequest {
   id: string;
@@ -46,48 +47,9 @@ export interface ProofResponse {
   oomAborted?: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// #728 — OOM preflight
-//
-// Peak witness-generation RAM grows roughly with 2^depth. These budgets are
-// conservative lower bounds measured on mid-range mobile devices:
-//
-//   depth 18 (default)  ~420 MB peak   — desktop/high-end mobile only
-//   depth 25            ~1.2 GB peak   — desktop only
-//   depth 20            ~600 MB peak   — desktop/high-end mobile
-//
-// If the device cannot satisfy the budget the worker returns oomAborted:true
-// immediately so the caller can redirect to server-assisted proving without
-// wasting battery and time on a doomed attempt.
-//
-// `navigator.deviceMemory` is a coarse hint (0.25 / 0.5 / 1 / 2 / 4 / 8 GB)
-// available in Chrome and Edge. Safari and Firefox do not expose it; in those
-// engines we allow the prove attempt and rely on the catch block below to
-// surface the failure gracefully.
-// ---------------------------------------------------------------------------
-
-/** Memory budget in MiB for each Merkle depth. */
-const DEPTH_MEMORY_BUDGET_MIB: Record<number, number> = {
-  18: 420,
-  20: 600,
-  25: 1200,
-};
+// Use the same depth-to-peak budget and headroom as the page provisioner.
+// A caller cannot bypass the gate by posting directly to the worker.
 const DEFAULT_DEPTH = 18;
-const MIB = 1024 * 1024;
-
-function estimatedPeakMib(merkleDepth: number): number {
-  return DEPTH_MEMORY_BUDGET_MIB[merkleDepth] ?? DEPTH_MEMORY_BUDGET_MIB[DEFAULT_DEPTH];
-}
-
-/** Returns false when the device almost certainly lacks enough RAM.
- *  Returns true (allow) when the API is unavailable (fail-open). */
-function memoryPreflightOk(requiredMib: number): boolean {
-  const nav = self.navigator as Navigator & { deviceMemory?: number };
-  if (typeof nav.deviceMemory !== "number") return true; // API unavailable — allow
-  const availableMib = nav.deviceMemory * 1024;
-  // Add 15 % headroom for the browser's own overhead.
-  return availableMib * 0.85 >= requiredMib;
-}
 
 function verifyWasm(wasm: Uint8Array | string): boolean {
   if (typeof wasm === "string") return true;
@@ -98,13 +60,17 @@ function verifyWasm(wasm: Uint8Array | string): boolean {
 async function prove(req: ProofRequest): Promise<ProofResponse> {
   // #728: OOM preflight — abort before attempting a prove we cannot finish.
   const depth = req.merkleDepth ?? DEFAULT_DEPTH;
-  const requiredMib = estimatedPeakMib(depth);
-  if (!memoryPreflightOk(requiredMib)) {
+  const plan = selectProvingPlan(depth, {
+    navigator: self.navigator as Navigator & { deviceMemory?: number },
+    workerAvailable: true,
+    rustAvailable: false,
+  });
+  if (plan.route === "unavailable") {
     return {
       id: req.id,
       ok: false,
       oomAborted: true,
-      error: `Insufficient device memory for depth-${depth} witness (estimated peak: ${requiredMib} MiB). Use a desktop browser or request server-assisted proving.`,
+      error: plan.reason ?? "This device cannot safely generate this election proof.",
     };
   }
 
