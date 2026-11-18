@@ -1,6 +1,7 @@
 export interface TrustedAnchorSession {
   url: string;
   origin: string;
+  nonce: string;
 }
 
 const DEFAULT_ANCHOR_ORIGINS = [
@@ -37,7 +38,7 @@ export function parseTrustedAnchorSession(
     ) {
       return null;
     }
-    return { url: url.toString(), origin: url.origin };
+    return { url: url.toString(), origin: url.origin, nonce };
   } catch {
     return null;
   }
@@ -56,8 +57,32 @@ export function isTrustedAnchorMessage(
 ): boolean {
   if (event.source !== frameWindow || event.origin !== session.origin)
     return false;
-  if (!event.data || typeof event.data !== "object") return false;
-  return ALLOWED_MESSAGE_TYPES.has(
-    (event.data as Record<string, unknown>).type as string,
-  );
+  if (!event.data || typeof event.data !== "object" || Array.isArray(event.data))
+    return false;
+
+  const data = event.data as Record<string, unknown>;
+  if (
+    data.nonce !== session.nonce ||
+    typeof data.type !== "string" ||
+    !ALLOWED_MESSAGE_TYPES.has(data.type)
+  ) {
+    return false;
+  }
+
+  // Keep the wire schema deliberately small. Provider-specific payloads are
+  // not trusted; only the documented fields for each event are accepted.
+  const allowedKeys =
+    data.type === "sep24:complete"
+      ? new Set(["type", "nonce", "transactionId"])
+      : data.type === "sep24:error"
+        ? new Set(["type", "nonce", "code"])
+        : new Set(["type", "nonce"]);
+  if (Object.keys(data).some((key) => !allowedKeys.has(key))) return false;
+  if (
+    data.transactionId !== undefined &&
+    (typeof data.transactionId !== "string" || data.transactionId.length > 128)
+  ) return false;
+  if (data.code !== undefined && (typeof data.code !== "string" || data.code.length > 64))
+    return false;
+  return true;
 }
