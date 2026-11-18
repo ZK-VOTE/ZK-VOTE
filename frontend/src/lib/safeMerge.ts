@@ -112,16 +112,21 @@ export function mergeVersioned<T>(
   current: VersionedValue<T>,
   incoming: VersionedValue<T>,
 ): VersionedResolution<T> {
-  if (incoming.sequence > current.sequence ||
-    (incoming.sequence === current.sequence && incoming.updatedAt > current.updatedAt)) {
+  if (incoming.sequence > current.sequence) {
     return { kind: "accepted", current: safeClone(incoming) };
   }
-  if (incoming.sequence < current.sequence ||
-    (incoming.sequence === current.sequence && incoming.updatedAt < current.updatedAt)) {
+  if (incoming.sequence < current.sequence) {
     return { kind: "stale", current: safeClone(current) };
   }
+  // Same causal revision: differing values are concurrent edits regardless
+  // of wall-clock skew. Never use timestamps to hide that conflict.
   const left = JSON.stringify(safeClone(current.value));
   const right = JSON.stringify(safeClone(incoming.value));
-  if (left === right) return { kind: "stale", current: safeClone(current) };
-  return { kind: "conflict", current: safeClone(current), incoming: safeClone(incoming) };
+  if (left !== right) {
+    return { kind: "conflict", current: safeClone(current), incoming: safeClone(incoming) };
+  }
+  if (incoming.updatedAt > current.updatedAt) {
+    return { kind: "accepted", current: safeClone(incoming) };
+  }
+  return { kind: "stale", current: safeClone(current) };
 }
