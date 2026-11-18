@@ -23,9 +23,16 @@ export function parseTrustedAnchorSession(
 ): TrustedAnchorSession | null {
   if (!payload || typeof payload !== "object") return null;
   const record = payload as Record<string, unknown>;
+  const sessionData = record.session;
+  const nonce =
+    sessionData && typeof sessionData === "object"
+      ? (sessionData as Record<string, unknown>).popupNonce
+      : undefined;
   if (
     typeof record.interactiveUrl !== "string" ||
-    typeof record.interactiveOrigin !== "string"
+    typeof record.interactiveOrigin !== "string" ||
+    typeof nonce !== "string" ||
+    !/^[a-f0-9]{32}$/.test(nonce)
   ) {
     return null;
   }
@@ -69,8 +76,6 @@ export function isTrustedAnchorMessage(
     return false;
   }
 
-  // Keep the wire schema deliberately small. Provider-specific payloads are
-  // not trusted; only the documented fields for each event are accepted.
   const allowedKeys =
     data.type === "sep24:complete"
       ? new Set(["type", "nonce", "transactionId"])
@@ -82,7 +87,9 @@ export function isTrustedAnchorMessage(
     data.transactionId !== undefined &&
     (typeof data.transactionId !== "string" || data.transactionId.length > 128)
   ) return false;
-  if (data.code !== undefined && (typeof data.code !== "string" || data.code.length > 64))
-    return false;
+  if (
+    data.code !== undefined &&
+    (typeof data.code !== "string" || data.code.length > 64)
+  ) return false;
   return true;
 }
