@@ -186,7 +186,11 @@ async function proveWithSnarkjs(
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
   validateWitnessInput(input);
-  const depth = Array.isArray(input.pathElements) ? input.pathElements.length : undefined;
+  const depth = Array.isArray(input.pathElements)
+    ? input.pathElements.length
+    : Array.isArray(input.votingPathElements)
+      ? input.votingPathElements.length
+      : undefined;
   if (depth !== undefined) {
     const plan = selectProvingPlan(depth, {
       workerAvailable: workerAvailable(),
@@ -719,8 +723,15 @@ export async function generateEncryptedVoteProof(
   wasmPath: string,
   zkeyPath: string,
 ): Promise<{ proof: Groth16Proof; publicSignals: string[] }> {
-  const snarkjs = await import("snarkjs");
-  return snarkjs.groth16.fullProve(input, wasmPath, zkeyPath);
+  // Encrypted ballots have the same mandatory election Merkle depth.
+  // Reuse the worker route and RAM gate; never generate a secret witness on
+  // an under-provisioned main thread.
+  const result = await proveWithSnarkjs(
+    input as unknown as Record<string, unknown>,
+    wasmPath,
+    zkeyPath,
+  );
+  return { proof: result.proof, publicSignals: result.publicSignals };
 }
 
 export async function generateVoteProof(
