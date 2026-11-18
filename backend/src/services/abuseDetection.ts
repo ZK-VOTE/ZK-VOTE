@@ -10,6 +10,7 @@
 
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
+import { dispatchAbuseDetectionToSiem } from "./abuse-siem.js";
 
 /**
  * Abuse pattern types
@@ -362,6 +363,16 @@ export function recordAbuseDetection(
     tenantId,
     patterns: result.patterns,
     confidence: result.confidence,
+  });
+
+  // Keep the synchronous audit write authoritative while delivering SIEM
+  // notifications asynchronously. A remote outage must not break payment
+  // processing or erase the local compliance record.
+  void dispatchAbuseDetectionToSiem(result).catch((error: unknown) => {
+    log("error", "abuse_detection_siem_delivery_failed", {
+      error: error instanceof Error ? error.message : "Unknown SIEM delivery error",
+      patterns: result.patterns,
+    });
   });
 }
 

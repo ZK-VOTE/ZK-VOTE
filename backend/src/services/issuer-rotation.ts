@@ -182,23 +182,30 @@ export async function migrateFlowToNewIssuer(
   }
 
   try {
-    // Update flow to new issuer
-    db.prepare(
-      `
-      UPDATE pending_flows
-      SET issuer = ?, status = 'pending', rotation_id = NULL
-      WHERE flow_id = ?
-      `,
-    ).run(newIssuer, flowId);
+    // Keep the flow update and its audit record atomic. A failed history
+    // insert must never leave a flow silently moved to another issuer.
+    const migrate = db.transaction(() => {
+      const update = db.prepare(
+        `
+        UPDATE pending_flows
+        SET issuer = ?, status = 'pending', rotation_id = NULL
+        WHERE flow_id = ? AND status = 'paused'
+        `,
+      ).run(newIssuer, flowId);
 
-    // Record migration event
-    db.prepare(
-      `
-      INSERT INTO flow_migrations
-      (flow_id, from_issuer, to_issuer, migrated_at)
-      VALUES (?, ?, ?, ?)
-      `,
-    ).run(flow.issuer, newIssuer, flowId, new Date().toISOString());
+      if (update.changes !== 1) {
+        throw new Error("Flow changed before issuer migration could be committed");
+      }
+
+      db.prepare(
+        `
+        INSERT INTO flow_migrations
+        (flow_id, from_issuer, to_issuer, migrated_at)
+        VALUES (?, ?, ?, ?)
+        `,
+      ).run(flowId, flow.issuer, newIssuer, new Date().toISOString());
+    });
+    migrate();
 
     log("info", "flow_migrated_to_new_issuer", {
       flowId,

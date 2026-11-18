@@ -71,7 +71,7 @@ export function parseMuxedAddress(address: string): MuxedDepositRoute {
  */
 export async function validateDepositDestination(
   destination: string,
-  asset: "USDC" | "EURC",
+  asset: "USDC" | "EURC" | "XLM",
 ): Promise<{
   valid: boolean;
   reason?: string;
@@ -136,23 +136,50 @@ export async function recordMuxedDeposit(
     attributed_at: new Date().toISOString(),
   };
 
-  db.prepare(
-    `
-    INSERT INTO muxed_deposits
-    (deposit_id, destination, base_account, mux_id, asset, amount, anchor_txn_id, source, attributed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-  ).run(
-    deposit.deposit_id,
-    deposit.destination,
-    deposit.base_account,
-    deposit.mux_id,
-    deposit.asset,
-    deposit.amount,
-    deposit.anchor_txn_id,
-    deposit.source,
-    deposit.attributed_at,
-  );
+  // Anchor callbacks and payment reconciliation can replay the same
+  // transaction. Treat an identical replay as a no-op, but reject reuse of
+  // the same id with different attribution or value.
+  const persist = db.transaction(() => {
+    const existing = db
+      .prepare(
+        `SELECT destination, asset, amount, source
+         FROM muxed_deposits WHERE deposit_id = ?`,
+      )
+      .get(deposit.deposit_id) as
+      | { destination: string; asset: string; amount: string; source: string }
+      | undefined;
+
+    if (existing) {
+      if (
+        existing.destination !== deposit.destination ||
+        existing.asset !== deposit.asset ||
+        existing.amount !== deposit.amount ||
+        existing.source !== deposit.source
+      ) {
+        throw new Error(`Conflicting replay for deposit ${deposit.deposit_id}`);
+      }
+      return;
+    }
+
+    db.prepare(
+      `
+      INSERT INTO muxed_deposits
+      (deposit_id, destination, base_account, mux_id, asset, amount, anchor_txn_id, source, attributed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    ).run(
+      deposit.deposit_id,
+      deposit.destination,
+      deposit.base_account,
+      deposit.mux_id,
+      deposit.asset,
+      deposit.amount,
+      deposit.anchor_txn_id,
+      deposit.source,
+      deposit.attributed_at,
+    );
+  });
+  persist();
 
   log("info", "muxed_deposit_attributed", {
     depositId: deposit.deposit_id,
