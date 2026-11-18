@@ -98,6 +98,8 @@ jobs:
         run: npm ci --legacy-peer-deps
       - name: Type check
         run: npm run type-check
+      - name: CSP origin-policy parity
+        run: npm run csp:check
       - name: Drift guard
         # ZK_VOTE_ALLOW_MISSING_VKEY=1: the vote proving/verification key is
         # produced by the MPC trusted setup, not by CI, and is deliberately not
@@ -176,6 +178,12 @@ jobs:
           VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
           COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+      - name: Enforce OpenAPI and generated TypeScript parity
+        run: |
+          npm run docs:types
+          git diff --exit-code -- openapi.json src/generated/api-types.ts || (echo '::error::OpenAPI or generated API types are stale. Run npm run docs:generate and commit both artifacts.' && exit 1)
+      - name: Enforce bounded metric label catalogue
+        run: npm run metrics:cardinality
       - name: Check config schema and .env.example are in sync
         run: |
           npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
