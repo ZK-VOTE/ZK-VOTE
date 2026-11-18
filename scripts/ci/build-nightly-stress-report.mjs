@@ -24,7 +24,7 @@ let drill = null, benchmark = null;
 if (drillFile) { try { drill = JSON.parse(fs.readFileSync(drillFile, "utf8")); } catch {} }
 if (benchmarkFile) { try { benchmark = JSON.parse(fs.readFileSync(benchmarkFile, "utf8")); } catch {} }
 const passed = Object.values(jobs).every((value) => value === "success") &&
-  (!drill || drill.result === "passed");
+  (jobs.relayerLifecycle === "success" && drill && drill.result === "passed");
 const report = {
   schemaVersion: 1,
   workflow: "nightly-stress",

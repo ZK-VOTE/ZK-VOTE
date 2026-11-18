@@ -23,6 +23,6 @@ if (existing) {
   execFileSync("gh", ["issue", "comment", existing, "--body", body]);
   console.log("Updated existing regression issue #" + existing);
 } else {
-  execFileSync("gh", ["issue", "create", "--title", title, "--body", body, "--label", "bug"]);
+  execFileSync("gh", ["issue", "create", "--title", title, "--body", body]);
   console.log("Opened a regression issue after consecutive failures.");
 }

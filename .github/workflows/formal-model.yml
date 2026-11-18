@@ -64,13 +64,32 @@ jobs:
 
       - name: Run TLC model checker (fail on invariant violations)
         run: |
+          set -o pipefail
           java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC \
             ZKVote.tla \
             -config ZKVote.ci.cfg \
             -simulate num=10000 \
             -depth 20 \
             -workers auto \
-            -cleanup
+            -cleanup 2>&1 | tee tlc-output.log
+
+      - name: Annotate TLC counterexample summary
+        if: failure()
+        run: |
+          if [ -f formal-model/tlc-output.log ]; then
+            grep -E "Error:|Invariant .* violated|State [0-9]+" formal-model/tlc-output.log | head -n 80 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+
+      - name: Archive TLC trace and checker output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-model-tlc-output
+          path: formal-model/tlc-output.log
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Display TLC output summary
         if: always()
