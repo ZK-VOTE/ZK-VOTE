@@ -20,3 +20,13 @@ equivalent to TLA+. TLC remains the state-space checker; Rust unit/integration
 tests and code review validate the actual guards and authorization behavior.
 Any new TLA+ safety invariant must be added to the mapping in the same change.
 The formal workflow retains the pinned TLC 1.7.4 checksum.
+
+## Action-level mapping
+
+The actions section of implementation-map.json covers every operator composed
+into the Next-state relation: DAO creation/admin transfer, proposal and
+membership policy changes, SBT lifecycle, tree initialization/registration/
+removal/reinstatement, VK setup, proposal creation/close/archive, voting, and
+the combined DAO initialization path. CI extracts action names from Next and
+fails if any action is unmapped, if the mapping contains a stale action, or if
+a referenced Rust public entrypoint disappears.
