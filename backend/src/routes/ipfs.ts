@@ -166,6 +166,7 @@ interface ProcessedImage {
   width: number;
   height: number;
   hash: string;
+  scan: Awaited<ReturnType<typeof assertMalwareFree>>;
 }
 
 function invalidUpload(
@@ -224,7 +225,7 @@ async function processImageUpload(file: {
     );
   }
 
-  await assertMalwareFree(file.buffer);
+  const scan = await assertMalwareFree(file.buffer);
 
   if (
     !hasSafeImageDimensions(file.buffer, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS)
@@ -290,6 +291,7 @@ async function processImageUpload(file: {
     width: metadata.width,
     height: metadata.height,
     hash: createHash("sha256").update(file.buffer).digest("hex"),
+    scan,
   };
 }
 
@@ -519,6 +521,7 @@ router.post(
         originalSize: req.file.size,
         filename: req.file.originalname,
         mimeType: processed.mimeType,
+        scan: { scanner: processed.scan.scanner, status: processed.scan.status },
       });
     } catch (err) {
       log("error", "ipfs_upload_failed", {
@@ -585,6 +588,9 @@ router.post(
     }
 
     try {
+      // Scan the raw payload before sanitization or pinning so malicious bytes
+      // cannot enter the CID registry through the metadata upload path.
+      const scan = await assertMalwareFree(Buffer.from(JSON.stringify(metadata)));
       // Sanitize metadata to prevent XSS attacks
       const sanitizedMetadata = ipfsService.sanitizeMetadata(metadata);
 
@@ -601,9 +607,16 @@ router.post(
       res.json({
         cid: result.cid,
         size: result.size,
+        scan: { scanner: scan.scanner, status: scan.status },
       });
     } catch (err) {
       const message = (err as Error).message;
+      if ((err as any).code === "SCANNER_UNAVAILABLE") {
+        return res.status(503).json({ error: "IPFS malware scanner unavailable; upload was not pinned" });
+      }
+      if ((err as any).code === "MALICIOUS_CONTENT") {
+        return res.status(400).json({ error: "Upload rejected and quarantined by malware scanner" });
+      }
       log("error", "ipfs_upload_failed", {
         error: message,
         type: "metadata",
