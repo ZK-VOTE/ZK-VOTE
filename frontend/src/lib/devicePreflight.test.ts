@@ -35,7 +35,7 @@ describe("ZV-129 device-aware preflight", () => {
   });
 
   it("shows actionable guidance when RAM is insufficient or worker unavailable", () => {
-    expect(provingPreflightError(nav(0.5), 18)).toContain("No proof was started");
+    expect(provingPreflightError(nav(0.25), 18)).toContain("No proof was started");
     expect(selectProvingPlan(18, { navigator: nav(1), workerAvailable: false }).reason).toContain("desktop browser");
   });
 });
