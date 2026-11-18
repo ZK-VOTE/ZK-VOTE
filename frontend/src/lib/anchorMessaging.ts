@@ -1,4 +1,4 @@
-export interface TrustedAnchorSession {
+import originPolicy from "../config/message-origin-policy.json";\n\nexport interface TrustedAnchorSession {
   url: string;
   origin: string;
   nonce: string;
