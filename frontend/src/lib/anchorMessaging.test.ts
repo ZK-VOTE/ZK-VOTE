@@ -9,6 +9,8 @@ describe("anchor messaging", () => {
     url: "https://anchor.circle.com/sep24/session/123",
     origin: "https://anchor.circle.com",
     nonce: "0123456789abcdef0123456789abcdef",
+    sessionId: "session-123",
+    token: "session-token",
   };
 
   it("rejects interactive URLs outside the allowlist", () => {
@@ -17,7 +19,7 @@ describe("anchor messaging", () => {
         {
           interactiveUrl: "https://evil.example/steal",
           interactiveOrigin: "https://evil.example",
-          session: { popupNonce: session.nonce },
+          session: { popupNonce: session.nonce, sessionId: session.sessionId, token: session.token },
         },
         new Set(["https://anchor.circle.com"]),
       ),
@@ -40,7 +42,7 @@ describe("anchor messaging", () => {
         {
           interactiveUrl: session.url,
           interactiveOrigin: session.origin,
-          session: { popupNonce: "stale" },
+          session: { popupNonce: "stale", sessionId: session.sessionId, token: session.token },
         },
         new Set([session.origin]),
       ),
