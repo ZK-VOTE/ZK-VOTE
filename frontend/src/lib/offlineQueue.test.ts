@@ -8,6 +8,7 @@ import {
   getOfflineQueue,
   clearOfflineQueue,
   processOfflineQueue,
+  resolveOfflineTitleEdit,
   MAX_PROPOSAL_TITLE_BYTES,
   MAX_DAO_NAME_CHARS,
 } from "./offlineQueue";
@@ -222,6 +223,14 @@ describe("offlineQueue & CRDT validation", () => {
     expect(a).toEqual(b);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(getOfflineQueue()).toHaveLength(0);
+  });
+
+  it("ZV-132 surfaces simultaneous divergent offline title edits", () => {
+    const result = resolveOfflineTitleEdit(
+      { title: "Approve budget", timestamp: 100, clientId: "a" },
+      { title: "Reject budget", timestamp: 100, clientId: "b" },
+    );
+    expect(result.kind).toBe("conflict");
   });
 
 });
