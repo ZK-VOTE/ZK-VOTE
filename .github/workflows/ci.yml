@@ -99,6 +99,9 @@ jobs:
       - name: Verify depth/memory device matrix from fixtures (ZV-129)
         working-directory: .
         run: node scripts/generate-proof-device-matrix.mjs --check
+      - name: Check localized proposal-template registry parity (ZV-128)
+        working-directory: .
+        run: node scripts/check-proposal-template-registry.mjs
       - name: Type check
         run: npm run type-check
       - name: Drift guard
