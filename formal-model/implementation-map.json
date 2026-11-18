@@ -1,0 +1,315 @@
+{
+  "schemaVersion": 1,
+  "invariants": {
+    "RootGroundedVoting": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "create_proposal"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "vote"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "set_merkle_root"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "get_root"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "root_ok"
+        ]
+      ]
+    },
+    "AdminContinuity": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "get_admin"
+        ],
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "transfer_admin"
+        ]
+      ]
+    },
+    "ProposalFSM": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "create_proposal"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "activate_proposal"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "close_proposal"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "archive_proposal"
+        ]
+      ]
+    },
+    "NullifierGlobalUniqueness": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "vote"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "is_nullifier_used"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "has_nullifier_been_used"
+        ]
+      ]
+    },
+    "FIFOSafety": {
+      "entrypoints": [
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "get_root"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "root_ok"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "root_idx"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "get_merkle_root_history"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "vote"
+        ]
+      ]
+    },
+    "MinRootCorrectness": {
+      "entrypoints": [
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "min_root"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "root_idx"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "get_root"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "vote"
+        ]
+      ]
+    },
+    "AuthDelegationSoundness": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "get_admin"
+        ],
+        [
+          "contracts/membership-sbt/src/lib.rs",
+          "mint_from_registry"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "init_tree_from_registry"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "register_from_registry"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "set_vk_from_registry"
+        ]
+      ]
+    }
+  },
+  "actions": {
+    "CreateDao": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "create_dao"
+        ]
+      ]
+    },
+    "TransferAdmin": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "transfer_admin"
+        ]
+      ]
+    },
+    "SetProposalMode": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "set_proposal_mode"
+        ]
+      ]
+    },
+    "SetMembershipOpen": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "set_membership_open"
+        ]
+      ]
+    },
+    "MintSbt": {
+      "entrypoints": [
+        [
+          "contracts/membership-sbt/src/lib.rs",
+          "mint_from_registry"
+        ]
+      ]
+    },
+    "RevokeSbt": {
+      "entrypoints": [
+        [
+          "contracts/membership-sbt/src/lib.rs",
+          "revoke"
+        ]
+      ]
+    },
+    "LeaveDao": {
+      "entrypoints": [
+        [
+          "contracts/membership-sbt/src/lib.rs",
+          "leave"
+        ]
+      ]
+    },
+    "SelfJoin": {
+      "entrypoints": [
+        [
+          "contracts/membership-sbt/src/lib.rs",
+          "self_join"
+        ]
+      ]
+    },
+    "InitTree": {
+      "entrypoints": [
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "init_tree_from_registry"
+        ]
+      ]
+    },
+    "RegisterCommitment": {
+      "entrypoints": [
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "register_from_registry"
+        ]
+      ]
+    },
+    "RemoveMember": {
+      "entrypoints": [
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "remove_member"
+        ]
+      ]
+    },
+    "ReinstateMember": {
+      "entrypoints": [
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "reinstate_member"
+        ]
+      ]
+    },
+    "SetVk": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "set_vk"
+        ]
+      ]
+    },
+    "SetVkFromRegistry": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "set_vk_from_registry"
+        ]
+      ]
+    },
+    "CreateProposal": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "create_proposal"
+        ]
+      ]
+    },
+    "Vote": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "vote"
+        ]
+      ]
+    },
+    "CloseProposal": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "close_proposal"
+        ]
+      ]
+    },
+    "ArchiveProposal": {
+      "entrypoints": [
+        [
+          "contracts/voting/src/lib.rs",
+          "archive_proposal"
+        ]
+      ]
+    },
+    "CreateAndInitDao": {
+      "entrypoints": [
+        [
+          "contracts/dao-registry/src/lib.rs",
+          "create_and_init_dao"
+        ],
+        [
+          "contracts/membership-sbt/src/lib.rs",
+          "mint_from_registry"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "init_tree_from_registry"
+        ],
+        [
+          "contracts/membership-tree/src/lib.rs",
+          "register_from_registry"
+        ],
+        [
+          "contracts/voting/src/lib.rs",
+          "set_vk_from_registry"
+        ]
+      ]
+    }
+  }
+}
