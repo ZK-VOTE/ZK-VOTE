@@ -1,20 +1,13 @@
-import originPolicy from "../config/message-origin-policy.json";\n\nexport interface TrustedAnchorSession {
+import originPolicy from "../config/message-origin-policy.json";
+
+export interface TrustedAnchorSession {
   url: string;
   origin: string;
   nonce: string;
 }
 
-const DEFAULT_ANCHOR_ORIGINS = [
-  "https://anchor.circle.com",
-  "https://anchor.eurc.circle.com",
-];
-
 export function configuredAnchorOrigins(): ReadonlySet<string> {
-  const configured = String(import.meta.env.VITE_ANCHOR_ORIGINS ?? "")
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean);
-  return new Set(configured.length > 0 ? configured : DEFAULT_ANCHOR_ORIGINS);
+  return new Set(originPolicy.flows.sep24);
 }
 
 export function parseTrustedAnchorSession(
