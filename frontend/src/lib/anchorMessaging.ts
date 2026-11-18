@@ -4,6 +4,8 @@ export interface TrustedAnchorSession {
   url: string;
   origin: string;
   nonce: string;
+  sessionId: string;
+  token: string;
 }
 
 export function configuredAnchorOrigins(): ReadonlySet<string> {
@@ -17,15 +19,19 @@ export function parseTrustedAnchorSession(
   if (!payload || typeof payload !== "object") return null;
   const record = payload as Record<string, unknown>;
   const sessionData = record.session;
-  const nonce =
-    sessionData && typeof sessionData === "object"
-      ? (sessionData as Record<string, unknown>).popupNonce
-      : undefined;
+  const session = sessionData && typeof sessionData === "object"
+    ? (sessionData as Record<string, unknown>)
+    : undefined;
+  const nonce = session?.popupNonce;
+  const sessionId = session?.sessionId;
+  const token = session?.token;
   if (
     typeof record.interactiveUrl !== "string" ||
     typeof record.interactiveOrigin !== "string" ||
     typeof nonce !== "string" ||
-    !/^[a-f0-9]{32}$/.test(nonce)
+    !/^[a-f0-9]{32}$/.test(nonce) ||
+    typeof sessionId !== "string" ||
+    typeof token !== "string"
   ) {
     return null;
   }
@@ -38,7 +44,7 @@ export function parseTrustedAnchorSession(
     ) {
       return null;
     }
-    return { url: url.toString(), origin: url.origin, nonce };
+    return { url: url.toString(), origin: url.origin, nonce, sessionId, token };
   } catch {
     return null;
   }
