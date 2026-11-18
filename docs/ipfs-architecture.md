@@ -76,3 +76,31 @@ Returns the status of the IPFS connection alongside rich statistics from the Pin
   }
 }
 ```
+
+
+## 5. Upload malware gate and quarantine (ZV-138)
+
+Every public IPFS pin operation scans the bytes at the service boundary before
+backup, pinning, secondary replication, or gateway propagation. JSON metadata
+is scanned before sanitization; images are scanned before image decoding and
+again at the pinning boundary. Pinata CID keyvalues record `scan_status`,
+`scan_engine`, and `scan_at` for clean uploads.
+
+Production requires a reachable ClamAV daemon. Configure either
+`CLAMAV_SOCKET` or `CLAMAV_HOST` (and optionally `CLAMAV_PORT`). When the
+scanner is absent or unavailable:
+
+- `/ready` and `/readyz` return HTTP 503 and report the scanner as unavailable.
+- IPFS image and metadata uploads return HTTP 503 and are not queued for later
+  pinning, backed up, or replicated.
+- A clean result is never inferred from a failed scan.
+
+Rejected EICAR or ClamAV-positive payloads are written to a private quarantine
+directory (default: `backend/data/ipfs-quarantine`, override with
+`IPFS_QUARANTINE_DIR`) with restrictive directory/file permissions and a
+sidecar record containing a content hash, reason, timestamp, and quarantine
+status. Quarantined files are not registered as CIDs, pinned, or served.
+
+For local development only, if no ClamAV endpoint is configured, the service
+uses an explicitly labelled EICAR-only fallback. This fallback is never
+accepted in production. CI includes the EICAR regression test.
