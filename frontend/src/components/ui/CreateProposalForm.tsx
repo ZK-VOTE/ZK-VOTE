@@ -275,6 +275,7 @@ export default function CreateProposalForm({
           Title <span className="text-destructive">*</span>
         </Label>
         <Input
+          dir={locale === "ar" ? "rtl" : "ltr"}
           value={title}
           onChange={(e) => setTitle(e.target.value.slice(0, 100))}
           placeholder="Brief proposal title (max 100 chars)"
@@ -289,6 +290,7 @@ export default function CreateProposalForm({
       <div
         className="space-y-2"
         data-color-mode={theme}
+        dir={locale === "ar" ? "rtl" : "ltr"}
         ref={editorContainerRef}
       >
         <Label>Description</Label>
