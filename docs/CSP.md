@@ -212,3 +212,26 @@ This allows you to test policies without blocking resources.
 - [CSP Level 3 Specification](https://www.w3.org/TR/CSP3/)
 - [Helmet CSP Documentation](https://helmetjs.github.io/)
 - [OWASP CSP Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html)
+
+## Trusted Types and user-generated Markdown (ZV-130)
+
+The application no longer registers a permissive `default` Trusted Types policy.
+The only named policy is `zkvote-escaped-text`, which **escapes all markup**;
+it cannot authorize scripts, executable URLs, or unsanitized user HTML.
+
+All untrusted proposal and comment Markdown is rendered as React elements by
+`SafeMarkdown`, with `rehype-sanitize`, restricted URL protocols and bidi
+override removal. New direct `dangerouslySetInnerHTML`, `innerHTML =`, or
+`insertAdjacentHTML` writes fail the frontend ESLint CI job.
+
+To enforce Trusted Types in a *staging* response, first deploy:
+
+```text
+Content-Security-Policy-Report-Only: require-trusted-types-for 'script'; trusted-types zkvote-escaped-text; report-to csp-endpoint
+```
+
+Then triage genuine violations (including third-party library operations)
+before changing to an enforcing `Content-Security-Policy` header. **Do not**
+add a permissive default policy to silence violations. Track staging report
+rates before/after the change; no runtime CSP violation reduction is claimed
+until that measurement exists (dependency ZV-098).
