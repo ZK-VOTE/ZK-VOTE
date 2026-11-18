@@ -2,10 +2,23 @@ name: Formal Model Check
 
 on:
   pull_request:
+    paths:
+      - "formal-model/**"
+      - "contracts/voting/**"
+      - "contracts/dao-registry/**"
+      - "contracts/membership-sbt/**"
+      - "contracts/membership-tree/**"
+      - "scripts/ci/check-model-conformance.mjs"
+      - ".github/workflows/formal-model.yml"
   push:
     branches: [master, main]
     paths:
       - "formal-model/**"
+      - "contracts/voting/**"
+      - "contracts/dao-registry/**"
+      - "contracts/membership-sbt/**"
+      - "contracts/membership-tree/**"
+      - "scripts/ci/check-model-conformance.mjs"
       - ".github/workflows/formal-model.yml"
 
 jobs:
@@ -44,6 +57,10 @@ jobs:
             echo "Error: ZKVote.ci.cfg not found"
             exit 1
           fi
+
+      - name: Check model-action to contract-entrypoint mapping
+        working-directory: .
+        run: node scripts/ci/check-model-conformance.mjs
 
       - name: Run TLC model checker (fail on invariant violations)
         run: |

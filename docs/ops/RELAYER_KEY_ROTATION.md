@@ -211,3 +211,18 @@ Other series: `zkvote_relayer_rotation_phase`, `zkvote_relayer_rotation_duration
 - **Soroban value:** tiers see native/asset payment value. Value moved inside a contract invocation is not visible to the policy; contract-level limits must cover it.
 - **Already-submitted txs** from a compromised key cannot be recalled; they land or expire within their timebounds.
 - HSM/KMS signing is a separate track (`docs/ops/KMS_RELAY_KEY_RUNBOOK.md`).
+
+
+## Scheduled lifecycle drill and evidence
+
+The nightly-stress workflow runs backend/tests/relayer-key-lifecycle.test.ts
+against its deterministic fake ledger. This synthetic drill exercises funded
+standby ranking, hot swap and sequence fencing with concurrent submissions,
+compromise revocation, fail-closed behavior, two-person sweep approval, and
+safe-account-only sweep shape. The run publishes TAP output plus a versioned
+JSON and Markdown timeline report as a 90-day artifact.
+
+The synthetic drill does not prove production key custody or replace a timed
+testnet incident exercise. Operations must still schedule a live testnet
+compromise-and-sweep rehearsal, record the declaration-to-rotation duration,
+and obtain operator sign-off before claiming the live response SLO is met.

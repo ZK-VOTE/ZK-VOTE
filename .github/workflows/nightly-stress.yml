@@ -82,3 +82,88 @@ jobs:
           path: |
             backend/benchmark-results.json
           retention-days: 30
+
+  relayer-key-lifecycle-drill:
+    name: Relayer key lifecycle drill (synthetic load)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+      - name: Install backend dependencies
+        run: npm ci
+      - name: Exercise standby ranking, hot swap, compromise and sweep
+        run: |
+          mkdir -p reports
+          set +e
+          npx tsx --test --test-reporter=tap --test-reporter-destination=reports/relayer-key-lifecycle.tap tests/relayer-key-lifecycle.test.ts
+          test_status=$?
+          node ../scripts/ci/build-relayer-drill-report.mjs reports/relayer-key-lifecycle.tap reports/relayer-key-lifecycle.json
+          report_status=$?
+          if [ "$test_status" -ne 0 ] || [ "$report_status" -ne 0 ]; then exit 1; fi
+      - name: Archive relayer drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relayer-key-lifecycle-report
+          path: |
+            backend/reports/relayer-key-lifecycle.tap
+            backend/reports/relayer-key-lifecycle.json
+            backend/reports/relayer-key-lifecycle.md
+          retention-days: 90
+
+  publish-nightly-report:
+    name: Publish machine-readable and human-readable SLO report
+    if: always()
+    needs: [stress-tests, load-test-backend, relayer-key-lifecycle-drill]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Download relayer drill report
+        uses: actions/download-artifact@v4
+        with:
+          name: relayer-key-lifecycle-report
+          path: reports/artifacts
+        continue-on-error: true
+      - name: Build stable nightly report
+        env:
+          RUST_STRESS_RESULT: ${{ needs.stress-tests.result }}
+          BACKEND_LOAD_RESULT: ${{ needs.load-test-backend.result }}
+          RELAYER_DRILL_RESULT: ${{ needs.relayer-key-lifecycle-drill.result }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: node scripts/ci/build-nightly-stress-report.mjs
+      - name: Compare with previous run and triage repeated regressions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          previous=$(gh run list --workflow nightly-stress.yml --branch "${GITHUB_REF_NAME}" --limit 2 --json databaseId --jq '.[1].databaseId // empty')
+          if [ -n "$previous" ]; then
+            mkdir -p reports/previous
+            gh run download "$previous" --name nightly-stress-report --dir reports/previous || true
+          fi
+          node scripts/ci/triage-nightly-regression.mjs
+      - name: Archive nightly report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-stress-report
+          path: |
+            reports/nightly-stress-report.json
+            reports/nightly-stress-report.md
+          retention-days: 90
