@@ -529,6 +529,9 @@ router.post(
         code: (err as any).code,
         type: "image",
       });
+      if ((err as any).code === "SCANNER_UNAVAILABLE") {
+        return res.status(503).json({ error: "IPFS malware scanner unavailable; upload was not pinned" });
+      }
       if (
         (err as any).code &&
         [
