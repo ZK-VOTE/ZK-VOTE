@@ -136,6 +136,8 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Shared message-origin policy parity
+        run: npm run origins:check
       - name: Enforce lockfile integrity
         run: npm ci --ignore-scripts --audit=false
       - name: Run tests (including .test.ts files)
