@@ -382,6 +382,7 @@ export default function CreateProposalForm({
         onChange={setDeadlineSeconds}
         disabled={isProcessing}
       />
+      {fieldErrors.deadlineSeconds && <p role="alert" className="text-xs text-destructive">{fieldErrors.deadlineSeconds}</p>}
 
       <div className="flex gap-2 pt-2">
         <Button
