@@ -3,13 +3,14 @@
  * Prevents bidi-override spoofing attacks (Issue #792)
  */
 
+const BIDI_OVERRIDE_TEST = /[\u202A-\u202E\u2066-\u2069]/;
 const BIDI_OVERRIDE_CHARS = /[\u202A-\u202E\u2066-\u2069]/g;
 
 /**
  * Check if text contains potentially malicious bidi override characters
  */
 export function hasBidiOverrides(text: string): boolean {
-  return BIDI_OVERRIDE_CHARS.test(text);
+  return BIDI_OVERRIDE_TEST.test(text);
 }
 
 /**
