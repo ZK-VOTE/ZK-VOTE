@@ -318,9 +318,19 @@ export const submissionQueue = {
       }
       // Once a vote is confirmed, stale offline/cache snapshots cannot undo it.
       if (local.status === "submitted" && other.status !== "submitted") continue;
+      // Compare meaningful state only; updatedAt/revision are causal
+      // metadata, not evidence that a user changed their ballot.
       const merged = mergeVersioned(
-        { value: local, sequence: local.revision ?? 0, updatedAt: local.updatedAt ?? local.enqueuedAt },
-        { value: other, sequence: other.revision ?? 0, updatedAt: other.updatedAt ?? other.enqueuedAt },
+        {
+          value: { payload: local.payload, status: local.status, txHash: local.txHash },
+          sequence: local.revision ?? 0,
+          updatedAt: local.updatedAt ?? local.enqueuedAt,
+        },
+        {
+          value: { payload: other.payload, status: other.status, txHash: other.txHash },
+          sequence: other.revision ?? 0,
+          updatedAt: other.updatedAt ?? other.enqueuedAt,
+        },
       );
       if (merged.kind === "conflict") {
         entries[id] = {
