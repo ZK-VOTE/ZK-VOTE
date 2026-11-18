@@ -36,15 +36,37 @@ export default function DepositWithdraw() {
   useEffect(() => {
     if (!anchorSession) return;
     const session = anchorSession;
-    const onMessage = (event: MessageEvent) => {
+    const onMessage = async (event: MessageEvent) => {
       if (
         !isTrustedAnchorMessage(
           event,
           iframeRef.current?.contentWindow ?? null,
           session,
         )
-      )
+      ) {
+        console.warn("Dropped SEP-24 message failing origin, nonce, or schema validation");
         return;
+      }
+
+      // Server-side one-time nonce consumption closes the replay window even
+      // if a browser handler is re-entered or the same message is resent.
+      try {
+        const verification = await relayerFetch("/ramp/session/nonce/consume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId: session.sessionId,
+            token: session.token,
+            popupNonce: session.nonce,
+            popupOrigin: event.origin,
+          }),
+        });
+        if (!verification.ok) return;
+      } catch {
+        console.warn("SEP-24 popup message was not accepted by the session verifier");
+        return;
+      }
+
       const type = (event.data as { type: string }).type;
       if (type === "sep24:close" || type === "sep24:complete") {
         setInfo((current: Record<string, unknown> | null) => ({

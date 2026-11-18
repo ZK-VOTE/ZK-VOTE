@@ -16,6 +16,7 @@ Content-Security-Policy:
   img-src 'self' data: https: blob:;
   connect-src 'self' https: wss: blob:;
   font-src 'self' data:;
+  frame-src https://anchor.circle.com https://anchor.eurc.circle.com;
   object-src 'none';
   base-uri 'self';
   form-action 'self';
@@ -212,3 +213,23 @@ This allows you to test policies without blocking resources.
 - [CSP Level 3 Specification](https://www.w3.org/TR/CSP3/)
 - [Helmet CSP Documentation](https://helmetjs.github.io/)
 - [OWASP CSP Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html)
+
+
+## Reviewed frame-origin policy (ZV-131)
+
+The frontend runtime and nginx CSP consume the reviewed allowlist at
+`frontend/src/config/message-origin-policy.json`. Origins are grouped by
+flow (`swap`, `payment`, `ramp`, and `sep24`). The build helper
+`frontend/scripts/sync-csp.mjs` generates the nginx `frame-src` directive
+from the SEP-24 list; CI runs `npm run csp:check` to reject drift.
+
+To add an anchor provider:
+
+1. Review the provider's canonical HTTPS origin and threat model.
+2. Add the exact origin to `flows.sep24` in the policy JSON; do not use wildcards.
+3. Add or update positive and negative origin/nonce/schema tests.
+4. Run `npm run csp:generate` and commit both the policy and nginx changes.
+5. Run `npm run csp:check`, frontend tests, and the production build.
+
+Provider additions require code review. Runtime environment variables cannot
+silently widen the allowlist beyond the CSP policy.

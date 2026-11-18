@@ -23,6 +23,7 @@ export interface SEP24Session {
   account: string;
   originalOrigin: string;
   popupNonce: string;
+  popupNonceConsumed: boolean;
   createdAt: number;
   lastActivityAt: number;
   issuedTokens: Set<string>; // Track all issued tokens for rotation
@@ -65,6 +66,7 @@ export function createSEP24Session(
     account,
     originalOrigin,
     popupNonce,
+    popupNonceConsumed: false,
     createdAt: now,
     lastActivityAt: now,
     issuedTokens: new Set([token]),
@@ -195,13 +197,26 @@ export function verifyPopupNonce(
     return false;
   }
 
-  // Constant-time comparison to prevent timing attacks
-  return (
-    crypto.timingSafeEqual(
-      Buffer.from(session.popupNonce),
-      Buffer.from(submittedNonce),
-    ) === 0
-  );
+  // A popup nonce is a one-time capability. Validate its shape and length
+  // before timingSafeEqual (which throws for unequal buffer lengths).
+  if (
+    session.popupNonceConsumed ||
+    typeof submittedNonce !== "string" ||
+    !/^[a-f0-9]{32}$/.test(submittedNonce)
+  ) {
+    return false;
+  }
+
+  const expected = Buffer.from(session.popupNonce, "hex");
+  const received = Buffer.from(submittedNonce, "hex");
+  const matches =
+    expected.length === received.length &&
+    crypto.timingSafeEqual(expected, received);
+
+  if (matches) {
+    session.popupNonceConsumed = true;
+  }
+  return matches;
 }
 
 /**

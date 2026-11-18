@@ -20,7 +20,11 @@ Thank you for your interest in contributing to ZKVote!
    cd circuits && npm install
    ```
 
-3. **Run tests** to verify your setup:
+3. **Check generated security policy** (frontend):
+   ```bash
+   cd frontend && npm run csp:check
+   ```
+4. **Run tests** to verify your setup:
    ```bash
    cargo test --workspace
    cd backend && npm test
@@ -123,3 +127,18 @@ If modifying `vote.circom`:
 - Check existing issues before creating new ones
 - See [README.md](README.md) for project overview
 - See [THREAT_MODEL.md](THREAT_MODEL.md) for security considerations
+
+
+## OpenAPI and generated types
+
+Backend route/schema changes must update both `backend/openapi.json` and
+`backend/src/generated/api-types.ts`. From `backend/`, run:
+
+```bash
+npm run docs:generate
+npm run docs:check
+npm run docs:types
+git diff --exit-code -- openapi.json src/generated/api-types.ts
+```
+
+CI regenerates the TypeScript types and fails if the committed artifacts differ.
