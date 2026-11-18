@@ -22,8 +22,7 @@ for (const invariant of expected) {
       continue;
     }
     const source = fs.readFileSync(sourcePath, "utf8");
-    const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (!new RegExp("\\bpub\\s+fn\\s+" + escaped + "\\b").test(source)) {
+    if (!new RegExp("\\bpub\\s+fn\\s+" + functionName + "\\b").test(source)) {
       failures.push("Mapped entrypoint missing: " + relativePath + "::" + functionName);
     }
   }

@@ -133,11 +133,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Download stress-test logs
+        uses: actions/download-artifact@v4
+        with:
+          name: stress-test-results
+          path: reports/artifacts/stress
+        continue-on-error: true
+      - name: Download backend benchmark output
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-load-test-results
+          path: reports/artifacts/backend
+        continue-on-error: true
       - name: Download relayer drill report
         uses: actions/download-artifact@v4
         with:
           name: relayer-key-lifecycle-report
-          path: reports/artifacts
+          path: reports/artifacts/relayer
         continue-on-error: true
       - name: Build stable nightly report
         env:
