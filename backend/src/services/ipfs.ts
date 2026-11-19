@@ -599,6 +599,10 @@ export async function pinJSON(
     throw new Error("Pinata client not initialized");
   }
 
+  // Scan at the service boundary too: internal callers and queued retries must
+  // not bypass the upload route's scanner gate.
+  const scan = await assertMalwareFree(Buffer.from(JSON.stringify(data)));
+
   // 1. Backup to local disk before uploading (recovery safety net)
   let backupPath: string | undefined;
   try {
@@ -614,6 +618,9 @@ export async function pinJSON(
     pinata!.upload.public.json(data).name(name).keyvalues({
       app: "zkvote",
       type: "proposal-metadata",
+      scan_status: scan.status,
+      scan_engine: scan.scanner,
+      scan_at: new Date().toISOString(),
     }),
   );
 
@@ -782,6 +789,7 @@ export async function pinFile(
 
   // Validate and sanitize the upload before it is backed up or pinned.
   const safeBuffer = await validateAndSanitizeImage(buffer, mimeType, uploader);
+  const scan = await assertMalwareFree(safeBuffer);
   const sha256 = crypto.createHash("sha256").update(safeBuffer).digest("hex");
   log("info", "ipfs_upload_audit", {
     filename,
@@ -814,6 +822,9 @@ export async function pinFile(
     pinata!.upload.public.file(file).name(filename).keyvalues({
       app: "zkvote",
       type: "proposal-image",
+      scan_status: scan.status,
+      scan_engine: scan.scanner,
+      scan_at: new Date().toISOString(),
     }),
   );
 

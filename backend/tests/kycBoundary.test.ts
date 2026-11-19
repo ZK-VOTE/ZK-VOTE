@@ -93,8 +93,10 @@ describe("KYC Boundary - Data Minimization", () => {
       kyc_provider: "Jumio",
     };
 
-    // Should log warning but not throw (unless KYC_STRICT_MODE=true)
-    expect(() => enforceMinimizationBoundary(responseWithExcessFields)).not.toThrow();
+    // Unknown anchor fields are rejected in every environment.
+    expect(() => enforceMinimizationBoundary(responseWithExcessFields)).toThrow(
+      /outside the minimized KYC schema/
+    );
   });
 
   it("should enforce strict mode if enabled", () => {

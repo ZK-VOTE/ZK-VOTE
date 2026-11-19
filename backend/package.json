@@ -44,6 +44,8 @@
     "backup:key": "tsx src/backup-key-manager.ts",
     "backup:key-rotate": "bash ../scripts/rotate-backup-key.sh",
     "backup:restore-test": "tsx src/backup-key-manager.ts restore-test",
+    "origins:sync": "node scripts/sync-message-origin-policy.mjs",
+    "origins:check": "node scripts/sync-message-origin-policy.mjs --check",
     "docs:generate": "RELAXER_TEST_MODE=true tsx scripts/generate-openapi.ts && npm run docs:types",
     "docs:check": "RELAYER_TEST_MODE=true tsx scripts/generate-openapi.ts --check",
     "docs:types": "openapi-typescript openapi.json -o src/generated/api-types.ts",

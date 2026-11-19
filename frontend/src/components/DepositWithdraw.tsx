@@ -36,15 +36,37 @@ export default function DepositWithdraw() {
   useEffect(() => {
     if (!anchorSession) return;
     const session = anchorSession;
-    const onMessage = (event: MessageEvent) => {
+    const onMessage = async (event: MessageEvent) => {
       if (
         !isTrustedAnchorMessage(
           event,
           iframeRef.current?.contentWindow ?? null,
           session,
         )
-      )
+      ) {
+        console.warn("Dropped SEP-24 message failing origin, nonce, or schema validation");
         return;
+      }
+
+      // Server-side one-time nonce consumption closes the replay window even
+      // if a browser handler is re-entered or the same message is resent.
+      try {
+        const verification = await relayerFetch("/ramp/session/nonce/consume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId: session.sessionId,
+            token: session.token,
+            popupNonce: session.nonce,
+            popupOrigin: event.origin,
+          }),
+        });
+        if (!verification.ok) return;
+      } catch {
+        console.warn("SEP-24 popup message was not accepted by the session verifier");
+        return;
+      }
+
       const type = (event.data as { type: string }).type;
       if (type === "sep24:close" || type === "sep24:complete") {
         setInfo((current: Record<string, unknown> | null) => ({
@@ -152,6 +174,11 @@ export default function DepositWithdraw() {
       <h3 className="text-lg font-semibold">
         Inflow / Outflow — SEP-6/24/31 (real anchors)
       </h3>
+      <aside role="note" aria-label="KYC and privacy boundary" className="rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
+        <strong className="text-foreground">What the anchor can see</strong>
+        <p className="mt-1">The anchor receives your Stellar wallet address, selected asset, transfer amount, and any information you provide directly in its verification flow. It may need identity details to meet its own KYC obligations.</p>
+        <p className="mt-1">ZK-VOTE keeps only a minimized verification status and coarse reason code; unexpected response fields are rejected. Your vote choice and zero-knowledge voting proof are not sent to the anchor. Your wallet address and transfer remain visible on the public Stellar ledger, so KYC privacy does not make the payment anonymous.</p>
+      </aside>
       <div className="flex gap-3">
         <select
           value={asset}

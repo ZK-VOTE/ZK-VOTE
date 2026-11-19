@@ -239,16 +239,13 @@ export function enforceMinimizationBoundary(
   );
 
   if (excessFields.length > 0) {
-    log("warn", "kyc_excess_fields_detected", {
-      excessFields: excessFields.slice(0, 10), // Log first 10 only
-      fieldCount: excessFields.length,
+    // Never log field names or values: an anchor may choose a PII-bearing or
+    // tracking-token field name. Counts are sufficient for operational review.
+    log("warn", "kyc_excess_fields_rejected", {
+      excessFieldCount: excessFields.length,
+      responseFieldCount: Object.keys(response).length,
     });
-    
-    // In strict mode, reject responses with excess fields
-    if (process.env.KYC_STRICT_MODE === "true") {
-      throw new Error(
-        `Anchor response contains excess KYC fields: ${excessFields.join(", ")}`
-      );
-    }
+    // Fail closed in every environment. New fields require explicit review.
+    throw new Error("Anchor response contains fields outside the minimized KYC schema");
   }
 }

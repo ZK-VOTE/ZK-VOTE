@@ -16,6 +16,7 @@ Content-Security-Policy:
   img-src 'self' data: https: blob:;
   connect-src 'self' https: wss: blob:;
   font-src 'self' data:;
+  frame-src https://anchor.circle.com https://anchor.eurc.circle.com;
   object-src 'none';
   base-uri 'self';
   form-action 'self';

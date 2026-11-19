@@ -1,0 +1,15 @@
+{
+  "flows": {
+    "swap": [
+      "https://api.soroswap.finance",
+      "https://app.soroswap.finance",
+      "https://soroswap.finance"
+    ],
+    "payment": [],
+    "ramp": [],
+    "sep24": [
+      "https://anchor.circle.com",
+      "https://anchor.eurc.circle.com"
+    ]
+  }
+}

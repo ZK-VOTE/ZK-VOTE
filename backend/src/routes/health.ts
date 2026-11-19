@@ -38,6 +38,7 @@ import {
   getCachedDaoCount,
 } from "../services/db.js";
 import { getBackupStatus } from "../services/backup.js";
+import { isMalwareScannerReady } from "../services/malwareScanner.js";
 import { getLogMetrics } from "../middleware/logging.js";
 import { getWalHealth } from "../services/walResilience.js";
 
@@ -279,15 +280,17 @@ router.get("/readyz", async (req: Request, res: Response) => {
 
     const isRpcOk = rpcStatus.ok;
     const isDbOk = dbHealth.available !== false;
+    const malwareScannerOk = await isMalwareScannerReady();
 
-    const overallStatus = isRpcOk && isDbOk ? "ready" : "not_ready";
-    const httpStatus = isRpcOk && isDbOk ? 200 : 503;
+    const overallStatus = isRpcOk && isDbOk && malwareScannerOk ? "ready" : "not_ready";
+    const httpStatus = isRpcOk && isDbOk && malwareScannerOk ? 200 : 503;
 
     const base: Record<string, unknown> = {
       status: overallStatus,
       dependencies: {
         rpc: isRpcOk ? "ok" : "unavailable",
         db: isDbOk ? "ok" : "unavailable",
+        malwareScanner: malwareScannerOk ? "ok" : "unavailable",
       },
     };
 
@@ -331,14 +334,16 @@ router.get("/ready", async (req: Request, res: Response) => {
 
     const isRpcOk = rpcStatus.ok;
     const isDbOk = dbHealth.available !== false;
+    const malwareScannerOk = await isMalwareScannerReady();
 
-    const overallStatus = isRpcOk && isDbOk ? "ready" : "degraded";
-    const httpStatus = isRpcOk && isDbOk ? 200 : 503;
+    const overallStatus = isRpcOk && isDbOk && malwareScannerOk ? "ready" : "degraded";
+    const httpStatus = isRpcOk && isDbOk && malwareScannerOk ? 200 : 503;
 
     const base: Record<string, unknown> = {
       status: overallStatus,
       rpc: rpcStatus,
       db: dbHealth,
+      malwareScanner: malwareScannerOk ? "ok" : "unavailable",
     };
 
     if (config.healthExposeDetails) {

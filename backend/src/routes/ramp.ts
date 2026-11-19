@@ -15,7 +15,11 @@ import {
   createSEP24Session,
   validateSEP24Session,
   rotateSEP24Token,
+  validatePopupParent,
+  validatePopupOrigin,
+  verifyPopupNonce,
 } from "../services/sep24-session-security.js";
+import originPolicy from "../generated/message-origin-policy.json";
 
 const router = Router();
 
@@ -131,6 +135,46 @@ router.get(
     } catch (e: any) {
       res.status(502).json({ error: e.message });
     }
+  },
+);
+
+
+/**
+ * Consume the SEP-24 popup nonce after the browser validates source, origin,
+ * and message schema. The nonce is one-use and bound to the session parent.
+ */
+router.post(
+  "/ramp/session/nonce/consume",
+  masterKeyGuard,
+  csrfOriginGuard,
+  queryLimiter,
+  (req, res) => {
+    const { sessionId, token, popupNonce, popupOrigin } = req.body ?? {};
+    if (
+      typeof sessionId !== "string" ||
+      typeof token !== "string" ||
+      typeof popupNonce !== "string" ||
+      typeof popupOrigin !== "string"
+    ) {
+      return res.status(400).json({ error: "Invalid popup verification payload" });
+    }
+
+    const session = validateSEP24Session(sessionId, token);
+    if (!session.valid) return res.status(401).json({ error: "Invalid SEP-24 session" });
+
+    const parentOrigin = req.headers.origin;
+    if (
+      typeof parentOrigin !== "string" ||
+      !validatePopupParent(sessionId, parentOrigin) ||
+      !validatePopupOrigin(new Set(originPolicy.flows.sep24), popupOrigin)
+    ) {
+      return res.status(403).json({ error: "Untrusted popup or parent origin" });
+    }
+
+    if (!verifyPopupNonce(sessionId, popupNonce)) {
+      return res.status(409).json({ error: "Popup nonce is stale or already used" });
+    }
+    return res.json({ accepted: true });
   },
 );
 
