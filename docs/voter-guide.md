@@ -115,3 +115,43 @@ console.log(electionKeys);
 }
 */
 ```
+
+## Versioned proposal templates (ZV-128)
+
+The Create Proposal form offers Quick Poll, Standard Proposal, Extended
+Discussion, and Treasury Spend templates. A template provides only initial
+title/body scaffolding, vote mode, and deadline; users can edit the content.
+The app validates the title against the on-chain **100 UTF-8 byte** bound,
+body length (100,000 characters), and optional YouTube/Vimeo URL before
+uploading proposal metadata to IPFS. Field errors must be corrected to
+continue.
+
+The saved IPFS metadata records `template: { id, version }` when a template
+was selected. The backend rejects unknown IDs and unsupported versions; these
+fields allow indexers and moderators to identify the exact template used.
+A proposal submitted without a template remains valid and carries no
+template metadata.
+
+### Adding or editing a template
+
+Edit the canonical `shared/proposal-template-registry.json`. Every template
+must have a unique kebab-case ID, a positive integer version, one of
+`fixed`/`trailing` vote modes, a positive deadline, and strings for each
+`en` and `ar` field: `name`, `description`, `titlePlaceholder`,
+and `bodyScaffold`. Keep translated titles within 100 UTF-8 bytes and
+avoid Unicode bidi override controls. RTL Arabic content is rendered in a
+direction-isolated template selector.
+
+When changing an existing template's meaning, increment its `version` and
+coordinate with the backend validation/deployment. Generated snapshots
+must stay in sync. Run:
+
+```bash
+node scripts/check-proposal-template-registry.mjs --write
+node scripts/check-proposal-template-registry.mjs
+```
+
+CI rejects mismatched frontend/backend snapshots or missing translations.
+Previously issued proposal metadata is retained with its recorded ID and
+version. A production registry may need to keep historical versions if
+old content is revalidated.

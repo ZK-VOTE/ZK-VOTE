@@ -1,7 +1,5 @@
 import { useState, useMemo } from "react";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Button } from "./ui/Button";
 import { Badge } from "./ui/Badge";
 import { ConfirmModal, AlertModal } from "./ui/ConfirmModal";
@@ -18,6 +16,7 @@ import {
   Loader2,
 } from "lucide-react";
 import CommentForm from "./CommentForm";
+import SafeMarkdown from "./SafeMarkdown";
 import {
   type CommentWithContent,
   formatRelativeTime,
@@ -375,11 +374,7 @@ export default function Comment({
             </div>
           </div>
         ) : (
-          <div className="prose prose-sm dark:prose-invert max-w-none">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {comment.content?.body || "*Failed to load comment content*"}
-            </ReactMarkdown>
-          </div>
+          <SafeMarkdown source={comment.content?.body || "*Failed to load comment content*"} />
         )}
 
         {/* Quick reply button for top-level comments */}

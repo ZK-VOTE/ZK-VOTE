@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import proposalTemplateRegistry from "./proposal-template-registry.json" with { type: "json" };
 
 // The payment schemas below call .openapi() at module load. openapi.ts also
 // extends zod, but ESM evaluates this module first whenever something imports
@@ -858,6 +859,22 @@ export type NotifyEventRequest = z.infer<typeof notifyEventSchema>;
 
 export const proposalMetadataSchema = z
   .object({
+    // ZV-128: preserve template provenance and reject stale/unknown versions.
+    template: z.object({
+      id: z.string().min(1),
+      version: z.number().int().positive(),
+    }).superRefine((template, ctx) => {
+      const known = proposalTemplateRegistry.templates.some(
+        (record) => record.id === template.id && record.version === template.version,
+      );
+      if (!known) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Unknown or unsupported proposal template version",
+          path: ["version"],
+        });
+      }
+    }).optional(),
     version: z.literal(1, {
       errorMap: () => ({ message: "version must be 1" }),
     }),

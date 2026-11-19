@@ -214,22 +214,25 @@ This allows you to test policies without blocking resources.
 - [Helmet CSP Documentation](https://helmetjs.github.io/)
 - [OWASP CSP Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html)
 
+## Trusted Types and user-generated Markdown (ZV-130)
 
-## Reviewed frame-origin policy (ZV-131)
+The application no longer registers a permissive `default` Trusted Types policy.
+The only named policy is `zkvote-escaped-text`, which **escapes all markup**;
+it cannot authorize scripts, executable URLs, or unsanitized user HTML.
 
-The frontend runtime and nginx CSP consume the reviewed allowlist at
-`frontend/src/config/message-origin-policy.json`. Origins are grouped by
-flow (`swap`, `payment`, `ramp`, and `sep24`). The build helper
-`frontend/scripts/sync-csp.mjs` generates the nginx `frame-src` directive
-from the SEP-24 list; CI runs `npm run csp:check` to reject drift.
+All untrusted proposal and comment Markdown is rendered as React elements by
+`SafeMarkdown`, with `rehype-sanitize`, restricted URL protocols and bidi
+override removal. New direct `dangerouslySetInnerHTML`, `innerHTML =`, or
+`insertAdjacentHTML` writes fail the frontend ESLint CI job.
 
-To add an anchor provider:
+To enforce Trusted Types in a *staging* response, first deploy:
 
-1. Review the provider's canonical HTTPS origin and threat model.
-2. Add the exact origin to `flows.sep24` in the policy JSON; do not use wildcards.
-3. Add or update positive and negative origin/nonce/schema tests.
-4. Run `npm run csp:generate` and commit both the policy and nginx changes.
-5. Run `npm run csp:check`, frontend tests, and the production build.
+```text
+Content-Security-Policy-Report-Only: require-trusted-types-for 'script'; trusted-types zkvote-escaped-text; report-to csp-endpoint
+```
 
-Provider additions require code review. Runtime environment variables cannot
-silently widen the allowlist beyond the CSP policy.
+Then triage genuine violations (including third-party library operations)
+before changing to an enforcing `Content-Security-Policy` header. **Do not**
+add a permissive default policy to silence violations. Track staging report
+rates before/after the change; no runtime CSP violation reduction is claimed
+until that measurement exists (dependency ZV-098).

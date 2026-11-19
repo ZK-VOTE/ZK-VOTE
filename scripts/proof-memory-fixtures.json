@@ -1,0 +1,32 @@
+{
+  "provenance": "estimated baseline from proof.worker.ts #728; NOT a release-build hardware measurement",
+  "releaseValidated": false,
+  "headroom": 0.85,
+  "depthPeakMib": {
+    "18": 420,
+    "20": 600,
+    "25": 1200
+  },
+  "profiles": [
+    {
+      "device": "Entry-level 0.5 GB",
+      "deviceMemoryGb": 0.5
+    },
+    {
+      "device": "Low-end 1 GB",
+      "deviceMemoryGb": 1
+    },
+    {
+      "device": "Mid-range 2 GB",
+      "deviceMemoryGb": 2
+    },
+    {
+      "device": "Desktop 4 GB",
+      "deviceMemoryGb": 4
+    },
+    {
+      "device": "Desktop 8 GB",
+      "deviceMemoryGb": 8
+    }
+  ]
+}

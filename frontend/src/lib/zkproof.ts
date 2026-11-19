@@ -10,6 +10,7 @@ import type { CircuitSignals, Groth16Proof } from "snarkjs";
 import { assertValidFieldElement, assertValidNullifier } from "../types/index";
 import { workerAvailable, proveInWorker } from "./proveInWorker";
 import { withMaskedTiming } from "./proofTiming";
+import { selectProvingPlan } from "./devicePreflight";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -133,6 +134,16 @@ async function proveWithRust(
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
   validateWitnessInput(input);
+  // Never start the Rust/main-thread path on a constrained device.
+  if (Array.isArray(input.pathElements)) {
+    const plan = selectProvingPlan(input.pathElements.length, {
+      workerAvailable: workerAvailable(),
+      rustAvailable: USE_RUST_PROVER,
+    });
+    if (plan.route !== "main") {
+      throw new Error(plan.reason ?? "Main-thread proving is not suitable for this device.");
+    }
+  }
   // Compute the witness with the circom WASM (snarkjs' engine).
   const { WitnessCalculatorBuilder } = await import("circom_runtime");
   const wasmBytes =
@@ -175,12 +186,26 @@ async function proveWithSnarkjs(
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
   validateWitnessInput(input);
+  const depth = Array.isArray(input.pathElements)
+    ? input.pathElements.length
+    : Array.isArray(input.votingPathElements)
+      ? input.votingPathElements.length
+      : undefined;
+  if (depth !== undefined) {
+    const plan = selectProvingPlan(depth, {
+      workerAvailable: workerAvailable(),
+      rustAvailable: false,
+    });
+    if (plan.route === "unavailable") {
+      throw new Error(plan.reason ?? "This device cannot generate the required election proof.");
+    }
+  }
   // Off the main thread where the platform allows it (#92): a multi-second
   // BigInt proof on the main thread blocks rendering, which hands any script
   // on the page a timing trace via frame pacing alone. Timing masking is
   // applied by the caller, so this path does not pad.
   if (workerAvailable()) {
-    const r = await proveInWorker(input, wasmPath, zkeyPath);
+    const r = await proveInWorker(input, wasmPath, zkeyPath, undefined, depth);
     return { proof: r.proof, publicSignals: r.publicSignals } as GeneratedProof;
   }
   const { groth16 } = await import("snarkjs");
@@ -698,8 +723,15 @@ export async function generateEncryptedVoteProof(
   wasmPath: string,
   zkeyPath: string,
 ): Promise<{ proof: Groth16Proof; publicSignals: string[] }> {
-  const snarkjs = await import("snarkjs");
-  return snarkjs.groth16.fullProve(input, wasmPath, zkeyPath);
+  // Encrypted ballots have the same mandatory election Merkle depth.
+  // Reuse the worker route and RAM gate; never generate a secret witness on
+  // an under-provisioned main thread.
+  const result = await proveWithSnarkjs(
+    input as unknown as Record<string, unknown>,
+    wasmPath,
+    zkeyPath,
+  );
+  return { proof: result.proof, publicSignals: result.publicSignals };
 }
 
 export async function generateVoteProof(
@@ -711,6 +743,15 @@ export async function generateVoteProof(
     throw new Error(
       "A proof generation process is already in progress. Please wait for it to finish.",
     );
+  }
+  // The witness path is built for the election's circuit depth (ZV-052).
+  // Never substitute a shallower circuit to make proving cheaper.
+  const plan = selectProvingPlan(input.pathElements.length, {
+    workerAvailable: workerAvailable(),
+    rustAvailable: USE_RUST_PROVER,
+  });
+  if (plan.route === "unavailable") {
+    throw new Error(plan.reason ?? "This device cannot generate the required election proof.");
   }
   activeProofGenerationCount++;
   try {
@@ -773,7 +814,7 @@ export async function generateVoteProof(
     // the clock. One masking boundary here covers every path; the individual
     // provers deliberately do not pad, so the padding cannot compound.
     return withMaskedTiming(async () => {
-      if (USE_RUST_PROVER) {
+      if (USE_RUST_PROVER && plan.route === "main") {
         try {
           const primary = await proveWithRust(circuitInput, wasmPath, zkeyPath);
           try {

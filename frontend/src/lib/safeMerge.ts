@@ -91,3 +91,42 @@ export function safeJsonParse<T>(jsonString: string): T | null {
     return null;
   }
 }
+
+/**
+ * ZV-132: deterministic causal order for server events, queue flushes and
+ * offline edits. Sequence is authoritative; wall-clock timestamps only order
+ * different updates inside one sequence. Equal clocks with different data
+ * must surface a typed conflict instead of silently choosing a winner.
+ */
+export interface VersionedValue<T> {
+  value: T;
+  sequence: number;
+  updatedAt: number;
+}
+
+export type VersionedResolution<T> =
+  | { kind: "accepted" | "stale"; current: VersionedValue<T> }
+  | { kind: "conflict"; current: VersionedValue<T>; incoming: VersionedValue<T> };
+
+export function mergeVersioned<T>(
+  current: VersionedValue<T>,
+  incoming: VersionedValue<T>,
+): VersionedResolution<T> {
+  if (incoming.sequence > current.sequence) {
+    return { kind: "accepted", current: safeClone(incoming) };
+  }
+  if (incoming.sequence < current.sequence) {
+    return { kind: "stale", current: safeClone(current) };
+  }
+  // Same causal revision: differing values are concurrent edits regardless
+  // of wall-clock skew. Never use timestamps to hide that conflict.
+  const left = JSON.stringify(safeClone(current.value));
+  const right = JSON.stringify(safeClone(incoming.value));
+  if (left !== right) {
+    return { kind: "conflict", current: safeClone(current), incoming: safeClone(incoming) };
+  }
+  if (incoming.updatedAt > current.updatedAt) {
+    return { kind: "accepted", current: safeClone(incoming) };
+  }
+  return { kind: "stale", current: safeClone(current) };
+}

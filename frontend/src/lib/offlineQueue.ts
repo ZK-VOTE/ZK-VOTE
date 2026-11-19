@@ -14,6 +14,7 @@ export interface QueuedAction {
 const OFFLINE_QUEUE_KEY = `zkvote_offline_queue_${NETWORK_CONFIG.networkName}`;
 export const MAX_QUEUE_RETRIES = 5;
 let memoryQueue: QueuedAction[] = [];
+let activeFlush: Promise<{ processed: number; failed: number }> | null = null;
 
 function getStorage(): Storage | undefined {
   return globalThis.localStorage;
@@ -38,7 +39,16 @@ export function clearOfflineQueue(): void {
 export function getOfflineQueue(): QueuedAction[] {
   try {
     const raw = getStorage()?.getItem(OFFLINE_QUEUE_KEY);
-    return raw ? (JSON.parse(raw) as QueuedAction[]) : memoryQueue;
+    const items = raw ? (JSON.parse(raw) as QueuedAction[]) : memoryQueue;
+    if (!Array.isArray(items)) return [];
+    // Local storage can contain old duplicates from racing tabs.
+    const byId = new Map<string, QueuedAction>();
+    for (const item of items) {
+      if (item && typeof item.id === "string" && !byId.has(item.id)) {
+        byId.set(item.id, item);
+      }
+    }
+    return [...byId.values()];
   } catch {
     return memoryQueue;
   }
@@ -304,7 +314,7 @@ export function updateQueueRetries(id: string): void {
  * Handles vote 409 responses as idempotent successes.
  * @returns Summary with count of processed and failed actions
  */
-export async function processOfflineQueue(): Promise<{
+async function drainOfflineQueue(): Promise<{
   processed: number;
   failed: number;
 }> {
@@ -354,6 +364,16 @@ export async function processOfflineQueue(): Promise<{
   return { processed, failed };
 }
 
+/**
+ * Only one drain per browser context. Duplicate online events and timers
+ * join the same promise rather than POSTing the same nullifier twice.
+ */
+export function processOfflineQueue(): Promise<{ processed: number; failed: number }> {
+  if (activeFlush) return activeFlush;
+  activeFlush = drainOfflineQueue().finally(() => { activeFlush = null; });
+  return activeFlush;
+}
+
 if (typeof window !== "undefined" && import.meta.env.MODE !== "test") {
   window.addEventListener("online", () => {
     processOfflineQueue().catch(() => {});
@@ -367,4 +387,23 @@ if (typeof window !== "undefined" && import.meta.env.MODE !== "test") {
       processOfflineQueue().catch(() => {});
     }
   }, 30_000);
+}
+
+/**
+ * ZV-132: offline title edits with exactly equal logical clocks are genuine
+ * concurrent edits, not a lexicographic tie-break the user never approved.
+ */
+export type OfflineTitleResolution =
+  | { kind: "merged"; value: ProposalTitleState }
+  | { kind: "conflict"; local: ProposalTitleState; remote: ProposalTitleState };
+
+export function resolveOfflineTitleEdit(
+  local: ProposalTitleState,
+  remote: ProposalTitleState,
+): OfflineTitleResolution {
+  if (local.timestamp === remote.timestamp &&
+      normalizeNFC(local.title) !== normalizeNFC(remote.title)) {
+    return { kind: "conflict", local, remote };
+  }
+  return { kind: "merged", value: mergeProposalTitleCRDT(local, remote) };
 }
