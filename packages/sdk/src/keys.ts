@@ -102,10 +102,11 @@ class KeyManager {
       throw new Error(`Failed to fetch manifest: ${response.statusText}`)
     }
 
-    this.manifest = await response.json()
+    const manifest = (await response.json()) as KeyManifest
+    this.manifest = manifest
 
     // Load each key
-    for (const [circuitName, keyInfo] of Object.entries(this.manifest.keys)) {
+    for (const [circuitName, keyInfo] of Object.entries(manifest.keys)) {
       console.log(`Loading key: ${circuitName} (${this.formatBytes(keyInfo.size)})`)
       
       // In production, would fetch actual keys

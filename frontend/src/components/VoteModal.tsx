@@ -411,7 +411,7 @@ export default function VoteModal({
         return bigInt.toString(16).padStart(64, "0");
       };
 
-      let votePayload: VotePayload & { redundantProof?: unknown } = {
+      const votePayload: VotePayload & { redundantProof?: unknown } = {
         daoId: Number(daoId),
         proposalId: Number(proposalId),
         choice: choice,

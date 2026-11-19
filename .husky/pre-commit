@@ -4,6 +4,18 @@ echo "Running pre-commit checks..."
 
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# GitHub Desktop invokes hooks through Git Bash. Use Git Bash's mounted
+# Windows path because `command -v npm` may return an unusable C:/ shim.
+if [ -x "/c/Program Files/nodejs/npm.cmd" ]; then
+    NPM_CMD="/c/Program Files/nodejs/npm.cmd"
+elif command -v npm.cmd >/dev/null 2>&1; then
+    NPM_CMD=npm.cmd
+elif command -v npm >/dev/null 2>&1; then
+    NPM_CMD=npm
+else
+    NPM_CMD=""
+fi
+
 # Secret Scanner: Block committed secret key patterns (SDKA... / S[A-Z2-7]{55} secret seeds)
 echo "→ Checking for committed secrets..."
 SECRET_LEAK=0
@@ -61,7 +73,11 @@ fi
 # Lint frontend if changes in frontend/
 if echo "$STAGED" | grep -q "^frontend/"; then
     echo "→ Linting frontend..."
-    cd frontend && npm run lint --silent || {
+    if [ -z "$NPM_CMD" ]; then
+        echo "ERROR: npm is not available to lint the frontend. Install Node.js or add it to PATH."
+        exit 1
+    fi
+    cd frontend && "$NPM_CMD" run lint --silent || {
         echo "ERROR: Frontend lint failed. Run 'cd frontend && npm run lint' to see errors."
         exit 1
     }
@@ -73,7 +89,11 @@ fi
 if echo "$STAGED" | grep -q "^backend/"; then
     if grep -q '"lint"' backend/package.json 2>/dev/null; then
         echo "→ Linting backend..."
-        cd backend && npm run lint --silent || {
+        if [ -z "$NPM_CMD" ]; then
+            echo "ERROR: npm is not available to lint the backend. Install Node.js or add it to PATH."
+            exit 1
+        fi
+        cd backend && "$NPM_CMD" run lint --silent || {
             echo "ERROR: Backend lint failed."
             exit 1
         }
