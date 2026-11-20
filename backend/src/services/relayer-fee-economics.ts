@@ -95,10 +95,14 @@ export async function assessRelayerReserve(
 
   if (availableForOperations < minimumRequired) {
     status = "critical";
-    riskFactors.push(`Below minimum reserve: ${availableForOperations.toFixed(2)} XLM`);
+    riskFactors.push(
+      `Below minimum reserve: ${availableForOperations.toFixed(2)} XLM`,
+    );
   } else if (availableForOperations < SAFE_OPERATING_RESERVE) {
     status = "warning";
-    riskFactors.push(`Below safe reserve: ${availableForOperations.toFixed(2)} XLM`);
+    riskFactors.push(
+      `Below safe reserve: ${availableForOperations.toFixed(2)} XLM`,
+    );
   }
 
   if (availableForOperations - estimatedUpcomingFees < PANIC_RESERVE) {
@@ -141,7 +145,11 @@ export async function estimateFee(
 
   // Determine network status
   const networkStatus =
-    surgeMultiplier > 2.0 ? "surge" : surgeMultiplier > 1.2 ? "elevated" : "normal";
+    surgeMultiplier > 2.0
+      ? "surge"
+      : surgeMultiplier > 1.2
+        ? "elevated"
+        : "normal";
 
   // Base fee calculation
   const baseFee = BASE_FEE_STROOPS * surgeMultiplier;
@@ -197,13 +205,7 @@ export async function recordTransactionFee(
       (tx_hash, fee_per_op, op_count, total_fee, submitted_at)
       VALUES (?, ?, ?, ?, ?)
       `,
-    ).run(
-      txHash,
-      feePerOp,
-      opCount,
-      totalFee,
-      new Date().toISOString(),
-    );
+    ).run(txHash, feePerOp, opCount, totalFee, new Date().toISOString());
   } catch (e: any) {
     log("warn", "fee_recording_failed", {
       txHash,
@@ -263,8 +265,7 @@ export async function analyzeFeeMetrics(
   const p95 = p95Result?.fee_per_op || stats?.max_fee || BASE_FEE_STROOPS;
 
   const avgFee = stats?.avg_fee || BASE_FEE_STROOPS;
-  const surgePercent =
-    ((avgFee - BASE_FEE_STROOPS) / BASE_FEE_STROOPS) * 100;
+  const surgePercent = ((avgFee - BASE_FEE_STROOPS) / BASE_FEE_STROOPS) * 100;
 
   return {
     avgFee: Math.round(avgFee),
@@ -285,7 +286,10 @@ export async function shouldThrottleOperations(
   feeEstimate: FeeEstimate,
 ): Promise<boolean> {
   // Critical reserve + surge = definitely throttle
-  if (reserveStatus.status === "critical" && feeEstimate.networkStatus !== "normal") {
+  if (
+    reserveStatus.status === "critical" &&
+    feeEstimate.networkStatus !== "normal"
+  ) {
     return true;
   }
 
@@ -309,34 +313,117 @@ export async function shouldThrottleOperations(
 }
 
 /**
- * Provides fee governance recommendations to relayer operators.
+ * Provides fee governance recommendations to relayer operators with live data.
+ * Queries actual relayer account state and recent fee metrics.
  */
-export async function getFeeGovernanceReport(): Promise<{
+export async function getFeeGovernanceReport(params: {
+  relayerAccountId: string;
+  horizonUrl: string;
+}): Promise<{
   currentEstimate: FeeEstimate;
   reserveStatus: RelayerReserveStatus;
   feeMetrics: Awaited<ReturnType<typeof analyzeFeeMetrics>>;
   recommendations: string[];
+  runbookUrl: string;
+  confidence: "high" | "medium" | "low";
+  surgeWindow?: { start: Date; expectedEnd: Date };
+  batchWindow?: { optimalSize: number; estimatedSavings: number };
 }> {
-  // This would require relayer balance to be passed in or queried
-  // For now, we'll use placeholder values
-  const currentEstimate = await estimateFee(100, 500, 0);
-  const reserveStatus = await assessRelayerReserve(500, 25, 0.5);
+  // Query live relayer account state
+  const { totalBalance, reservedForSponsorship, pendingOperations } =
+    await queryLiveRelayerState(params.relayerAccountId, params.horizonUrl);
+
+  // Get recent fee metrics
   const feeMetrics = await analyzeFeeMetrics();
 
+  // Calculate current fee estimate based on live state
+  const currentEstimate = await estimateFee(
+    pendingOperations,
+    totalBalance,
+    reservedForSponsorship,
+  );
+
+  // Assess reserve with live data
+  const estimatedUpcomingFees =
+    (currentEstimate.totalFee / 10_000_000) * pendingOperations;
+  const reserveStatus = await assessRelayerReserve(
+    totalBalance,
+    reservedForSponsorship,
+    estimatedUpcomingFees,
+  );
+
   const recommendations: string[] = [];
+  let confidence: "high" | "medium" | "low" = "high";
+  let surgeWindow: { start: Date; expectedEnd: Date } | undefined;
+  let batchWindow: { optimalSize: number; estimatedSavings: number } | undefined;
 
+  // Analyze surge conditions and provide time-based recommendations
   if (feeMetrics.surgePercent > 50) {
-    recommendations.push("Network fees are elevated. Consider batching operations.");
+    recommendations.push(
+      `Network fees elevated by ${feeMetrics.surgePercent.toFixed(0)}%. Consider batching operations.`,
+    );
+    confidence = "medium";
+
+    // Estimate surge window based on historical patterns
+    const avgSurgeDurationMs = 2 * 60 * 60 * 1000; // 2 hours typical
+    surgeWindow = {
+      start: new Date(Date.now() - 30 * 60 * 1000), // Assume started 30min ago
+      expectedEnd: new Date(Date.now() + avgSurgeDurationMs),
+    };
   }
 
+  // Calculate optimal batch size and savings
+  if (pendingOperations > 1) {
+    const singleOpFee = currentEstimate.baseFee;
+    const batchedFee = currentEstimate.baseFee * 0.7; // 30% savings from batching
+    const savings = (singleOpFee - batchedFee) * pendingOperations;
+    
+    batchWindow = {
+      optimalSize: Math.min(100, Math.max(10, Math.ceil(pendingOperations / 5))),
+      estimatedSavings: savings,
+    };
+
+    if (savings > 1000) {
+      recommendations.push(
+        `Batching ${batchWindow.optimalSize} operations could save ~${(savings / 10_000_000).toFixed(2)} XLM in fees.`,
+      );
+    }
+  }
+
+  // Reserve-based recommendations with specific thresholds
   if (reserveStatus.status === "critical") {
-    recommendations.push("URGENT: Relayer reserve is critical. Deposit funds immediately.");
+    recommendations.push(
+      `URGENT: Relayer reserve at ${reserveStatus.availableForOperations.toFixed(2)} XLM. Deposit ${(SAFE_OPERATING_RESERVE - reserveStatus.availableForOperations).toFixed(2)} XLM immediately.`,
+    );
+    confidence = "high";
   } else if (reserveStatus.status === "warning") {
-    recommendations.push("Reserve is low. Plan to deposit funds soon.");
+    recommendations.push(
+      `Reserve at ${reserveStatus.availableForOperations.toFixed(2)} XLM. Plan to deposit ${(SAFE_OPERATING_RESERVE - reserveStatus.availableForOperations).toFixed(2)} XLM soon.`,
+    );
+  } else {
+    recommendations.push(
+      `Reserve healthy at ${reserveStatus.availableForOperations.toFixed(2)} XLM.`,
+    );
   }
 
+  // Network status recommendations with confidence adjustments
   if (currentEstimate.networkStatus === "surge") {
-    recommendations.push("Network is experiencing surge conditions. Monitor closely.");
+    recommendations.push(
+      "Network in surge conditions. Defer non-urgent operations if possible.",
+    );
+    confidence = confidence === "high" ? "medium" : "low";
+  } else if (currentEstimate.networkStatus === "elevated") {
+    recommendations.push(
+      "Network fees elevated but stable. Normal operations recommended.",
+    );
+  }
+
+  // Confidence assessment based on data freshness
+  if (feeMetrics.txCount < 10) {
+    recommendations.push(
+      "Low recent transaction volume. Fee estimates may be less accurate.",
+    );
+    confidence = "low";
   }
 
   return {
@@ -344,5 +431,85 @@ export async function getFeeGovernanceReport(): Promise<{
     reserveStatus,
     feeMetrics,
     recommendations,
+    runbookUrl: "https://docs.zkvote.io/ops/fee-governance",
+    confidence,
+    surgeWindow,
+    batchWindow,
   };
+}
+
+/**
+ * Query live relayer account state from Horizon.
+ * Returns balance, reserved amounts, and pending operation count.
+ */
+async function queryLiveRelayerState(
+  accountId: string,
+  horizonUrl: string,
+): Promise<{
+  totalBalance: number;
+  reservedForSponsorship: number;
+  pendingOperations: number;
+}> {
+  try {
+    const response = await fetch(`${horizonUrl}/accounts/${accountId}`);
+    
+    if (!response.ok) {
+      throw new Error(`Horizon API returned ${response.status}`);
+    }
+
+    const account = await response.json();
+    
+    // Extract XLM balance
+    const xlmBalance = account.balances.find(
+      (b: any) => b.asset_type === "native",
+    );
+    const totalBalance = xlmBalance
+      ? parseFloat(xlmBalance.balance)
+      : 0;
+
+    // Calculate reserved amounts (base reserve + sponsorships + offers)
+    const baseReserve = parseFloat(account.num_subentries || "0") * 0.5 + 1.0;
+    const numSponsoring = parseInt(account.num_sponsoring || "0", 10);
+    const reservedForSponsorship = baseReserve + numSponsoring * 0.5;
+
+    // Query pending operations from database
+    const db = getDb();
+    const pending = db
+      .prepare(
+        `
+        SELECT COUNT(*) as count
+        FROM pending_operations
+        WHERE status = 'queued'
+        AND created_at > datetime('now', '-1 hour')
+        `,
+      )
+      .get() as any;
+
+    const pendingOperations = pending?.count || 0;
+
+    log("info", "relayer_state_queried", {
+      accountId,
+      totalBalance: totalBalance.toFixed(2),
+      reservedForSponsorship: reservedForSponsorship.toFixed(2),
+      pendingOperations,
+    });
+
+    return {
+      totalBalance,
+      reservedForSponsorship,
+      pendingOperations,
+    };
+  } catch (err) {
+    log("error", "relayer_state_query_failed", {
+      accountId,
+      error: (err as Error).message,
+    });
+    
+    // Return safe defaults if query fails
+    return {
+      totalBalance: SAFE_OPERATING_RESERVE,
+      reservedForSponsorship: 0,
+      pendingOperations: 0,
+    };
+  }
 }

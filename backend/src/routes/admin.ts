@@ -955,4 +955,65 @@ router.post(
   }) as AsyncHandler,
 );
 
+// ============================================
+// FEE GOVERNANCE REPORTING (#960)
+// ============================================
+
+/**
+ * GET /admin/fee-governance - Live fee governance report (admin only).
+ *
+ * Provides current fee estimates, reserve status, and actionable recommendations
+ * based on live relayer account state and recent fee metrics.
+ *
+ * Query params:
+ *   relayerAccountId - Stellar account ID of the relayer (required)
+ *   horizonUrl       - Horizon API URL (optional, defaults to config)
+ */
+router.get(
+  "/admin/fee-governance",
+  authGuard,
+  queryLimiter,
+  (async (req: Request, res: Response) => {
+    try {
+      const relayerAccountId = req.query.relayerAccountId as string;
+      const horizonUrl = (req.query.horizonUrl as string) ||
+        process.env.HORIZON_URL ||
+        "https://horizon-testnet.stellar.org";
+
+      if (!relayerAccountId) {
+        res.status(400).json({
+          error: "relayerAccountId query parameter is required",
+        });
+        return;
+      }
+
+      const { getFeeGovernanceReport } = await import(
+        "../services/relayer-fee-economics.js"
+      );
+
+      const report = await getFeeGovernanceReport({
+        relayerAccountId,
+        horizonUrl,
+      });
+
+      log("info", "admin_fee_governance_report_generated", {
+        relayerAccountId,
+        reserveStatus: report.reserveStatus.status,
+        networkStatus: report.currentEstimate.networkStatus,
+        confidence: report.confidence,
+      });
+
+      res.json(report);
+    } catch (err) {
+      log("error", "admin_fee_governance_report_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({
+        error: "Failed to generate fee governance report",
+        details: (err as Error).message,
+      });
+    }
+  }) as AsyncHandler,
+);
+
 export default router;
