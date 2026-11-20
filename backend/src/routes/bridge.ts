@@ -23,6 +23,19 @@ import {
   u256ToScVal,
 } from "../services/stellar.js";
 import { verifyBridgeProof } from "../services/bridgeProof.js";
+import {
+  recordLock,
+  getLock,
+  getLocksForProposal,
+  markReleased,
+  markCancelled,
+  markRefunded,
+  EscrowLockAlreadyExistsError,
+  EscrowLockNotFoundError,
+  EscrowLockNotActiveError,
+  EscrowNonceReplayError,
+  EscrowTimeoutNotElapsedError,
+} from "../services/treasuryEscrow.js";
 
 import {
   authGuard,
@@ -31,7 +44,12 @@ import {
   validateBody,
   voteLimiter,
 } from "../middleware/index.js";
-import { bridgeVoteSchema } from "../validation/schemas.js";
+import {
+  bridgeVoteSchema,
+  escrowLockRecordSchema,
+  escrowResolutionSchema,
+  escrowRefundSchema,
+} from "../validation/schemas.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();
@@ -319,5 +337,201 @@ router.post("/bridge/relay", authGuard, (async (
     res.status(500).json({ error: "Failed to trigger relay" });
   }
 }) as AsyncHandler);
+
+// ============================================
+// SATELLITE TREASURY ESCROW (ZV-107)
+// ============================================
+//
+// `TreasuryEscrow.sol` is the source of truth for custody; these routes are
+// a best-effort status cache the frontend polls instead of running its own
+// chain indexer. See backend/src/services/treasuryEscrow.ts.
+
+/**
+ * POST /bridge/escrow/lock
+ *
+ * Record a lock a depositor confirmed on-chain (self-reported after their
+ * `TreasuryEscrow.lock()` transaction lands). Anyone can report a lock
+ * transaction hash because the underlying funds custody is enforced by the
+ * contract itself, not by this cache.
+ */
+router.post(
+  "/bridge/escrow/lock",
+  bodyLimit("5kb"),
+  voteLimiter,
+  validateBody(escrowLockRecordSchema),
+  (async (req: Request, res: Response) => {
+    const { lockId, daoId, proposalId, depositor, recipient, amount, lockTxHash } =
+      req.body;
+
+    try {
+      const record = recordLock({
+        lockId,
+        daoId,
+        proposalId,
+        depositor,
+        recipient,
+        amount,
+        lockTxHash,
+      });
+      res.status(201).json(record);
+    } catch (err) {
+      if (err instanceof EscrowLockAlreadyExistsError) {
+        return res.status(409).json({ error: "Lock already recorded" });
+      }
+      log("error", "escrow_lock_record_error", {
+        lockId,
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to record lock" });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * GET /bridge/escrow/proposal/:daoId/:proposalId - list locks for a proposal
+ */
+router.get(
+  "/bridge/escrow/proposal/:daoId/:proposalId",
+  queryLimiter,
+  (async (req: Request, res: Response) => {
+    const daoId = parseInt(req.params.daoId, 10);
+    const proposalId = parseInt(req.params.proposalId, 10);
+
+    if (!Number.isInteger(daoId) || !Number.isInteger(proposalId)) {
+      return res.status(400).json({ error: "Invalid daoId or proposalId" });
+    }
+
+    res.json({ locks: getLocksForProposal(daoId, proposalId) });
+  }) as AsyncHandler,
+);
+
+/**
+ * GET /bridge/escrow/:lockId - current status of a single lock
+ */
+router.get(
+  "/bridge/escrow/:lockId",
+  queryLimiter,
+  (async (req: Request, res: Response) => {
+    const record = getLock(req.params.lockId);
+    if (!record) {
+      return res.status(404).json({ error: "Lock not found" });
+    }
+    res.json(record);
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /bridge/escrow/:lockId/release
+ *
+ * Relayer-only: report that `release()` was submitted on-chain after
+ * observing a finalized Soroban approval. `sorobanNonce` is the finality
+ * message's nonce, which can never be reused once consumed.
+ */
+router.post(
+  "/bridge/escrow/:lockId/release",
+  bodyLimit("2kb"),
+  authGuard,
+  validateBody(escrowResolutionSchema),
+  (async (req: Request, res: Response) => {
+    const { lockId } = req.params;
+    const { sorobanNonce, resolutionTxHash } = req.body;
+
+    try {
+      const record = markReleased(lockId, sorobanNonce, resolutionTxHash);
+      res.json(record);
+    } catch (err) {
+      if (err instanceof EscrowLockNotFoundError) {
+        return res.status(404).json({ error: "Lock not found" });
+      }
+      if (err instanceof EscrowLockNotActiveError) {
+        return res.status(409).json({ error: "Lock is not active" });
+      }
+      if (err instanceof EscrowNonceReplayError) {
+        return res.status(409).json({ error: "Soroban nonce already used" });
+      }
+      log("error", "escrow_release_error", {
+        lockId,
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to mark lock released" });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /bridge/escrow/:lockId/cancel
+ *
+ * Relayer-only: report that `cancel()` was submitted on-chain after
+ * observing a Soroban cancellation proof (early unlock to the depositor).
+ */
+router.post(
+  "/bridge/escrow/:lockId/cancel",
+  bodyLimit("2kb"),
+  authGuard,
+  validateBody(escrowResolutionSchema),
+  (async (req: Request, res: Response) => {
+    const { lockId } = req.params;
+    const { sorobanNonce, resolutionTxHash } = req.body;
+
+    try {
+      const record = markCancelled(lockId, sorobanNonce, resolutionTxHash);
+      res.json(record);
+    } catch (err) {
+      if (err instanceof EscrowLockNotFoundError) {
+        return res.status(404).json({ error: "Lock not found" });
+      }
+      if (err instanceof EscrowLockNotActiveError) {
+        return res.status(409).json({ error: "Lock is not active" });
+      }
+      if (err instanceof EscrowNonceReplayError) {
+        return res.status(409).json({ error: "Soroban nonce already used" });
+      }
+      log("error", "escrow_cancel_error", {
+        lockId,
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to mark lock cancelled" });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /bridge/escrow/:lockId/refund
+ *
+ * Report that `refund()` was submitted on-chain after the 24h timeout
+ * elapsed. Anyone may report it (the depositor is always the payee, so
+ * reporting it on their behalf cannot redirect funds), but the cache still
+ * enforces that the timeout has in fact elapsed.
+ */
+router.post(
+  "/bridge/escrow/:lockId/refund",
+  bodyLimit("2kb"),
+  voteLimiter,
+  validateBody(escrowRefundSchema),
+  (async (req: Request, res: Response) => {
+    const { lockId } = req.params;
+    const { resolutionTxHash } = req.body;
+
+    try {
+      const record = markRefunded(lockId, resolutionTxHash);
+      res.json(record);
+    } catch (err) {
+      if (err instanceof EscrowLockNotFoundError) {
+        return res.status(404).json({ error: "Lock not found" });
+      }
+      if (err instanceof EscrowLockNotActiveError) {
+        return res.status(409).json({ error: "Lock is not active" });
+      }
+      if (err instanceof EscrowTimeoutNotElapsedError) {
+        return res.status(409).json({ error: "Timeout has not elapsed" });
+      }
+      log("error", "escrow_refund_error", {
+        lockId,
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to mark lock refunded" });
+    }
+  }) as AsyncHandler,
+);
 
 export default router;

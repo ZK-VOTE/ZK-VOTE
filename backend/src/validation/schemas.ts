@@ -1038,6 +1038,34 @@ export const bridgeVoteSchema = z.object({
 export type BridgeVoteRequest = z.infer<typeof bridgeVoteSchema>;
 
 // ============================================
+// SATELLITE TREASURY ESCROW SCHEMAS (ZV-107)
+// ============================================
+
+const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address");
+const evmTxHash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "Invalid transaction hash");
+/** uint256 lock id / Soroban message nonce / wei amount, as a decimal string. */
+const uint256Decimal = z.string().regex(/^[0-9]{1,78}$/, "Must be a decimal uint256");
+
+export const escrowLockRecordSchema = z.object({
+  lockId: uint256Decimal,
+  daoId: z.number().int().positive(),
+  proposalId: z.number().int().positive(),
+  depositor: evmAddress,
+  recipient: evmAddress,
+  amount: uint256Decimal,
+  lockTxHash: evmTxHash,
+});
+
+export const escrowResolutionSchema = z.object({
+  sorobanNonce: uint256Decimal,
+  resolutionTxHash: evmTxHash,
+});
+
+export const escrowRefundSchema = z.object({
+  resolutionTxHash: evmTxHash,
+});
+
+// ============================================
 // CIRCUIT PARAMETER SCHEMA
 // ============================================
 
