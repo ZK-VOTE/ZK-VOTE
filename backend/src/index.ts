@@ -268,9 +268,12 @@ const noStore = (
 // Metrics middleware (before other middleware to capture all requests)
 app.use(metricsMiddleware);
 
-// Reserve vote capacity before global throttling or any route mount. The
-// classifier normalizes /, /api/v1, and /api/v2 so every public mount gets
-// the same vote-over-comment scheduling guarantee.
+// Reserve per-tier capacity (vote, admin/dispute, payment, comment) before
+// global throttling or any route mount (ZV-110). The classifier normalizes
+// /, /api/v1, and /api/v2 so every public mount gets the same scheduling
+// guarantee, and each tier has its own worker pool: a payment burst can
+// fill the NORMAL pool but can never occupy an admin/dispute (HIGH) worker
+// or a vote (CRITICAL) worker, regardless of arrival order.
 app.use(priorityMiddleware());
 
 // Request-scoped degradation tracking (#204)

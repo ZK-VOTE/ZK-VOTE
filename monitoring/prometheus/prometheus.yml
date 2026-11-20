@@ -4,6 +4,7 @@ global:
 
 rule_files:
   - /etc/prometheus/zkvote-alerts.yml
+  - /etc/prometheus/priority-queue-alerts.yml
 
 scrape_configs:
   - job_name: zkvote-relayer
