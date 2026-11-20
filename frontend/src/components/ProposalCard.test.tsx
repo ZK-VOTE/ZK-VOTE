@@ -80,7 +80,7 @@ describe("ProposalCard", () => {
     it("renders proposal title", () => {
       renderWithRouter(<ProposalCard {...defaultProps} />);
 
-      expect(screen.getByText("Test Proposal")).toBeInTheDocument();
+      expect(screen.getByText(/Test Proposal/)).toBeInTheDocument();
     });
 
     it("renders proposal ID", () => {
@@ -200,7 +200,7 @@ describe("ProposalCard", () => {
 
       // Click the card
       const card = screen
-        .getByText("Test Proposal")
+        .getByText(/Test Proposal/)
         .closest("[class*='group/card']");
       if (card) {
         fireEvent.click(card);
@@ -390,7 +390,7 @@ describe("ProposalCard", () => {
       renderWithRouter(<ProposalCard {...defaultProps} />);
 
       const card = screen
-        .getByText("Test Proposal")
+        .getByText(/Test Proposal/)
         .closest("[class*='cursor-pointer']");
       expect(card).toBeTruthy();
     });

@@ -54,7 +54,7 @@ export function Docs() {
             />
           </button>
           {mobileNavOpen && (
-            <div className="absolute top-full left-0 right-0 mt-2 rounded-lg border bg-background shadow-lg z-10">
+            <div className="absolute top-full start-0 end-0 mt-2 rounded-lg border bg-background shadow-lg z-10">
               {sections.map((section) => (
                 <button
                   key={section.id}
@@ -62,7 +62,7 @@ export function Docs() {
                     setActiveSection(section.id);
                     setMobileNavOpen(false);
                   }}
-                  className={`w-full flex items-center justify-between px-4 py-3 text-left text-sm transition-colors first:rounded-t-lg last:rounded-b-lg ${
+                  className={`w-full flex items-center justify-between px-4 py-3 text-start text-sm transition-colors first:rounded-t-lg last:rounded-b-lg ${
                     activeSection === section.id
                       ? "bg-muted font-medium"
                       : "hover:bg-muted/50 text-muted-foreground"
@@ -84,7 +84,7 @@ export function Docs() {
             <button
               key={section.id}
               onClick={() => setActiveSection(section.id)}
-              className={`w-full flex items-center justify-between px-4 py-2.5 rounded-lg text-left text-sm transition-colors ${
+              className={`w-full flex items-center justify-between px-4 py-2.5 rounded-lg text-start text-sm transition-colors ${
                 activeSection === section.id
                   ? "bg-muted font-medium"
                   : "hover:bg-muted/50 text-muted-foreground"
@@ -711,42 +711,42 @@ function CreatingProposal() {
         <div className="p-6 rounded-lg border bg-card font-mono text-sm">
           <p className="text-muted-foreground mb-2">// On-chain ProposalInfo</p>
           <p>{"{"}</p>
-          <p className="ml-4">id: u64,</p>
-          <p className="ml-4">dao_id: u64,</p>
-          <p className="ml-4">
+          <p className="ms-4">id: u64,</p>
+          <p className="ms-4">dao_id: u64,</p>
+          <p className="ms-4">
             title: String,{" "}
             <span className="text-muted-foreground">// Max 100 bytes</span>
           </p>
-          <p className="ml-4">
+          <p className="ms-4">
             content_cid: String,{" "}
             <span className="text-muted-foreground">
               // IPFS CID for full content
             </span>
           </p>
-          <p className="ml-4">yes_votes: u64,</p>
-          <p className="ml-4">no_votes: u64,</p>
-          <p className="ml-4">
+          <p className="ms-4">yes_votes: u64,</p>
+          <p className="ms-4">no_votes: u64,</p>
+          <p className="ms-4">
             end_time: u64,{" "}
             <span className="text-muted-foreground">
               // Unix timestamp, 0 = no deadline
             </span>
           </p>
-          <p className="ml-4">created_by: Address,</p>
-          <p className="ml-4">created_at: u64,</p>
-          <p className="ml-4">state: ProposalState,</p>
-          <p className="ml-4">vk_hash: BytesN&lt;32&gt;,</p>
-          <p className="ml-4">vk_version: u32,</p>
-          <p className="ml-4">
+          <p className="ms-4">created_by: Address,</p>
+          <p className="ms-4">created_at: u64,</p>
+          <p className="ms-4">state: ProposalState,</p>
+          <p className="ms-4">vk_hash: BytesN&lt;32&gt;,</p>
+          <p className="ms-4">vk_version: u32,</p>
+          <p className="ms-4">
             eligible_root: U256,{" "}
             <span className="text-muted-foreground">
               // Merkle root snapshot
             </span>
           </p>
-          <p className="ml-4">
+          <p className="ms-4">
             vote_mode: VoteMode,{" "}
             <span className="text-muted-foreground">// Fixed or Trailing</span>
           </p>
-          <p className="ml-4">
+          <p className="ms-4">
             earliest_root_index: u32,{" "}
             <span className="text-muted-foreground">// For Trailing mode</span>
           </p>
@@ -1136,11 +1136,11 @@ function TechnicalDeepDive() {
             <div className="flex items-center gap-3">
               <div className="w-3 h-3 rounded-full bg-zinc-400"></div>
               <span className="font-semibold">DAORegistry</span>
-              <span className="text-muted-foreground ml-auto">
+              <span className="text-muted-foreground ms-auto">
                 create_dao(), get_admin()
               </span>
             </div>
-            <div className="border-l-2 border-border ml-1.5 pl-6 py-2">
+            <div className="border-s-2 border-border ms-1.5 ps-6 py-2">
               <p className="text-muted-foreground text-xs">
                 Manages DAO creation and admin verification
               </p>
@@ -1149,11 +1149,11 @@ function TechnicalDeepDive() {
             <div className="flex items-center gap-3">
               <div className="w-3 h-3 rounded-full bg-blue-500"></div>
               <span className="font-semibold">MembershipSBT</span>
-              <span className="text-muted-foreground ml-auto">
+              <span className="text-muted-foreground ms-auto">
                 mint(), has()
               </span>
             </div>
-            <div className="border-l-2 border-border ml-1.5 pl-6 py-2">
+            <div className="border-s-2 border-border ms-1.5 ps-6 py-2">
               <p className="text-muted-foreground text-xs">
                 Issues soulbound tokens for DAO membership
               </p>
@@ -1162,11 +1162,11 @@ function TechnicalDeepDive() {
             <div className="flex items-center gap-3">
               <div className="w-3 h-3 rounded-full bg-green-500"></div>
               <span className="font-semibold">MembershipTree</span>
-              <span className="text-muted-foreground ml-auto">
+              <span className="text-muted-foreground ms-auto">
                 self_register(), get_root()
               </span>
             </div>
-            <div className="border-l-2 border-border ml-1.5 pl-6 py-2">
+            <div className="border-s-2 border-border ms-1.5 ps-6 py-2">
               <p className="text-muted-foreground text-xs">
                 On-chain Poseidon Merkle tree for commitments
               </p>
@@ -1175,11 +1175,11 @@ function TechnicalDeepDive() {
             <div className="flex items-center gap-3">
               <div className="w-3 h-3 rounded-full bg-orange-500"></div>
               <span className="font-semibold">Voting</span>
-              <span className="text-muted-foreground ml-auto">
+              <span className="text-muted-foreground ms-auto">
                 vote(), create_proposal()
               </span>
             </div>
-            <div className="border-l-2 border-border ml-1.5 pl-6 py-2">
+            <div className="border-s-2 border-border ms-1.5 ps-6 py-2">
               <p className="text-muted-foreground text-xs">
                 Groth16 proof verification and vote tallying
               </p>
@@ -1188,11 +1188,11 @@ function TechnicalDeepDive() {
             <div className="flex items-center gap-3">
               <div className="w-3 h-3 rounded-full bg-purple-500"></div>
               <span className="font-semibold">Comments</span>
-              <span className="text-muted-foreground ml-auto">
+              <span className="text-muted-foreground ms-auto">
                 add_comment(), add_anonymous_comment()
               </span>
             </div>
-            <div className="border-l-2 border-border ml-1.5 pl-6 py-2">
+            <div className="border-s-2 border-border ms-1.5 ps-6 py-2">
               <p className="text-muted-foreground text-xs">
                 Public and anonymous comments with ZK proof verification
               </p>
@@ -1310,9 +1310,9 @@ function TechnicalDeepDive() {
             // Comment metadata format
           </p>
           <p>{"{"}</p>
-          <p className="ml-4">"version": 1,</p>
-          <p className="ml-4">"body": "Comment text...",</p>
-          <p className="ml-4">"createdAt": "2024-01-15T10:30:00Z"</p>
+          <p className="ms-4">"version": 1,</p>
+          <p className="ms-4">"body": "Comment text...",</p>
+          <p className="ms-4">"createdAt": "2024-01-15T10:30:00Z"</p>
           <p>{"}"}</p>
           <p className="text-muted-foreground mt-4">
             -&gt; IPFS CID: bafybeig...

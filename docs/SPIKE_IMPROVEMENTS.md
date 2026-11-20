@@ -37,12 +37,50 @@ import { BidiSafe, SafeAddress } from "@/lib/bidiSafe";
 <SafeAddress address={stellarAddress} />
 ```
 
-### Remaining Work
+### ZV-109: Physical->Logical CSS Migration, Isolation Coverage & Confusable Names
 
-- Audit all components for physical CSS properties (ml-, mr-, left-, right-)
-- Convert to logical properties (ms-, me-, start-, end-)
-- Add RTL visual regression tests
-- Get native speaker review for shipped Arabic locale
+- **Audited and converted** every physical directional utility
+  (`ml-`/`mr-`/`pl-`/`pr-`/`left-`/`right-`/`text-left`/`text-right`/
+  `float-left`/`float-right`/`border-l`/`border-r`) across the 29
+  `frontend/src/components/**` files that used them, to their logical
+  equivalents (`ms-`/`me-`/`ps-`/`pe-`/`start-`/`end-`/`text-start`/
+  `text-end`/`float-start`/`float-end`/`border-s`/`border-e`). Tailwind
+  3.3+ ships this whole scale natively, so `tailwind.config.js`'s custom
+  plugin was trimmed down to just the two utilities Tailwind doesn't
+  provide (`ps-safe`/`pe-safe`). `frontend/src/test/logical-css.test.ts`
+  statically scans every component file and fails if a physical utility
+  is reintroduced, so this stays enforced going forward.
+- **Fixed a `hasBidiOverrides` false-negative** in
+  `frontend/src/lib/bidi.ts`: it reused a global-flagged regex for
+  `.test()`, so `lastIndex` persisting between calls could make a real
+  override in a later, unrelated string go undetected. The backend
+  (`backend/src/utils/bidi.ts`) already had the equivalent fix from
+  ZV-130; the frontend copy had the same bug and was missed.
+- **Wired `<BidiSafe>`/`<SafeAddress>` into real rendering**: both
+  components existed but were never actually used anywhere. DAO names
+  (`DAOHeader.tsx`, `DAOCard.tsx`), proposal titles (`ProposalCard.tsx`,
+  `ProposalPage.tsx`), truncated/full member and comment-author addresses
+  (`Comment.tsx`, `ManageMembers.tsx`), and the DAO description markdown
+  now isolate or strip bidi overrides. `RevisionHistory.tsx` was
+  rendering a historical comment body through bare `ReactMarkdown` with
+  no sanitization at all (unlike `Comment.tsx`'s current-revision view) —
+  switched to the shared `SafeMarkdown` component.
+- **Confusable DAO names** (`backend/src/utils/confusables.ts`): detects
+  a name that mixes plain Latin letters with visually-identical
+  Cyrillic/Greek letters (e.g. a Cyrillic "а" substituted into "DAO"),
+  which is almost always an impersonation attempt — a name written
+  entirely in one script, including entirely in Cyrillic or Greek, is
+  left alone. Wired into the previously-unused `daoNameSchema` and into
+  `DaoProvisioningService.start()`, the one concrete backend "create a
+  DAO" entry point, so a confusable name is rejected before provisioning
+  begins.
+
+**Still open** (need a human, not just code): RTL visual regression
+screenshots and native-speaker review of the shipped Arabic locale. A
+Playwright + `@playwright/test` smoke suite already exists
+(`frontend/e2e/smoke.spec.ts`) targeting the deployed site, but there's
+no visual-diffing baseline yet, and establishing one still needs someone
+to eyeball the first screenshots; this should be a follow-up.
 
 ## Issue #791: User Onboarding & Secret Backup
 

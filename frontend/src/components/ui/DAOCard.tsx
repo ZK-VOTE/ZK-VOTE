@@ -1,4 +1,5 @@
 import { Lock, Unlock } from "lucide-react";
+import { BidiSafe } from "../../lib/bidiSafe";
 
 interface DAOCardProps {
   id: number;
@@ -30,7 +31,7 @@ export default function DAOCard({
   return (
     <button
       onClick={onClick}
-      className={`group text-left rounded-xl overflow-hidden border transition-all duration-200 ease-out hover:shadow-lg ${
+      className={`group text-start rounded-xl overflow-hidden border transition-all duration-200 ease-out hover:shadow-lg ${
         isSelected
           ? "border-primary ring-2 ring-primary"
           : "border-border hover:border-primary/50"
@@ -63,7 +64,7 @@ export default function DAOCard({
         )}
 
         {/* Top row: badges + selection indicator */}
-        <div className="absolute top-3 left-3 right-3 flex items-start justify-between">
+        <div className="absolute top-3 start-3 end-3 flex items-start justify-between">
           <div className="flex items-center gap-1">
             <span className="inline-flex items-center h-5 px-1.5 text-[10px] font-medium gap-0.5 rounded-full bg-black/50 text-white">
               #{id}
@@ -114,7 +115,7 @@ export default function DAOCard({
               hasCover ? "text-white" : "text-gray-900 dark:text-white"
             }`}
           >
-            {name}
+            <BidiSafe>{name}</BidiSafe>
           </h3>
         </div>
       </div>

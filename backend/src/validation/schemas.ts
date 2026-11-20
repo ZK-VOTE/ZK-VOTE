@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import { detectConfusableMixedScript } from "../utils/confusables.js";
 import proposalTemplateRegistry from "./proposal-template-registry.json" with { type: "json" };
 
 // The payment schemas below call .openapi() at module load. openapi.ts also
@@ -431,7 +432,11 @@ export const daoNameSchema = z
       return byteLen >= 1 && byteLen <= 24 && val.length <= 24;
     },
     { message: "DAO name must be 1-24 characters (max 24 UTF-8 bytes) without control or zero-width characters" },
-  );
+  )
+  .refine((val) => !detectConfusableMixedScript(val).confusable, {
+    message:
+      "DAO name mixes Latin letters with visually-identical characters from another script",
+  });
 
 /**
  * Proposal title schema matching on-chain MAX_TITLE_LEN = 100 bytes and Unicode NFC normalization.

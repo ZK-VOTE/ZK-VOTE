@@ -294,7 +294,7 @@ Anyone with this phrase can derive all your election voting keys.
         <CardContent className="space-y-3">
           <button
             onClick={handleChooseExplore}
-            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-muted/30 hover:bg-muted/50 text-left transition-colors"
+            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-muted/30 hover:bg-muted/50 text-start transition-colors"
           >
             <Eye className="w-5 h-5 text-muted-foreground shrink-0" />
             <div>
@@ -306,7 +306,7 @@ Anyone with this phrase can derive all your election voting keys.
           </button>
           <button
             onClick={handleChooseCreate}
-            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-primary/5 hover:bg-primary/10 border-primary/30 text-left transition-colors"
+            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-primary/5 hover:bg-primary/10 border-primary/30 text-start transition-colors"
           >
             <Key className="w-5 h-5 text-primary shrink-0" />
             <div>
@@ -318,7 +318,7 @@ Anyone with this phrase can derive all your election voting keys.
           </button>
           <button
             onClick={handleChooseImport}
-            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-muted/30 hover:bg-muted/50 text-left transition-colors"
+            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-muted/30 hover:bg-muted/50 text-start transition-colors"
           >
             <RefreshCw className="w-5 h-5 text-muted-foreground shrink-0" />
             <div>

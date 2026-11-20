@@ -5,6 +5,7 @@ import path from "node:path";
 import { after, describe, it } from "node:test";
 import {
   DaoProvisioningService,
+  ProvisioningError,
   type ExecutorMap,
 } from "../src/services/dao-provisioning.js";
 
@@ -178,5 +179,46 @@ describe("DAO bootstrap saga", () => {
       }),
       /32 bytes of hex/,
     );
+  });
+
+  it("rejects a DAO name that mixes Latin and confusable Cyrillic letters (ZV-109)", async () => {
+    const service = new DaoProvisioningService({}, { stateDir: await tempDir() });
+    const key = "cd".repeat(32);
+    await assert.rejects(
+      service.start(key, {
+        name: "Stellаr DAO", // Cyrillic а in place of Latin 'a'
+        creator: "GAAA",
+        membershipOpen: true,
+        membersCanPropose: true,
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ProvisioningError);
+        assert.equal(err.code, "INVALID_NAME");
+        return true;
+      },
+    );
+    // The rejected attempt must not have created a checkpoint.
+    assert.equal(await service.get(key), null);
+  });
+
+  it("allows a single-script (all-Cyrillic) DAO name", async () => {
+    const service = new DaoProvisioningService(
+      {
+        registry: {
+          async execute() {
+            return { daoId: 1, detail: {} };
+          },
+        },
+      },
+      { stateDir: await tempDir() },
+    );
+    const key = "11".repeat(32);
+    const record = await service.start(key, {
+      name: "Привет ДАО",
+      creator: "GAAA",
+      membershipOpen: true,
+      membersCanPropose: true,
+    });
+    assert.notEqual(record.status, undefined);
   });
 });

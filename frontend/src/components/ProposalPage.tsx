@@ -13,6 +13,7 @@ import { Button } from "./ui/Button";
 import { Card, CardContent } from "./ui/Card";
 import { LoadingSpinner } from "./ui";
 import VoteModal from "./VoteModal";
+import { BidiSafe } from "../lib/bidiSafe";
 import ClaimRewards from "./ClaimRewards";
 import CommentSection from "./CommentSection";
 import VoteResults from "./VoteResults";
@@ -393,7 +394,9 @@ export default function ProposalPage({
                       )}
                     </div>
                     <div className="flex items-center justify-between gap-4">
-                      <h1 className="text-2xl font-bold">{proposal.title}</h1>
+                      <h1 className="text-2xl font-bold">
+                        <BidiSafe>{proposal.title}</BidiSafe>
+                      </h1>
                       {hasDeadline && (
                         <div
                           className={`flex items-center gap-1.5 text-sm font-medium whitespace-nowrap ${getDeadlineColor()}`}
@@ -439,14 +442,14 @@ export default function ProposalPage({
                     >
                       {!isRegistered ? (
                         <>
-                          <AlertCircle className="w-4 h-4 mr-1.5" />
+                          <AlertCircle className="w-4 h-4 me-1.5" />
                           Register
                         </>
                       ) : isPastDeadline ? (
                         "Closed"
                       ) : (
                         <>
-                          <Vote className="w-4 h-4 mr-1.5" />
+                          <Vote className="w-4 h-4 me-1.5" />
                           Vote
                         </>
                       )}
@@ -460,7 +463,7 @@ export default function ProposalPage({
                       size="sm"
                       data-testid="claim-rewards-button"
                     >
-                      <Gift className="w-4 h-4 mr-1.5" />
+                      <Gift className="w-4 h-4 me-1.5" />
                       Claim Reward
                     </Button>
                   )}

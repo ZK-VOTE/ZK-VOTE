@@ -418,12 +418,12 @@ export default function CommentForm({
         >
           {isSubmitting ? (
             <>
-              <Loader2 className="w-4 h-4 mr-1.5 animate-spin" />
+              <Loader2 className="w-4 h-4 me-1.5 animate-spin" />
               {isAnonymous ? "Generating proof..." : "Posting..."}
             </>
           ) : (
             <>
-              <MessageSquare className="w-4 h-4 mr-1.5" />
+              <MessageSquare className="w-4 h-4 me-1.5" />
               {parentId ? "Reply" : "Comment"}
             </>
           )}

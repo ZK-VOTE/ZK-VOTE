@@ -13,7 +13,7 @@ export function LanguageSwitcher() {
   const { language, setLanguage, t } = useTranslation();
 
   return (
-    <div className="relative inline-block text-left">
+    <div className="relative inline-block text-start">
       <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border bg-muted/50 text-xs font-medium">
         <Globe className="h-3.5 w-3.5 text-muted-foreground" />
         <select

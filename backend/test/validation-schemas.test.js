@@ -36,6 +36,7 @@ import {
   adminAuditLogQuerySchema,
   adminSbtTransferAttemptsQuerySchema,
   remediationHistoryQuerySchema,
+  daoNameSchema,
 } from "../src/validation/schemas.js";
 
 const TWO_G1 = "0x" + "11".repeat(64); // 128 hex chars
@@ -576,6 +577,44 @@ describe("remediationHistoryQuerySchema", () => {
     );
     assert.equal(
       remediationHistoryQuerySchema.safeParse({ limit: "1001" }).success,
+      false,
+    );
+  });
+});
+
+describe("daoNameSchema (ZV-109 naming policy)", () => {
+  it("accepts a plain Latin name", () => {
+    assert.equal(daoNameSchema.safeParse("ZKVote Governance").success, true);
+  });
+
+  it("accepts a name written entirely in one non-Latin script", () => {
+    assert.equal(daoNameSchema.safeParse("Привет ДАО").success, true);
+  });
+
+  it("rejects a name mixing Latin letters with confusable Cyrillic letters", () => {
+    const result = daoNameSchema.safeParse("Stellаr DAO"); // Cyrillic а
+    assert.equal(result.success, false);
+  });
+
+  it("rejects a name mixing Latin letters with confusable Greek letters", () => {
+    const result = daoNameSchema.safeParse("Sρlit DAO"); // Greek rho
+    assert.equal(result.success, false);
+  });
+
+  it("still rejects an empty name", () => {
+    assert.equal(daoNameSchema.safeParse("").success, false);
+  });
+
+  it("still rejects a name over the 24-byte on-chain limit", () => {
+    assert.equal(
+      daoNameSchema.safeParse("This Name Is Definitely Too Long").success,
+      false,
+    );
+  });
+
+  it("still rejects zero-width characters", () => {
+    assert.equal(
+      daoNameSchema.safeParse("Go​od DAO").success,
       false,
     );
   });

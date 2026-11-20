@@ -50,7 +50,7 @@ export default function Navbar({
         {/* Mobile menu button */}
         <button
           onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-          className="mr-2 p-3 min-h-[48px] min-w-[48px] flex items-center justify-center rounded-md hover:bg-muted focus:outline-none lg:hidden"
+          className="me-2 p-3 min-h-[48px] min-w-[48px] flex items-center justify-center rounded-md hover:bg-muted focus:outline-none lg:hidden"
           aria-label="Toggle Navigation Menu"
         >
           {mobileMenuOpen ? (
@@ -63,7 +63,7 @@ export default function Navbar({
         {/* Logo - visible on all screens */}
         <button
           onClick={() => handleNavigate("home")}
-          className="mr-3 lg:mr-8 flex items-center space-x-2 shrink-0 py-2 min-h-[48px]"
+          className="me-3 lg:me-8 flex items-center space-x-2 shrink-0 py-2 min-h-[48px]"
         >
           <svg
             className="h-5 w-auto"
@@ -134,7 +134,7 @@ export default function Navbar({
             {relayerStatus && (
               <div className="hidden sm:flex items-center px-2 py-1 rounded-md bg-muted text-xs font-medium">
                 <div
-                  className={`w-2 h-2 rounded-full mr-2 ${
+                  className={`w-2 h-2 rounded-full me-2 ${
                     relayerStatus === "ready" ? "bg-green-500" : "bg-yellow-500"
                   }`}
                 />
@@ -172,7 +172,7 @@ export default function Navbar({
                     onClick={onDisconnect}
                     className="min-h-[48px] sm:min-h-0 sm:h-9"
                   >
-                    <LogOut className="mr-1.5 h-4 w-4 sm:h-3.5 sm:w-3.5" />
+                    <LogOut className="me-1.5 h-4 w-4 sm:h-3.5 sm:w-3.5" />
                     <span className="text-xs sm:text-sm">
                       {t("nav.disconnect")}
                     </span>
@@ -185,7 +185,7 @@ export default function Navbar({
                   size="sm"
                   className="min-h-[48px] sm:min-h-0 sm:h-9 px-3 sm:px-4"
                 >
-                  <Wallet className="mr-1.5 h-4 w-4 sm:h-3.5 sm:w-3.5" />
+                  <Wallet className="me-1.5 h-4 w-4 sm:h-3.5 sm:w-3.5" />
                   <span className="text-xs sm:text-sm">
                     {connecting ? t("nav.connecting") : t("nav.connectWallet")}
                   </span>
@@ -201,7 +201,7 @@ export default function Navbar({
           <div className="container mx-auto px-4 py-3 space-y-2">
             <button
               onClick={() => handleNavigate("browse")}
-              className={`flex items-center w-full text-left px-4 min-h-[48px] rounded-md text-base font-medium transition-colors ${
+              className={`flex items-center w-full text-start px-4 min-h-[48px] rounded-md text-base font-medium transition-colors ${
                 currentView === "browse"
                   ? "bg-muted text-foreground"
                   : "text-foreground/70 hover:bg-muted/50"
@@ -211,7 +211,7 @@ export default function Navbar({
             </button>
             <button
               onClick={() => handleNavigate("votes")}
-              className={`flex items-center w-full text-left px-4 min-h-[48px] rounded-md text-base font-medium transition-colors ${
+              className={`flex items-center w-full text-start px-4 min-h-[48px] rounded-md text-base font-medium transition-colors ${
                 currentView === "votes"
                   ? "bg-muted text-foreground"
                   : "text-foreground/70 hover:bg-muted/50"
@@ -221,7 +221,7 @@ export default function Navbar({
             </button>
             <button
               onClick={() => handleNavigate("docs")}
-              className={`flex items-center w-full text-left px-4 min-h-[48px] rounded-md text-base font-medium transition-colors ${
+              className={`flex items-center w-full text-start px-4 min-h-[48px] rounded-md text-base font-medium transition-colors ${
                 currentView === "docs"
                   ? "bg-muted text-foreground"
                   : "text-foreground/70 hover:bg-muted/50"
@@ -231,7 +231,7 @@ export default function Navbar({
             </button>
             <button
               onClick={() => handleNavigate("profile")}
-              className={`block w-full text-left px-3 py-2 rounded-md transition-colors ${
+              className={`block w-full text-start px-3 py-2 rounded-md transition-colors ${
                 currentView === "profile"
                   ? "bg-muted text-foreground"
                   : "text-foreground/60 hover:bg-muted/50"
@@ -241,7 +241,7 @@ export default function Navbar({
             </button>
             <button
               onClick={() => handleNavigate("pay")}
-              className={`block w-full text-left px-3 py-2 rounded-md transition-colors ${
+              className={`block w-full text-start px-3 py-2 rounded-md transition-colors ${
                 currentView === "pay"
                   ? "bg-muted text-foreground"
                   : "text-foreground/60 hover:bg-muted/50"
