@@ -349,6 +349,79 @@ export const votesProcessed = new Counter({
   registers: [register],
 });
 
+// Imported by routes/voting.ts, routes/pay.ts and routes/health.ts but
+// missing from this file, which broke importing those routers (and
+// therefore backend/src/index.ts) entirely - found while adding the
+// ZV-113 compatibility-matrix route test, unrelated to voting/payment
+// instrumentation itself.
+export const proofVerificationDuration = new Histogram({
+  name: "zkvote_proof_verification_duration_seconds",
+  help: "Time to verify a submitted vote proof, in seconds",
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+  registers: [register],
+});
+
+export const proofValidationErrors = new Counter({
+  name: "zkvote_proof_validation_errors_total",
+  help: "Total vote proof validation errors, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const proofSubmissionsTotal = new Counter({
+  name: "zkvote_proof_submissions_total",
+  help: "Total vote proof submissions, by outcome",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const relayAttemptsTotal = new Counter({
+  name: "zkvote_relay_attempts_total",
+  help: "Total relayer submission attempts for vote proofs",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const relayDuration = new Histogram({
+  name: "zkvote_relay_duration_seconds",
+  help: "Time to relay a vote proof to the chain, in seconds",
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+export const relayErrors = new Counter({
+  name: "zkvote_relay_errors_total",
+  help: "Total relayer submission errors, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const relayQueueDepth = new Gauge({
+  name: "zkvote_relay_queue_depth",
+  help: "Current depth of the vote-relay submission queue",
+  registers: [register],
+});
+
+export const rootFetchFailuresTotal = new Counter({
+  name: "zkvote_root_fetch_failures_total",
+  help: "Total failures fetching a DAO's current Merkle root, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const paymentOpsPerMinute = new Histogram({
+  name: "zkvote_payment_ops_per_minute",
+  help: "Number of payment ops submitted per /pay/batch request",
+  buckets: [1, 2, 5, 10, 20, 50, 100],
+  registers: [register],
+});
+
+export const healthEndpointStatus = new Gauge({
+  name: "zkvote_health_endpoint_status",
+  help: "HTTP status code most recently returned by the /health endpoint",
+  registers: [register],
+});
+
 export const commentsSubmitted = new Counter({
   name: "zkvote_comments_submitted_total",
   help: "Total comments submitted",
@@ -989,6 +1062,46 @@ export const backupRestoreDrillTotal = new Counter({
   name: "zkvote_backup_restore_drill_total",
   help: "Total encrypted restore drills run (verify/decrypt round-trip)",
   labelNames: ["status"] as const,
+  registers: [register],
+});
+
+// Imported by backupCrypto.ts but missing from this file, which broke
+// every import of that module (and therefore anything that transitively
+// imports it, including backend/src/index.ts) - found while adding the
+// ZV-113 compatibility-matrix route test, unrelated to backup/crypto work
+// itself.
+export const backupTamperDetected = new Counter({
+  name: "zkvote_backup_tamper_detected_total",
+  help: "Total backup restores that detected tampering (AEAD auth-tag failure or size mismatch)",
+  labelNames: ["keyId"] as const,
+  registers: [register],
+});
+
+export const backupRestoreSuccess = new Counter({
+  name: "zkvote_backup_restore_success_total",
+  help: "Total backup restores that completed successfully",
+  labelNames: ["keyId"] as const,
+  registers: [register],
+});
+
+export const backupRestoreFailed = new Counter({
+  name: "zkvote_backup_restore_failed_total",
+  help: "Total backup restores that failed, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const backupEncryptionDuration = new Histogram({
+  name: "zkvote_backup_encryption_duration_seconds",
+  help: "Time to encrypt a backup payload, in seconds",
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30],
+  registers: [register],
+});
+
+export const backupDecryptionDuration = new Histogram({
+  name: "zkvote_backup_decryption_duration_seconds",
+  help: "Time to decrypt a backup payload, in seconds",
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30],
   registers: [register],
 });
 

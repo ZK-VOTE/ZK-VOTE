@@ -17,6 +17,8 @@ import {
   invalidateVersionCache,
   getDaoCurrentCircuit,
   getCircuitInfo,
+  getCompatibilityMatrix,
+  KNOWN_CIRCUIT_IDS,
   type CircuitRegistryDeps,
 } from "../../src/services/circuit-registry.js";
 
@@ -135,4 +137,31 @@ test("circuit-registry: getCircuitInfo returns null when unconfigured", async ()
   initCircuitRegistry(mockDeps({ circuitRegistryContractId: undefined }));
   const info = await getCircuitInfo("vote_v2", "Vote");
   assert.equal(info, null);
+});
+
+// ZV-113 / #953: SDK circuit-compatibility matrix enforcement. Exercised
+// directly against this service (not over HTTP) - see
+// routes/circuits.ts's GET /circuits/compatibility-matrix, which is a
+// thin wrapper around getCompatibilityMatrix() with no logic of its own.
+test("circuit-registry: getCompatibilityMatrix covers every known circuit with its N/N-1 window", async () => {
+  initCircuitRegistry(mockDeps());
+  invalidateVersionCache();
+
+  const matrix = await getCompatibilityMatrix();
+  assert.equal(matrix.length, KNOWN_CIRCUIT_IDS.length);
+  for (const circuitId of KNOWN_CIRCUIT_IDS) {
+    assert.ok(
+      matrix.some((e) => e.circuitId === circuitId),
+      `${circuitId} must be in the matrix`,
+    );
+  }
+
+  const voteV2 = matrix.find((e) => e.circuitId === "vote_v2");
+  assert.equal(voteV2?.currentVersion, 2);
+  assert.deepEqual(voteV2?.supportedVersions, [2, 1]);
+
+  const voteV1 = matrix.find((e) => e.circuitId === "vote_v1");
+  assert.equal(voteV1?.currentVersion, 1);
+  // N-1 would be 0, which is not a valid version - clamped out, not included as 0.
+  assert.deepEqual(voteV1?.supportedVersions, [1]);
 });
