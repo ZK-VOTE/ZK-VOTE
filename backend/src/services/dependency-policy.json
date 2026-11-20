@@ -1,0 +1,247 @@
+{
+  "$comment": "Dependency inventory and safety classes (ZV-067, SPIKE-125). Read from the base branch by CI, so a PR cannot weaken its own classification; any change to this file is itself proof-sensitive.",
+  "version": 1,
+  "exceptionExpiryDays": 30,
+  "signoff": {
+    "statusContext": "supply-chain/sign-off",
+    "maintainerPermissions": ["admin", "maintain"],
+    "ceremonyPlanPattern": "Ceremony plan:\\s*(https?://\\S+)"
+  },
+  "classes": {
+    "patch-safe": {
+      "rank": 0,
+      "label": "deps:patch-safe",
+      "signoff": false,
+      "ceremonyPlan": false,
+      "parity": ["package-tests"]
+    },
+    "proof-sensitive": {
+      "rank": 1,
+      "label": "deps:proof-sensitive",
+      "signoff": true,
+      "ceremonyPlan": false,
+      "parity": [
+        "package-tests",
+        "circuit-kat",
+        "rebuild-compare",
+        "proof-corpus"
+      ]
+    },
+    "ceremony-linked": {
+      "rank": 2,
+      "label": "deps:ceremony-linked",
+      "signoff": true,
+      "ceremonyPlan": true,
+      "parity": [
+        "package-tests",
+        "circuit-kat",
+        "rebuild-compare",
+        "proof-corpus"
+      ]
+    }
+  },
+  "packages": {
+    "ceremony-linked": ["snarkjs", "circomlib", "circom", "circom2"],
+    "proof-sensitive": [
+      "ffjavascript",
+      "wasmcurves",
+      "circom_runtime",
+      "circom_tester",
+      "circomlibjs",
+      "r1csfile",
+      "binfileutils",
+      "fastfile",
+      "@iden3/*",
+      "ark-*",
+      "soroban-sdk",
+      "soroban-env-*",
+      "num-bigint",
+      "wasmtime"
+    ]
+  },
+  "policyFiles": ["supply-chain/dependency-policy.json"],
+  "parity": {
+    "circuit-kat": {
+      "name": "Circuit known-answer tests",
+      "setup": ["node", "rust"],
+      "run": "(cd circuits && npm ci && npm test) && cargo test -p zkvote-integration-tests --test poseidon_kat --locked -- --test-threads=1"
+    },
+    "rebuild-compare": {
+      "name": "Rebuild-compare (reproducible WASM)",
+      "setup": ["rust"],
+      "run": "bash scripts/supply-chain/rebuild-compare.sh"
+    },
+    "proof-corpus": {
+      "name": "Differential proof corpus",
+      "setup": ["rust"],
+      "run": "cargo test -p zkvote-groth16 --test bn254_edge_case_corpus --locked -- --nocapture && cargo test -p zkvote-groth16 --test verifier_stub_gate --locked"
+    }
+  },
+  "workspaces": [
+    {
+      "id": "root-npm",
+      "manager": "npm",
+      "dir": ".",
+      "manifest": "package.json",
+      "lockfile": "package-lock.json",
+      "owner": "protocol maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "npm ci --ignore-scripts"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "backend",
+      "manager": "npm",
+      "dir": "backend",
+      "manifest": "backend/package.json",
+      "lockfile": "backend/package-lock.json",
+      "owner": "backend maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd backend && npm ci && RELAYER_TEST_MODE=true SOROBAN_RPC_URL=https://soroban-testnet.stellar.org NETWORK_PASSPHRASE='Test SDF Network ; September 2015' RELAYER_SECRET_KEY=SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS RELAYER_AUTH_TOKEN=ci-test-token-placeholder-32-chars-min VOTING_CONTRACT_ID=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC TREE_CONTRACT_ID=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC COMMENTS_CONTRACT_ID=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC npm test"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "frontend",
+      "manager": "npm",
+      "dir": "frontend",
+      "manifest": "frontend/package.json",
+      "lockfile": "frontend/package-lock.json",
+      "owner": "frontend maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd frontend && npm ci --legacy-peer-deps && npx vitest run"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "circuits",
+      "manager": "npm",
+      "dir": "circuits",
+      "manifest": "circuits/package.json",
+      "lockfile": "circuits/package-lock.json",
+      "owner": "circuit maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd circuits && npm ci && npm test"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "ceremony",
+      "manager": "npm",
+      "dir": "circuits/ceremony",
+      "manifest": "circuits/ceremony/package.json",
+      "lockfile": null,
+      "owner": "ceremony coordinators",
+      "defaultClass": "ceremony-linked",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd circuits/ceremony && npm install --no-audit --no-fund && npm run test:ceremony"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "bridge-evm",
+      "manager": "npm",
+      "dir": "contracts/bridge/evm",
+      "manifest": "contracts/bridge/evm/package.json",
+      "lockfile": "contracts/bridge/evm/package-lock.json",
+      "owner": "bridge maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd contracts/bridge/evm && npm ci --legacy-peer-deps && npx hardhat compile && npx hardhat test"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "sdk",
+      "manager": "npm",
+      "dir": "packages/sdk",
+      "manifest": "packages/sdk/package.json",
+      "lockfile": "packages/sdk/package-lock.json",
+      "owner": "SDK maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd packages/sdk && npm ci && npm test"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "tests-bridge",
+      "manager": "npm",
+      "dir": "tests/bridge",
+      "manifest": "tests/bridge/package.json",
+      "lockfile": "tests/bridge/package-lock.json",
+      "owner": "bridge maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd tests/bridge && npm ci"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "tests-e2e",
+      "manager": "npm",
+      "dir": "tests/e2e",
+      "manifest": "tests/e2e/package.json",
+      "lockfile": "tests/e2e/package-lock.json",
+      "owner": "protocol maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["node"],
+        "run": "cd tests/e2e && npm ci"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "generated-contract-bindings",
+      "manager": "npm",
+      "dir": "frontend/src/contracts/*",
+      "manifest": "frontend/src/contracts/*/package.json",
+      "lockfile": "frontend/src/contracts/*/package-lock.json",
+      "owner": "frontend maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "none (regenerated from contract builds)",
+      "test": {
+        "setup": ["node"],
+        "run": "cd frontend && npm ci --legacy-peer-deps && npm run type-check"
+      },
+      "reviewDate": "2027-01-31"
+    },
+    {
+      "id": "cargo",
+      "manager": "cargo",
+      "dir": ".",
+      "manifest": "Cargo.toml",
+      "lockfile": "Cargo.lock",
+      "owner": "contract maintainers",
+      "defaultClass": "patch-safe",
+      "updater": "dependabot",
+      "test": {
+        "setup": ["rust"],
+        "run": "cargo test --workspace --exclude zkvote-integration-tests --locked"
+      },
+      "reviewDate": "2027-01-31"
+    }
+  ]
+}
