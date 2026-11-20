@@ -2,6 +2,8 @@
  * Proof generation functions
  */
 
+import { assertCircuitReady } from './keys'
+
 export interface VoteProofParams {
   identitySecret: Uint8Array
   pollId: string
@@ -11,6 +13,13 @@ export interface VoteProofParams {
     siblings: string[]
     pathIndices: number[]
   }
+  /**
+   * Which loaded manifest key (by circuit name) this proof is generated
+   * against. Defaults to 'vote'. Used only to look up the ZV-113
+   * registry-compatibility result recorded by loadKeys() - see
+   * `assertCircuitReady()`. Proving itself is still mocked below.
+   */
+  circuitName?: string
 }
 
 export interface ClaimProofParams {
@@ -21,6 +30,8 @@ export interface ClaimProofParams {
     siblings: string[]
     pathIndices: number[]
   }
+  /** Same purpose as `VoteProofParams.circuitName`. Defaults to 'claim'. */
+  circuitName?: string
 }
 
 export interface Proof {
@@ -38,6 +49,11 @@ export interface Proof {
  * Generate a zero-knowledge proof for voting
  */
 export async function generateVoteProof(params: VoteProofParams): Promise<Proof> {
+  // ZV-113: refuse to prove with a circuit version the registry rejected
+  // during loadKeys(). Throws UnsupportedCircuitVersionError if so; a
+  // no-op if that circuit was never registry-checked at all.
+  assertCircuitReady(params.circuitName ?? 'vote')
+
   // Validate inputs
   if (!params.identitySecret || params.identitySecret.length !== 32) {
     throw new Error('Identity secret must be 32 bytes')
@@ -71,6 +87,8 @@ export async function generateVoteProof(params: VoteProofParams): Promise<Proof>
  * Generate a zero-knowledge proof for membership claim
  */
 export async function generateClaimProof(params: ClaimProofParams): Promise<Proof> {
+  assertCircuitReady(params.circuitName ?? 'claim')
+
   if (!params.identitySecret || params.identitySecret.length !== 32) {
     throw new Error('Identity secret must be 32 bytes')
   }
