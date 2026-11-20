@@ -44,7 +44,12 @@ CREATE TABLE IF NOT EXISTS deposit_trustlines (
   asset TEXT NOT NULL CHECK (asset IN ('USDC', 'EURC', 'XLM')),
   issuer TEXT,                        -- NULL for XLM
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (account, asset, COALESCE(issuer, ''))
+  -- SQLite PRIMARY KEY/UNIQUE constraints cannot contain expressions
+  -- (unlike the Postgres flavor of this migration, which coalesced NULL
+  -- issuer to '' here); plain-column composite key, see
+  -- idx_deposit_trustlines_account_asset for the (account, asset) lookup
+  -- actually used by muxed-deposit-router.ts.
+  PRIMARY KEY (account, asset, issuer)
 );
 
 CREATE INDEX idx_deposit_trustlines_account_asset ON deposit_trustlines(account, asset);

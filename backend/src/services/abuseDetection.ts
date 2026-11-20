@@ -8,6 +8,7 @@
  * - Metadata-only analysis (never vote linkage)
  */
 
+import crypto from "crypto";
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
 import { dispatchAbuseDetectionToSiem } from "./abuse-siem.js";
@@ -46,7 +47,94 @@ export const ABUSE_THRESHOLDS = {
 
   // Threshold evasion: amounts clustering just below reporting thresholds
   THRESHOLD_MARGIN: 0.95, // Within 95% of threshold
+
+  // Enforcement tiers (ZV-111): confidence bands that select the graduated
+  // action taken on a detection. Bumping this file's values must also bump
+  // ABUSE_THRESHOLDS_VERSION so tuning changes are auditable and the
+  // labelled-fixture regression test (abuseEnforcement.test.ts) is forced
+  // to re-confirm expected behavior against the drill scenarios in
+  // docs/abuse-detection-policy.md.
+  HOLD_CONFIDENCE: 0.5, // >= this: hold payment pending dual-control review
+  BLOCK_CONFIDENCE: 0.9, // >= this: hard block, mandatory review
 } as const;
+
+/**
+ * Version stamp for the threshold/action tuning above. Anything that reads
+ * or stores a confidence-derived action should also persist this value so
+ * historical holds/cases remain interpretable after thresholds change.
+ */
+export const ABUSE_THRESHOLDS_VERSION = "2026.11.0";
+
+/**
+ * Graduated enforcement actions (ZV-111). Detection alone ("suspicious")
+ * only ever advised; this maps a confidence score to what the system
+ * actually does about it.
+ */
+export enum AbuseAction {
+  NONE = "none",
+  FLAG = "flag",
+  HOLD = "hold",
+  BLOCK = "block",
+}
+
+/**
+ * Human/audit-facing reason codes, one per pattern, attached to every hold
+ * and dispute case so a reviewer never has to re-derive "why" from raw
+ * detector metadata.
+ */
+export const ABUSE_REASON_CODES: Record<AbusePattern, string> = {
+  [AbusePattern.WASH_PAYMENT]: "WASH_PAYMENT_ROUNDTRIP",
+  [AbusePattern.STRUCTURING]: "STRUCTURING_THRESHOLD_EVASION",
+  [AbusePattern.MULE_CONVERGENCE]: "MULE_CONVERGENCE_FANIN",
+  [AbusePattern.RAPID_CYCLING]: "RAPID_CYCLING_MIXER_LIKE",
+  [AbusePattern.THRESHOLD_EVASION]: "THRESHOLD_EVASION",
+};
+
+/** Fields that must never appear in an abuse evidence bundle (ZV-010 privacy red lines). */
+const FORBIDDEN_EVIDENCE_KEYS = [
+  "nullifier",
+  "voteNullifier",
+  "vote_nullifier",
+  "membershipProof",
+  "membership_proof",
+  "ballotCommitment",
+  "ballot_commitment",
+  "daoId",
+  "dao_id",
+  "proposalId",
+  "proposal_id",
+];
+
+/**
+ * Recursively check that an evidence object carries no vote/membership
+ * linkage. Thrown errors here are a hard stop: abuse evidence is payment
+ * metadata only and must never become a deanonymization oracle.
+ */
+export function assertNoVoteLinkage(value: unknown, path = "evidence"): void {
+  if (value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => assertNoVoteLinkage(item, `${path}[${i}]`));
+    return;
+  }
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (FORBIDDEN_EVIDENCE_KEYS.includes(key)) {
+      throw new Error(
+        `Privacy violation: evidence bundle contains forbidden key "${path}.${key}" (vote/membership linkage is never permitted in abuse evidence)`
+      );
+    }
+    assertNoVoteLinkage(val, `${path}.${key}`);
+  }
+}
+
+/**
+ * Select the graduated enforcement action for a confidence score.
+ */
+export function determineAction(suspicious: boolean, confidence: number): AbuseAction {
+  if (!suspicious) return AbuseAction.NONE;
+  if (confidence >= ABUSE_THRESHOLDS.BLOCK_CONFIDENCE) return AbuseAction.BLOCK;
+  if (confidence >= ABUSE_THRESHOLDS.HOLD_CONFIDENCE) return AbuseAction.HOLD;
+  return AbuseAction.FLAG;
+}
 
 /**
  * Abuse detection result
@@ -405,4 +493,233 @@ export function getAbuseStats(
   }
 
   return stats;
+}
+
+// ============================================
+// ENFORCEMENT & DISPUTE-CASE LINKAGE (ZV-111)
+// ============================================
+
+export type HoldStatus = "held" | "pending_release" | "released" | "escalated";
+
+export interface PaymentHold {
+  id: string;
+  tenantId: string;
+  paymentRef: string;
+  action: AbuseAction;
+  reasonCode: string;
+  patterns: AbusePattern[];
+  confidence: number;
+  thresholdsVersion: string;
+  status: HoldStatus;
+  evidence: Record<string, unknown>;
+  disputeCaseId: string | null;
+  firstReviewerId: string | null;
+  releasedBy: string | null;
+  releasedAt: string | null;
+  createdAt: string;
+}
+
+interface PaymentHoldRow {
+  id: string;
+  tenant_id: string;
+  payment_ref: string;
+  action: string;
+  reason_code: string;
+  patterns: string;
+  confidence: number;
+  thresholds_version: string;
+  status: HoldStatus;
+  evidence: string;
+  dispute_case_id: string | null;
+  first_reviewer_id: string | null;
+  first_review_at: string | null;
+  first_review_reason: string | null;
+  released_by: string | null;
+  released_at: string | null;
+  release_reason: string | null;
+  created_at: string;
+}
+
+function rowToHold(row: PaymentHoldRow): PaymentHold {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    paymentRef: row.payment_ref,
+    action: row.action as AbuseAction,
+    reasonCode: row.reason_code,
+    patterns: JSON.parse(row.patterns),
+    confidence: row.confidence,
+    thresholdsVersion: row.thresholds_version,
+    status: row.status,
+    evidence: JSON.parse(row.evidence),
+    disputeCaseId: row.dispute_case_id,
+    firstReviewerId: row.first_reviewer_id,
+    releasedBy: row.released_by,
+    releasedAt: row.released_at,
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * Place a flagged payment on hold (or hard-block it) and open a linked
+ * dispute case with an evidence bundle. The evidence bundle is asserted
+ * privacy-clean before it is ever written - this is the enforcement hook
+ * the policy doc describes as missing (detection was advisory only).
+ *
+ * Returns null for AbuseAction.NONE/FLAG, since those tiers do not create
+ * a case - they are logged via recordAbuseDetection() only.
+ */
+export function placeOnHold(input: {
+  tenantId: string;
+  paymentRef: string;
+  action: AbuseAction;
+  patterns: AbusePattern[];
+  confidence: number;
+  evidence: Record<string, unknown>;
+}): { holdId: string; disputeCaseId: string | null } | null {
+  if (input.action === AbuseAction.NONE || input.action === AbuseAction.FLAG) {
+    return null;
+  }
+
+  assertNoVoteLinkage(input.evidence);
+
+  const db = getDb();
+  const holdId = crypto.randomUUID();
+  const reasonCode =
+    input.patterns.map((p) => ABUSE_REASON_CODES[p]).join("+") || "UNSPECIFIED";
+
+  db.prepare(
+    `INSERT INTO payment_holds (
+      id, tenant_id, payment_ref, action, reason_code, patterns, confidence,
+      thresholds_version, status, evidence
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', ?)`
+  ).run(
+    holdId,
+    input.tenantId,
+    input.paymentRef,
+    input.action,
+    reasonCode,
+    JSON.stringify(input.patterns),
+    input.confidence,
+    ABUSE_THRESHOLDS_VERSION,
+    JSON.stringify(input.evidence)
+  );
+
+  const disputeCaseId = crypto.randomUUID();
+  db.prepare(
+    `INSERT INTO dispute_cases (
+      id, class, tenant_id, hold_id, status, evidence_bundle
+    ) VALUES (?, 'payment', ?, ?, 'open', ?)`
+  ).run(
+    disputeCaseId,
+    input.tenantId,
+    holdId,
+    JSON.stringify({ reasonCode, patterns: input.patterns, confidence: input.confidence, ...input.evidence })
+  );
+
+  db.prepare(`UPDATE payment_holds SET dispute_case_id = ? WHERE id = ?`).run(
+    disputeCaseId,
+    holdId
+  );
+
+  log("warn", "abuse_enforcement_hold_created", {
+    holdId,
+    disputeCaseId,
+    tenantId: input.tenantId,
+    action: input.action,
+    reasonCode,
+    confidence: input.confidence,
+  });
+
+  return { holdId, disputeCaseId };
+}
+
+export function getHold(holdId: string): PaymentHold | null {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT * FROM payment_holds WHERE id = ?`)
+    .get(holdId) as PaymentHoldRow | undefined;
+  return row ? rowToHold(row) : null;
+}
+
+export function listHolds(
+  filter: { tenantId?: string; status?: HoldStatus } = {}
+): PaymentHold[] {
+  const db = getDb();
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (filter.tenantId) {
+    clauses.push("tenant_id = ?");
+    params.push(filter.tenantId);
+  }
+  if (filter.status) {
+    clauses.push("status = ?");
+    params.push(filter.status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const rows = db
+    .prepare(`SELECT * FROM payment_holds ${where} ORDER BY created_at DESC LIMIT 200`)
+    .all(...params) as PaymentHoldRow[];
+  return rows.map(rowToHold);
+}
+
+/**
+ * Dual-control release: the first reviewer records intent (status moves to
+ * pending_release); a *different* reviewer must confirm before the hold is
+ * actually released and the linked dispute case resolved. A single
+ * operator can never release their own hold.
+ */
+export function reviewHold(
+  holdId: string,
+  reviewerId: string,
+  reason: string
+): PaymentHold {
+  const db = getDb();
+  const hold = getHold(holdId);
+  if (!hold) {
+    throw new Error(`Hold ${holdId} not found`);
+  }
+  if (hold.status === "released") {
+    throw new Error(`Hold ${holdId} is already released`);
+  }
+
+  const now = new Date().toISOString();
+
+  if (hold.status === "held") {
+    db.prepare(
+      `UPDATE payment_holds
+       SET status = 'pending_release', first_reviewer_id = ?, first_review_at = ?, first_review_reason = ?
+       WHERE id = ?`
+    ).run(reviewerId, now, reason, holdId);
+
+    log("info", "abuse_hold_first_review", { holdId, reviewerId });
+    return getHold(holdId)!;
+  }
+
+  // status === "pending_release": require a second, distinct reviewer.
+  if (hold.firstReviewerId === reviewerId) {
+    throw new Error(
+      "Dual control violation: the second reviewer must be different from the first reviewer"
+    );
+  }
+
+  db.prepare(
+    `UPDATE payment_holds
+     SET status = 'released', released_by = ?, released_at = ?, release_reason = ?
+     WHERE id = ?`
+  ).run(reviewerId, now, reason, holdId);
+
+  if (hold.disputeCaseId) {
+    db.prepare(
+      `UPDATE dispute_cases SET status = 'resolved', resolved_at = ?, resolution = ? WHERE id = ?`
+    ).run(now, reason, hold.disputeCaseId);
+  }
+
+  log("info", "abuse_hold_released", {
+    holdId,
+    firstReviewerId: hold.firstReviewerId,
+    secondReviewerId: reviewerId,
+  });
+
+  return getHold(holdId)!;
 }

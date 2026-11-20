@@ -1408,6 +1408,17 @@ export const adminRelayerRotateSchema = z.object({
   actor: z.string().min(1).max(100).optional(),
 });
 
+// Abuse-detection enforcement review queue (ZV-111)
+export const adminAbuseHoldsQuerySchema = z.object({
+  tenantId: z.string().min(1).max(64).optional(),
+  status: z.enum(["held", "pending_release", "released", "escalated"]).optional(),
+});
+
+export const adminAbuseHoldReviewSchema = z.object({
+  reviewerId: z.string().min(1).max(100),
+  reason: z.string().min(1).max(500),
+});
+
 // Relayer key lifecycle (#746)
 const operatorId = z.string().min(1).max(100);
 // `${cosignerId}.${expiresAtMs}.${hmacHex}` — see issueActionApproval.

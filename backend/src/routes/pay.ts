@@ -98,11 +98,15 @@ import {
   abusePatternConfidence,
   suspiciousPaymentVolume,
   paymentDestinationFanout,
+  paymentHoldsTotal,
 } from "../services/metrics.js";
-import { 
-  analyzeBatchPayment, 
+import {
+  analyzeBatchPayment,
   recordAbuseDetection,
-  AbusePattern 
+  determineAction,
+  placeOnHold,
+  AbuseAction,
+  AbusePattern,
 } from "../services/abuseDetection.js";
 
 router.post("/pay/batch", csrfOriginGuard, bodyLimit("256kb"), async (req, res) => {
@@ -161,13 +165,42 @@ router.post("/pay/batch", csrfOriginGuard, bodyLimit("256kb"), async (req, res) 
         opsCount: ops.length,
         uniqueDestinations,
       });
-      
-      // For high-confidence abuse, return 403 (review required)
-      if (abuseResult.confidence >= 0.9) {
-        return res.status(403).json({
-          error: "Payment batch flagged for review due to suspicious patterns",
+
+      // Graduated enforcement (ZV-111): flag -> hold -> block. A hold/block
+      // opens a linked dispute case with a metadata-only evidence bundle so
+      // a reviewer can act on it without re-running detection from scratch.
+      const action = determineAction(abuseResult.suspicious, abuseResult.confidence);
+      if (action === AbuseAction.HOLD || action === AbuseAction.BLOCK) {
+        const paymentRef = idempotencyKey || `batch:${Date.now()}:${tenantId}`;
+        const enforcement = placeOnHold({
+          tenantId,
+          paymentRef,
+          action,
+          patterns: abuseResult.patterns,
+          confidence: abuseResult.confidence,
+          evidence: {
+            opsCount: ops.length,
+            uniqueDestinations,
+            structuring: abuseResult.metadata.structuring,
+            wash: abuseResult.metadata.wash,
+            mule: abuseResult.metadata.mule,
+          },
+        });
+
+        for (const pattern of abuseResult.patterns) {
+          paymentHoldsTotal.inc({ pattern, action });
+        }
+
+        const statusCode = action === AbuseAction.BLOCK ? 403 : 423;
+        return res.status(statusCode).json({
+          error:
+            action === AbuseAction.BLOCK
+              ? "Payment batch blocked due to suspicious patterns"
+              : "Payment batch held pending dual-control review",
           patterns: abuseResult.patterns,
           reviewRequired: true,
+          holdId: enforcement?.holdId,
+          disputeCaseId: enforcement?.disputeCaseId,
         });
       }
     }

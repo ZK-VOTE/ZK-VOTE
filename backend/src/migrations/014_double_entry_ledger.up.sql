@@ -3,14 +3,14 @@
 
 -- Chart of Accounts
 CREATE TABLE IF NOT EXISTS ledger_accounts (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   code VARCHAR(50) NOT NULL UNIQUE,
   name VARCHAR(255) NOT NULL,
   account_type VARCHAR(50) NOT NULL CHECK (account_type IN ('asset', 'liability', 'equity', 'revenue', 'expense')),
   parent_id INTEGER REFERENCES ledger_accounts(id) ON DELETE RESTRICT,
-  is_active BOOLEAN NOT NULL DEFAULT true,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 -- Operational accounts for ZK-VOTE
@@ -27,21 +27,21 @@ INSERT INTO ledger_accounts (code, name, account_type) VALUES
 
 -- Journal Entries (double-entry postings)
 CREATE TABLE IF NOT EXISTS ledger_entries (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   entry_date DATE NOT NULL DEFAULT CURRENT_DATE,
   description VARCHAR(500) NOT NULL,
   reference_type VARCHAR(50), -- 'payment', 'swap', 'anchor_deposit', 'anchor_withdraw', 'reward'
   reference_id VARCHAR(255), -- External ID (payment hash, swap ID, etc.)
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   created_by VARCHAR(255),
-  is_reconciled BOOLEAN NOT NULL DEFAULT false,
-  reconciled_at TIMESTAMP WITH TIME ZONE
+  is_reconciled INTEGER NOT NULL DEFAULT 0,
+  reconciled_at TEXT
 );
 
 -- Journal Entry Lines (debits and credits)
 CREATE TABLE IF NOT EXISTS ledger_lines (
-  id BIGSERIAL PRIMARY KEY,
-  entry_id BIGINT NOT NULL REFERENCES ledger_entries(id) ON DELETE CASCADE,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id INTEGER NOT NULL REFERENCES ledger_entries(id) ON DELETE CASCADE,
   account_id INTEGER NOT NULL REFERENCES ledger_accounts(id) ON DELETE RESTRICT,
   debit_stroops BIGINT NOT NULL DEFAULT 0 CHECK (debit_stroops >= 0),
   credit_stroops BIGINT NOT NULL DEFAULT 0 CHECK (credit_stroops >= 0),
@@ -57,15 +57,15 @@ CREATE TABLE IF NOT EXISTS ledger_daily_close (
   total_debits BIGINT NOT NULL,
   total_credits BIGINT NOT NULL,
   balance_proof_hash VARCHAR(64) NOT NULL,
-  is_balanced BOOLEAN NOT NULL,
+  is_balanced INTEGER NOT NULL,
   discrepancy_stroops BIGINT NOT NULL DEFAULT 0,
-  closed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  closed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   closed_by VARCHAR(255)
 );
 
 -- Reconciliation Table (chain vs books)
 CREATE TABLE IF NOT EXISTS ledger_reconciliations (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   reconciliation_date DATE NOT NULL,
   account_id INTEGER NOT NULL REFERENCES ledger_accounts(id),
   ledger_balance_stroops BIGINT NOT NULL,
@@ -73,8 +73,8 @@ CREATE TABLE IF NOT EXISTS ledger_reconciliations (
   discrepancy_stroops BIGINT,
   status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'matched', 'discrepancy', 'resolved')),
   notes TEXT,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  resolved_at TIMESTAMP WITH TIME ZONE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  resolved_at TEXT,
   resolved_by VARCHAR(255)
 );
 
@@ -87,7 +87,7 @@ CREATE INDEX idx_ledger_reconciliations_date ON ledger_reconciliations(reconcili
 CREATE INDEX idx_ledger_reconciliations_status ON ledger_reconciliations(status);
 
 -- View: Account Balances
-CREATE OR REPLACE VIEW ledger_account_balances AS
+CREATE VIEW IF NOT EXISTS ledger_account_balances AS
 SELECT 
   a.id AS account_id,
   a.code,
@@ -105,8 +105,8 @@ LEFT JOIN ledger_lines l ON a.id = l.account_id
 GROUP BY a.id, a.code, a.name, a.account_type, l.asset_code;
 
 -- View: Daily Trial Balance (verifies books balance)
-CREATE OR REPLACE VIEW ledger_trial_balance AS
-SELECT 
+CREATE VIEW IF NOT EXISTS ledger_trial_balance AS
+SELECT
   entry_date,
   SUM(debit_stroops) AS total_debits,
   SUM(credit_stroops) AS total_credits,
@@ -116,34 +116,14 @@ JOIN ledger_lines l ON e.id = l.entry_id
 GROUP BY entry_date
 ORDER BY entry_date DESC;
 
--- Function: Check if entry is balanced
-CREATE OR REPLACE FUNCTION check_entry_balanced()
-RETURNS TRIGGER AS $$
-DECLARE
-  entry_debits BIGINT;
-  entry_credits BIGINT;
-BEGIN
-  SELECT SUM(debit_stroops), SUM(credit_stroops)
-  INTO entry_debits, entry_credits
-  FROM ledger_lines
-  WHERE entry_id = NEW.entry_id;
-
-  IF entry_debits != entry_credits THEN
-    RAISE EXCEPTION 'Journal entry % is unbalanced: debits=% credits=%', 
-      NEW.entry_id, entry_debits, entry_credits;
-  END IF;
-
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER ensure_balanced_entry
-AFTER INSERT OR UPDATE ON ledger_lines
-FOR EACH ROW
-EXECUTE FUNCTION check_entry_balanced();
-
-COMMENT ON TABLE ledger_accounts IS 'Chart of accounts for double-entry bookkeeping';
-COMMENT ON TABLE ledger_entries IS 'Journal entries (transaction headers)';
-COMMENT ON TABLE ledger_lines IS 'Journal entry lines (debits and credits)';
-COMMENT ON TABLE ledger_daily_close IS 'Daily period close with balance proof';
-COMMENT ON TABLE ledger_reconciliations IS 'Chain-vs-books reconciliation tracking';
+-- NOTE (SQLite has no stored procedures/functions, unlike the Postgres
+-- flavor of this migration): entry-balance validation is enforced at the
+-- application layer in LedgerService.postEntry() before any line is
+-- inserted (see backend/src/services/ledger.ts), which also avoids the
+-- false positive an AFTER-INSERT-per-row trigger would raise on the first
+-- line of a valid multi-line entry, before its balancing line exists.
+--
+-- Table comments (chart of accounts for double-entry bookkeeping; journal
+-- entries; journal entry lines; daily period close with balance proof;
+-- chain-vs-books reconciliation tracking) are Postgres-only COMMENT ON
+-- statements in that flavor and are omitted here.
