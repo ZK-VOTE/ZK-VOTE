@@ -1,6 +1,6 @@
 import { LoadingSpinner } from "./ui";
 import { Card, CardContent } from "./ui/Card";
-import { CheckCircle, Key, FileSignature } from "lucide-react";
+import { CheckCircle, Key, FileSignature, Info } from "lucide-react";
 
 interface RegistrationFlowProps {
   registrationStatus: string | null;
@@ -77,6 +77,15 @@ export default function RegistrationFlow({
             </div>
           )}
         </div>
+
+        {stepInfo && !stepInfo.done && stepInfo.step === 1 && (
+          <p className="mt-3 pt-3 border-t border-border/50 text-xs text-muted-foreground flex items-start gap-1.5">
+            <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+            This voting key is derived from your wallet's signature, not a
+            backup phrase — there's nothing separate to save. Sign in again
+            with the same wallet any time to recover it.
+          </p>
+        )}
       </CardContent>
     </Card>
   );

@@ -64,18 +64,53 @@ import { verifyMnemonicBackup } from "@/lib/backupVerification";
 // Verify user entered their backup correctly
 const result = verifyMnemonicBackup(masterSecret, userEnteredMnemonic);
 if (result.success) {
-  markBackupVerified();
+  markBackupVerified(masterSecret);
 }
 ```
 
-### Remaining Work
+### ZV-108: Integration, Funnel Instrumentation & Progressive Onboarding
 
-- Integrate verification flow into VoterRegistration component
-- Add verification reminder banners for unverified backups
-- Implement word-challenge verification UI
-- Add funnel instrumentation (analytics.ts) to track drop-offs
-- Document dual-secret system (HD vs wallet-signature) clearly
-- Add progressive onboarding (read-only exploration before secrets)
+The items below were the open gap: the backup-verification library existed
+but nothing called it, there were no reminders or word-challenge UI, and a
+new visitor was forced into HD-mnemonic secret generation immediately.
+
+- **`VoterRegistration.tsx`** now has three modes: `choice` (first visit —
+  browse read-only, create an identity, or import one), `explore`
+  (read-only; never generates a secret or derives keys), and `setup` (the
+  existing HD-mnemonic flow). A new member can't finish — `derivedKeys`
+  are handed to `onCredentialsDerived` only once the backup is confirmed.
+- **Word-challenge UI**: `generateVerificationChallenge()` /
+  `verifyWordAtPosition()` are wired into a "confirm one word" step. Note
+  `verifyWordAtPosition` now takes the mnemonic directly rather than
+  re-deriving one from the master secret — `mnemonicToMasterSecret` /
+  `masterSecretToMnemonic` reduce entropy modulo the BN254 field and
+  aren't a faithful round trip, so re-deriving could silently check
+  against a different phrase than the one actually backed up. The exact
+  phrase is now also persisted (`zkvote_hd_mnemonic`) so a restored
+  session shows what was actually backed up, not a regenerated
+  approximation.
+- **`markBackupVerified()`/`isBackupVerified()`** are now scoped to a
+  specific master secret (not a bare global boolean), so importing a
+  different secret into the same browser doesn't inherit a previous
+  secret's verified status.
+- **Reminder banner**: an unverified backup shows a static-copy warning
+  (no interpolated secret data) with a "Verify my backup" action.
+- **Funnel instrumentation** (`frontend/src/lib/onboardingFunnel.ts` +
+  `backend/src/services/onboardingFunnel.ts`, migration `017`): each step
+  (`registration_started`, `explore_readonly_selected`, `secret_created`,
+  `backup_viewed`, `backup_verification_started`,
+  `backup_verification_passed`, `registration_completed`) increments a
+  single aggregate counter server-side — no session id, wallet address,
+  secret, or mnemonic is ever sent, and no per-event record is stored, so
+  the server can never reconstruct one member's path through onboarding.
+  Drop-off is read via `GET /onboarding/funnel/summary` as the delta
+  between consecutive step counts. Wired into both credential systems
+  below, including the wallet-signature flow (`useRegistration.ts`).
+- **Dual-secret model documented in the UI**: `VoterRegistration.tsx`
+  explains the HD mnemonic is self-custodied and must be backed up here,
+  while `RegistrationFlow.tsx` (the wallet-signature flow used by
+  `useRegistration.ts`) explains that credential system is derived from a
+  wallet signature on demand and has nothing separate to back up.
 
 ## Issue #796: Double-Entry Financial Ledger
 

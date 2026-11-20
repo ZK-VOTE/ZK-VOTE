@@ -27,3 +27,4 @@ export { default as randomnessRoutes } from "./randomness.js";
 export { default as payRoutes } from "./pay.js";
 export { default as swapRoutes } from "./swap.js";
 export { default as rampRoutes } from "./ramp.js";
+export { default as onboardingRoutes } from "./onboarding.js";

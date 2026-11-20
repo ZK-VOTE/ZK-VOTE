@@ -135,6 +135,7 @@ import {
   payRoutes,
   swapRoutes,
   rampRoutes,
+  onboardingRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
 import openApiSpec from "./openapi.js";
@@ -383,6 +384,7 @@ app.use(noStore, randomnessRoutes);
 app.use(payRoutes);
 app.use(swapRoutes);
 app.use(rampRoutes);
+app.use(onboardingRoutes);
 
 // ============================================
 // API VERSIONING (#139)
@@ -425,6 +427,7 @@ function mountV1(): void {
   v1Router.use(payRoutes);
   v1Router.use(swapRoutes);
   v1Router.use(rampRoutes);
+  v1Router.use(onboardingRoutes);
 }
 
 mountV1();

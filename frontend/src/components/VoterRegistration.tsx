@@ -10,6 +10,8 @@ import {
   Download,
   AlertTriangle,
   Lock,
+  Info,
+  ShieldQuestion,
 } from "lucide-react";
 import {
   Card,
@@ -26,6 +28,13 @@ import {
   masterSecretToMnemonic,
   type DerivedElectionKeys,
 } from "../lib/crypto";
+import {
+  generateVerificationChallenge,
+  verifyWordAtPosition,
+  markBackupVerified,
+  isBackupVerified,
+} from "../lib/backupVerification";
+import { trackOnboardingStep } from "../lib/onboardingFunnel";
 
 interface VoterRegistrationProps {
   electionId?: string | number;
@@ -34,12 +43,28 @@ interface VoterRegistrationProps {
 }
 
 const STORAGE_MASTER_SECRET_KEY = "zkvote_hd_master_secret";
+/**
+ * Stores the exact backup phrase shown to the user, not just the derived
+ * secret: `mnemonicToMasterSecret`/`masterSecretToMnemonic` aren't a
+ * faithful round trip (the secret is reduced modulo the BN254 field), so
+ * regenerating a phrase from the stored secret alone could show a
+ * *different* phrase than the one the user actually backed up.
+ */
+const STORAGE_MNEMONIC_KEY = "zkvote_hd_mnemonic";
+
+/**
+ * Progressive onboarding: a first-time visitor sees this choice before any
+ * secret is generated. "explore" never calls key-derivation code (ZV-108
+ * acceptance criterion: read-only mode performs no proof or key generation).
+ */
+type ViewMode = "choice" | "explore" | "setup";
 
 export default function VoterRegistration({
   electionId = "default-election",
   onCredentialsDerived,
   className = "",
 }: VoterRegistrationProps) {
+  const [viewMode, setViewMode] = useState<ViewMode>("choice");
   const [mnemonic, setMnemonic] = useState<string>("");
   const [masterSecret, setMasterSecret] = useState<string>("");
   const [customInput, setCustomInput] = useState<string>("");
@@ -52,19 +77,31 @@ export default function VoterRegistration({
   const [activeTab, setActiveTab] = useState<"generate" | "import">("generate");
   const [error, setError] = useState<string | null>(null);
 
-  // Initialize or restore master secret from storage
+  const [backupVerified, setBackupVerified] = useState<boolean>(false);
+  const [challengePosition, setChallengePosition] = useState<number | null>(
+    null,
+  );
+  const [challengeInput, setChallengeInput] = useState("");
+  const [challengeResult, setChallengeResult] = useState<
+    "idle" | "correct" | "incorrect"
+  >("idle");
+
+  // Restore an existing secret on mount; otherwise stay on the "choice"
+  // screen rather than generating one automatically (progressive onboarding).
   useEffect(() => {
+    trackOnboardingStep("registration_started");
+
     const savedSecret = localStorage.getItem(STORAGE_MASTER_SECRET_KEY);
     if (savedSecret) {
       try {
         setMasterSecret(savedSecret);
-        const restoredMnemonic = masterSecretToMnemonic(savedSecret);
-        setMnemonic(restoredMnemonic);
+        const savedMnemonic = localStorage.getItem(STORAGE_MNEMONIC_KEY);
+        setMnemonic(savedMnemonic ?? masterSecretToMnemonic(savedSecret));
+        setBackupVerified(isBackupVerified(savedSecret));
+        setViewMode("setup");
       } catch (err) {
         console.error("Failed to restore saved master secret:", err);
       }
-    } else {
-      handleGenerateNewMasterSecret();
     }
   }, []);
 
@@ -73,7 +110,40 @@ export default function VoterRegistration({
     if (masterSecret && electionId) {
       deriveKeys(masterSecret, electionId);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [masterSecret, electionId]);
+
+  // Onboarding can only "finish" (hand credentials to the caller) once the
+  // backup has been confirmed (ZV-108 acceptance criterion).
+  useEffect(() => {
+    if (derivedKeys && backupVerified) {
+      onCredentialsDerived?.(derivedKeys);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [derivedKeys, backupVerified]);
+
+  const handleChooseExplore = () => {
+    trackOnboardingStep("explore_readonly_selected");
+    setViewMode("explore");
+  };
+
+  const handleChooseCreate = () => {
+    setViewMode("setup");
+    setActiveTab("generate");
+    handleGenerateNewMasterSecret();
+  };
+
+  const handleChooseImport = () => {
+    setViewMode("setup");
+    setActiveTab("import");
+  };
+
+  const resetVerificationState = () => {
+    setBackupVerified(false);
+    setChallengePosition(null);
+    setChallengeInput("");
+    setChallengeResult("idle");
+  };
 
   const handleGenerateNewMasterSecret = () => {
     try {
@@ -83,6 +153,9 @@ export default function VoterRegistration({
       setMnemonic(newMnemonic);
       setMasterSecret(newSecret);
       localStorage.setItem(STORAGE_MASTER_SECRET_KEY, newSecret);
+      localStorage.setItem(STORAGE_MNEMONIC_KEY, newMnemonic);
+      resetVerificationState();
+      trackOnboardingStep("secret_created");
     } catch (err: any) {
       setError("Failed to generate master secret: " + err.message);
     }
@@ -113,8 +186,14 @@ export default function VoterRegistration({
       setMasterSecret(secretStr);
       setMnemonic(phraseStr);
       localStorage.setItem(STORAGE_MASTER_SECRET_KEY, secretStr);
+      localStorage.setItem(STORAGE_MNEMONIC_KEY, phraseStr);
+      setBackupVerified(isBackupVerified(secretStr));
+      setChallengePosition(null);
+      setChallengeInput("");
+      setChallengeResult("idle");
       setCustomInput("");
       setActiveTab("generate");
+      trackOnboardingStep("secret_created");
     } catch (err: any) {
       setError("Invalid seed phrase or master secret format: " + err.message);
     }
@@ -125,9 +204,6 @@ export default function VoterRegistration({
     try {
       const keys = await deriveElectionSecret(secret, electId);
       setDerivedKeys(keys);
-      if (onCredentialsDerived) {
-        onCredentialsDerived(keys);
-      }
     } catch (err: any) {
       setError("Key derivation failed: " + err.message);
     } finally {
@@ -139,6 +215,12 @@ export default function VoterRegistration({
     navigator.clipboard.writeText(mnemonic);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleToggleMnemonicVisibility = () => {
+    const next = !showMnemonic;
+    setShowMnemonic(next);
+    if (next) trackOnboardingStep("backup_viewed");
   };
 
   const handleDownloadBackup = () => {
@@ -162,6 +244,135 @@ Anyone with this phrase can derive all your election voting keys.
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  const handleStartVerification = () => {
+    setChallengePosition(generateVerificationChallenge());
+    setChallengeInput("");
+    setChallengeResult("idle");
+    trackOnboardingStep("backup_verification_started");
+  };
+
+  const handleSubmitChallenge = () => {
+    if (challengePosition === null) return;
+    const ok = verifyWordAtPosition(
+      mnemonic,
+      challengePosition,
+      challengeInput,
+    );
+    if (ok) {
+      markBackupVerified(masterSecret);
+      setBackupVerified(true);
+      setChallengeResult("correct");
+      trackOnboardingStep("backup_verification_passed");
+      trackOnboardingStep("registration_completed");
+    } else {
+      setChallengeResult("incorrect");
+    }
+  };
+
+  if (viewMode === "choice") {
+    return (
+      <Card
+        className={`w-full border shadow-lg bg-card text-card-foreground ${className}`}
+      >
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <div className="p-2 rounded-lg bg-primary/10 text-primary">
+              <Key className="w-5 h-5" />
+            </div>
+            <div>
+              <CardTitle className="text-lg font-bold">
+                Set Up Your Voting Identity
+              </CardTitle>
+              <CardDescription>
+                You can look around first — creating a voting identity is
+                optional until you're ready to vote.
+              </CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <button
+            onClick={handleChooseExplore}
+            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-muted/30 hover:bg-muted/50 text-left transition-colors"
+          >
+            <Eye className="w-5 h-5 text-muted-foreground shrink-0" />
+            <div>
+              <p className="font-medium text-sm">Browse read-only</p>
+              <p className="text-xs text-muted-foreground">
+                No secret is created. You can set up voting later.
+              </p>
+            </div>
+          </button>
+          <button
+            onClick={handleChooseCreate}
+            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-primary/5 hover:bg-primary/10 border-primary/30 text-left transition-colors"
+          >
+            <Key className="w-5 h-5 text-primary shrink-0" />
+            <div>
+              <p className="font-medium text-sm">Create a voting identity</p>
+              <p className="text-xs text-muted-foreground">
+                Generates a 12-word backup phrase you'll need to confirm.
+              </p>
+            </div>
+          </button>
+          <button
+            onClick={handleChooseImport}
+            className="w-full flex items-center gap-3 p-4 rounded-xl border bg-muted/30 hover:bg-muted/50 text-left transition-colors"
+          >
+            <RefreshCw className="w-5 h-5 text-muted-foreground shrink-0" />
+            <div>
+              <p className="font-medium text-sm">
+                Import an existing phrase
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Already have a backup phrase or master secret? Enter it here.
+              </p>
+            </div>
+          </button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (viewMode === "explore") {
+    return (
+      <Card
+        className={`w-full border shadow-lg bg-card text-card-foreground ${className}`}
+      >
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <div className="p-2 rounded-lg bg-primary/10 text-primary">
+              <Eye className="w-5 h-5" />
+            </div>
+            <div>
+              <CardTitle className="text-lg font-bold">
+                Browsing Read-Only
+              </CardTitle>
+              <CardDescription>
+                No voting secret has been created on this device, and none
+                is required to browse.
+              </CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <button
+            onClick={handleChooseCreate}
+            className="w-full py-2 px-4 bg-primary text-primary-foreground font-medium rounded-lg hover:opacity-90 transition-opacity"
+          >
+            Create a Voting Identity
+          </button>
+          <button
+            onClick={handleChooseImport}
+            className="w-full py-2 px-4 border rounded-lg text-sm hover:bg-muted/50 transition-colors"
+          >
+            Import an Existing Phrase
+          </button>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <Card
@@ -190,6 +401,43 @@ Anyone with this phrase can derive all your election voting keys.
       </CardHeader>
 
       <CardContent className="space-y-6">
+        {/* Dual-secret model explainer */}
+        <div className="p-3 rounded-lg border bg-muted/20 flex items-start gap-2 text-xs text-muted-foreground">
+          <Info className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>
+            This is one of two credential systems ZKVote uses. This HD
+            mnemonic is self-custodied — you back it up here, and it's the
+            only way to recover these keys. Some elections instead derive a
+            key from a signature your connected wallet makes on demand; that
+            kind never needs a separate backup phrase. Only follow the steps
+            below if this election uses the HD mnemonic system.
+          </span>
+        </div>
+
+        {/* Unverified backup reminder */}
+        {mnemonic && !backupVerified && challengeResult !== "correct" && (
+          <div className="p-3 rounded-lg border border-amber-300/50 bg-amber-50 dark:bg-amber-950 dark:border-amber-800 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+            <div className="flex-1 text-xs">
+              <p className="text-amber-800 dark:text-amber-300 font-medium">
+                Your backup hasn't been confirmed yet.
+              </p>
+              <p className="text-amber-700 dark:text-amber-400 mt-0.5">
+                Confirm you've saved your phrase to finish setting up voting.
+                We'll only ask for a single word — never the full phrase.
+              </p>
+              {challengePosition === null && (
+                <button
+                  onClick={handleStartVerification}
+                  className="mt-2 text-xs font-medium text-amber-800 dark:text-amber-300 underline"
+                >
+                  Verify my backup
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Navigation Tabs */}
         <div className="flex border-b border-border">
           <button
@@ -232,7 +480,7 @@ Anyone with this phrase can derive all your election voting keys.
                 </span>
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => setShowMnemonic(!showMnemonic)}
+                    onClick={handleToggleMnemonicVisibility}
                     className="p-1.5 text-xs text-muted-foreground hover:text-foreground rounded hover:bg-muted transition-colors flex items-center gap-1"
                   >
                     {showMnemonic ? (
@@ -293,6 +541,43 @@ Anyone with this phrase can derive all your election voting keys.
                 </button>
               </div>
             </div>
+
+            {/* Word-challenge backup verification */}
+            {challengePosition !== null && challengeResult !== "correct" && (
+              <div className="p-4 rounded-xl border bg-muted/30 space-y-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <ShieldQuestion className="w-4 h-4 text-primary" />
+                  Confirm word #{challengePosition + 1} of your backup phrase
+                </div>
+                <input
+                  type="text"
+                  value={challengeInput}
+                  onChange={(e) => setChallengeInput(e.target.value)}
+                  placeholder={`Word ${challengePosition + 1}`}
+                  aria-label={`Backup word ${challengePosition + 1}`}
+                  className="w-full p-2.5 rounded-lg border bg-background text-sm font-mono focus:ring-2 focus:ring-primary focus:outline-none"
+                />
+                {challengeResult === "incorrect" && (
+                  <p className="text-xs text-destructive">
+                    That doesn't match. Check your saved phrase and try
+                    again.
+                  </p>
+                )}
+                <button
+                  onClick={handleSubmitChallenge}
+                  className="w-full py-2 px-4 bg-primary text-primary-foreground font-medium rounded-lg hover:opacity-90 transition-opacity"
+                >
+                  Confirm Backup
+                </button>
+              </div>
+            )}
+
+            {challengeResult === "correct" && (
+              <div className="p-3 rounded-lg border border-emerald-300/50 bg-emerald-50 dark:bg-emerald-950 dark:border-emerald-800 flex items-center gap-2 text-sm text-emerald-700 dark:text-emerald-300">
+                <ShieldCheck className="w-4 h-4 shrink-0" />
+                Backup confirmed. Your voting identity is ready to use.
+              </div>
+            )}
           </div>
         ) : (
           <div className="space-y-4">
@@ -366,6 +651,12 @@ Anyone with this phrase can derive all your election voting keys.
                   </span>
                 </div>
               </div>
+              {!backupVerified && (
+                <p className="text-xs text-muted-foreground italic">
+                  These keys are derived locally, but won't be handed to the
+                  app until your backup is confirmed above.
+                </p>
+              )}
             </div>
           ) : null}
         </div>

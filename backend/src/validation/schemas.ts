@@ -1066,6 +1066,22 @@ export const escrowRefundSchema = z.object({
 });
 
 // ============================================
+// ONBOARDING FUNNEL SCHEMA (ZV-108)
+// ============================================
+
+export const onboardingFunnelStepSchema = z.object({
+  step: z.enum([
+    "registration_started",
+    "explore_readonly_selected",
+    "secret_created",
+    "backup_viewed",
+    "backup_verification_started",
+    "backup_verification_passed",
+    "registration_completed",
+  ]),
+});
+
+// ============================================
 // CIRCUIT PARAMETER SCHEMA
 // ============================================
 

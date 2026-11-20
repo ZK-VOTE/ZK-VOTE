@@ -3,7 +3,7 @@
  * Helps users verify their backup before relying on it
  */
 
-import { mnemonicToMasterSecret, masterSecretToMnemonic } from "./crypto";
+import { mnemonicToMasterSecret } from "./crypto";
 
 export interface BackupVerificationResult {
   success: boolean;
@@ -63,16 +63,21 @@ export function generateVerificationChallenge(): number {
 }
 
 /**
- * Verify a single word from the mnemonic at a given position
+ * Verify a single word from the backup phrase at a given position.
+ *
+ * Takes the mnemonic itself rather than re-deriving one from a master
+ * secret: `mnemonicToMasterSecret` reduces entropy modulo the BN254 field,
+ * so `masterSecretToMnemonic(mnemonicToMasterSecret(m))` is not guaranteed
+ * to equal `m` — re-deriving here could silently check the user's answer
+ * against a *different* phrase than the one they actually backed up.
  */
 export function verifyWordAtPosition(
-  masterSecret: string,
+  mnemonic: string,
   position: number,
   userWord: string,
 ): boolean {
   try {
-    const mnemonic = masterSecretToMnemonic(masterSecret);
-    const words = mnemonic.split(" ");
+    const words = mnemonic.trim().split(/\s+/);
     return words[position]?.toLowerCase() === userWord.trim().toLowerCase();
   } catch {
     return false;
@@ -96,16 +101,22 @@ export function getBackupAge(): number | null {
 }
 
 /**
- * Mark backup as verified
+ * Mark the backup for a specific master secret as verified.
+ *
+ * Scoped to `masterSecret` (not a bare boolean) so that importing a
+ * *different* secret into the same browser doesn't inherit a previous
+ * secret's verified status (#791 follow-up: the flag used to be global).
  */
-export function markBackupVerified(): void {
-  localStorage.setItem("zkvote_backup_verified", "true");
+export function markBackupVerified(masterSecret: string): void {
+  localStorage.setItem("zkvote_backup_verified_for", masterSecret);
   localStorage.setItem("zkvote_backup_verified_at", Date.now().toString());
 }
 
 /**
- * Check if backup has been verified
+ * Check whether the backup for this specific master secret has been
+ * verified. Returns false for any other secret, including one previously
+ * verified in this browser.
  */
-export function isBackupVerified(): boolean {
-  return localStorage.getItem("zkvote_backup_verified") === "true";
+export function isBackupVerified(masterSecret: string): boolean {
+  return localStorage.getItem("zkvote_backup_verified_for") === masterSecret;
 }
