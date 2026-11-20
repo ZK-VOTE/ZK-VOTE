@@ -134,3 +134,48 @@ pub fn submit_recursive_tally(
 ## 7. Conclusion
 
 Nova/SuperNova IVC recursive proof composition provides ZK-VOTE with complete cryptographic scalability. By transforming an $O(N)$ on-chain verification workload into an $O(1)$ constant-time proof submission, ZK-VOTE can easily support governance elections with 100,000+ voters.
+
+---
+
+## 8. Universal Tally-Semantics Verification (ZV-112 / Issue #952)
+
+Everything above hard-codes yes/no semantics into the step state
+($\text{yes\_votes}_i$, $\text{no\_votes}_i$) and into
+`submit_recursive_tally`'s fixed signature. #699 (see
+`docs/spikes/698-701-protocol-boundary-findings.md`) flagged that
+`tally.circom` (and, by extension, this Nova step circuit) has **no
+universal semantics verification**: a tally proof is correct arithmetic
+for *some* ballot shape, but nothing binds which shape, so a quadratic or
+weighted tally could not be safely reinterpreted as yes/no (or vice
+versa) without a protocol migration.
+
+ZV-112 adds a parallel, additive path rather than generalizing the Nova
+step state above (that would be a larger, riskier change to an
+already-wired aggregation pipeline):
+
+- `circuits/tally_universal.circom` defines one template per semantics
+  (`TallyYesNo`, `TallyQV`, `TallyWeighted`), each exposing its
+  `(semanticsId, semanticsVersion)` as public signals asserted equal to
+  the template's compile-time constants.
+- `contracts/voting/src/lib.rs` adds `set_proposal_semantics` (pins the
+  tuple for a proposal before voting starts), `set_semantics_vk` (one VK
+  slot per `(dao_id, semanticsId, semanticsVersion)`), and
+  `submit_universal_tally` (checks the proof's declared tuple against the
+  pinned one *before* attempting Groth16 verification - `submit_recursive_tally`
+  and `verify_tally_proof` are untouched).
+- `circuits/universal-tally-reference.js` + `circuits/universal-tally.test.js`
+  give a pure-JS differential oracle for the three semantics' tally math
+  and the mixed-proof-family rejection gate, runnable without the circom
+  toolchain.
+
+**Still needed** (same honesty convention as #698-701's findings, not
+claimed done here): actual compilation of `tally_universal.circom` against
+the pinned circom 2.1.8 toolchain and a witness-generation smoke test (no
+compiler was available in the environment this was written in);
+reconciling the circuit's additive nullifier accumulator with the
+contract's SHA256 hash-chain `accumulate_nullifier`; a real trusted-setup
+per semantics/version; measured (not estimated) proving/verification cost
+per semantics via `circuits/universal-tally.benchmark.js`'s harness; and,
+if this is ever folded into the Nova IVC path above, a generalized step
+state that carries the semantics tuple through every fold rather than
+only at the final on-chain submission.

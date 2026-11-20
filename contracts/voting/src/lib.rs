@@ -319,6 +319,26 @@ pub enum VotingError {
     RandomnessCommitClosed = 78,
     RandomnessRevealClosed = 79,
     RandomnessAlreadyCommitted = 80,
+
+    // ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────
+    /// `set_proposal_semantics` is one-shot: a tuple has already been pinned
+    /// for this proposal.
+    SemanticsAlreadyPinned = 114,
+    /// No (semanticsId, semanticsVersion) tuple has been pinned for this
+    /// proposal yet, so there is nothing a universal tally proof can be
+    /// checked against.
+    SemanticsNotPinned = 115,
+    /// The submitted proof's declared (semanticsId, semanticsVersion) does
+    /// not match the tuple pinned for this proposal - rejects a tally
+    /// proven under the wrong proof family before any Groth16 verification
+    /// is attempted (#699).
+    SemanticsMismatch = 116,
+    /// No verification key is registered for this
+    /// (dao_id, semanticsId, semanticsVersion) tuple.
+    SemanticsVkNotSet = 117,
+    /// `semanticsId` is not one of the known universal-tally semantics
+    /// (yes/no, quadratic, weighted).
+    UnknownSemanticsId = 118,
 }
 
 impl VotingError {
@@ -463,6 +483,27 @@ const MIN_SATISFIABLE_NUM_CANDIDATES: u32 = 2;
 const TALLY_NUM_PUBLIC_SIGNALS: u32 = 6;
 /// IC vector length for the tally Groth16 VK = TALLY_NUM_PUBLIC_SIGNALS + 1
 const TALLY_CIRCUIT_IC_LEN: u32 = TALLY_NUM_PUBLIC_SIGNALS + 1;
+
+// ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────────
+// Additive to the plain yes/no tally above (`submit_recursive_tally`,
+// `verify_tally_proof`), which this does not touch or replace. Mirrors
+// circuits/tally_universal.circom.
+/// Known semantics ids. There is deliberately no "generic"/unknown id that
+/// verifies - `universal_tally_ic_len` rejects anything else.
+pub const SEMANTICS_YES_NO: u32 = 0;
+pub const SEMANTICS_QUADRATIC: u32 = 1;
+pub const SEMANTICS_WEIGHTED: u32 = 2;
+/// Signals shared by every universal-tally semantics:
+/// [dao_id, proposal_id, semanticsId, semanticsVersion, num_votes].
+const UNIVERSAL_TALLY_BASE_SIGNALS: u32 = 5;
+/// Yes/no adds [yesVotes, noVotes] plus the trailing nullifier accumulator.
+const UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS: u32 = UNIVERSAL_TALLY_BASE_SIGNALS + 2 + 1;
+/// Quadratic and weighted each add one output signal plus the nullifier accumulator.
+const UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS: u32 = UNIVERSAL_TALLY_BASE_SIGNALS + 1 + 1;
+const UNIVERSAL_TALLY_WEIGHTED_NUM_SIGNALS: u32 = UNIVERSAL_TALLY_BASE_SIGNALS + 1 + 1;
+const UNIVERSAL_TALLY_YES_NO_IC_LEN: u32 = UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS + 1;
+const UNIVERSAL_TALLY_QUADRATIC_IC_LEN: u32 = UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS + 1;
+const UNIVERSAL_TALLY_WEIGHTED_IC_LEN: u32 = UNIVERSAL_TALLY_WEIGHTED_NUM_SIGNALS + 1;
 pub const MAX_PAUSE_DURATION: u64 = 72 * 60 * 60;
 pub const RANDOMNESS_COMMIT_WINDOW: u64 = 3_600;
 pub const RANDOMNESS_REVEAL_WINDOW: u64 = 3_600;
@@ -652,6 +693,19 @@ pub enum DataKey {
     /// ever issued — it is a *public input*, so a prover picks it. Pinning it
     /// on-chain is what closes the "commit to any balance you like" hole.
     WeightedBalanceCommitment(u64, U256), // (dao_id, commitment)
+
+    // ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────
+    /// Proposal-level pinned (semanticsId, semanticsVersion) tuple. Set once
+    /// via `set_proposal_semantics` while the proposal is still in
+    /// `Registration`. Appended at the end so existing storage
+    /// discriminants stay stable.
+    ProposalSemantics(u64, u64), // (dao_id, proposal_id) -> TallySemantics
+    /// Verification key for the universal tally circuit family, one per
+    /// (dao_id, semanticsId, semanticsVersion) - "VK pinned per semantics
+    /// version".
+    SemanticsVk(u64, u32, u32), // (dao_id, semantics_id, semantics_version) -> VerificationKey
+    /// Finalized universal tally result, additive to `RecursiveTally`.
+    UniversalTally(u64, u64), // (dao_id, proposal_id) -> UniversalTallyInfo
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -674,6 +728,36 @@ pub struct RecursiveTallyInfo {
     pub num_votes: u64,
     pub yes_votes: u64,
     pub no_votes: u64,
+    pub final_nullifier_acc: U256,
+    pub finalized_at: u64,
+}
+
+/// A proposal-level (semanticsId, semanticsVersion) tuple, pinned once
+/// before voting starts (ZV-112 / #952, #699). A universal tally proof
+/// whose own declared tuple does not equal this is rejected without a
+/// Groth16 verification attempt - see
+/// [`Voting::set_proposal_semantics`]/[`Voting::submit_universal_tally`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TallySemantics {
+    pub semantics_id: u32,
+    pub semantics_version: u32,
+}
+
+/// Finalized universal tally result. Additive alongside
+/// [`RecursiveTallyInfo`] (yes/no only, unversioned) - it does not replace
+/// it. Only the fields relevant to `semantics_id` are meaningful; the rest
+/// are zero (enforced by [`Voting::submit_universal_tally`]).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UniversalTallyInfo {
+    pub semantics_id: u32,
+    pub semantics_version: u32,
+    pub num_votes: u64,
+    pub yes_votes: u64,
+    pub no_votes: u64,
+    pub total_credits_spent: u64,
+    pub weighted_total: u64,
     pub final_nullifier_acc: U256,
     pub finalized_at: u64,
 }
@@ -1027,6 +1111,12 @@ pub struct ProposalInfo {
     /// if that root is otherwise valid for the DAO — it is not the root that
     /// was in effect when this proposal was created.
     pub eligibility_snapshot_root: U256,
+    /// Ledger timestamp at which a `VoteMode::Trailing` proposal's tally was
+    /// frozen by `close_proposal`. `None` until closed, and for
+    /// `VoteMode::Fixed` proposals always. All result consumers (rewards,
+    /// randomness, upgrades) must treat the tally as immutable once this is
+    /// set, since a Trailing-mode root can otherwise keep moving.
+    pub trailing_finalized_at: Option<u64>,
 }
 
 // Typed Events
@@ -2221,6 +2311,300 @@ impl Voting {
         Ok(())
     }
 
+    // ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────
+    //
+    // Additive alongside submit_recursive_tally/verify_tally_proof above,
+    // which these do not touch or replace. See
+    // docs/spikes/698-701-protocol-boundary-findings.md (#699) for the
+    // design recommendation this implements: pin a proposal-level
+    // (semanticsId, semanticsVersion) tuple before voting starts and
+    // reject any ballot/tally whose proof circuit/version does not match.
+
+    /// Expected Groth16 VK `ic` length for a given semantics id, or
+    /// [`VotingError::UnknownSemanticsId`] if `semantics_id` is not one of
+    /// [`SEMANTICS_YES_NO`] / [`SEMANTICS_QUADRATIC`] / [`SEMANTICS_WEIGHTED`].
+    fn universal_tally_ic_len(semantics_id: u32) -> Result<u32, VotingError> {
+        match semantics_id {
+            SEMANTICS_YES_NO => Ok(UNIVERSAL_TALLY_YES_NO_IC_LEN),
+            SEMANTICS_QUADRATIC => Ok(UNIVERSAL_TALLY_QUADRATIC_IC_LEN),
+            SEMANTICS_WEIGHTED => Ok(UNIVERSAL_TALLY_WEIGHTED_IC_LEN),
+            _ => Err(VotingError::UnknownSemanticsId),
+        }
+    }
+
+    /// Pin the (semanticsId, semanticsVersion) tuple a proposal's universal
+    /// tally must be proven under (admin only). One-shot
+    /// ([`VotingError::SemanticsAlreadyPinned`] on a second call) and only
+    /// while the proposal is still in [`ProposalState::Registration`] -
+    /// pinning after voting has started would let an admin retroactively
+    /// pick which semantics a tally is checked against.
+    pub fn set_proposal_semantics(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        semantics_id: u32,
+        semantics_version: u32,
+        admin: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+
+        Self::universal_tally_ic_len(semantics_id)?;
+
+        let key = DataKey::Proposal(dao_id, proposal_id);
+        let proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(VotingError::VotingClosed)?;
+        Self::bump_persistent(&env, &key);
+        if proposal.state != ProposalState::Registration {
+            return Err(VotingError::VotingClosed);
+        }
+
+        let semantics_key = DataKey::ProposalSemantics(dao_id, proposal_id);
+        if env.storage().persistent().has(&semantics_key) {
+            return Err(VotingError::SemanticsAlreadyPinned);
+        }
+
+        let semantics = TallySemantics {
+            semantics_id,
+            semantics_version,
+        };
+        env.storage().persistent().set(&semantics_key, &semantics);
+        Self::bump_persistent(&env, &semantics_key);
+        Ok(())
+    }
+
+    /// Fetch the (semanticsId, semanticsVersion) tuple pinned for a proposal, if any.
+    pub fn get_proposal_semantics(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<TallySemantics> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProposalSemantics(dao_id, proposal_id))
+    }
+
+    /// Register the verification key for the universal tally circuit at a
+    /// specific (semanticsId, semanticsVersion) (admin only). Each tuple
+    /// gets its own VK slot - this is what "VK pinned per semantics
+    /// version" means in practice: a proof built for one semantics/version
+    /// has no VK to verify against under any other tuple, so there is no
+    /// way to reuse one semantics' proof to satisfy another's tally.
+    pub fn set_semantics_vk(
+        env: Env,
+        dao_id: u64,
+        semantics_id: u32,
+        semantics_version: u32,
+        vk: VerificationKey,
+        admin: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+
+        let expected_ic_len = Self::universal_tally_ic_len(semantics_id)?;
+        if vk.ic.len() != expected_ic_len {
+            return Err(VotingError::VkIcLengthMismatch);
+        }
+
+        let key = DataKey::SemanticsVk(dao_id, semantics_id, semantics_version);
+        env.storage().persistent().set(&key, &vk);
+        Self::bump_persistent(&env, &key);
+        Ok(())
+    }
+
+    /// Submit a universal-tally proof (ZV-112). Checks the proof's declared
+    /// (semanticsId, semanticsVersion) against the proposal's pinned tuple
+    /// *before* attempting Groth16 verification, so a tally proven under
+    /// the wrong proof family is rejected with
+    /// [`VotingError::SemanticsMismatch`] rather than a generic invalid-proof
+    /// result - this is the "reject a tally over mixed proof families
+    /// without a compatible tuple" behavior from the acceptance criteria.
+    ///
+    /// Only the output fields relevant to `semantics_id` may be non-zero;
+    /// this is checked explicitly rather than left to the Groth16 pairing
+    /// check alone; the bound nullifier accumulator check is identical to
+    /// `verify_tally_proof_data`.
+    pub fn submit_universal_tally(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        semantics_id: u32,
+        semantics_version: u32,
+        num_votes: u64,
+        yes_votes: u64,
+        no_votes: u64,
+        total_credits_spent: u64,
+        weighted_total: u64,
+        final_nullifier_acc: U256,
+        proof: Proof,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+
+        let semantics_key = DataKey::ProposalSemantics(dao_id, proposal_id);
+        let pinned: TallySemantics = env
+            .storage()
+            .persistent()
+            .get(&semantics_key)
+            .ok_or(VotingError::SemanticsNotPinned)?;
+        Self::bump_persistent(&env, &semantics_key);
+
+        if pinned.semantics_id != semantics_id || pinned.semantics_version != semantics_version {
+            return Err(VotingError::SemanticsMismatch);
+        }
+
+        match semantics_id {
+            SEMANTICS_YES_NO => {
+                if total_credits_spent != 0 || weighted_total != 0 {
+                    return Err(VotingError::SemanticsMismatch);
+                }
+                let total = yes_votes
+                    .checked_add(no_votes)
+                    .ok_or(VotingError::TallyOverflow)?;
+                if total != num_votes {
+                    return Err(VotingError::RecursiveProofInvalid);
+                }
+            }
+            SEMANTICS_QUADRATIC => {
+                if yes_votes != 0 || no_votes != 0 || weighted_total != 0 {
+                    return Err(VotingError::SemanticsMismatch);
+                }
+            }
+            SEMANTICS_WEIGHTED => {
+                if yes_votes != 0 || no_votes != 0 || total_credits_spent != 0 {
+                    return Err(VotingError::SemanticsMismatch);
+                }
+            }
+            _ => return Err(VotingError::UnknownSemanticsId),
+        }
+
+        let vk_key = DataKey::SemanticsVk(dao_id, semantics_id, semantics_version);
+        let vk: VerificationKey = env
+            .storage()
+            .persistent()
+            .get(&vk_key)
+            .ok_or(VotingError::SemanticsVkNotSet)?;
+        Self::bump_persistent(&env, &vk_key);
+
+        let expected_ic_len = Self::universal_tally_ic_len(semantics_id)?;
+        if vk.ic.len() != expected_ic_len {
+            return Err(VotingError::VkIcLengthMismatch);
+        }
+
+        Self::assert_in_field(&env, PathContext::Admin, &final_nullifier_acc);
+
+        let acc_key = DataKey::NullifierAccumulator(dao_id, proposal_id);
+        let expected_acc: U256 = match env.storage().persistent().get(&acc_key) {
+            Some(acc) => {
+                Self::bump_persistent(&env, &acc_key);
+                acc
+            }
+            None => U256::from_u32(&env, 0),
+        };
+        if expected_acc != final_nullifier_acc {
+            return Err(VotingError::TallyProofInvalid);
+        }
+
+        let dao_signal = U256::from_u128(&env, dao_id as u128);
+        let proposal_signal = U256::from_u128(&env, proposal_id as u128);
+        let semantics_id_signal = U256::from_u128(&env, semantics_id as u128);
+        let semantics_version_signal = U256::from_u128(&env, semantics_version as u128);
+        let num_votes_signal = U256::from_u128(&env, num_votes as u128);
+
+        let mut pub_signals = soroban_sdk::vec![
+            &env,
+            dao_signal,
+            proposal_signal,
+            semantics_id_signal,
+            semantics_version_signal,
+            num_votes_signal,
+        ];
+        match semantics_id {
+            SEMANTICS_YES_NO => {
+                pub_signals.push_back(U256::from_u128(&env, yes_votes as u128));
+                pub_signals.push_back(U256::from_u128(&env, no_votes as u128));
+            }
+            SEMANTICS_QUADRATIC => {
+                pub_signals.push_back(U256::from_u128(&env, total_credits_spent as u128));
+            }
+            SEMANTICS_WEIGHTED => {
+                pub_signals.push_back(U256::from_u128(&env, weighted_total as u128));
+            }
+            _ => return Err(VotingError::UnknownSemanticsId),
+        }
+        pub_signals.push_back(final_nullifier_acc.clone());
+
+        if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
+            return Err(VotingError::TallyProofInvalid);
+        }
+
+        let key = DataKey::Proposal(dao_id, proposal_id);
+        let mut proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(VotingError::VotingClosed)?;
+        if proposal.state != ProposalState::Active {
+            return Err(VotingError::VotingClosed);
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.end_time {
+            return Err(VotingError::VotingClosed);
+        }
+        proposal.state = ProposalState::Closed;
+        // Only yes/no feeds the legacy yes_votes/no_votes fields that
+        // existing outcome logic reads; QV/weighted results live solely in
+        // UniversalTallyInfo until those read paths are migrated (#699
+        // "still needed": on-chain tally integration beyond storage).
+        if semantics_id == SEMANTICS_YES_NO {
+            proposal.yes_votes = proposal
+                .yes_votes
+                .checked_add(yes_votes)
+                .ok_or(VotingError::TallyOverflow)?;
+            proposal.no_votes = proposal
+                .no_votes
+                .checked_add(no_votes)
+                .ok_or(VotingError::TallyOverflow)?;
+        }
+        env.storage().persistent().set(&key, &proposal);
+        Self::bump_persistent(&env, &key);
+
+        let info = UniversalTallyInfo {
+            semantics_id,
+            semantics_version,
+            num_votes,
+            yes_votes,
+            no_votes,
+            total_credits_spent,
+            weighted_total,
+            final_nullifier_acc,
+            finalized_at: now,
+        };
+        let tally_key = DataKey::UniversalTally(dao_id, proposal_id);
+        env.storage().persistent().set(&tally_key, &info);
+        Self::bump_persistent(&env, &tally_key);
+
+        Ok(())
+    }
+
+    /// Fetch the finalized universal tally for a proposal, if any.
+    pub fn get_universal_tally(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<UniversalTallyInfo> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UniversalTally(dao_id, proposal_id))
+    }
+
     /// Internal helper to fetch a BN254 VK by version or fail with a clear error
     fn get_vk_by_version(env: &Env, dao_id: u64, version: u32) -> VerificationKey {
         env.storage()
@@ -2626,6 +3010,7 @@ impl Voting {
             earliest_root_index,
             snapshot_ledger,
             eligibility_snapshot_root,
+            trailing_finalized_at: None,
         };
 
         let key = DataKey::Proposal(dao_id, proposal_id);
@@ -2830,6 +3215,10 @@ impl Voting {
         );
 
         let proposal_id = Self::next_proposal_id(&env, dao_id);
+        // #736: pin the eligibility snapshot root, same as the other
+        // proposal constructors - votes must prove membership against
+        // this root, not whatever root is current at vote time.
+        let eligibility_snapshot_root = eligible_root.clone();
         let proposal = ProposalInfo {
             id: proposal_id,
             dao_id,
@@ -2847,6 +3236,8 @@ impl Voting {
             vote_mode: params.vote_mode,
             earliest_root_index,
             snapshot_ledger: env.ledger().sequence(),
+            eligibility_snapshot_root,
+            trailing_finalized_at: None,
         };
         let key = DataKey::Proposal(dao_id, proposal_id);
         env.storage().persistent().set(&key, &proposal);

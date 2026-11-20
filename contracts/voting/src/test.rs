@@ -3477,6 +3477,226 @@ fn test_recursive_tally_submission() {
 }
 
 // ============================================================================
+// Universal tally-semantics verification (ZV-112 / Issue #952, #699)
+// ============================================================================
+
+/// Create a `Registration`-state proposal, pin `semantics_id`/`semantics_version`
+/// on it, register a matching dummy VK, then activate it. Returns
+/// (env, client, admin, dao_id, proposal_id).
+fn setup_universal_tally_proposal(
+    semantics_id: u32,
+    semantics_version: u32,
+    num_public_signals: u32,
+) -> (Env, VotingClient<'static>, Address, u64, u64) {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    let now = env.ledger().timestamp();
+    let proposal_id = client.create_proposal_in_registration(
+        &dao_id,
+        &String::from_str(&env, "Universal Tally Test Proposal"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    client.set_proposal_semantics(&dao_id, &proposal_id, &semantics_id, &semantics_version, &admin);
+    client.set_semantics_vk(
+        &dao_id,
+        &semantics_id,
+        &semantics_version,
+        &create_dummy_tally_vk(&env, num_public_signals),
+        &admin,
+    );
+    client.activate_proposal(&dao_id, &proposal_id, &admin);
+
+    (env, client, admin, dao_id, proposal_id)
+}
+
+#[test]
+fn test_universal_tally_yes_no_submission() {
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    client.submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &10u64,
+        &6u64,
+        &4u64,
+        &0u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+
+    let tally = client.get_universal_tally(&dao_id, &proposal_id).unwrap();
+    assert_eq!(tally.semantics_id, SEMANTICS_YES_NO);
+    assert_eq!(tally.yes_votes, 6);
+    assert_eq!(tally.no_votes, 4);
+
+    let prop_info = client.get_proposal(&dao_id, &proposal_id);
+    assert_eq!(prop_info.yes_votes, 6);
+    assert_eq!(prop_info.no_votes, 4);
+    assert_eq!(prop_info.state, ProposalState::Closed);
+}
+
+#[test]
+fn test_universal_tally_quadratic_submission() {
+    let (env, client, _admin, dao_id, proposal_id) = setup_universal_tally_proposal(
+        SEMANTICS_QUADRATIC,
+        1,
+        UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS,
+    );
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    client.submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_QUADRATIC,
+        &1u32,
+        &3u64,
+        &0u64,
+        &0u64,
+        &14u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+
+    let tally = client.get_universal_tally(&dao_id, &proposal_id).unwrap();
+    assert_eq!(tally.semantics_id, SEMANTICS_QUADRATIC);
+    assert_eq!(tally.total_credits_spent, 14);
+
+    // QV results do not feed the legacy yes/no fields.
+    let prop_info = client.get_proposal(&dao_id, &proposal_id);
+    assert_eq!(prop_info.yes_votes, 0);
+    assert_eq!(prop_info.no_votes, 0);
+}
+
+#[test]
+fn test_universal_tally_rejects_mismatched_semantics() {
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+
+    // Proof declares QV even though the proposal is pinned to yes/no.
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_QUADRATIC,
+        &1u32,
+        &3u64,
+        &0u64,
+        &0u64,
+        &14u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_universal_tally_rejects_cross_semantics_output_leakage() {
+    // Pinned + declared tuple both say yes/no, but the caller also smuggles
+    // in a non-zero QV output - must be rejected even though the tuple matches.
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &10u64,
+        &6u64,
+        &4u64,
+        &999u64, // non-zero totalCreditsSpent under a yes/no tuple
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_set_proposal_semantics_is_one_shot() {
+    let (_env, client, admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    // Proposal was already activated by the fixture, so even a repeat call
+    // with the same tuple is now also rejected for being past Registration;
+    // this just confirms pinning is not silently idempotent either way.
+    let res = client.try_set_proposal_semantics(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &admin,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_submit_universal_tally_without_pinned_semantics_fails() {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    let now = env.ledger().timestamp();
+    let proposal_id = client.create_proposal_in_registration(
+        &dao_id,
+        &String::from_str(&env, "No Semantics Pinned"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+    client.activate_proposal(&dao_id, &proposal_id, &admin);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &1u64,
+        &1u64,
+        &0u64,
+        &0u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+// ============================================================================
 // Quadratic voting with range proofs (issue #50)
 // ============================================================================
 
