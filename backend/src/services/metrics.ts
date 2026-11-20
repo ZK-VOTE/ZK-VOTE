@@ -1029,6 +1029,13 @@ export const paymentDestinationFanout = new Histogram({
   registers: [register],
 });
 
+export const paymentHoldsTotal = new Counter({
+  name: "zkvote_payment_holds_total",
+  help: "Graduated enforcement actions (hold/block) taken on flagged payments, by pattern and action (ZV-111)",
+  labelNames: ["pattern", "action"] as const,
+  registers: [register],
+});
+
 // ============================================
 // KYC BOUNDARY METRICS (SPIKE-146 / #797)
 // ============================================

@@ -1,7 +1,8 @@
 # Payment Abuse Detection Policy
 
-**Status**: Implemented (SPIKE-147 / Issue #798)  
-**Last Updated**: 2026-10-15
+**Status**: Detection implemented (SPIKE-147 / Issue #798); enforcement, case
+linkage, and dual-control review implemented (ZV-111 / Issue #951)  
+**Last Updated**: 2026-11-20
 
 ## Overview
 
@@ -112,23 +113,50 @@ detectMuleConvergence(destination: string, windowMs: number): AbuseDetectionResu
 3. Run structuring, wash, and mule detection
 4. Combine results with confidence scoring
 
-### Response Actions
+### Response Actions (Graduated Enforcement, ZV-111)
 
-| Confidence       | Action                                   |
-| ---------------- | ---------------------------------------- |
-| < 0.5 (Low)      | Log only, allow payment                  |
-| 0.5-0.8 (Medium) | Log + metrics, allow payment             |
-| ≥ 0.9 (High)     | **Block payment**, require manual review |
+`determineAction()` in `abuseDetection.ts` maps a detection's confidence to a
+graduated action. Detection was previously advisory only; HOLD and BLOCK now
+call `placeOnHold()`, which opens a linked dispute case and persists an
+audited reason code - this is the enforcement hook the original policy was
+missing.
 
-High-confidence blocks return:
+| Confidence                    | Action    | Effect                                                              |
+| ------------------------------ | --------- | --------------------------------------------------------------------- |
+| Not suspicious                 | NONE      | Allow payment, no record                                               |
+| < 0.5 (Low)                     | FLAG      | Log only, allow payment (unchanged from the original behavior)         |
+| 0.5-0.89 (Medium)               | **HOLD**  | **Deny the request (423), open a `payment_holds` row + dispute case, pending dual-control review** |
+| ≥ 0.9 (High)                    | **BLOCK** | **Deny the request (403), open a `payment_holds` row + dispute case, pending dual-control review** |
+
+A HOLD or BLOCK response carries the hold and case ids so a client/operator
+can reference them directly:
 
 ```json
 {
-  "error": "Payment batch flagged for review due to suspicious patterns",
-  "patterns": ["structuring", "wash_payment"],
-  "reviewRequired": true
+  "error": "Payment batch held pending dual-control review",
+  "patterns": ["structuring"],
+  "reviewRequired": true,
+  "holdId": "f0b6...",
+  "disputeCaseId": "9ac2..."
 }
 ```
+
+Thresholds (`ABUSE_THRESHOLDS.HOLD_CONFIDENCE` / `BLOCK_CONFIDENCE`) are
+versioned via `ABUSE_THRESHOLDS_VERSION`, which is stamped onto every hold
+row so historical holds stay interpretable after a tuning change, and is
+exercised by labelled drill fixtures in
+`backend/test/abuse-enforcement.test.ts` (see Testing, below).
+
+### Case Linkage (EPIC-006 Dispute Center)
+
+Every HOLD/BLOCK creates one `dispute_cases` row (`class = 'payment'`)
+linked to its `payment_holds` row by `hold_id`, with a metadata-only
+evidence bundle (pattern list, confidence, opsCount, destination fanout,
+and the per-detector metadata already described above). `assertNoVoteLinkage()`
+is run against every evidence bundle before it is written and throws if the
+object contains a nullifier, membership proof, DAO id, or proposal id key at
+any depth - evidence can never become a deanonymization oracle, even by
+accident in a future edit.
 
 ### Audit Trail
 
@@ -172,22 +200,29 @@ Add to `monitoring/prometheus/zkvote-alerts.yml`:
 
 ## Review Workflow
 
-**Manual Review Queue** (not yet implemented - acceptance criteria):
+**Review Queue** (ZV-111):
 
-1. **Analyst Dashboard**: View flagged payments with:
-   - Pattern details (structuring count, wash pairs, mule senders)
-   - Confidence score
-   - Historical context (tenant payment history)
-   - Redacted account identifiers (first 8 chars only)
+1. **Queue API**: `GET /admin/abuse/holds` (filter by `tenantId`/`status`) and
+   `GET /admin/abuse/holds/:id` return each hold's reason code, patterns,
+   confidence, thresholds version, and evidence bundle (metadata-only; see
+   Case Linkage above). Both require the operator auth token.
 
-2. **Actions**:
-   - **Approve**: Allowlist tenant for future (legitimate high-volume user)
-   - **Reject**: Confirm abuse, block tenant
-   - **Escalate**: Refer to legal/compliance for SAR-like review
+2. **Dual-control release**: `POST /admin/abuse/holds/:id/review` takes
+   `{ reviewerId, reason }` and requires the relayer master key. The first
+   call moves a `held` hold to `pending_release`; a *second* call from a
+   **different** `reviewerId` releases it and resolves the linked dispute
+   case. A reviewer calling twice with the same id gets a 409 ("Dual control
+   violation"). There is no single-operator path to clear a hold.
 
-3. **Access Control**: Analyst role per SPIKE-123 RBAC (not implemented yet).
+3. **Actions available today**: release (clear after review) or leave held
+   pending escalation. Allowlisting a tenant going forward and a
+   legal/compliance SAR-style escalation path are still manual (see
+   Limitations).
 
-4. **Audit**: All review actions logged with reviewer ID, timestamp, reason.
+4. **Audit**: `placeOnHold()` and `reviewHold()` log structured events
+   (`abuse_enforcement_hold_created`, `abuse_hold_first_review`,
+   `abuse_hold_released`) in addition to the existing `audit_log` write from
+   `recordAbuseDetection()`.
 
 ## Red-Team Calibration
 
@@ -235,29 +270,42 @@ This implementation **enables compliance** but does not **decide** it. Legal cou
 
 1. **Cross-tenant blind spot**: Current detection scopes to single `tenant_id`. Coordinated abuse across tenants not detected.
 2. **Ramp event correlation**: Rapid cycling detection requires ramp telemetry integration (not yet built).
-3. **Allowlist management**: No UI for analysts to mark legitimate high-volume users (manual DB edits only).
-4. **Appeal path**: Users blocked by high-confidence detection have no self-service appeal (requires support ticket).
+3. **Allowlist management**: Releasing a hold (dual control) clears that specific hold, but there is still no standing allowlist UI for analysts to pre-clear a recognized legitimate high-volume user (manual DB edits only).
+4. **Appeal path**: Users held/blocked by detection have no self-service appeal; they see `holdId`/`disputeCaseId` in the response but resolution still requires an operator to run the dual-control review (requires support ticket).
+5. **No async re-submission**: `/pay/batch` is synchronous, so a HOLD/BLOCK rejects the original request outright; releasing the hold does not retry the original payment - the client must resubmit after release.
 
 ## Testing
 
 ### Unit Tests
 
-- [ ] Structuring: 5+ payments at 95%+ threshold flagged
-- [ ] Wash: 3+ roundtrips in 1h flagged
-- [ ] Mule: 10+ senders to one destination flagged
-- [ ] Privacy boundary: No queries join `vote_nullifiers` table
+- [x] Structuring: 5+ payments at 95%+ threshold flagged (`backend/tests/abuseDetection.test.ts`)
+- [x] Wash: 3+ roundtrips in 1h flagged (`backend/tests/abuseDetection.test.ts`)
+- [ ] Mule: 10+ senders to one destination flagged (requires a seeded `payment_jobs` fixture; not yet added)
+- [x] Privacy boundary: evidence bundles are asserted free of nullifier/membership/dao/proposal keys at any depth (`assertNoVoteLinkage`, `backend/test/abuse-enforcement.test.ts`)
+
+### Enforcement & Case-Linkage Tests (ZV-111)
+
+`backend/test/abuse-enforcement.test.ts` runs against a real (temp-file)
+SQLite database with migrations applied:
+
+- [x] `determineAction` maps confidence to flag/hold/block tiers
+- [x] `placeOnHold` opens a linked dispute case with a privacy-clean evidence bundle, and rejects tainted evidence before it is ever written
+- [x] `reviewHold` dual control: same reviewer cannot release their own hold; a second, distinct reviewer can
+- [x] Already-released holds cannot be re-reviewed
 
 ### Integration Tests
 
-- [ ] `/pay/batch` with structuring pattern returns 403
-- [ ] Low-confidence detection allows payment, logs audit
-- [ ] Metrics increment correctly per pattern
+- [x] `/pay/batch` with a block-tier pattern returns 403 with `holdId`/`disputeCaseId`
+- [x] `/pay/batch` with a hold-tier pattern returns 423 with `holdId`/`disputeCaseId`
+- [ ] Low-confidence detection allows payment, logs audit (covered at the unit level; no route-level test yet)
+- [ ] Metrics increment correctly per pattern (`zkvote_payment_holds_total`; no route-level test yet)
 
 ### Red-Team Drills
 
-- [ ] Synthetic structuring campaign detected
+- [x] Synthetic structuring campaign reaches hold/block, not flag-only (`backend/test/abuse-enforcement.test.ts`)
 - [ ] Synthetic wash payments detected
-- [ ] Legitimate payroll batch NOT flagged (false positive test)
+- [ ] Synthetic mule convergence detected
+- [x] Legitimate payroll batch NOT held or blocked (false positive test, `backend/test/abuse-enforcement.test.ts`)
 
 ## Future Enhancements
 
@@ -268,8 +316,12 @@ This implementation **enables compliance** but does not **decide** it. Legal cou
 
 ## References
 
-- `backend/src/services/abuseDetection.ts` - Core detection logic
+- `backend/src/services/abuseDetection.ts` - Core detection logic, graduated enforcement (`determineAction`, `placeOnHold`, `reviewHold`), and the privacy guard (`assertNoVoteLinkage`)
 - `backend/src/routes/pay.ts` - Integration with batch payments
+- `backend/src/routes/admin.ts` - `/admin/abuse/holds` review queue and dual-control release
+- `backend/src/migrations/017_abuse_enforcement_dispute_cases.up.sql` - `payment_holds` / `dispute_cases` schema
 - `backend/src/services/metrics.ts` - Prometheus metrics
+- `backend/test/abuse-enforcement.test.ts` - Enforcement, dual-control, and labelled-drill regression tests
 - SPIKE-147 (Issue #798) - Original spike specification
+- ZV-111 (Issue #951) - Enforcement, case linkage, and dual-control review
 - THREAT_MODEL.md - Updated threat actors (to be added)

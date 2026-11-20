@@ -35,9 +35,12 @@ import {
   adminRelayerCompromiseSchema,
   adminRelayerSweepSchema,
   adminRelayerHaltSchema,
+  adminAbuseHoldsQuerySchema,
+  adminAbuseHoldReviewSchema,
 } from "../validation/schemas.js";
 import { relayerKeyManager } from "../services/relayerKeyManager.js";
 import { server, relayerRotation } from "../services/stellar.js";
+import { listHolds, getHold, reviewHold } from "../services/abuseDetection.js";
 
 const router = Router();
 
@@ -951,6 +954,71 @@ router.post(
         error: (err as Error).message,
       });
       res.status(500).json({ error: "Failed to check balances" });
+    }
+  }) as AsyncHandler,
+);
+
+// ============================================
+// ABUSE-DETECTION ENFORCEMENT REVIEW (ZV-111)
+// ============================================
+
+/**
+ * GET /admin/abuse/holds - review queue for held/blocked payments.
+ *
+ * Query params: tenantId, status (held | pending_release | released | escalated)
+ */
+router.get(
+  "/admin/abuse/holds",
+  authGuard,
+  queryLimiter,
+  validateQuery(adminAbuseHoldsQuerySchema),
+  ((req: Request, res: Response) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { tenantId, status } = (req as any).validatedQuery;
+    const holds = listHolds({ tenantId, status });
+    res.json({ holds, total: holds.length });
+  }) as AsyncHandler,
+);
+
+/** GET /admin/abuse/holds/:id - fetch a single hold with its evidence bundle. */
+router.get(
+  "/admin/abuse/holds/:id",
+  authGuard,
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    const hold = getHold(req.params.id);
+    if (!hold) {
+      res.status(404).json({ error: "Hold not found" });
+      return;
+    }
+    res.json({ hold });
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/abuse/holds/:id/review - dual-control review step.
+ *
+ * The first call (by reviewerA) moves the hold to pending_release. A
+ * second call by a *different* reviewer actually releases it and resolves
+ * the linked dispute case. Requires the master key, since this is the
+ * action that lets a previously held/blocked payment be treated as cleared.
+ */
+router.post(
+  "/admin/abuse/holds/:id/review",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminAbuseHoldReviewSchema),
+  ((req: Request, res: Response) => {
+    try {
+      const hold = reviewHold(req.params.id, req.body.reviewerId, req.body.reason);
+      res.json({ status: "success", hold });
+    } catch (err) {
+      log("error", "admin_abuse_hold_review_failed", {
+        holdId: req.params.id,
+        error: (err as Error).message,
+      });
+      res.status(409).json({ error: (err as Error).message });
     }
   }) as AsyncHandler,
 );
