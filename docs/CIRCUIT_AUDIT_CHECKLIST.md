@@ -85,7 +85,7 @@ describe('Soundness & Forgery Harness: vote_template', () => {
 Audits and remediation must be executed in descending order of financial and governance impact:
 
 1. **`bridge.circom`**: Cross-chain asset & vote bridging. Blast radius: unlimited synthetic minting.
-2. **`tally.circom`**: Batch vote aggregation. Blast radius: arbitrary election outcome manipulation.
+2. **`tally.circom`** and **`tally_universal.circom`** (ZV-112 / #952): Batch vote aggregation, including the versioned per-semantics (yes/no, QV, weighted) tally templates. Blast radius: arbitrary election outcome manipulation, or a tally proven under one proof family being accepted as another's result if the on-chain semantics-tuple/VK pinning in `contracts/voting/src/lib.rs` (`set_proposal_semantics`, `set_semantics_vk`) is ever bypassed. Not yet compiled against the pinned circom toolchain or witness-tested - see `docs/recursive-proof-architecture.md` §8.
 3. **`vote_template.circom` & depth variants**: Individual ballot cast. Blast radius: single ballot forgery.
 4. **`quadratic_vote.circom`**: Quadratic credit spending. Blast radius: credit inflation.
 5. **`exclusion_proof.circom`**: Non-membership proofs. Blast radius: unauthorized proposal execution.
