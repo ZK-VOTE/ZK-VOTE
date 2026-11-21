@@ -1,16 +1,19 @@
 /**
  * SEP-24 Session Security — Session Fixation & Popup-Abuse Prevention (#762)
+ * Enhanced with Persistent Storage (ZV-119 / #958)
  *
  * Implements secure session management for SEP-24 interactive deposit/withdrawal flows:
  * - Generates cryptographically secure session tokens with short TTL
  * - Prevents session fixation via token rotation on privilege escalation
  * - Validates popup origin and parent window to prevent abuse
  * - Implements CSRF protection specific to interactive flows
+ * - Persists sessions in shared database for multi-replica continuity
  */
 
 import * as crypto from "crypto";
 import { log } from "./logger.js";
-import { getDb } from "./db.js";
+import { kysely } from "./kysely.js";
+import { sql } from "kysely";
 
 const SESSION_TOKEN_LENGTH = 32; // 256 bits
 const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -29,13 +32,18 @@ export interface SEP24Session {
   issuedTokens: Set<string>; // Track all issued tokens for rotation
 }
 
-const activeSessions = new Map<string, SEP24Session>();
-
 /**
  * Generates a cryptographically secure random token.
  */
 function generateSecureToken(): string {
   return crypto.randomBytes(SESSION_TOKEN_LENGTH).toString("hex");
+}
+
+/**
+ * Hashes a token for storage (prevents token leakage in DB dumps).
+ */
+function hashToken(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
 }
 
 /**
@@ -48,101 +56,215 @@ function generatePopupNonce(): string {
 /**
  * Creates a new SEP-24 session with secure token generation.
  * Session is bound to a specific origin and account to prevent fixation attacks.
+ * Persists to database for cross-replica continuity (ZV-119).
  */
-export function createSEP24Session(
+export async function createSEP24Session(
   asset: "USDC" | "EURC",
   account: string,
   originalOrigin: string,
-): { sessionId: string; token: string; popupNonce: string } {
+  clientIp?: string,
+): Promise<{ sessionId: string; token: string; popupNonce: string }> {
   const sessionId = crypto.randomUUID();
   const token = generateSecureToken();
+  const tokenHash = hashToken(token);
   const popupNonce = generatePopupNonce();
-  const now = Date.now();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + MAX_SESSION_AGE_MS);
 
-  const session: SEP24Session = {
-    sessionId,
-    token,
-    asset,
-    account,
-    originalOrigin,
-    popupNonce,
-    popupNonceConsumed: false,
-    createdAt: now,
-    lastActivityAt: now,
-    issuedTokens: new Set([token]),
-  };
+  try {
+    await kysely.transaction().execute(async (trx) => {
+      // Insert session
+      await trx
+        .insertInto("sep24_sessions")
+        .values({
+          session_id: sessionId,
+          asset,
+          account,
+          original_origin: originalOrigin,
+          popup_nonce: popupNonce,
+          popup_nonce_consumed: false,
+          created_at: now,
+          last_activity_at: now,
+          expires_at: expiresAt,
+          created_by_ip: clientIp,
+        })
+        .execute();
 
-  activeSessions.set(sessionId, session);
+      // Insert initial token
+      await trx
+        .insertInto("sep24_session_tokens")
+        .values({
+          session_id: sessionId,
+          token_hash: tokenHash,
+          issued_at: now,
+          is_current: true,
+          rotated_from_token_id: null,
+          revoked_at: null,
+        })
+        .execute();
+    });
 
-  log("info", "sep24_session_created", {
-    sessionId,
-    asset,
-    account: account.slice(0, 8) + "...",
-  });
+    log("info", "sep24_session_created", {
+      sessionId,
+      asset,
+      account: account.slice(0, 8) + "...",
+    });
 
-  return { sessionId, token, popupNonce };
+    return { sessionId, token, popupNonce };
+  } catch (error: any) {
+    log("error", "sep24_session_creation_failed", {
+      error: error.message,
+      asset,
+      account: account.slice(0, 8) + "...",
+    });
+    throw new Error("Failed to create SEP-24 session");
+  }
 }
 
 /**
  * Validates a session token and checks for expiration or tampering.
  * Returns null if session is invalid, expired, or has been fixated.
+ * Checks database for cross-replica session validity (ZV-119).
  */
-export function validateSEP24Session(
+export async function validateSEP24Session(
   sessionId: string,
   token: string,
-): { valid: boolean; reason?: string } {
-  const session = activeSessions.get(sessionId);
+): Promise<{ valid: boolean; reason?: string; account?: string }> {
+  const tokenHash = hashToken(token);
+  
+  try {
+    const result = await kysely
+      .selectFrom("sep24_sessions")
+      .innerJoin("sep24_session_tokens", "sep24_sessions.session_id", "sep24_session_tokens.session_id")
+      .select([
+        "sep24_sessions.session_id",
+        "sep24_sessions.account",
+        "sep24_sessions.asset",
+        "sep24_sessions.original_origin",
+        "sep24_sessions.popup_nonce",
+        "sep24_sessions.popup_nonce_consumed",
+        "sep24_sessions.created_at",
+        "sep24_sessions.expires_at",
+        "sep24_session_tokens.token_hash",
+        "sep24_session_tokens.is_current",
+        "sep24_session_tokens.revoked_at",
+      ])
+      .where("sep24_sessions.session_id", "=", sessionId)
+      .where("sep24_session_tokens.token_hash", "=", tokenHash)
+      .where("sep24_session_tokens.is_current", "=", true)
+      .where("sep24_session_tokens.revoked_at", "is", null)
+      .executeTakeFirst();
 
-  if (!session) {
-    return { valid: false, reason: "Session not found" };
-  }
+    if (!result) {
+      await recordSecurityEvent(sessionId, "token_validation_failed", {
+        reason: "session_or_token_not_found",
+      });
+      return { valid: false, reason: "Session not found or token invalid" };
+    }
 
-  const now = Date.now();
-  const age = now - session.createdAt;
+    const now = new Date();
+    if (now > new Date(result.expires_at)) {
+      await recordSecurityEvent(sessionId, "session_expired", {
+        expired_at: result.expires_at,
+      });
+      return { valid: false, reason: "Session expired" };
+    }
 
-  if (age > MAX_SESSION_AGE_MS) {
-    activeSessions.delete(sessionId);
-    return { valid: false, reason: "Session expired" };
-  }
+    // Update last activity timestamp
+    await kysely
+      .updateTable("sep24_sessions")
+      .set({ last_activity_at: now })
+      .where("session_id", "=", sessionId)
+      .execute();
 
-  if (!session.issuedTokens.has(token)) {
-    // Token not issued by this session - possible fixation attack
-    log("warn", "sep24_potential_fixation_attack", {
+    return { valid: true, account: result.account };
+  } catch (error: any) {
+    log("error", "sep24_validation_error", {
       sessionId,
-      account: session.account.slice(0, 8) + "...",
+      error: error.message,
     });
-    return { valid: false, reason: "Invalid token for this session" };
+    return { valid: false, reason: "Validation error" };
   }
-
-  session.lastActivityAt = now;
-  return { valid: true };
 }
 
 /**
  * Rotates the session token after privilege escalation or sensitive operations.
  * Invalidates old token and issues a new one to prevent fixation attacks.
+ * Prevents replay of rotated tokens (ZV-119).
  */
-export function rotateSEP24Token(
+export async function rotateSEP24Token(
   sessionId: string,
   currentToken: string,
-): { newToken: string } | null {
-  const session = activeSessions.get(sessionId);
+): Promise<{ newToken: string } | null> {
+  const currentTokenHash = hashToken(currentToken);
+  const newToken = generateSecureToken();
+  const newTokenHash = hashToken(newToken);
+  const now = new Date();
 
-  if (!session || !session.issuedTokens.has(currentToken)) {
+  try {
+    const result = await kysely.transaction().execute(async (trx) => {
+      // Verify current token is valid and current
+      const currentTokenRecord = await trx
+        .selectFrom("sep24_session_tokens")
+        .select(["id", "session_id"])
+        .where("session_id", "=", sessionId)
+        .where("token_hash", "=", currentTokenHash)
+        .where("is_current", "=", true)
+        .where("revoked_at", "is", null)
+        .executeTakeFirst();
+
+      if (!currentTokenRecord) {
+        return null;
+      }
+
+      // Mark old token as not current
+      await trx
+        .updateTable("sep24_session_tokens")
+        .set({ is_current: false, revoked_at: now })
+        .where("id", "=", currentTokenRecord.id)
+        .execute();
+
+      // Insert new token
+      await trx
+        .insertInto("sep24_session_tokens")
+        .values({
+          session_id: sessionId,
+          token_hash: newTokenHash,
+          issued_at: now,
+          is_current: true,
+          rotated_from_token_id: currentTokenRecord.id,
+          revoked_at: null,
+        })
+        .execute();
+
+      // Update last activity
+      await trx
+        .updateTable("sep24_sessions")
+        .set({ last_activity_at: now })
+        .where("session_id", "=", sessionId)
+        .execute();
+
+      return { newToken };
+    });
+
+    if (result) {
+      await recordSecurityEvent(sessionId, "token_rotated", {
+        rotated_at: now.toISOString(),
+      });
+
+      log("info", "sep24_token_rotated", {
+        sessionId,
+      });
+    }
+
+    return result;
+  } catch (error: any) {
+    log("error", "sep24_token_rotation_failed", {
+      sessionId,
+      error: error.message,
+    });
     return null;
   }
-
-  const newToken = generateSecureToken();
-  session.issuedTokens.add(newToken);
-  session.token = newToken;
-  session.lastActivityAt = Date.now();
-
-  log("info", "sep24_token_rotated", {
-    sessionId,
-    account: session.account.slice(0, 8) + "...",
-  });
-
-  return { newToken };
 }
 
 /**
@@ -165,19 +287,23 @@ export function validatePopupOrigin(
  * Validates the popup's parent window reference.
  * Ensures the popup was opened from the expected parent window.
  */
-export function validatePopupParent(
+export async function validatePopupParent(
   sessionId: string,
   parentOrigin: string,
-): boolean {
-  const session = activeSessions.get(sessionId);
-
-  if (!session) {
-    return false;
-  }
-
+): Promise<boolean> {
   try {
+    const session = await kysely
+      .selectFrom("sep24_sessions")
+      .select(["original_origin"])
+      .where("session_id", "=", sessionId)
+      .executeTakeFirst();
+
+    if (!session) {
+      return false;
+    }
+
     const parent = new URL(parentOrigin).origin;
-    const expected = new URL(session.originalOrigin).origin;
+    const expected = new URL(session.original_origin).origin;
     return parent === expected;
   } catch {
     return false;
@@ -187,48 +313,90 @@ export function validatePopupParent(
 /**
  * Verifies popup nonce to prevent replay attacks.
  * Nonce should be included in popup window opener parameters.
+ * Database-backed replay detection (ZV-119).
  */
-export function verifyPopupNonce(
+export async function verifyPopupNonce(
   sessionId: string,
   submittedNonce: string,
-): boolean {
-  const session = activeSessions.get(sessionId);
-  if (!session) {
-    return false;
-  }
-
-  // A popup nonce is a one-time capability. Validate its shape and length
-  // before timingSafeEqual (which throws for unequal buffer lengths).
+): Promise<boolean> {
+  // Validate nonce shape and length before database check
   if (
-    session.popupNonceConsumed ||
     typeof submittedNonce !== "string" ||
     !/^[a-f0-9]{32}$/.test(submittedNonce)
   ) {
     return false;
   }
 
-  const expected = Buffer.from(session.popupNonce, "hex");
-  const received = Buffer.from(submittedNonce, "hex");
-  const matches =
-    expected.length === received.length &&
-    crypto.timingSafeEqual(expected, received);
+  try {
+    const session = await kysely
+      .selectFrom("sep24_sessions")
+      .select(["popup_nonce", "popup_nonce_consumed"])
+      .where("session_id", "=", sessionId)
+      .executeTakeFirst();
 
-  if (matches) {
-    session.popupNonceConsumed = true;
+    if (!session || session.popup_nonce_consumed) {
+      await recordSecurityEvent(sessionId, "nonce_verification_failed", {
+        reason: session ? "already_consumed" : "session_not_found",
+      });
+      return false;
+    }
+
+    // Constant-time comparison
+    const expected = Buffer.from(session.popup_nonce, "hex");
+    const received = Buffer.from(submittedNonce, "hex");
+    const matches =
+      expected.length === received.length &&
+      crypto.timingSafeEqual(expected, received);
+
+    if (matches) {
+      // Mark nonce as consumed
+      await kysely
+        .updateTable("sep24_sessions")
+        .set({ popup_nonce_consumed: true })
+        .where("session_id", "=", sessionId)
+        .execute();
+
+      await recordSecurityEvent(sessionId, "nonce_verified", {});
+    } else {
+      await recordSecurityEvent(sessionId, "nonce_mismatch", {});
+    }
+
+    return matches;
+  } catch (error: any) {
+    log("error", "sep24_nonce_verification_error", {
+      sessionId,
+      error: error.message,
+    });
+    return false;
   }
-  return matches;
 }
 
 /**
  * Invalidates a session explicitly (logout, error, or abuse detected).
  */
-export function invalidateSEP24Session(sessionId: string): void {
-  const session = activeSessions.get(sessionId);
-  if (session) {
-    activeSessions.delete(sessionId);
-    log("info", "sep24_session_invalidated", {
+export async function invalidateSEP24Session(sessionId: string): Promise<void> {
+  try {
+    const session = await kysely
+      .selectFrom("sep24_sessions")
+      .select(["account"])
+      .where("session_id", "=", sessionId)
+      .executeTakeFirst();
+
+    if (session) {
+      await kysely
+        .deleteFrom("sep24_sessions")
+        .where("session_id", "=", sessionId)
+        .execute();
+
+      log("info", "sep24_session_invalidated", {
+        sessionId,
+        account: session.account.slice(0, 8) + "...",
+      });
+    }
+  } catch (error: any) {
+    log("error", "sep24_session_invalidation_error", {
       sessionId,
-      account: session.account.slice(0, 8) + "...",
+      error: error.message,
     });
   }
 }
@@ -237,22 +405,26 @@ export function invalidateSEP24Session(sessionId: string): void {
  * Cleans up expired sessions periodically.
  * Should be called by a background scheduler.
  */
-export function cleanupExpiredSEP24Sessions(): number {
-  const now = Date.now();
-  let cleaned = 0;
+export async function cleanupExpiredSEP24Sessions(): Promise<number> {
+  try {
+    const now = new Date();
+    
+    const result = await kysely
+      .deleteFrom("sep24_sessions")
+      .where("expires_at", "<", now)
+      .executeTakeFirst();
 
-  for (const [sessionId, session] of activeSessions.entries()) {
-    if (now - session.createdAt > MAX_SESSION_AGE_MS) {
-      activeSessions.delete(sessionId);
-      cleaned++;
+    const cleaned = Number(result.numDeletedRows) || 0;
+
+    if (cleaned > 0) {
+      log("info", "sep24_sessions_cleanup", { cleaned });
     }
-  }
 
-  if (cleaned > 0) {
-    log("info", "sep24_sessions_cleanup", { cleaned });
+    return cleaned;
+  } catch (error: any) {
+    log("error", "sep24_cleanup_error", { error: error.message });
+    return 0;
   }
-
-  return cleaned;
 }
 
 /**
@@ -263,31 +435,38 @@ export async function recordSEP24Completion(
   token: string,
   transactionId: string,
 ): Promise<{ success: boolean; reason?: string }> {
-  const validation = validateSEP24Session(sessionId, token);
+  const validation = await validateSEP24Session(sessionId, token);
 
   if (!validation.valid) {
     return { success: false, reason: validation.reason };
   }
 
-  const session = activeSessions.get(sessionId);
-  if (!session) {
-    return { success: false, reason: "Session not found" };
-  }
-
-  const db = getDb();
-  const now = new Date().toISOString();
-
   try {
-    db.prepare(
-      `
-      INSERT INTO sep24_completions
-      (session_id, transaction_id, asset, account, completed_at)
-      VALUES (?, ?, ?, ?, ?)
-      `,
-    ).run(sessionId, transactionId, session.asset, session.account, now);
+    const session = await kysely
+      .selectFrom("sep24_sessions")
+      .select(["asset", "account"])
+      .where("session_id", "=", sessionId)
+      .executeTakeFirst();
+
+    if (!session) {
+      return { success: false, reason: "Session not found" };
+    }
+
+    const now = new Date();
+
+    await kysely
+      .insertInto("sep24_completions")
+      .values({
+        session_id: sessionId,
+        transaction_id: transactionId,
+        asset: session.asset,
+        account: session.account,
+        completed_at: now,
+      })
+      .execute();
 
     // Invalidate session after successful completion
-    activeSessions.delete(sessionId);
+    await invalidateSEP24Session(sessionId);
 
     log("info", "sep24_completion_recorded", {
       sessionId,
@@ -302,5 +481,71 @@ export async function recordSEP24Completion(
       error: e.message,
     });
     return { success: false, reason: "Failed to record completion" };
+  }
+}
+
+/**
+ * Records a security event for audit trail.
+ * Internal helper for session security monitoring (ZV-119).
+ */
+async function recordSecurityEvent(
+  sessionId: string | null,
+  eventType: string,
+  details: Record<string, any>,
+  ipAddress?: string,
+  userAgent?: string,
+): Promise<void> {
+  try {
+    await kysely
+      .insertInto("sep24_security_events")
+      .values({
+        session_id: sessionId,
+        event_type: eventType,
+        details: JSON.stringify(details),
+        ip_address: ipAddress,
+        user_agent: userAgent,
+        occurred_at: new Date(),
+      })
+      .execute();
+  } catch (error: any) {
+    // Don't let audit logging failure break the main flow
+    log("warn", "sep24_security_event_logging_failed", {
+      eventType,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Gets session statistics for monitoring.
+ * Returns count of active sessions and cleanup metrics (ZV-119).
+ */
+export async function getSEP24SessionStats(): Promise<{
+  activeSessions: number;
+  expiredNotCleaned: number;
+}> {
+  try {
+    const now = new Date();
+    
+    const [activeCount, expiredCount] = await Promise.all([
+      kysely
+        .selectFrom("sep24_sessions")
+        .select(({ fn }) => [fn.count<number>("session_id").as("count")])
+        .where("expires_at", ">", now)
+        .executeTakeFirst(),
+      kysely
+        .selectFrom("sep24_sessions")
+        .select(({ fn }) => [fn.count<number>("session_id").as("count")])
+        .where("expires_at", "<=", now)
+        .executeTakeFirst(),
+    ]);
+
+    return {
+      activeSessions: activeCount?.count || 0,
+      expiredNotCleaned: expiredCount?.count || 0,
+    };
+  } catch (error: any) {
+    log("error", "sep24_stats_error", { error: error.message });
+    return { activeSessions: 0, expiredNotCleaned: 0 };
   }
 }

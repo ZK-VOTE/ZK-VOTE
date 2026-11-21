@@ -41,8 +41,29 @@ jobs:
         # default-members, so it must be invoked explicitly — otherwise
         # reentrancy/stress coverage stays hidden from CI.
         run: cargo test -p zkvote-integration-tests --locked -- --test-threads=1
-      - name: Groth16 production edge corpus
-        run: cargo test -p zkvote-groth16 --test bn254_edge_case_corpus --locked -- --nocapture
+      - name: Groth16 production edge corpus (REQUIRED, ZV-117)
+        # Full BN254 edge-case corpus must pass on every PR touching the verifier.
+        # Catches identity points, subgroup attacks, field-boundary cases, and
+        # ensures validator guards are actually invoked by all entry points.
+        run: |
+          set -euo pipefail
+          echo "=== Running BN254 Edge-Case Corpus (ZV-117) ==="
+          cargo test -p zkvote-groth16 --test bn254_edge_case_corpus --locked -- --nocapture --test-threads=1 | tee corpus-output.txt
+
+          # Verify minimum corpus size (control + 50 edge cases)
+          if ! grep -q "corpus must include the control plus at least 50 edge cases" corpus-output.txt; then
+            echo "::error::BN254 corpus did not run or was truncated"
+            exit 1
+          fi
+
+          echo "✓ BN254 edge-case corpus passed"
+      - name: Upload corpus results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bn254-corpus-results
+          path: corpus-output.txt
+          retention-days: 30
       - name: Groth16 verifier stub gate
         # Fails if `verify_groth16` ever stops really verifying in a default
         # build. The stub is reachable only via the `testutils` feature, so a
@@ -91,8 +112,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version: "24"
+          cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
@@ -137,8 +158,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version: "24"
+          cache: "npm"
           cache-dependency-path: backend/package-lock.json
       - name: Install dependencies
         run: npm ci
@@ -150,14 +171,14 @@ jobs:
         # Runs before lint so repo-wide lint errors on main cannot skip the tests.
         run: npm test 2>&1 | tee test-output.log
         env:
-          RELAYER_TEST_MODE: 'true'
-          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org'
-          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
-          RELAYER_SECRET_KEY: 'SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS'
-          RELAYER_AUTH_TOKEN: 'ci-test-token-placeholder-32-chars-min'
-          VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+          RELAYER_TEST_MODE: "true"
+          SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+          NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          RELAYER_SECRET_KEY: "SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS"
+          RELAYER_AUTH_TOKEN: "ci-test-token-placeholder-32-chars-min"
+          VOTING_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          TREE_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          COMMENTS_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
       - name: Report test counts
         if: always()
         run: |
@@ -178,14 +199,14 @@ jobs:
       - name: Check OpenAPI spec and API.md are up to date
         run: npm run docs:check
         env:
-          RELAYER_TEST_MODE: 'true'
-          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org'
-          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
-          RELAYER_SECRET_KEY: 'SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS'
-          RELAYER_AUTH_TOKEN: 'ci-test-token-placeholder-32-chars-min'
-          VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+          RELAYER_TEST_MODE: "true"
+          SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+          NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          RELAYER_SECRET_KEY: "SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS"
+          RELAYER_AUTH_TOKEN: "ci-test-token-placeholder-32-chars-min"
+          VOTING_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          TREE_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          COMMENTS_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
       - name: Enforce OpenAPI and generated TypeScript parity
         run: |
           npm run docs:types
@@ -218,8 +239,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version: "24"
+          cache: "npm"
           cache-dependency-path: circuits/package-lock.json
 
       # Cache compiled circuits to speed up CI
@@ -283,7 +304,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: "24"
       - name: Install Stellar CLI
         run: |
           curl -Lo stellar.tar.gz https://github.com/stellar/stellar-cli/releases/download/v21.0.0/stellar-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz
@@ -315,8 +336,8 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version: "24"
+          cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
         run: |
