@@ -382,7 +382,137 @@ router.post(
 );
 
 /**
- * GET /api/v1/claim/status/:daoId/:proposalId/:claimNullifier — check if claimed
+ * GET /api/v1/claim/status/:daoId/:proposalId/:claimNullifier/:voteNullifier — check claim and vote status
+ *
+ * Returns authoritative status for both claim and vote nullifiers.
+ * Resolves ZV-124: No longer hard-codes isVoted; queries on-chain voting contract.
+ */
+router.get(
+  "/api/v1/claim/status/:daoId/:proposalId/:claimNullifier/:voteNullifier",
+  queryLimiter,
+  (async (req: Request, res: Response) => {
+    const { daoId, proposalId, claimNullifier, voteNullifier } = req.params;
+    try {
+      if (!config.rewardsContractId) {
+        return res
+          .status(503)
+          .json({ error: "Rewards contract not configured" });
+      }
+      if (!config.votingContractId) {
+        return res
+          .status(503)
+          .json({ error: "Voting contract not configured" });
+      }
+
+      const rewardsContract = new StellarSdk.Contract(
+        config.rewardsContractId!,
+      );
+      const votingContract = new StellarSdk.Contract(config.votingContractId!);
+
+      const scClaimNullifier = u256ToScVal(claimNullifier);
+      const scVoteNullifier = u256ToScVal(voteNullifier);
+
+      // Check is_claimed via rewards contract
+      const claimArgs = [
+        StellarSdk.nativeToScVal(parseInt(daoId), { type: "u64" }),
+        StellarSdk.nativeToScVal(parseInt(proposalId), { type: "u64" }),
+        scClaimNullifier,
+      ];
+      const claimOperation = rewardsContract.call("is_claimed", ...claimArgs);
+
+      // Check is_nullifier_used via voting contract
+      const voteArgs = [
+        StellarSdk.nativeToScVal(parseInt(daoId), { type: "u64" }),
+        StellarSdk.nativeToScVal(parseInt(proposalId), { type: "u64" }),
+        scVoteNullifier,
+      ];
+      const voteOperation = votingContract.call(
+        "is_nullifier_used",
+        ...voteArgs,
+      );
+
+      const account = await (server as StellarSdk.rpc.Server).getAccount(
+        relayerKeypair.publicKey(),
+      );
+
+      // Simulate claim status
+      const claimTx = new StellarSdk.TransactionBuilder(account, {
+        fee: "100000",
+        networkPassphrase: config.networkPassphrase,
+      })
+        .addOperation(claimOperation)
+        .setTimeout(30)
+        .build();
+
+      const claimSimResult = await (
+        server as StellarSdk.rpc.Server
+      ).simulateTransaction(claimTx);
+
+      if (!StellarSdk.rpc.Api.isSimulationSuccess(claimSimResult)) {
+        log("warn", "claim_status_simulation_failed", {
+          daoId,
+          proposalId,
+          error: claimSimResult.error,
+        });
+        return res.status(500).json({ error: "Failed to check claim status" });
+      }
+
+      // Simulate vote status
+      const voteTx = new StellarSdk.TransactionBuilder(account, {
+        fee: "100000",
+        networkPassphrase: config.networkPassphrase,
+      })
+        .addOperation(voteOperation)
+        .setTimeout(30)
+        .build();
+
+      const voteSimResult = await (
+        server as StellarSdk.rpc.Server
+      ).simulateTransaction(voteTx);
+
+      if (!StellarSdk.rpc.Api.isSimulationSuccess(voteSimResult)) {
+        log("warn", "vote_status_simulation_failed", {
+          daoId,
+          proposalId,
+          error: voteSimResult.error,
+        });
+        return res.status(500).json({ error: "Failed to check vote status" });
+      }
+
+      const claimResultScVal = claimSimResult.result?.retval;
+      const voteResultScVal = voteSimResult.result?.retval;
+
+      const isClaimed = claimResultScVal
+        ? StellarSdk.scValToNative(claimResultScVal)
+        : false;
+      const isVoted = voteResultScVal
+        ? StellarSdk.scValToNative(voteResultScVal)
+        : false;
+
+      res.json({
+        daoId: parseInt(daoId),
+        proposalId: parseInt(proposalId),
+        claimNullifier,
+        voteNullifier,
+        isClaimed: Boolean(isClaimed),
+        isVoted: Boolean(isVoted),
+      });
+    } catch (err) {
+      log("error", "claim_status_error", {
+        daoId,
+        proposalId,
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: "Failed to fetch claim status" });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * GET /api/v1/claim/status/:daoId/:proposalId/:claimNullifier — check if claimed (legacy)
+ *
+ * Backwards-compatible endpoint for clients that don't provide voteNullifier.
+ * Returns isClaimed only; isVoted is not checked.
  */
 router.get(
   "/api/v1/claim/status/:daoId/:proposalId/:claimNullifier",
