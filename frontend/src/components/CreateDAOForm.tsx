@@ -310,7 +310,7 @@ export function CreateDAOForm({
                 className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
               >
                 DAO Name
-                <span className="ml-2 text-xs text-muted-foreground font-normal">
+                <span className="ms-2 text-xs text-muted-foreground font-normal">
                   ({newDaoName.length}/24 characters)
                 </span>
               </label>
@@ -337,7 +337,7 @@ export function CreateDAOForm({
                 className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
               >
                 Open Membership
-                <span className="ml-2 text-xs text-muted-foreground font-normal">
+                <span className="ms-2 text-xs text-muted-foreground font-normal">
                   (Allow users to join without admin approval)
                 </span>
               </label>
@@ -355,7 +355,7 @@ export function CreateDAOForm({
                 className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
               >
                 Member Proposals
-                <span className="ml-2 text-xs text-muted-foreground font-normal">
+                <span className="ms-2 text-xs text-muted-foreground font-normal">
                   (Allow members to create proposals, or admin-only)
                 </span>
               </label>
@@ -383,7 +383,7 @@ export function CreateDAOForm({
                 <div className="space-y-2">
                   <Label htmlFor="dao-description">
                     Description
-                    <span className="ml-2 text-xs text-muted-foreground font-normal">
+                    <span className="ms-2 text-xs text-muted-foreground font-normal">
                       ({description.length}/{MAX_DESCRIPTION_LENGTH} characters,
                       Markdown supported)
                     </span>
@@ -526,7 +526,7 @@ export function CreateDAOForm({
             className="flex-1"
           >
             {creating && (
-              <LoadingSpinner size="sm" color="white" className="mr-2" />
+              <LoadingSpinner size="sm" color="white" className="me-2" />
             )}
             {creating ? "Creating..." : "Create DAO"}
           </Button>

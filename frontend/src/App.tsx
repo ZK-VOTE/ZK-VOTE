@@ -484,7 +484,7 @@ function App() {
         {/* Footer */}
         <footer className="border-t border-border/40 bg-background">
           <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-16">
-            <div className="flex flex-col lg:flex-row lg:justify-between gap-8 mb-12 text-center lg:text-left">
+            <div className="flex flex-col lg:flex-row lg:justify-between gap-8 mb-12 text-center lg:text-start">
               {/* Brand */}
               <div className="space-y-4 flex flex-col items-center lg:items-start">
                 <svg
@@ -508,7 +508,7 @@ function App() {
               {/* Right columns */}
               <div className="flex justify-center lg:justify-end gap-24">
                 {/* Product */}
-                <div className="space-y-4 lg:text-right">
+                <div className="space-y-4 lg:text-end">
                   <h4 className="text-sm font-semibold">Product</h4>
                   <ul className="space-y-3 text-sm text-muted-foreground">
                     <li>
@@ -539,7 +539,7 @@ function App() {
                 </div>
 
                 {/* Resources */}
-                <div className="space-y-4 lg:text-right">
+                <div className="space-y-4 lg:text-end">
                   <h4 className="text-sm font-semibold">Resources</h4>
                   <ul className="space-y-3 text-sm text-muted-foreground">
                     <li>

@@ -37,12 +37,50 @@ import { BidiSafe, SafeAddress } from "@/lib/bidiSafe";
 <SafeAddress address={stellarAddress} />
 ```
 
-### Remaining Work
+### ZV-109: Physical->Logical CSS Migration, Isolation Coverage & Confusable Names
 
-- Audit all components for physical CSS properties (ml-, mr-, left-, right-)
-- Convert to logical properties (ms-, me-, start-, end-)
-- Add RTL visual regression tests
-- Get native speaker review for shipped Arabic locale
+- **Audited and converted** every physical directional utility
+  (`ml-`/`mr-`/`pl-`/`pr-`/`left-`/`right-`/`text-left`/`text-right`/
+  `float-left`/`float-right`/`border-l`/`border-r`) across the 29
+  `frontend/src/components/**` files that used them, to their logical
+  equivalents (`ms-`/`me-`/`ps-`/`pe-`/`start-`/`end-`/`text-start`/
+  `text-end`/`float-start`/`float-end`/`border-s`/`border-e`). Tailwind
+  3.3+ ships this whole scale natively, so `tailwind.config.js`'s custom
+  plugin was trimmed down to just the two utilities Tailwind doesn't
+  provide (`ps-safe`/`pe-safe`). `frontend/src/test/logical-css.test.ts`
+  statically scans every component file and fails if a physical utility
+  is reintroduced, so this stays enforced going forward.
+- **Fixed a `hasBidiOverrides` false-negative** in
+  `frontend/src/lib/bidi.ts`: it reused a global-flagged regex for
+  `.test()`, so `lastIndex` persisting between calls could make a real
+  override in a later, unrelated string go undetected. The backend
+  (`backend/src/utils/bidi.ts`) already had the equivalent fix from
+  ZV-130; the frontend copy had the same bug and was missed.
+- **Wired `<BidiSafe>`/`<SafeAddress>` into real rendering**: both
+  components existed but were never actually used anywhere. DAO names
+  (`DAOHeader.tsx`, `DAOCard.tsx`), proposal titles (`ProposalCard.tsx`,
+  `ProposalPage.tsx`), truncated/full member and comment-author addresses
+  (`Comment.tsx`, `ManageMembers.tsx`), and the DAO description markdown
+  now isolate or strip bidi overrides. `RevisionHistory.tsx` was
+  rendering a historical comment body through bare `ReactMarkdown` with
+  no sanitization at all (unlike `Comment.tsx`'s current-revision view) —
+  switched to the shared `SafeMarkdown` component.
+- **Confusable DAO names** (`backend/src/utils/confusables.ts`): detects
+  a name that mixes plain Latin letters with visually-identical
+  Cyrillic/Greek letters (e.g. a Cyrillic "а" substituted into "DAO"),
+  which is almost always an impersonation attempt — a name written
+  entirely in one script, including entirely in Cyrillic or Greek, is
+  left alone. Wired into the previously-unused `daoNameSchema` and into
+  `DaoProvisioningService.start()`, the one concrete backend "create a
+  DAO" entry point, so a confusable name is rejected before provisioning
+  begins.
+
+**Still open** (need a human, not just code): RTL visual regression
+screenshots and native-speaker review of the shipped Arabic locale. A
+Playwright + `@playwright/test` smoke suite already exists
+(`frontend/e2e/smoke.spec.ts`) targeting the deployed site, but there's
+no visual-diffing baseline yet, and establishing one still needs someone
+to eyeball the first screenshots; this should be a follow-up.
 
 ## Issue #791: User Onboarding & Secret Backup
 
@@ -64,18 +102,53 @@ import { verifyMnemonicBackup } from "@/lib/backupVerification";
 // Verify user entered their backup correctly
 const result = verifyMnemonicBackup(masterSecret, userEnteredMnemonic);
 if (result.success) {
-  markBackupVerified();
+  markBackupVerified(masterSecret);
 }
 ```
 
-### Remaining Work
+### ZV-108: Integration, Funnel Instrumentation & Progressive Onboarding
 
-- Integrate verification flow into VoterRegistration component
-- Add verification reminder banners for unverified backups
-- Implement word-challenge verification UI
-- Add funnel instrumentation (analytics.ts) to track drop-offs
-- Document dual-secret system (HD vs wallet-signature) clearly
-- Add progressive onboarding (read-only exploration before secrets)
+The items below were the open gap: the backup-verification library existed
+but nothing called it, there were no reminders or word-challenge UI, and a
+new visitor was forced into HD-mnemonic secret generation immediately.
+
+- **`VoterRegistration.tsx`** now has three modes: `choice` (first visit —
+  browse read-only, create an identity, or import one), `explore`
+  (read-only; never generates a secret or derives keys), and `setup` (the
+  existing HD-mnemonic flow). A new member can't finish — `derivedKeys`
+  are handed to `onCredentialsDerived` only once the backup is confirmed.
+- **Word-challenge UI**: `generateVerificationChallenge()` /
+  `verifyWordAtPosition()` are wired into a "confirm one word" step. Note
+  `verifyWordAtPosition` now takes the mnemonic directly rather than
+  re-deriving one from the master secret — `mnemonicToMasterSecret` /
+  `masterSecretToMnemonic` reduce entropy modulo the BN254 field and
+  aren't a faithful round trip, so re-deriving could silently check
+  against a different phrase than the one actually backed up. The exact
+  phrase is now also persisted (`zkvote_hd_mnemonic`) so a restored
+  session shows what was actually backed up, not a regenerated
+  approximation.
+- **`markBackupVerified()`/`isBackupVerified()`** are now scoped to a
+  specific master secret (not a bare global boolean), so importing a
+  different secret into the same browser doesn't inherit a previous
+  secret's verified status.
+- **Reminder banner**: an unverified backup shows a static-copy warning
+  (no interpolated secret data) with a "Verify my backup" action.
+- **Funnel instrumentation** (`frontend/src/lib/onboardingFunnel.ts` +
+  `backend/src/services/onboardingFunnel.ts`, migration `017`): each step
+  (`registration_started`, `explore_readonly_selected`, `secret_created`,
+  `backup_viewed`, `backup_verification_started`,
+  `backup_verification_passed`, `registration_completed`) increments a
+  single aggregate counter server-side — no session id, wallet address,
+  secret, or mnemonic is ever sent, and no per-event record is stored, so
+  the server can never reconstruct one member's path through onboarding.
+  Drop-off is read via `GET /onboarding/funnel/summary` as the delta
+  between consecutive step counts. Wired into both credential systems
+  below, including the wallet-signature flow (`useRegistration.ts`).
+- **Dual-secret model documented in the UI**: `VoterRegistration.tsx`
+  explains the HD mnemonic is self-custodied and must be backed up here,
+  while `RegistrationFlow.tsx` (the wallet-signature flow used by
+  `useRegistration.ts`) explains that credential system is derived from a
+  wallet signature on demand and has nothing separate to back up.
 
 ## Issue #796: Double-Entry Financial Ledger
 

@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import { detectConfusableMixedScript } from "../utils/confusables.js";
 import proposalTemplateRegistry from "./proposal-template-registry.json" with { type: "json" };
 
 // The payment schemas below call .openapi() at module load. openapi.ts also
@@ -431,7 +432,11 @@ export const daoNameSchema = z
       return byteLen >= 1 && byteLen <= 24 && val.length <= 24;
     },
     { message: "DAO name must be 1-24 characters (max 24 UTF-8 bytes) without control or zero-width characters" },
-  );
+  )
+  .refine((val) => !detectConfusableMixedScript(val).confusable, {
+    message:
+      "DAO name mixes Latin letters with visually-identical characters from another script",
+  });
 
 /**
  * Proposal title schema matching on-chain MAX_TITLE_LEN = 100 bytes and Unicode NFC normalization.
@@ -1036,6 +1041,50 @@ export const bridgeVoteSchema = z.object({
 });
 
 export type BridgeVoteRequest = z.infer<typeof bridgeVoteSchema>;
+
+// ============================================
+// SATELLITE TREASURY ESCROW SCHEMAS (ZV-107)
+// ============================================
+
+const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address");
+const evmTxHash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "Invalid transaction hash");
+/** uint256 lock id / Soroban message nonce / wei amount, as a decimal string. */
+const uint256Decimal = z.string().regex(/^[0-9]{1,78}$/, "Must be a decimal uint256");
+
+export const escrowLockRecordSchema = z.object({
+  lockId: uint256Decimal,
+  daoId: z.number().int().positive(),
+  proposalId: z.number().int().positive(),
+  depositor: evmAddress,
+  recipient: evmAddress,
+  amount: uint256Decimal,
+  lockTxHash: evmTxHash,
+});
+
+export const escrowResolutionSchema = z.object({
+  sorobanNonce: uint256Decimal,
+  resolutionTxHash: evmTxHash,
+});
+
+export const escrowRefundSchema = z.object({
+  resolutionTxHash: evmTxHash,
+});
+
+// ============================================
+// ONBOARDING FUNNEL SCHEMA (ZV-108)
+// ============================================
+
+export const onboardingFunnelStepSchema = z.object({
+  step: z.enum([
+    "registration_started",
+    "explore_readonly_selected",
+    "secret_created",
+    "backup_viewed",
+    "backup_verification_started",
+    "backup_verification_passed",
+    "registration_completed",
+  ]),
+});
 
 // ============================================
 // CIRCUIT PARAMETER SCHEMA

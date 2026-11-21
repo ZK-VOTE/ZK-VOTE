@@ -212,6 +212,7 @@ describe("Bridge", function () {
           nullifier + 10n,
           voteRoot,
           newRoot,
+          memberAddr,
           mockProof
         )
       ).to.be.revertedWithCustomError(bridge, "SbtRootNotFinalized");

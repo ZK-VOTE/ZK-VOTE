@@ -254,7 +254,7 @@ export default function CreateProposalForm({
               type="button"
               disabled={isProcessing}
               onClick={() => applyTemplate(template.id)}
-              className={`text-left rounded-lg border p-3 transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              className={`text-start rounded-lg border p-3 transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                 appliedTemplateId === template.id
                   ? "border-primary bg-primary/5"
                   : "border-input hover:border-primary/50"
@@ -393,7 +393,7 @@ export default function CreateProposalForm({
           disabled={isProcessing || !title.trim()}
           className="flex-1"
         >
-          {isProcessing && <LoadingSpinner size="sm" className="mr-2" />}
+          {isProcessing && <LoadingSpinner size="sm" className="me-2" />}
           {uploadingImage
             ? "Uploading..."
             : isSubmitting

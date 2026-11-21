@@ -687,7 +687,7 @@ export default function DAOInfoPanel({
                       </button>
                     )}
                   </div>
-                  <div className="text-xs text-muted-foreground text-right">
+                  <div className="text-xs text-muted-foreground text-end">
                     <p>
                       Ledger{" "}
                       {typeof event.ledger === "number" && !isNaN(event.ledger)

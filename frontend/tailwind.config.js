@@ -90,23 +90,16 @@ export default {
   plugins: [
     require("tailwindcss-animate"),
     require("@tailwindcss/typography"),
-    // RTL logical properties plugin
+    // Tailwind 3.3+ ships the full logical-property scale natively
+    // (ms-*/me-*/ps-*/pe-*/start-*/end-*/text-start/text-end/border-s/
+    // border-e/float-start/float-end, across the whole spacing scale —
+    // not just "auto" or "0"), so this plugin only needs to add what
+    // Tailwind doesn't already provide: safe-area-aware logical padding.
     function ({ addUtilities }) {
-      const newUtilities = {
-        ".ms-auto": { "margin-inline-start": "auto" },
-        ".me-auto": { "margin-inline-end": "auto" },
+      addUtilities({
         ".ps-safe": { "padding-inline-start": "env(safe-area-inset-left)" },
         ".pe-safe": { "padding-inline-end": "env(safe-area-inset-right)" },
-        ".border-s": { "border-inline-start-width": "1px" },
-        ".border-e": { "border-inline-end-width": "1px" },
-        ".start-0": { "inset-inline-start": "0" },
-        ".end-0": { "inset-inline-end": "0" },
-        ".text-start": { "text-align": "start" },
-        ".text-end": { "text-align": "end" },
-        ".float-start": { float: "inline-start" },
-        ".float-end": { float: "inline-end" },
-      };
-      addUtilities(newUtilities);
+      });
     },
   ],
 };

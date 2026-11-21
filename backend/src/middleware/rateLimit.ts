@@ -22,6 +22,7 @@ import {
   membershipRegistrationLimited,
   rate_limit_store_size,
 } from "../services/metrics.js";
+import { isCriticalRequest } from "../priority/priorityConfig.js";
 
 const isTestMode = process.env.RELAYER_TEST_MODE === "true";
 

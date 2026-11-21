@@ -74,6 +74,15 @@ contract Bridge {
     /// @notice Admin who can propose verifier changes and transfer admin
     address public admin;
 
+    /// @notice Address pending acceptance of the admin role (#650 two-step transfer)
+    address public pendingAdmin;
+
+    /// @notice Address authorized to post SBT/vote roots (in addition to admin)
+    address public rootUpdater;
+
+    /// @notice Vote tally roots per DAO+proposal (posted by rootUpdater)
+    mapping(uint256 => mapping(uint256 => uint256)) public voteRoots; // daoId => proposalId => voteRoot
+
     /// @notice Minimum confirmation depth before a posted SBT root is accepted.
     uint256 public finalityDepth;
 
@@ -105,6 +114,8 @@ contract Bridge {
     error TimelockNotElapsed();
     error NoPendingVerifier();
     error ChainIdMismatch();
+    error VoteRootNotSet();
+    error VoteRootMismatch();
 
     // ============================================
     // CONSTRUCTOR
@@ -119,6 +130,7 @@ contract Bridge {
         verifier = _verifier;
         sbtContractAddr = _sbtContractAddr;
         admin = msg.sender;
+        rootUpdater = msg.sender;
         finalityDepth = 0;
         chainId = block.chainid;
     }
@@ -182,8 +194,7 @@ contract Bridge {
     }
 
     /**
-     * @notice Transfer admin role
-     * @param newAdmin Address of the new admin
+     * @notice Post a new vote tally root for a DAO proposal
      */
     function updateVoteRoot(
         uint256 daoId,
@@ -196,6 +207,9 @@ contract Bridge {
         emit VoteRootUpdated(daoId, proposalId, voteRoot, block.number);
     }
 
+    /**
+     * @notice Set the address authorized to post SBT/vote roots
+     */
     function setRootUpdater(address newRootUpdater) external {
         if (msg.sender != admin) revert OnlyAdmin();
         if (newRootUpdater == address(0)) revert InvalidAddress();
@@ -205,6 +219,7 @@ contract Bridge {
 
     /**
      * @notice Start two-step admin transfer (#650)
+     * @param newAdmin Address of the new admin
      */
     function transferAdmin(address newAdmin) external {
         if (msg.sender != admin) revert OnlyAdmin();
@@ -255,6 +270,13 @@ contract Bridge {
 
         if (sbtRoots[daoId] == 0) revert SbtRootNotSet();
         if (sbtRoot != sbtRoots[daoId]) revert SbtRootNotSet();
+
+        // Vote root must be anchored to a value previously posted by the root
+        // updater; otherwise an attacker could submit a proof against an
+        // arbitrary, unanchored vote tree.
+        uint256 anchoredVoteRoot = voteRoots[daoId][proposalId];
+        if (anchoredVoteRoot == 0) revert VoteRootNotSet();
+        if (voteRoot != anchoredVoteRoot) revert VoteRootMismatch();
 
         // Enforce confirmation depth to prevent replaying against unfinalized roots.
         if (block.number < sbtRootBlock[daoId] + finalityDepth) {

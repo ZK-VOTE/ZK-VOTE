@@ -35,6 +35,7 @@ import { initExclusionProof } from "./services/exclusion-proof.js";
 import { initTtlChecker } from "./services/ttl-checker.js";
 import { initSyncService } from "./services/sync.js";
 import { initBridgeRelay } from "./services/bridge.js";
+import { initOnboardingFunnel } from "./services/onboardingFunnel.js";
 import * as indexer from "./services/indexer.js";
 import { kysely } from "./services/kysely.js";
 import * as dbService from "./services/db.js";
@@ -93,6 +94,10 @@ export function buildAppServices(): AppServices {
   // Wire the anti-spam service with explicit dependencies (#358): the write
   // DB handle, the Kysely query builder and the structured logger.
   initAntiSpam({ getDb: dbService.getWriteDb, kysely, logger });
+
+  // Wire the onboarding funnel metrics service (ZV-108) with the shared
+  // Kysely query builder.
+  initOnboardingFunnel({ kysely });
 
   // Wire the TTL renewal service with explicit dependencies (#358): the RPC
   // surface, config flags, contract IDs, persistence, TTL introspection,

@@ -1,4 +1,5 @@
 import { useState, useCallback } from "react";
+import { TreasuryEscrowPanel } from "./TreasuryEscrowPanel";
 
 interface BridgePanelProps {
   daoId: number;
@@ -244,6 +245,14 @@ export function BridgePanel({
         </p>
         <p>Gas cost target: &lt;500k gas for proof verification on EVM.</p>
       </div>
+
+      {evmConnected && (
+        <TreasuryEscrowPanel
+          daoId={daoId}
+          proposalId={proposalId}
+          evmAddress={evmAddress}
+        />
+      )}
     </div>
   );
 }

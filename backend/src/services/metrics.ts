@@ -954,6 +954,20 @@ export const priorityStarvationTotal = new Counter({
   registers: [register],
 });
 
+export const priorityQueueDepth = new Gauge({
+  name: "zkvote_priority_queue_depth",
+  help: "Current number of requests waiting in a priority tier's queue (not yet running)",
+  labelNames: ["tier"] as const,
+  registers: [register],
+});
+
+export const priorityQueueInFlight = new Gauge({
+  name: "zkvote_priority_queue_in_flight",
+  help: "Current number of requests running in a priority tier's reserved worker pool",
+  labelNames: ["tier"] as const,
+  registers: [register],
+});
+
 // ============================================
 // BACKUP FORWARD-SECRECY METRICS (#600)
 // ============================================

@@ -169,7 +169,7 @@ export default function UserDAOList({
         </h2>
         <div className="flex items-center justify-center py-8">
           <LoadingSpinner size="md" />
-          <span className="ml-3 text-muted-foreground">
+          <span className="ms-3 text-muted-foreground">
             Loading your DAOs...
           </span>
         </div>

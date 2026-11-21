@@ -24,6 +24,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { detectConfusableMixedScript } from "../utils/confusables.js";
 
 export const DEFAULT_BOOTSTRAP_STEPS = [
   "registry",
@@ -133,7 +134,8 @@ export class ProvisioningError extends Error {
       | "NOT_FOUND"
       | "STEP_NOT_CONFIGURED"
       | "INVALID_STATE"
-      | "CHECKPOINT_CORRUPT",
+      | "CHECKPOINT_CORRUPT"
+      | "INVALID_NAME",
   ) {
     super(message);
     this.name = "ProvisioningError";
@@ -243,6 +245,14 @@ export class DaoProvisioningService {
     rawKey: string,
     params: BootstrapParams,
   ): Promise<ProvisioningRecord> {
+    const nameCheck = detectConfusableMixedScript(params.name);
+    if (nameCheck.confusable) {
+      throw new ProvisioningError(
+        `DAO name rejected by naming policy: ${nameCheck.reason}`,
+        "INVALID_NAME",
+      );
+    }
+
     const key = normalizeKey(rawKey);
     const existing = await this.load(key);
     if (existing) return existing;

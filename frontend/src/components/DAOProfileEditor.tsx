@@ -451,7 +451,7 @@ export default function DAOProfileEditor({
                     e.stopPropagation();
                     setCoverImageCid(null);
                   }}
-                  className="absolute top-2 right-2 p-1 bg-background/80 rounded-full hover:bg-background"
+                  className="absolute top-2 end-2 p-1 bg-background/80 rounded-full hover:bg-background"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -496,7 +496,7 @@ export default function DAOProfileEditor({
                       e.stopPropagation();
                       setProfileImageCid(null);
                     }}
-                    className="absolute -top-1 -right-1 p-0.5 bg-background rounded-full border"
+                    className="absolute -top-1 -end-1 p-0.5 bg-background rounded-full border"
                   >
                     <X className="w-3 h-3" />
                   </button>
@@ -535,7 +535,7 @@ export default function DAOProfileEditor({
               maxLength={MAX_NAME_LENGTH}
               placeholder="My DAO"
             />
-            <p className="text-xs text-muted-foreground text-right">
+            <p className="text-xs text-muted-foreground text-end">
               {name.length}/{MAX_NAME_LENGTH}
             </p>
           </div>
@@ -550,7 +550,7 @@ export default function DAOProfileEditor({
               placeholder="Describe your DAO's purpose and goals... (Markdown supported)"
               rows={5}
             />
-            <p className="text-xs text-muted-foreground text-right">
+            <p className="text-xs text-muted-foreground text-end">
               {description.length}/{MAX_DESCRIPTION_LENGTH}
             </p>
           </div>
@@ -710,7 +710,7 @@ export default function DAOProfileEditor({
         >
           {isSaving ? (
             <>
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              <Loader2 className="w-4 h-4 me-2 animate-spin" />
               Saving...
             </>
           ) : (

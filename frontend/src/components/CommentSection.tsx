@@ -97,7 +97,7 @@ export default function CommentSection({
             <h3 className="text-lg font-semibold">
               Comments
               {totalComments > 0 && (
-                <span className="ml-2 text-sm font-normal text-muted-foreground">
+                <span className="ms-2 text-sm font-normal text-muted-foreground">
                   ({totalComments})
                 </span>
               )}

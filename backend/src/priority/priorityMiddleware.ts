@@ -1,5 +1,9 @@
 import type { NextFunction, Request, Response } from "express";
-import { priorityStarvationTotal } from "../services/metrics.js";
+import {
+  priorityStarvationTotal,
+  priorityQueueDepth,
+  priorityQueueInFlight,
+} from "../services/metrics.js";
 import { classifyPriority, type PriorityTier } from "./priorityConfig.js";
 import { PriorityQueue, RequestTimeoutError } from "./priorityQueue.js";
 
@@ -10,6 +14,12 @@ export interface PriorityRequest extends Request {
 export const globalPriorityQueue = new PriorityQueue({
   onStarvation: ({ tier, route }) => {
     priorityStarvationTotal.inc({ priority: tier, route });
+  },
+  onDepthChange: (snapshot) => {
+    for (const { tier, queued, inFlight } of snapshot) {
+      priorityQueueDepth.set({ tier }, queued);
+      priorityQueueInFlight.set({ tier }, inFlight);
+    }
   },
 });
 

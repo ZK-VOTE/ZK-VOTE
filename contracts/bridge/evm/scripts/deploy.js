@@ -51,9 +51,18 @@ async function main() {
   const bridgeAddr = await bridge.getAddress();
   console.log("Bridge deployed to:", bridgeAddr);
 
+  const escrowRelayer = process.env.ESCROW_RELAYER_ADDR || deployer.address;
+  const TreasuryEscrow = await hre.ethers.getContractFactory("TreasuryEscrow");
+  const escrow = await TreasuryEscrow.deploy(escrowRelayer);
+  await escrow.waitForDeployment();
+  const escrowAddr = await escrow.getAddress();
+  console.log("TreasuryEscrow deployed to:", escrowAddr);
+  console.log("TreasuryEscrow relayer:", escrowRelayer);
+
   console.log("\nDeployment complete!");
   console.log("Verifier:", verifierAddr);
   console.log("Bridge:", bridgeAddr);
+  console.log("TreasuryEscrow:", escrowAddr);
   console.log("chainId:", (await bridge.chainId()).toString());
 }
 

@@ -8,6 +8,7 @@ import {
 } from "../lib/zk";
 import { isUserRejection, extractTxHash } from "../lib/utils";
 import { notifyEvent } from "../lib/api";
+import { trackOnboardingStep } from "../lib/onboardingFunnel";
 
 interface UseRegistrationOptions {
   daoId: number;
@@ -102,6 +103,7 @@ export function useRegistration({
       setIsRegistering(true);
       setError(null);
       setRegistrationStatus(null);
+      trackOnboardingStep("registration_started");
 
       if (!kit) {
         throw new Error("Wallet kit not available");
@@ -142,6 +144,7 @@ export function useRegistration({
         salt = credentials.salt;
         blindingFactor = credentials.blindingFactor;
         commitment = credentials.commitment;
+        trackOnboardingStep("secret_created");
 
         if (import.meta.env.DEV)
           console.log(
@@ -234,6 +237,7 @@ export function useRegistration({
       setRegistrationStatus(
         alreadyRegistered ? "Credentials recovered!" : "Registration complete!",
       );
+      trackOnboardingStep("registration_completed");
       if (import.meta.env.DEV)
         console.log(
           alreadyRegistered

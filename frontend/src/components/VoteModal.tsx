@@ -600,7 +600,7 @@ export default function VoteModal({
             size="icon"
             onClick={onClose}
             aria-label="Close voting dialog"
-            className="h-10 w-10 min-h-[48px] min-w-[48px] sm:h-8 sm:w-8 sm:min-h-0 sm:min-w-0 p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted shrink-0 ml-2"
+            className="h-10 w-10 min-h-[48px] min-w-[48px] sm:h-8 sm:w-8 sm:min-h-0 sm:min-w-0 p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted shrink-0 ms-2"
           >
             <X className="h-5 w-5" aria-hidden="true" />
           </Button>
@@ -772,7 +772,7 @@ export default function VoteModal({
                     : "Your vote has been queued and will be submitted shortly."}
                 </p>
               </div>
-              <Alert className="text-xs text-left">
+              <Alert className="text-xs text-start">
                 <AlertTriangle
                   className="h-4 w-4 shrink-0"
                   aria-hidden="true"
@@ -806,7 +806,7 @@ export default function VoteModal({
                 <h3 className="font-bold text-xl">Vote Saved, Not Sent</h3>
                 <p className="text-sm text-muted-foreground">{heldReason}</p>
               </div>
-              <Alert className="text-xs text-left">
+              <Alert className="text-xs text-start">
                 <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
                 <span>
                   Do not vote again from another account. Nothing has been
