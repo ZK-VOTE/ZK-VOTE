@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "Backend services for ZKVote: Relayer (required) and optional Proof Query Service",
   "type": "module",
-  "packageManager": "npm@9.5.0",
+  "packageManager": "npm@10.9.2",
   "engines": {
-    "node": "22.x",
+    "node": "24.x",
     "npm": "10.x"
   },
   "scripts": {

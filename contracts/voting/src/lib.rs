@@ -6143,7 +6143,15 @@ impl Voting {
         Self::bump_persistent(&env, &delay_key);
 
         // Derive and store the VDF input from election parameters
-        let block_hash = BytesN::from_array(&env, &[0u8; 32]); // Placeholder — in production use ledger hash
+        // Derive per-ledger entropy from sequence + timestamp so the VDF
+        // input is unpredictable before close but deterministically verifiable
+        // by anyone who knows the ledger header.
+        let seq: u32 = env.ledger().sequence();
+        let ts: u64  = env.ledger().timestamp();
+        let mut entropy_buf = [0u8; 12];
+        entropy_buf[..4].copy_from_slice(&seq.to_be_bytes());
+        entropy_buf[4..12].copy_from_slice(&ts.to_be_bytes());
+        let block_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &entropy_buf)).into();
         let admin_xdr = admin.to_xdr(&env);
         let admin_seed: BytesN<32> = env.crypto().sha256(&admin_xdr).into();
         let vdf_input = vdf::derive_vdf_input(&env, dao_id, proposal_id, &block_hash, &admin_seed);
