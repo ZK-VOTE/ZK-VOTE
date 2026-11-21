@@ -11,6 +11,7 @@
 import { createLogger } from "./logger.js";
 import { runMaintenanceTasks } from "./authTokens.js";
 import { getDb } from "./db.js";
+import { reclaimExpiredLeases, getQueueHealth } from "./durable-jobs.js";
 import {
   session_store_size,
   rate_limit_store_size,
@@ -101,6 +102,17 @@ export class JobScheduler {
 
       // 4. State reconciliation check
       this.checkStateReconciliation();
+
+      // 5. Durable job queue — reclaim expired leases so stuck jobs re-enter
+      //    the ready pool, and log queue depth for observability.
+      try {
+        reclaimExpiredLeases();
+        const qh = getQueueHealth();
+        logger.debug("durable_job_queue_health", qh);
+      } catch (err) {
+        // Jobs table may not exist in environments running old migrations.
+        logger.debug("durable_job_queue_unavailable", { error: (err as Error).message });
+      }
 
       return {
         cleanedSessions,

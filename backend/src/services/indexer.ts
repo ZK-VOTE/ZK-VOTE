@@ -64,6 +64,12 @@ const EVENT_TYPES: Record<string, string> = {
   ProposalClosedEvent: "proposal_closed",
   ProposalArchivedEvent: "proposal_archived",
   VoteEvent: "vote_cast",
+  // SEP-41 token events (ZV-065)
+  MintEvent: "token_mint",
+  BurnEvent: "token_burn",
+  TransferEvent: "token_transfer",
+  DelegateChanged: "token_delegate",
+  Checkpoint: "token_checkpoint",
 };
 
 /** Parsed event from the chain */

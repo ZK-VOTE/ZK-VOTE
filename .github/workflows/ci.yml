@@ -112,7 +112,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".nvmrc"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
@@ -158,9 +158,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".nvmrc"
           cache: "npm"
           cache-dependency-path: backend/package-lock.json
+      - name: Preflight — verify toolchain versions
+        run: bash ../scripts/preflight-check.sh
       - name: Install dependencies
         run: npm ci
       - name: Shared message-origin policy parity
@@ -239,7 +241,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".nvmrc"
           cache: "npm"
           cache-dependency-path: circuits/package-lock.json
 
@@ -304,7 +306,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".nvmrc"
       - name: Install Stellar CLI
         run: |
           curl -Lo stellar.tar.gz https://github.com/stellar/stellar-cli/releases/download/v21.0.0/stellar-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz
@@ -336,7 +338,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".nvmrc"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
