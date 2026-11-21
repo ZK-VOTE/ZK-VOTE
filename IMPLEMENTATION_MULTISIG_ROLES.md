@@ -323,6 +323,21 @@ interface DaoMultisigManagementProps {
 
 **Total New Code:** ~2800 LOC (contracts + backend + frontend)
 
+## Related: Tiered Emergency Halt Quorum (ZV-114 / Issue #954)
+
+The DAO-governance multisig above (`contracts/dao-registry/src/lib.rs`,
+M-of-N signers + threshold over `MultisigProposal`s with a 7-day signing
+window) is a separate mechanism from the voting contract's new halt
+quorum (`contracts/voting/src/lib.rs`: `set_halt_quorum`/`ratify_halt`/
+`resume_halt`). They are not wired together - the halt quorum is its own
+signer list and threshold, scoped to approving/resuming an emergency halt
+tier, with no proposal object, no signing window, and a distinct "fast
+single-signer activation, quorum-only resume of a ratified halt" shape
+that the DAO multisig's uniform M-of-N doesn't have. A DAO operating both
+configures them independently; see
+`docs/ops/runbooks/panic-plus-surge.md`'s "Tiered Emergency Halt" section
+for the halt quorum's own semantics.
+
 ## References
 
 - Issue: #363

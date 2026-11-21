@@ -16,6 +16,7 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
+import { getAllTierStatus } from "../services/haltStatus.js";
 import {
   server,
   rpcPoolManager,
@@ -579,6 +580,30 @@ function respondToVoteExecution(
 router.get("/relayer/pubkey", (_req: Request, res: Response) => {
   res.json({ publicKey: getRelayerPublicKey() });
 });
+
+/**
+ * GET /voting/halt/status - tiered emergency halt status (ZV-114 / #954):
+ * vote submission, tally finalization, treasury execution. Public and
+ * unauthenticated, like the circuit-compatibility matrix - whether voting
+ * is halted is exactly the kind of thing voters/UI need to know, not
+ * privileged operator data, so this intentionally does not live under
+ * /admin (which requires the relayer auth token browser clients must not
+ * hold, #647). Activating/ratifying/resuming a halt is a guardian/quorum
+ * contract call made directly against the voting contract, not exposed
+ * here or anywhere else in this backend.
+ */
+router.get("/voting/halt/status", queryLimiter, (async (
+  _req: Request,
+  res: Response,
+) => {
+  try {
+    const tiers = await getAllTierStatus();
+    res.json({ tiers });
+  } catch (err) {
+    log("error", "halt_status_failed", { error: (err as Error).message });
+    res.status(500).json({ error: "Failed to fetch halt status" });
+  }
+}) as AsyncHandler);
 
 /**
  * POST /vote/commit - Commit to a proof hash before revealing
