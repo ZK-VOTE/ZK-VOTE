@@ -389,6 +389,28 @@ router.get("/services", async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /lifecycle
+ * Lifecycle dashboard: compact per-worker state with summary counts (#924).
+ * Admin-gated like /services.
+ */
+router.get("/lifecycle", async (req: Request, res: Response) => {
+  if (config.healthExposeDetails) {
+    const token = extractAuthToken(req);
+    if (!safeTokenMatch(token, config.relayerAuthToken)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
+  try {
+    const supervisor = getSupervisor();
+    res.json(supervisor.getLifecycleDashboard());
+  } catch (err) {
+    log("error", "lifecycle_dashboard_failed", { error: (err as Error).message });
+    res.status(500).json({ error: "Failed to get lifecycle dashboard" });
+  }
+});
+
+/**
  * GET /config
  * Returns public configuration (for frontend)
  */
