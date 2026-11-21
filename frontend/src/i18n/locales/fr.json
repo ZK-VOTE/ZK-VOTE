@@ -1,33 +1,117 @@
 {
-  "nav.browse": "Parcourir les DAO",
-  "nav.publicVotes": "Votes Publics",
-  "nav.docs": "Documentation",
-  "nav.connectWallet": "Connecter le Portefeuille",
-  "nav.connecting": "Connexion...",
-  "nav.disconnect": "Déconnecter",
-  "vote.button": "Voter Maintenant",
-  "vote.cast": "Voter Anonymement",
-  "vote.yes": "Voter Oui",
-  "vote.no": "Voter Non",
-  "vote.submitting": "Soumission du vote...",
-  "vote.generating": "Génération de la preuve...",
-  "vote.success": "Vote Soumis !",
-  "common.loading": "Chargement...",
-  "common.error": "Erreur",
-  "common.close": "Fermer",
-  "common.save": "Enregistrer",
-  "common.cancel": "Annuler",
-  "language.select": "Choisir la langue",
-  "home.hero.title": "Vote privé pour",
-  "home.hero.subtitle": "organisations décentralisées",
-  "home.hero.description": "Vote à preuve de connaissance zéro sur Stellar. Votez de manière privée tout en maintenant une vérifiabilité complète via les SNARKs Groth16.",
-  "home.hero.startVoting": "Commencer à voter",
-  "home.hero.documentation": "Documentation",
-  "home.techStack": "Construit sur Stellar avec des primitives cryptographiques de pointe",
-  "dao.member_one": "membre",
-  "dao.member_other": "membres",
-  "dao.vote_one": "vote",
-  "dao.vote_other": "votes",
-  "dao.proposal_one": "proposition",
-  "dao.proposal_other": "propositions"
+  "nav": {
+    "home": "Accueil",
+    "vote": "Voter",
+    "dao": "DAO",
+    "about": "À propos"
+  },
+  "vote": {
+    "title": "Émettre votre vote",
+    "submit": "Envoyer le vote",
+    "submitting": "Envoi en cours…",
+    "success": "Vote envoyé avec succès",
+    "error": "Échec de l'envoi du vote"
+  },
+  "common": {
+    "loading": "Chargement…",
+    "error": "Une erreur s'est produite",
+    "retry": "Réessayer",
+    "cancel": "Annuler",
+    "confirm": "Confirmer",
+    "close": "Fermer"
+  },
+  "home": {
+    "hero": {
+      "title": "Gouvernance privée et vérifiable",
+      "subtitle": "Vote à connaissance nulle pour les DAOs"
+    }
+  },
+  "dao": {
+    "title": "Gouvernance DAO",
+    "proposals": "Propositions",
+    "members": "Membres"
+  },
+  "governance": {
+    "quorum": {
+      "label": "Quorum",
+      "met": "Quorum atteint",
+      "not_met": "Quorum non atteint",
+      "required": "Requis : {{count}} vote",
+      "current": "Actuel : {{count}} vote",
+      "percentage": "{{percent}}% du quorum requis",
+      "reaching_in": "Le quorum devrait être atteint dans {{duration}}"
+    },
+    "freshness": {
+      "label": "Fraîcheur du décompte",
+      "live": "En direct",
+      "stale": "Périmé — dernière mise à jour {{ago}}",
+      "as_of": "Au {{timestamp}}",
+      "updating": "Mise à jour du décompte…",
+      "staleness_warning": "Le décompte n'a pas été mis à jour depuis {{duration}}. Les résultats peuvent ne pas refléter les votes récents."
+    },
+    "dispute": {
+      "status": {
+        "label": "Statut de la contestation",
+        "none": "Aucune contestation",
+        "open": "Contestation ouverte",
+        "under_review": "En cours d'examen",
+        "resolved": "Résolue",
+        "rejected": "Contestation rejetée",
+        "escalated": "Escaladée",
+        "filed_at": "Déposée le {{timestamp}}",
+        "resolved_at": "Résolue le {{timestamp}}",
+        "reason": "Motif : {{reason}}"
+      }
+    },
+    "proposal": {
+      "status": {
+        "pending": "En attente",
+        "active": "Active",
+        "passed": "Approuvée",
+        "failed": "Rejetée",
+        "cancelled": "Annulée",
+        "executed": "Exécutée"
+      },
+      "voting_ends": "Vote se termine le {{timestamp}}",
+      "voting_ended": "Vote terminé le {{timestamp}}",
+      "time_remaining": "{{duration}} restant"
+    }
+  },
+  "proof": {
+    "phase": {
+      "label": "Phase de preuve",
+      "generating": "Génération de la preuve…",
+      "generated": "Preuve générée",
+      "submitting": "Envoi de la preuve…",
+      "verifying": "Vérification de la preuve…",
+      "verified": "Preuve vérifiée",
+      "failed": "Échec de la preuve",
+      "retrying": "Nouvelle tentative de génération…",
+      "hint": {
+        "generating": "Cela peut prendre quelques secondes. Ne fermez pas cette page.",
+        "submitting": "Envoi de votre preuve au réseau.",
+        "verifying": "Le réseau confirme votre vote.",
+        "verified": "Votre vote a été enregistré on-chain.",
+        "failed": "La génération de preuve a échoué. Votre vote n'a pas été envoyé."
+      }
+    }
+  },
+  "error": {
+    "unknown": "Une erreur inattendue s'est produite.",
+    "network": "Erreur réseau. Vérifiez votre connexion.",
+    "rate_limit": "Trop de requêtes. Veuillez patienter avant de réessayer.",
+    "proof_generation_failed": "La génération de preuve a échoué. Veuillez réessayer.",
+    "proof_verification_failed": "La vérification de preuve on-chain a échoué.",
+    "nullifier_already_used": "Ce vote a déjà été émis depuis cette identité.",
+    "proposal_not_found": "Proposition introuvable.",
+    "proposal_expired": "Cette proposition est clôturée.",
+    "proposal_not_active": "Le vote n'est pas actuellement ouvert pour cette proposition.",
+    "quorum_check_failed": "Impossible de récupérer le statut du quorum.",
+    "tally_unavailable": "Les données de décompte ne sont pas disponibles actuellement.",
+    "wallet_not_connected": "Veuillez connecter votre portefeuille pour voter.",
+    "wallet_wrong_network": "Veuillez passer au bon réseau.",
+    "insufficient_voting_power": "Pouvoir de vote insuffisant pour cette proposition.",
+    "dao_contract_error": "Le contrat DAO a renvoyé une erreur : {{message}}",
+    "session_expired": "Votre session a expiré. Veuillez reconnecter votre portefeuille."
+  }
 }
