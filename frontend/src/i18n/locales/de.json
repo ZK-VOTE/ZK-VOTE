@@ -1,33 +1,117 @@
 {
-  "nav.browse": "DAOs durchsuchen",
-  "nav.publicVotes": "Öffentliche Stimmen",
-  "nav.docs": "Dokumentation",
-  "nav.connectWallet": "Wallet verbinden",
-  "nav.connecting": "Verbinde...",
-  "nav.disconnect": "Trennen",
-  "vote.button": "Jetzt abstimmen",
-  "vote.cast": "Anonyme Stimme abgeben",
-  "vote.yes": "Ja stimmen",
-  "vote.no": "Nein stimmen",
-  "vote.submitting": "Stimme wird übermittelt...",
-  "vote.generating": "Beweis wird generiert...",
-  "vote.success": "Stimme übermittelt!",
-  "common.loading": "Laden...",
-  "common.error": "Fehler",
-  "common.close": "Schließen",
-  "common.save": "Speichern",
-  "common.cancel": "Abbrechen",
-  "language.select": "Sprache auswählen",
-  "home.hero.title": "Private Abstimmung für",
-  "home.hero.subtitle": "dezentrale Organisationen",
-  "home.hero.description": "Zero-Knowledge-Beweis-Abstimmung auf Stellar. Stimmen Sie privat ab und behalten Sie die volle Verifizierbarkeit durch Groth16-SNARKs bei.",
-  "home.hero.startVoting": "Abstimmen starten",
-  "home.hero.documentation": "Dokumentation",
-  "home.techStack": "Auf Stellar gebaut mit modernsten kryptografischen Primitive",
-  "dao.member_one": "Mitglied",
-  "dao.member_other": "Mitglieder",
-  "dao.vote_one": "Stimme",
-  "dao.vote_other": "Stimmen",
-  "dao.proposal_one": "Vorschlag",
-  "dao.proposal_other": "Vorschläge"
+  "nav": {
+    "home": "Startseite",
+    "vote": "Abstimmen",
+    "dao": "DAO",
+    "about": "Über"
+  },
+  "vote": {
+    "title": "Stimme abgeben",
+    "submit": "Stimme senden",
+    "submitting": "Wird gesendet…",
+    "success": "Stimme erfolgreich abgegeben",
+    "error": "Fehler bei der Stimmabgabe"
+  },
+  "common": {
+    "loading": "Wird geladen…",
+    "error": "Ein Fehler ist aufgetreten",
+    "retry": "Erneut versuchen",
+    "cancel": "Abbrechen",
+    "confirm": "Bestätigen",
+    "close": "Schließen"
+  },
+  "home": {
+    "hero": {
+      "title": "Private, überprüfbare Governance",
+      "subtitle": "Zero-Knowledge-Abstimmung für DAOs"
+    }
+  },
+  "dao": {
+    "title": "DAO-Governance",
+    "proposals": "Vorschläge",
+    "members": "Mitglieder"
+  },
+  "governance": {
+    "quorum": {
+      "label": "Quorum",
+      "met": "Quorum erreicht",
+      "not_met": "Quorum nicht erreicht",
+      "required": "Erforderlich: {{count}} Stimmen",
+      "current": "Aktuell: {{count}} Stimmen",
+      "percentage": "{{percent}}% des erforderlichen Quorums",
+      "reaching_in": "Quorum wird voraussichtlich in {{duration}} erreicht"
+    },
+    "freshness": {
+      "label": "Aktualität der Auszählung",
+      "live": "Live",
+      "stale": "Veraltet — zuletzt aktualisiert {{ago}}",
+      "as_of": "Stand {{timestamp}}",
+      "updating": "Auszählung wird aktualisiert…",
+      "staleness_warning": "Die Auszählung wurde seit {{duration}} nicht aktualisiert. Die Ergebnisse spiegeln möglicherweise nicht die neuesten Stimmen wider."
+    },
+    "dispute": {
+      "status": {
+        "label": "Einspruchsstatus",
+        "none": "Keine Einsprüche",
+        "open": "Einspruch offen",
+        "under_review": "In Prüfung",
+        "resolved": "Gelöst",
+        "rejected": "Einspruch abgelehnt",
+        "escalated": "Eskaliert",
+        "filed_at": "Eingereicht am {{timestamp}}",
+        "resolved_at": "Gelöst am {{timestamp}}",
+        "reason": "Grund: {{reason}}"
+      }
+    },
+    "proposal": {
+      "status": {
+        "pending": "Ausstehend",
+        "active": "Aktiv",
+        "passed": "Angenommen",
+        "failed": "Abgelehnt",
+        "cancelled": "Abgebrochen",
+        "executed": "Ausgeführt"
+      },
+      "voting_ends": "Abstimmung endet {{timestamp}}",
+      "voting_ended": "Abstimmung beendet {{timestamp}}",
+      "time_remaining": "Noch {{duration}}"
+    }
+  },
+  "proof": {
+    "phase": {
+      "label": "Beweisphase",
+      "generating": "Beweis wird generiert…",
+      "generated": "Beweis generiert",
+      "submitting": "Beweis wird gesendet…",
+      "verifying": "Beweis wird verifiziert…",
+      "verified": "Beweis verifiziert",
+      "failed": "Beweis fehlgeschlagen",
+      "retrying": "Beweisgeneration wird wiederholt…",
+      "hint": {
+        "generating": "Dies kann einige Sekunden dauern. Schließe diese Seite nicht.",
+        "submitting": "Dein Beweis wird an das Netzwerk gesendet.",
+        "verifying": "Das Netzwerk bestätigt deine Stimme.",
+        "verified": "Deine Stimme wurde on-chain gespeichert.",
+        "failed": "Beweisgeneration fehlgeschlagen. Deine Stimme wurde nicht gesendet."
+      }
+    }
+  },
+  "error": {
+    "unknown": "Ein unerwarteter Fehler ist aufgetreten.",
+    "network": "Netzwerkfehler. Bitte überprüfe deine Verbindung.",
+    "rate_limit": "Zu viele Anfragen. Bitte warte, bevor du es erneut versuchst.",
+    "proof_generation_failed": "Beweisgeneration fehlgeschlagen. Bitte versuche es erneut.",
+    "proof_verification_failed": "Beweisverifizierung on-chain fehlgeschlagen.",
+    "nullifier_already_used": "Diese Stimme wurde bereits von dieser Identität abgegeben.",
+    "proposal_not_found": "Vorschlag nicht gefunden.",
+    "proposal_expired": "Dieser Vorschlag ist abgeschlossen.",
+    "proposal_not_active": "Die Abstimmung ist für diesen Vorschlag derzeit nicht geöffnet.",
+    "quorum_check_failed": "Quorum-Status konnte nicht abgerufen werden.",
+    "tally_unavailable": "Auszählungsdaten sind derzeit nicht verfügbar.",
+    "wallet_not_connected": "Bitte verbinde deine Wallet, um abzustimmen.",
+    "wallet_wrong_network": "Bitte wechsle zum richtigen Netzwerk.",
+    "insufficient_voting_power": "Unzureichende Stimmkraft für diesen Vorschlag.",
+    "dao_contract_error": "DAO-Vertrag hat einen Fehler zurückgegeben: {{message}}",
+    "session_expired": "Deine Sitzung ist abgelaufen. Bitte verbinde deine Wallet erneut."
+  }
 }
