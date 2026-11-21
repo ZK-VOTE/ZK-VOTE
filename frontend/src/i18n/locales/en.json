@@ -1,33 +1,117 @@
 {
-  "nav.browse": "Browse DAOs",
-  "nav.publicVotes": "Public Votes",
-  "nav.docs": "Docs",
-  "nav.connectWallet": "Connect Wallet",
-  "nav.connecting": "Connecting...",
-  "nav.disconnect": "Disconnect",
-  "vote.button": "Vote Now",
-  "vote.cast": "Cast Anonymous Vote",
-  "vote.yes": "Vote Yes",
-  "vote.no": "Vote No",
-  "vote.submitting": "Submitting Vote...",
-  "vote.generating": "Generating Proof...",
-  "vote.success": "Vote Submitted!",
-  "common.loading": "Loading...",
-  "common.error": "Error",
-  "common.close": "Close",
-  "common.save": "Save",
-  "common.cancel": "Cancel",
-  "language.select": "Select Language",
-  "home.hero.title": "Private voting for",
-  "home.hero.subtitle": "decentralized organizations",
-  "home.hero.description": "Zero-knowledge proof voting on Stellar. Cast your vote privately while maintaining full verifiability through Groth16 SNARKs.",
-  "home.hero.startVoting": "Start voting",
-  "home.hero.documentation": "Documentation",
-  "home.techStack": "Built on Stellar with cutting-edge cryptographic primitives",
-  "dao.member_one": "member",
-  "dao.member_other": "members",
-  "dao.vote_one": "vote",
-  "dao.vote_other": "votes",
-  "dao.proposal_one": "proposal",
-  "dao.proposal_other": "proposals"
+  "nav": {
+    "home": "Home",
+    "vote": "Vote",
+    "dao": "DAO",
+    "about": "About"
+  },
+  "vote": {
+    "title": "Cast Your Vote",
+    "submit": "Submit Vote",
+    "submitting": "Submitting…",
+    "success": "Vote submitted successfully",
+    "error": "Vote submission failed"
+  },
+  "common": {
+    "loading": "Loading…",
+    "error": "An error occurred",
+    "retry": "Retry",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "close": "Close"
+  },
+  "home": {
+    "hero": {
+      "title": "Private, Verifiable Governance",
+      "subtitle": "Zero-knowledge voting for DAOs"
+    }
+  },
+  "dao": {
+    "title": "DAO Governance",
+    "proposals": "Proposals",
+    "members": "Members"
+  },
+  "governance": {
+    "quorum": {
+      "label": "Quorum",
+      "met": "Quorum met",
+      "not_met": "Quorum not met",
+      "required": "Required: {{count}} votes",
+      "current": "Current: {{count}} votes",
+      "percentage": "{{percent}}% of required quorum",
+      "reaching_in": "Quorum expected within {{duration}}"
+    },
+    "freshness": {
+      "label": "Tally freshness",
+      "live": "Live",
+      "stale": "Stale — last updated {{ago}}",
+      "as_of": "As of {{timestamp}}",
+      "updating": "Updating tally…",
+      "staleness_warning": "Tally has not been updated in {{duration}}. Results may not reflect recent votes."
+    },
+    "dispute": {
+      "status": {
+        "label": "Dispute status",
+        "none": "No disputes",
+        "open": "Dispute open",
+        "under_review": "Under review",
+        "resolved": "Resolved",
+        "rejected": "Dispute rejected",
+        "escalated": "Escalated",
+        "filed_at": "Filed {{timestamp}}",
+        "resolved_at": "Resolved {{timestamp}}",
+        "reason": "Reason: {{reason}}"
+      }
+    },
+    "proposal": {
+      "status": {
+        "pending": "Pending",
+        "active": "Active",
+        "passed": "Passed",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "executed": "Executed"
+      },
+      "voting_ends": "Voting ends {{timestamp}}",
+      "voting_ended": "Voting ended {{timestamp}}",
+      "time_remaining": "{{duration}} remaining"
+    }
+  },
+  "proof": {
+    "phase": {
+      "label": "Proof phase",
+      "generating": "Generating proof…",
+      "generated": "Proof generated",
+      "submitting": "Submitting proof…",
+      "verifying": "Verifying proof…",
+      "verified": "Proof verified",
+      "failed": "Proof failed",
+      "retrying": "Retrying proof generation…",
+      "hint": {
+        "generating": "This may take a few seconds. Do not close this page.",
+        "submitting": "Sending your proof to the network.",
+        "verifying": "The network is confirming your vote.",
+        "verified": "Your vote has been recorded on-chain.",
+        "failed": "Proof generation failed. Your vote was not submitted."
+      }
+    }
+  },
+  "error": {
+    "unknown": "An unexpected error occurred.",
+    "network": "Network error. Please check your connection.",
+    "rate_limit": "Too many requests. Please wait before retrying.",
+    "proof_generation_failed": "Proof generation failed. Please try again.",
+    "proof_verification_failed": "Proof verification failed on-chain.",
+    "nullifier_already_used": "This vote has already been cast from this identity.",
+    "proposal_not_found": "Proposal not found.",
+    "proposal_expired": "This proposal has closed.",
+    "proposal_not_active": "Voting is not currently open for this proposal.",
+    "quorum_check_failed": "Could not retrieve quorum status.",
+    "tally_unavailable": "Tally data is currently unavailable.",
+    "wallet_not_connected": "Please connect your wallet to vote.",
+    "wallet_wrong_network": "Please switch to the correct network.",
+    "insufficient_voting_power": "Insufficient voting power for this proposal.",
+    "dao_contract_error": "DAO contract returned an error: {{message}}",
+    "session_expired": "Your session has expired. Please reconnect your wallet."
+  }
 }
