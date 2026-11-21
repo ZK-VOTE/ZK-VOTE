@@ -1,0 +1,132 @@
+{
+  "$schema": "./release-manifest.schema.json",
+  "schemaVersion": "1",
+  "releases": [
+    {
+      "version": "1.0.0",
+      "releasedAt": "2024-01-15T00:00:00Z",
+      "status": "stable",
+      "components": {
+        "backend": "1.0.0",
+        "frontend": "1.0.0",
+        "contracts": "1.0.0"
+      },
+      "compatibility": {
+        "stellarNetwork": ["testnet", "mainnet"],
+        "sorobanRpcMinVersion": "21.0.0",
+        "nodeMinVersion": "20.0.0",
+        "postgresMinVersion": "14.0"
+      },
+      "breakingChanges": [],
+      "migrations": []
+    },
+    {
+      "version": "1.1.0",
+      "releasedAt": "2024-03-01T00:00:00Z",
+      "status": "stable",
+      "components": {
+        "backend": "1.1.0",
+        "frontend": "1.1.0",
+        "contracts": "1.0.0"
+      },
+      "compatibility": {
+        "stellarNetwork": ["testnet", "mainnet"],
+        "sorobanRpcMinVersion": "21.0.0",
+        "nodeMinVersion": "20.0.0",
+        "postgresMinVersion": "14.0"
+      },
+      "breakingChanges": [],
+      "migrations": [
+        {
+          "id": "001_add_confirmation_cache",
+          "description": "Add confirmation_cache table for durable tx confirmations",
+          "required": true
+        }
+      ]
+    },
+    {
+      "version": "2.0.0",
+      "releasedAt": "2024-06-01T00:00:00Z",
+      "status": "stable",
+      "components": {
+        "backend": "2.0.0",
+        "frontend": "2.0.0",
+        "contracts": "2.0.0"
+      },
+      "compatibility": {
+        "stellarNetwork": ["testnet", "mainnet"],
+        "sorobanRpcMinVersion": "21.3.0",
+        "nodeMinVersion": "20.0.0",
+        "postgresMinVersion": "15.0"
+      },
+      "breakingChanges": [
+        {
+          "area": "api",
+          "description": "POST /vote now requires proof_version field (1 or 2)",
+          "migrationType": "additive"
+        },
+        {
+          "area": "contracts",
+          "description": "cast_votes entry point accepts new batch_v2 format; v1 batches rejected after ledger 5000000",
+          "migrationType": "breaking"
+        }
+      ],
+      "migrations": [
+        {
+          "id": "002_proof_batch_v2",
+          "description": "Add proof_batches table for durable batch collection",
+          "required": true
+        },
+        {
+          "id": "003_pending_waiters",
+          "description": "Add pending_confirmation_waiters table for durable queue",
+          "required": true
+        }
+      ]
+    },
+    {
+      "version": "2.1.0",
+      "releasedAt": null,
+      "status": "prerelease",
+      "components": {
+        "backend": "2.1.0",
+        "frontend": "2.1.0",
+        "contracts": "2.0.0"
+      },
+      "compatibility": {
+        "stellarNetwork": ["testnet", "mainnet"],
+        "sorobanRpcMinVersion": "21.3.0",
+        "nodeMinVersion": "20.0.0",
+        "postgresMinVersion": "15.0"
+      },
+      "breakingChanges": [],
+      "migrations": []
+    }
+  ],
+  "upgradeMatrix": [
+    {
+      "from": "1.0.0",
+      "to": "1.1.0",
+      "supported": true,
+      "notes": "Run migration 001 before deploying backend"
+    },
+    {
+      "from": "1.1.0",
+      "to": "2.0.0",
+      "supported": true,
+      "notes": "Run migrations 002 and 003 before deploying backend; update contracts before cutover ledger"
+    },
+    {
+      "from": "1.0.0",
+      "to": "2.0.0",
+      "supported": false,
+      "notes": "Upgrade to 1.1.0 first"
+    },
+    {
+      "from": "2.0.0",
+      "to": "2.1.0",
+      "supported": true,
+      "notes": "No migrations required"
+    }
+  ]
+}
