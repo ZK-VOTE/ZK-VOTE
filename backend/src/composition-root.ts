@@ -28,6 +28,7 @@ import {
 } from "./services/stellar.js";
 import type { StellarContext } from "./services/interfaces.js";
 import { initCircuitRegistry } from "./services/circuit-registry.js";
+import { initHaltStatus } from "./services/haltStatus.js";
 import { initAntiSpam } from "./services/anti-spam.js";
 import { initTtlService } from "./services/ttl.js";
 import { initSbtGuard } from "./services/sbt-guard.js";
@@ -86,6 +87,17 @@ export function buildAppServices(): AppServices {
     relayerKeypair,
     callWithTimeout,
     circuitRegistryContractId: config.circuitRegistryContractId,
+    networkPassphrase: config.networkPassphrase,
+    logger,
+  });
+
+  // Tiered emergency halt status (ZV-114 / #954): read-only, same DI
+  // convention as circuit-registry above.
+  initHaltStatus({
+    server,
+    relayerKeypair,
+    callWithTimeout,
+    votingContractId: config.votingContractId,
     networkPassphrase: config.networkPassphrase,
     logger,
   });

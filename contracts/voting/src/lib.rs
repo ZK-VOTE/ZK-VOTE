@@ -339,6 +339,21 @@ pub enum VotingError {
     /// `semanticsId` is not one of the known universal-tally semantics
     /// (yes/no, quadratic, weighted).
     UnknownSemanticsId = 118,
+
+    // ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────
+    /// `tiers` is zero or sets a bit outside the known halt-tier bitmask.
+    InvalidHaltTier = 119,
+    /// Halt-quorum threshold is zero or exceeds the number of configured signers.
+    InvalidHaltQuorum = 120,
+    /// Caller is not one of the configured halt-quorum signers.
+    NotHaltQuorumSigner = 121,
+    /// No halt is currently active (nothing to ratify/resume).
+    HaltNotActive = 122,
+    /// This signer has already approved the pending ratification/resume.
+    DuplicateHaltApproval = 123,
+    /// A fast (unratified) halt may only be stood down by the guardian who
+    /// activated it, not by an arbitrary quorum signer.
+    NotHaltActivator = 124,
 }
 
 impl VotingError {
@@ -505,6 +520,27 @@ const UNIVERSAL_TALLY_YES_NO_IC_LEN: u32 = UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS + 
 const UNIVERSAL_TALLY_QUADRATIC_IC_LEN: u32 = UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS + 1;
 const UNIVERSAL_TALLY_WEIGHTED_IC_LEN: u32 = UNIVERSAL_TALLY_WEIGHTED_NUM_SIGNALS + 1;
 pub const MAX_PAUSE_DURATION: u64 = 72 * 60 * 60;
+
+// ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────────
+// Additive alongside the plain `pause`/`unpause` above (single guardian,
+// contract-wide, 72h auto-expiry), which are untouched. Separates "which
+// operations are blocked" into independently settable tiers, and
+// distinguishes a fast single-signer activation (short, mandatory expiry)
+// from a quorum-ratified one (durable until a quorum resumes it).
+pub const HALT_TIER_VOTE_SUBMISSION: u32 = 0x1;
+pub const HALT_TIER_TALLY_FINALIZATION: u32 = 0x2;
+/// No treasury-execution entrypoint exists in this contract today; other
+/// contracts (e.g. a future rewards/treasury contract) can cross-call
+/// `is_tier_halted(HALT_TIER_TREASURY_EXECUTION)` before paying out. See
+/// "Still needed" in docs/ops/runbooks/panic-plus-surge.md.
+pub const HALT_TIER_TREASURY_EXECUTION: u32 = 0x4;
+const ALL_HALT_TIERS: u32 =
+    HALT_TIER_VOTE_SUBMISSION | HALT_TIER_TALLY_FINALIZATION | HALT_TIER_TREASURY_EXECUTION;
+/// A fast (unratified) halt is a stopgap, not a resolution: it expires far
+/// sooner than the legacy pause's 72h so an un-ratified emergency action
+/// can never quietly become permanent.
+pub const FAST_HALT_MAX_DURATION: u64 = 24 * 60 * 60;
+
 pub const RANDOMNESS_COMMIT_WINDOW: u64 = 3_600;
 pub const RANDOMNESS_REVEAL_WINDOW: u64 = 3_600;
 const MIN_RANDOMNESS_PARTICIPANTS: u32 = 2;
@@ -706,6 +742,19 @@ pub enum DataKey {
     SemanticsVk(u64, u32, u32), // (dao_id, semantics_id, semantics_version) -> VerificationKey
     /// Finalized universal tally result, additive to `RecursiveTally`.
     UniversalTally(u64, u64), // (dao_id, proposal_id) -> UniversalTallyInfo
+
+    // ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────
+    /// Current halt, if any. Contract-wide, same scope as the legacy
+    /// `Paused` flag (not per-DAO).
+    HaltState,
+    /// Configured halt-quorum signers.
+    HaltQuorumSigners,
+    /// Configured halt-quorum threshold (M-of-N over `HaltQuorumSigners`).
+    HaltQuorumThreshold,
+    /// Signers who have approved ratifying the current pending halt.
+    HaltRatificationApprovals,
+    /// Signers who have approved resuming the current ratified halt.
+    HaltResumeApprovals,
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -1255,6 +1304,48 @@ pub struct ContractUnpausedEvent {
     pub guardian: Address,
 }
 
+/// Tiered emergency halt state (ZV-114 / #954). `tiers` is a bitmask of
+/// [`HALT_TIER_VOTE_SUBMISSION`] / [`HALT_TIER_TALLY_FINALIZATION`] /
+/// [`HALT_TIER_TREASURY_EXECUTION`]. While `!ratified`, the halt is a fast
+/// single-signer activation and expires automatically at `expires_at`
+/// ([`FAST_HALT_MAX_DURATION`] after `activated_at`) unless a quorum
+/// ratifies it first via `ratify_halt`, at which point it is durable until
+/// a quorum calls `resume_halt`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltInfo {
+    pub tiers: u32,
+    pub activated_at: u64,
+    pub expires_at: u64,
+    pub ratified: bool,
+    pub activated_by: Address,
+    pub reason: String,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltActivatedEvent {
+    pub tiers: u32,
+    pub activated_by: Address,
+    pub expires_at: u64,
+    pub reason: String,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltRatifiedEvent {
+    pub tiers: u32,
+    pub approvals: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltResumedEvent {
+    pub tiers: u32,
+    pub resumed_by: Address,
+    pub via_quorum: bool,
+}
+
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RandomnessRevealedEvent {
@@ -1788,6 +1879,276 @@ impl Voting {
         paused && env.ledger().timestamp() < paused_at.saturating_add(MAX_PAUSE_DURATION)
     }
 
+    // ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────
+    //
+    // Additive alongside pause/unpause above, which this does not touch:
+    // those remain a simple contract-wide guardian kill switch. This adds
+    // a halt model scoped to named tiers (vote submission, tally
+    // finalization, treasury execution - the last with no entrypoint of
+    // its own here yet, exposed for other contracts to consult), with a
+    // fast single-signer activation path (mandatory expiry, no quorum
+    // needed) and a quorum-ratified path (durable, requires a quorum to
+    // resume). See docs/ops/runbooks/panic-plus-surge.md for the drill.
+
+    /// Configure the halt quorum (admin/guardian only). Replaces any
+    /// existing configuration; does not touch an in-progress
+    /// ratification/resume (those read the signer list fresh on each
+    /// call, so changing it mid-flight changes who the remaining
+    /// approvals must come from - document this operationally rather than
+    /// trying to "freeze" a vote in progress).
+    pub fn set_halt_quorum(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        guardian: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        guardian.require_auth();
+        Self::require_guardian(&env, &guardian);
+
+        if threshold == 0 || threshold > signers.len() as u32 {
+            return Err(VotingError::InvalidHaltQuorum);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltQuorumSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltQuorumThreshold, &threshold);
+        Ok(())
+    }
+
+    /// Fast single-signer halt activation (guardian only). Expires
+    /// automatically after [`FAST_HALT_MAX_DURATION`] unless ratified by
+    /// quorum first via `ratify_halt` - "temporary halts expire
+    /// automatically if not ratified".
+    pub fn activate_halt(
+        env: Env,
+        tiers: u32,
+        reason: String,
+        guardian: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        guardian.require_auth();
+        Self::require_guardian(&env, &guardian);
+
+        if tiers == 0 || tiers & !ALL_HALT_TIERS != 0 {
+            return Err(VotingError::InvalidHaltTier);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(FAST_HALT_MAX_DURATION);
+        let info = HaltInfo {
+            tiers,
+            activated_at: now,
+            expires_at,
+            ratified: false,
+            activated_by: guardian.clone(),
+            reason: reason.clone(),
+        };
+        env.storage().instance().set(&DataKey::HaltState, &info);
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltRatificationApprovals, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltResumeApprovals, &Vec::<Address>::new(&env));
+
+        HaltActivatedEvent {
+            tiers,
+            activated_by: guardian,
+            expires_at,
+            reason,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Add `signer`'s approval toward ratifying the current pending halt.
+    /// Once the configured threshold is met, the halt becomes durable
+    /// (its expiry no longer applies) until a quorum resumes it. Returns
+    /// whether the halt is now ratified.
+    pub fn ratify_halt(env: Env, signer: Address) -> Result<bool, VotingError> {
+        Self::bump_instance(&env);
+        signer.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumSigners)
+            .unwrap_or(Vec::new(&env));
+        if !signers.contains(&signer) {
+            return Err(VotingError::NotHaltQuorumSigner);
+        }
+
+        let mut info: HaltInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltState)
+            .ok_or(VotingError::HaltNotActive)?;
+        if info.ratified {
+            return Ok(true);
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltRatificationApprovals)
+            .unwrap_or(Vec::new(&env));
+        if approvals.contains(&signer) {
+            return Err(VotingError::DuplicateHaltApproval);
+        }
+        approvals.push_back(signer);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumThreshold)
+            .unwrap_or(u32::MAX);
+        let ratified_now = approvals.len() as u32 >= threshold;
+
+        if ratified_now {
+            info.ratified = true;
+            env.storage().instance().set(&DataKey::HaltState, &info);
+            HaltRatifiedEvent {
+                tiers: info.tiers,
+                approvals: approvals.len() as u32,
+            }
+            .publish(&env);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltRatificationApprovals, &approvals);
+        Ok(ratified_now)
+    }
+
+    /// Stand down the current halt. A fast (unratified) halt may only be
+    /// resumed by the guardian who activated it - the "distinct quorum
+    /// path" for activation already lets anyone with the guardian key act
+    /// alone, so letting any other solo caller resume it would add no new
+    /// protection. A ratified halt always requires its own quorum, so a
+    /// single compromised guardian can never undo what a quorum deliberately
+    /// ratified. Returns whether the halt was actually cleared.
+    pub fn resume_halt(env: Env, caller: Address) -> Result<bool, VotingError> {
+        Self::bump_instance(&env);
+        caller.require_auth();
+
+        let info: HaltInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltState)
+            .ok_or(VotingError::HaltNotActive)?;
+
+        if !info.ratified {
+            if caller != info.activated_by {
+                return Err(VotingError::NotHaltActivator);
+            }
+            Self::clear_halt(&env);
+            HaltResumedEvent {
+                tiers: info.tiers,
+                resumed_by: caller,
+                via_quorum: false,
+            }
+            .publish(&env);
+            return Ok(true);
+        }
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumSigners)
+            .unwrap_or(Vec::new(&env));
+        if !signers.contains(&caller) {
+            return Err(VotingError::NotHaltQuorumSigner);
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltResumeApprovals)
+            .unwrap_or(Vec::new(&env));
+        if approvals.contains(&caller) {
+            return Err(VotingError::DuplicateHaltApproval);
+        }
+        approvals.push_back(caller.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumThreshold)
+            .unwrap_or(u32::MAX);
+        let resumed = approvals.len() as u32 >= threshold;
+
+        if resumed {
+            Self::clear_halt(&env);
+            HaltResumedEvent {
+                tiers: info.tiers,
+                resumed_by: caller,
+                via_quorum: true,
+            }
+            .publish(&env);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::HaltResumeApprovals, &approvals);
+        }
+        Ok(resumed)
+    }
+
+    fn clear_halt(env: &Env) {
+        env.storage().instance().remove(&DataKey::HaltState);
+        env.storage()
+            .instance()
+            .remove(&DataKey::HaltRatificationApprovals);
+        env.storage()
+            .instance()
+            .remove(&DataKey::HaltResumeApprovals);
+    }
+
+    /// Whether `tier` is currently halted: active, covers `tier`, and
+    /// either ratified or not yet past its fast-activation expiry. A
+    /// fast halt past its expiry is treated as resumed without needing an
+    /// explicit transaction, same as the legacy pause's auto-expiry.
+    fn tier_is_halted(env: &Env, tier: u32) -> bool {
+        let info: Option<HaltInfo> = env.storage().instance().get(&DataKey::HaltState);
+        match info {
+            None => false,
+            Some(info) => {
+                if info.tiers & tier == 0 {
+                    return false;
+                }
+                info.ratified || env.ledger().timestamp() < info.expires_at
+            }
+        }
+    }
+
+    /// Panics with [`VotingError::ContractPaused`] if `tier` is halted.
+    /// Reuses `ContractPaused` rather than a new error so existing
+    /// clients that already handle that error (from `require_not_paused`)
+    /// handle this too without a taxonomy change.
+    fn require_tier_not_halted(env: &Env, tier: u32) {
+        if Self::tier_is_halted(env, tier) {
+            panic_with_error!(env, VotingError::ContractPaused);
+        }
+    }
+
+    /// Public status check for `tier` - lets other contracts (e.g. a
+    /// future treasury contract gating [`HALT_TIER_TREASURY_EXECUTION`])
+    /// cross-call this instead of needing their own halt state.
+    pub fn is_tier_halted(env: Env, tier: u32) -> bool {
+        Self::bump_instance(&env);
+        Self::tier_is_halted(&env, tier)
+    }
+
+    /// Fetch the current halt, if any (regardless of whether it has
+    /// expired - callers that need the live gate should use
+    /// `is_tier_halted` instead).
+    pub fn get_halt_status(env: Env) -> Option<HaltInfo> {
+        Self::bump_instance(&env);
+        env.storage().instance().get(&DataKey::HaltState)
+    }
+
     /// Validate that a U256 value is within the BN254 scalar field (< r).
     /// Panics with a coarse-mapped [`VotingError::SignalNotInField`] under
     /// [`PathContext::Anonymous`].
@@ -2086,6 +2447,7 @@ impl Voting {
     ) -> Result<(), VotingError> {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_TALLY_FINALIZATION);
 
         let total_votes = yes_votes
             .checked_add(no_votes)
@@ -2447,6 +2809,7 @@ impl Voting {
     ) -> Result<(), VotingError> {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_TALLY_FINALIZATION);
 
         let semantics_key = DataKey::ProposalSemantics(dao_id, proposal_id);
         let pinned: TallySemantics = env
@@ -3318,6 +3681,7 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
         let ctx = PathContext::Anonymous;
         Self::set_reentrancy_lock(&env);
 
@@ -3703,6 +4067,7 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
 
         let ctx = PathContext::Anonymous;
 
@@ -4641,6 +5006,7 @@ impl Voting {
         let ctx = PathContext::Anonymous;
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
         Self::set_reentrancy_lock(&env);
 
         let count = votes.len();
@@ -5553,6 +5919,7 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
         Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
         Self::assert_in_field(&env, PathContext::Anonymous, &root);
 
