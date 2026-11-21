@@ -2,368 +2,112 @@ groups:
   - name: zkvote-relayer
     rules:
       - alert: ZKVoteRelayerHighErrorRate
-        expr: sum(rate(zkvote_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(zkvote_http_requests_total[5m])), 1) > 0.05
-        for: 10m
+        expr: |
+          rate(http_requests_total{job="zkvote-relayer",status=~"5.."}[5m])
+            / rate(http_requests_total{job="zkvote-relayer"}[5m]) > 0.05
+        for: 2m
         labels:
           severity: warning
           service: zkvote-relayer
         annotations:
-          summary: ZKVote relayer error rate is elevated
-          description: More than 5% of relayer requests have returned 5xx for 10 minutes.
+          summary: "High error rate on ZK-VOTE relayer ({{ $value | humanizePercentage }})"
+          description: "More than 5% of relayer requests are returning 5xx errors over the last 5 minutes."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
       - alert: ZKVoteRelayerHighLatency
-        expr: histogram_quantile(0.95, sum by (le) (rate(zkvote_http_request_duration_seconds_bucket[5m]))) > 2
-        for: 10m
+        expr: |
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{job="zkvote-relayer"}[5m])
+          ) > 2
+        for: 5m
         labels:
           severity: warning
           service: zkvote-relayer
         annotations:
-          summary: ZKVote relayer latency is high
-          description: HTTP request p95 latency has exceeded 2 seconds for 10 minutes.
+          summary: "High p95 latency on ZK-VOTE relayer ({{ $value | humanizeDuration }})"
+          description: "95th percentile request latency exceeds 2 s over the last 5 minutes."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/rotation-under-congestion.md"
+
       - alert: ZKVoteRelayerIndexerStalled
-        expr: zkvote_service_running{service="indexer"} == 1 and time() - zkvote_service_last_run_timestamp_seconds{service="indexer"} > 600
-        for: 5m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: ZKVote indexer appears stalled
-          description: The indexer has not completed a successful run for more than 10 minutes.
-      - alert: ZKVoteRelayerDatabaseUnavailable
-        expr: zkvote_db_write_healthy == 0
-        for: 5m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: ZKVote database write connection is unhealthy
-          description: The relayer write database connection has been unhealthy for 5 minutes.
-      - alert: ZKVoteRelayerHighUnauthenticatedRejections
-        expr: sum(rate(zkvote_unauthenticated_rejection_total[5m])) > 10
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: High rate of unauthenticated requests rejected
-          description: More than 10 unauthenticated requests per second have been rejected for 5 minutes.
-      - alert: ZKVoteRelayerCrossTenantViolation
-        expr: sum(rate(zkvote_cross_tenant_denial_total[5m])) > 0
-        for: 1m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: Cross-tenant access denial detected
-          description: Cross-tenant isolation violation attempted on relayer resources.
-      - alert: ZKVoteRelayerReconciliationMismatch
-        expr: sum(rate(zkvote_reconciliation_mismatch_total[5m])) > 0
-        for: 2m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: State reconciliation mismatch detected
-          description: State divergence detected between SQLite cache and Soroban on-chain state.
-      - alert: ZKVoteRelayerDaoTallyMismatch
-        expr: sum(rate(zkvote_reconciliation_mismatch_total{component="dao_tally"}[5m])) > 0
-        for: 2m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: DAO hash-vs-DB tally mismatch detected
-          description: Per-DAO vote_cast hash count (Horizon/stellar.expert) diverges from relayer DB pipeline counts. See FIX_REPORT.md blast-radius workflow.
-      - alert: ZKVoteRelayerDaoReconciliationStale
-        expr: time() - zkvote_dao_reconciliation_last_ok_timestamp_seconds > 900
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: DAO reconciliation has not completed cleanly
-          description: No fully-consistent DAO reconciliation run in the last 15 minutes.
-      - alert: ZKVoteRelayerRateLimitStoreExhaustion
-        expr: zkvote_rate_limit_store_size > 50000
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: Rate limit store capacity elevated
-          description: In-memory rate limit store tracking over 50,000 active keys.
-      - alert: ZKVoteRelayerBatchPartialFailureSpike
-        expr: sum(rate(zkvote_batch_partial_failure_total[5m])) > 1
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: Batch partial failure rate elevated
-          description: Elevated partial failures observed in multi-item batch execution.
-      - alert: ZKVoteRelayerBackupStale
-        expr: zkvote_backup_age_seconds > 93600
-        for: 15m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: No successful backup for over 26 hours
-          description: Backup age exceeds 26h; litestream/S3 replication or scheduled backups may be stalled. Verify litestream.yml sync and S3 backup.
-      - alert: ZKVoteRelayerRestoreDrillFailing
-        expr: sum(rate(zkvote_backup_restore_drill_total{status="error"}[15m])) > 0
-        for: 5m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: Encrypted restore drill failing
-          description: Restore drills are failing; backups may not be recoverable or forward secrecy check is tripping. Run backup:key-rotate drill and check key ring.
-      - alert: ZKVoteRelayerFeeSurge
-        expr: sum(rate(zkvote_rpc_errors_total{error_type=~"fee|congestion|surge"}[5m])) > 0.5
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: Possible fee surge delaying vote inclusion
-          description: Fee/congestion RPC errors rising; surge-aware feeEstimator should be bumping priority fees. Check feeStats p99 spread and fee-bump queue.
-
-      # ── Network-reset detection (SPIKE-100 / #766) ──────────────────────
-      #
-      # A Stellar network reset (testnet wipe, ledger-sequence rollback) looks
-      # identical to a prolonged outage from the relayer's perspective: ledger age
-      # grows beyond any reasonable block time.  The two events require completely
-      # different runbook responses — an outage waits for the RPC to recover,
-      # while a reset requires wiping the local SQLite cache and re-syncing from
-      # ledger 0.  The alerts below distinguish them by combining ledger-age with
-      # a ledger-sequence regression signal.
-      #
-      # Runbook:
-      #   - ZKVoteNetworkLedgerStale alone  → wait; page on-call after for:
-      #   - ZKVoteNetworkLedgerReset firing  → execute network-reset runbook:
-      #       1. Stop relayer
-      #       2. sqlite3 data/zkvote.db "DELETE FROM processed_events;"
-      #       3. Reset horizon cursor: rm data/horizon_cursor.txt
-      #       4. Restart relayer; confirm ledger_sequence_number rising in Grafana
-
-      - alert: ZKVoteNetworkLedgerStale
-        # Horizon reports a last_ledger_close_time; we derive age from current
-        # wall time minus that timestamp.  >120 s is two missed 5-s ledger slots.
-        expr: (time() - zkvote_horizon_last_ledger_close_time_seconds) > 120
+        expr: |
+          time() - zkvote_relayer_last_indexed_block_timestamp > 120
         for: 3m
         labels:
-          severity: warning
+          severity: critical
           service: zkvote-relayer
         annotations:
-          summary: Stellar ledger has not advanced for >2 minutes
-          description: >
-            zkvote_horizon_last_ledger_close_time_seconds is stale.  Could be a
-            transient RPC outage or a network reset.  Monitor ZKVoteNetworkLedgerReset
-            to distinguish.  If only this alert fires, wait for recovery; if both
-            fire, follow the network-reset runbook.
+          summary: "ZK-VOTE relayer indexer has stalled"
+          description: "No new block has been indexed for more than 2 minutes. Chain sync may have dropped."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
 
-      - alert: ZKVoteNetworkLedgerReset
-        # A ledger-sequence regression (current sequence < previous recorded max)
-        # is the definitive signal for a network reset.  The relayer gauge
-        # zkvote_horizon_ledger_sequence tracks the latest sequence seen; a
-        # decrease_over_time indicates the ledger rolled back.
-        expr: decrease(zkvote_horizon_ledger_sequence[10m]) > 1000
+      - alert: ZKVoteRelayerDatabaseUnavailable
+        expr: |
+          zkvote_relayer_db_up == 0
         for: 1m
         labels:
           severity: critical
           service: zkvote-relayer
         annotations:
-          summary: Stellar ledger sequence regression detected — possible network reset
-          description: >
-            zkvote_horizon_ledger_sequence decreased by >1 000 in the last 10 minutes.
-            This is the canonical signal for a testnet/network reset.  Execute the
-            network-reset runbook immediately: stop the relayer, wipe processed_events,
-            remove the horizon cursor file, then restart and verify sequence is climbing.
+          summary: "ZK-VOTE relayer cannot reach its database"
+          description: "Database health check has been failing for more than 1 minute."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
 
-  # ── External endpoint pools (#745) ─────────────────────────────────────
-  # Horizon, Soroban RPC and anchor pools. `dependency` is horizon,
-  # soroban_rpc, anchor_usdc or anchor_eurc; `endpoint` is a URL origin.
-  - name: zkvote-endpoints
-    rules:
-      - alert: ZKVoteDependencyNoEligibleEndpoint
-        expr: zkvote_dependency_available_endpoints == 0 and zkvote_dependency_total_endpoints > 0
+      - alert: ZKVoteRelayerHighUnauthenticatedRejections
+        expr: |
+          rate(zkvote_relayer_auth_rejections_total[5m]) > 0.5
         for: 2m
         labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Elevated unauthenticated request rejections on ZK-VOTE relayer"
+          description: "More than 0.5 auth rejections per second over 5 minutes. May indicate a brute-force attempt."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
+      - alert: ZKVoteRelayerCrossTenantViolation
+        expr: |
+          increase(zkvote_relayer_cross_tenant_violations_total[5m]) > 0
+        for: 0m
+        labels:
           severity: critical
           service: zkvote-relayer
         annotations:
-          summary: "{{ $labels.dependency }} has no eligible endpoint"
-          description: >
-            Every configured {{ $labels.dependency }} endpoint is down, rate-limited
-            or breaker-open, so its money path is halted. Runbook: check
-            /health endpointPools for per-endpoint breakerState and
-            cooldownRemainingMs; confirm upstream status pages; add a provider to
-            HORIZON_URLS / SOROBAN_RPC_URLS / ANCHOR_*_URLS and restart if one
-            provider is down for longer than its SLA.
+          summary: "Cross-tenant data access violation detected on ZK-VOTE relayer"
+          description: "A request accessed data belonging to another tenant. Immediate investigation required."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
 
-      - alert: ZKVoteDependencyWithoutRedundancy
-        expr: zkvote_dependency_total_endpoints{dependency=~"horizon|soroban_rpc"} < 2
-        for: 1h
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: "{{ $labels.dependency }} is configured with a single endpoint"
-          description: >
-            A single {{ $labels.dependency }} endpoint is a single point of failure for
-            votes and payments. Runbook: configure at least two independent providers
-            in HORIZON_URLS / SOROBAN_RPC_URLS.
-
-      - alert: ZKVoteDependencyDegraded
-        expr: zkvote_dependency_available_endpoints < zkvote_dependency_total_endpoints
-        for: 10m
-  # ── Bounded-label alerts with log drill-down (#749) ─────────────────────
-  # Metrics carry bounded labels only (backend/src/services/metric-cardinality.ts).
-  # Per-DAO / per-client detail is on `event="metric_drilldown"` log records
-  # with the same metric name and labels, joined to traces by traceId.
-  - name: zkvote-cardinality
-    rules:
-      - alert: ZKVoteMetricCardinalityOverflow
-        expr: sum by (metric, label) (increase(zkvote_metric_cardinality_overflow_total[10m])) > 0
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: "{{ $labels.dependency }} is running with reduced redundancy"
-          description: >
-            At least one {{ $labels.dependency }} endpoint has been ineligible for 10
-            minutes; traffic is served by the rest. Runbook: find the endpoint with
-            zkvote_endpoint_healthy == 0 and check its provider; no action is needed
-            while another endpoint remains eligible.
-
-      - alert: ZKVoteEndpointLedgerLag
-        expr: max by (dependency, endpoint) (zkvote_endpoint_ledger_lag) > 5
-          summary: "{{ $labels.metric }} hit its cardinality budget ({{ $labels.label }})"
-          description: >
-            New label values for {{ $labels.metric }} are collapsing into
-            "__overflow__". Either a dimension is being minted (attack, scan) or
-            new code added an unbounded value. Runbook: check recent deploys for
-            new label values; if traffic-driven, find the source with
-            event="metric_drilldown" metric="{{ $labels.metric }}".
-
-      - alert: ZKVoteRootFetchFailures
-        expr: sum by (reason) (rate(zkvote_root_fetch_failures_total[5m])) > 0.2
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: "{{ $labels.endpoint }} trails the {{ $labels.dependency }} tip by {{ $value }} ledgers"
-          description: >
-            The endpoint is past ENDPOINT_MAX_FINALITY_LAG_LEDGERS and is excluded
-            from witness, sequence and quote reads. Runbook: if all endpoints lag,
-            check network status before raising the bound; never raise it to make
-            a lagging provider eligible for witness reads.
-
-      - alert: ZKVoteStaleReadsRejected
-        expr: sum by (dependency, op_class) (increase(zkvote_endpoint_stale_rejected_total[5m])) > 0
+      - alert: ZKVoteRelayerReconciliationMismatch
+        expr: |
+          zkvote_relayer_reconciliation_mismatch_count > 0
         for: 5m
         labels:
           severity: critical
           service: zkvote-relayer
         annotations:
-          summary: "{{ $labels.dependency }} {{ $labels.op_class }} reads refused: no fresh endpoint"
-          description: >
-            Reads that feed witnesses, sequence numbers or quotes are failing closed
-            because no endpoint is within the finality-lag bound. Runbook: same as
-            ZKVoteEndpointLedgerLag; votes and payments resume automatically once a
-            fresh endpoint is available.
+          summary: "ZK-VOTE relayer tally reconciliation mismatch"
+          description: "On-chain vote tally does not match the relayer's local count. Data integrity issue."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
 
-      - alert: ZKVoteEndpointDisagreement
-        expr: sum by (dependency) (increase(zkvote_endpoint_disagreement_total[10m])) > 0
+      - alert: ZKVoteRelayerDaoTallyMismatch
+        expr: |
+          abs(zkvote_relayer_dao_tally_local - zkvote_relayer_dao_tally_onchain) > 0
+        for: 5m
         labels:
           severity: critical
           service: zkvote-relayer
         annotations:
-          summary: "{{ $labels.dependency }} endpoints returned different state at the same ledger"
-          description: >
-            Two fresh endpoints disagreed about the same ledger and the read failed
-            closed. This indicates a fork, a provider bug or a malicious endpoint.
-            Runbook: grep relayer logs for endpoint_disagreement, compare both
-            providers against a third source, and remove the faulty endpoint from
-            the pool.
+          summary: "ZK-VOTE DAO tally mismatch between local and on-chain state"
+          description: "Local DAO tally diverges from on-chain tally. Governance integrity at risk."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
 
-      - alert: ZKVoteEndpointFailoverSpike
-        expr: sum by (dependency) (rate(zkvote_endpoint_failover_total[5m])) > 0.1
+      - alert: ZKVoteRelayerDaoReconciliationStale
+        expr: |
+          time() - zkvote_relayer_dao_last_reconciliation_timestamp > 3600
         for: 10m
-          summary: "Merkle root reads failing ({{ $labels.reason }})"
-          description: >
-            Voters cannot fetch roots to build witnesses. Drill-down:
-            event="metric_drilldown" metric="zkvote_root_fetch_failures_total"
-            labels.reason="{{ $labels.reason }}" → group by dao_id to find the
-            affected DAOs → open a traceId for the failing RPC call.
-
-      - alert: ZKVoteWebSocketRateLimitSpike
-        expr: rate(zkvote_ws_rate_limit_total[5m]) > 5
-        for: 5m
         labels:
           severity: warning
           service: zkvote-relayer
         annotations:
-          summary: WebSocket connections are being rate-limited at a high rate
-          description: >
-            Aggregate only (no per-IP series). Drill-down:
-            event="metric_drilldown" metric="zkvote_ws_rate_limit_total" →
-            group by client (hashed IP) to identify the sources.
-
-      - alert: ZKVoteCrossTenantDenials
-        expr: sum by (resource_type, reason) (increase(zkvote_cross_tenant_denial_total[10m])) > 10
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: "{{ $labels.dependency }} calls are repeatedly failing over"
-          description: >
-            Calls succeed only after rerouting; latency is elevated by the
-            zkvote_endpoint_failover_latency_seconds distribution. Runbook: identify
-            the failing endpoint via zkvote_endpoint_requests_total by outcome.
-
-      - alert: ZKVoteEndpointRateLimited
-        expr: sum by (dependency, endpoint) (rate(zkvote_endpoint_requests_total{outcome="rate_limited"}[5m])) > 0.5
-        for: 10m
-          summary: "Cross-tenant denials on {{ $labels.resource_type }} ({{ $labels.reason }})"
-          description: >
-            Possible registry spoofing. Drill-down: event="metric_drilldown"
-            metric="zkvote_cross_tenant_denial_total" → group by dao_id and caller.
-
-      - alert: ZKVoteUnpinnedRegistryRejections
-        expr: sum by (endpoint, reason) (increase(zkvote_unauthenticated_rejection_total[10m])) > 10
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: "{{ $labels.endpoint }} is rate-limiting the relayer"
-          description: >
-            The endpoint keeps answering 429. It is cooled down per Retry-After and
-            traffic sheds to peers. Runbook: request a higher quota or add a
-            provider; do not raise ENDPOINT_RETRY_BUDGET_RATIO.
-
-      - alert: ZKVoteEndpointRetryBudgetExhausted
-        expr: sum by (dependency) (increase(zkvote_endpoint_retry_budget_exhausted_total[5m])) > 0
-        for: 5m
-          summary: "Unauthenticated rejections at {{ $labels.endpoint }} ({{ $labels.reason }})"
-          description: >
-            Drill-down: event="metric_drilldown"
-            metric="zkvote_unauthenticated_rejection_total" → group by dao_id.
-
-      - alert: ZKVoteRelayerStandbyBalanceLow
-        expr: min by (role) (zkvote_relayer_key_balance_xlm{role=~"secondary|standby"}) < 10
-        for: 30m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: "{{ $labels.dependency }} retry budget exhausted"
-          description: >
-            Retries are being suppressed to avoid a retry storm, so transient
-            failures now reach users. Runbook: treat as a dependency outage; see
-            ZKVoteDependencyDegraded.
-          summary: "Lowest {{ $labels.role }} relayer key balance is {{ $value }} XLM"
-          description: >
-            Per-role aggregate (no per-key series). Runbook: GET
-            /admin/relayer/keys lists each key's balance; fund the low one.
+          summary: "ZK-VOTE DAO reconciliation has not run in over 1 hour"
+          description: "The last successful DAO reconciliation is more than 1 hour old. Stale governance state possible."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/rotation-under-congestion.md"
