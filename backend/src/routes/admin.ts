@@ -1103,4 +1103,105 @@ router.post(
   }) as AsyncHandler,
 );
 
+// ── Blackout calendar status (ZV-059) ────────────────────────────────────────
+
+import {
+  computeBlackoutStatus,
+  issueOverrideToken,
+  validateOverrideToken,
+} from "../services/blackout-calendar.js";
+import { getDb } from "../services/db.js";
+
+/**
+ * GET /admin/blackout-status
+ *
+ * Returns the current blackout status derived from active proposals stored in
+ * the local database cache.  Operators can supply `X-Blackout-Override` to
+ * show that they hold a valid override token; this is validated and reflected
+ * in the response but does NOT consume the token.
+ */
+router.get(
+  "/admin/blackout-status",
+  authGuard,
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      // Pull active proposals from the local DAO cache.  Each row must have
+      // dao_id, proposal_id, end_time (unix seconds).
+      const proposals: Array<{
+        daoId: number;
+        proposalId: number;
+        endTime: number;
+      }> = (
+        db
+          .prepare(
+            `SELECT dao_id AS daoId, proposal_id AS proposalId, end_time AS endTime
+               FROM dao_proposal_cache
+              WHERE end_time > 0
+              ORDER BY end_time ASC`,
+          )
+          .all() as any[]
+      ).map((r) => ({
+        daoId: r.daoId,
+        proposalId: r.proposalId,
+        endTime: r.endTime,
+      }));
+
+      const status = computeBlackoutStatus(proposals);
+
+      const overrideHeader = req.headers["x-blackout-override"] as
+        | string
+        | undefined;
+      const overrideValid = overrideHeader
+        ? validateOverrideToken(overrideHeader) !== null
+        : false;
+
+      res.json({ ...status, overridePresent: !!overrideHeader, overrideValid });
+    } catch (err) {
+      log("error", "admin_blackout_status_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/blackout-override
+ *
+ * Issue an emergency override token that permits a deploy during a blackout.
+ * Requires the master key.  The issuance is written to the audit log.
+ */
+router.post(
+  "/admin/blackout-override",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    const { issuedBy, reason } = req.body as {
+      issuedBy?: string;
+      reason?: string;
+    };
+    if (!issuedBy || !reason) {
+      res.status(400).json({ error: "issuedBy and reason are required" });
+      return;
+    }
+    issueOverrideToken(issuedBy, reason)
+      .then((override) => {
+        res.json({
+          token: override.token,
+          issuedAt: override.issuedAt,
+          expiresAt: override.expiresAt,
+        });
+      })
+      .catch((err) => {
+        log("error", "admin_blackout_override_failed", {
+          error: (err as Error).message,
+        });
+        res.status(500).json({ error: (err as Error).message });
+      });
+  }) as AsyncHandler,
+);
+
 export default router;
