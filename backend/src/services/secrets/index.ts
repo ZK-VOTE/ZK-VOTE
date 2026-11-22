@@ -1,5 +1,6 @@
 export {
   initSecretManager,
+  assertSecretBackendReady,
   getSecret,
   setSecret,
   checkRotationHealth,

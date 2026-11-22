@@ -66,6 +66,35 @@ export function initSecretManager(options: SecretManagerOptions): void {
   });
 }
 
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+/**
+ * Boot-time readiness check (#919). In production, refuses to start when Vault
+ * is configured but unreachable, so the process never runs against a silently
+ * downgraded secret source. No-op when Vault is not configured.
+ */
+export async function assertSecretBackendReady(
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (!vaultConfig?.url) return;
+  try {
+    const response = await fetch(`${vaultConfig.url}/v1/sys/health`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok && response.status !== 429 && response.status !== 472 && response.status !== 473) {
+      throw new Error(`Vault health returned ${response.status}`);
+    }
+  } catch (err) {
+    const message = (err as Error).message;
+    log("error", "vault_unavailable_at_boot", { error: message });
+    if (isProduction()) {
+      throw new Error(`Refusing to start: Vault is configured but unavailable (${message})`);
+    }
+  }
+}
+
 /**
  * Get the current backend in use
  */
@@ -192,7 +221,17 @@ export async function getSecret(
   try {
     const value = await fetchPromise;
     pendingFetches.delete(key);
-    auditLog(createAuditEntry(key, "get", true, requestId, options?.source));
+    // Audit records the outcome; the value itself is never logged.
+    auditLog(
+      createAuditEntry(
+        key,
+        "get",
+        value !== undefined,
+        requestId,
+        options?.source,
+        value === undefined ? "not_found_or_fail_closed" : undefined,
+      ),
+    );
     return value;
   } catch (err) {
     pendingFetches.delete(key);
@@ -224,6 +263,12 @@ async function fetchSecretValue(key: string): Promise<string | undefined> {
     const vaultValue = await fetchFromVault(key);
     if (vaultValue !== null) {
       return vaultValue;
+    }
+    // Fail closed in production: a Vault miss must never downgrade the secret
+    // source to env vars (#919).
+    if (isProduction()) {
+      log("error", "vault_fail_closed", { key });
+      return undefined;
     }
     log("warn", "vault_fallback_to_env", { key });
   }

@@ -18,8 +18,25 @@ versions of the backend remain compatible and safe to use.
 ## Schema Definition
 
 The expected schema is defined in `backend/src/services/db.ts` as the `EXPECTED_SCHEMA`
-constant. It contains six tables: `events`, `metadata`, `daos`, `comment_submissions`,
-`comment_flags`, and `hidden_comments`.
+constant. The table index below is kept in sync with that constant by
+`backend/test/schema-drift.test.js`; the test fails CI when they disagree.
+
+<!-- schema-tables:start -->
+- `events`
+- `metadata`
+- `daos`
+- `comment_submissions`
+- `comment_flags`
+- `hidden_comments`
+- `ttl_tracking`
+- `ttl_cost_log`
+- `auth_tokens`
+- `auth_token_audit`
+- `vote_submissions`
+- `proposal_lifecycle_subscriptions`
+- `proposal_lifecycle_notifications`
+- `proof_commitments`
+<!-- schema-tables:end -->
 
 ### Tables
 
