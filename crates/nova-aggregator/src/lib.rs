@@ -5,6 +5,8 @@
 
 pub mod aggregator;
 pub mod circuit;
+#[cfg(test)]
+mod proptest_suite;
 
 use serde::{Deserialize, Serialize};
 
