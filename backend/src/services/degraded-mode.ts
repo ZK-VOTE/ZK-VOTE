@@ -1,6 +1,15 @@
 /**
  * Degraded Mode Service
  * Manages graceful degradation during combined fault scenarios
+ *
+ * Changes (#922):
+ * - Reasons are now persisted as a serialisable map (reason → level) so the
+ *   full set survives serialisation across replicas (write to shared store if
+ *   needed; the type is intentionally a plain record for JSON round-trips).
+ * - Per-endpoint DataStatus matrix exposed via `endpointStatus()`.
+ * - Cursor-based replay/dedup: `shouldReplay()` / `markReplayed()` track
+ *   which event cursors have already been processed after a reconnect so the
+ *   same event is never handled twice.
  */
 
 export enum DegradationLevel {
@@ -11,6 +20,9 @@ export enum DegradationLevel {
   CRITICAL = 4
 }
 
+/** Data freshness status reported per endpoint in responses. */
+export type DataStatus = "fresh" | "cached" | "degraded" | "unavailable"
+
 export interface DegradationState {
   level: DegradationLevel
   activeReasons: string[]
@@ -18,17 +30,66 @@ export interface DegradationState {
   expectedRecovery?: Date
 }
 
+/**
+ * Per-endpoint status matrix: each endpoint declares what data status it
+ * provides at each degradation level.  Absent entries fall back to the
+ * generic mapping in `endpointStatus()`.
+ */
+const ENDPOINT_STATUS_MATRIX: Record<string, Partial<Record<DegradationLevel, DataStatus>>> = {
+  "daos/list": {
+    [DegradationLevel.NORMAL]: "fresh",
+    [DegradationLevel.SLIGHT]: "cached",
+    [DegradationLevel.MODERATE]: "cached",
+    [DegradationLevel.SEVERE]: "degraded",
+    [DegradationLevel.CRITICAL]: "unavailable",
+  },
+  "daos/get": {
+    [DegradationLevel.NORMAL]: "fresh",
+    [DegradationLevel.SLIGHT]: "cached",
+    [DegradationLevel.MODERATE]: "cached",
+    [DegradationLevel.SEVERE]: "degraded",
+    [DegradationLevel.CRITICAL]: "unavailable",
+  },
+  "proposals/list": {
+    [DegradationLevel.NORMAL]: "fresh",
+    [DegradationLevel.SLIGHT]: "cached",
+    [DegradationLevel.MODERATE]: "degraded",
+    [DegradationLevel.SEVERE]: "unavailable",
+    [DegradationLevel.CRITICAL]: "unavailable",
+  },
+  "vote/submit": {
+    [DegradationLevel.NORMAL]: "fresh",
+    [DegradationLevel.SLIGHT]: "fresh",
+    [DegradationLevel.MODERATE]: "fresh",
+    [DegradationLevel.SEVERE]: "fresh",
+    [DegradationLevel.CRITICAL]: "fresh",
+  },
+  "payment/submit": {
+    [DegradationLevel.NORMAL]: "fresh",
+    [DegradationLevel.SLIGHT]: "fresh",
+    [DegradationLevel.MODERATE]: "fresh",
+    [DegradationLevel.SEVERE]: "fresh",
+    [DegradationLevel.CRITICAL]: "fresh",
+  },
+}
+
 export class DegradedModeService {
   private currentLevel: DegradationLevel = DegradationLevel.NORMAL
-  private activeReasons: Set<string> = new Set()
+  /**
+   * Serialisable reason → level map.  Stored as a plain record so it can be
+   * round-tripped through JSON for cross-replica propagation.
+   */
+  private reasonLevels: Record<string, DegradationLevel> = {}
+  /** Dedup set for cursor-based replay after reconnect. */
+  private replayedCursors: Set<string> = new Set()
   private degradationStartTime?: Date
 
   /**
    * Trigger degradation for a specific reason
    */
   triggerDegradation(reason: string, level: DegradationLevel): void {
-    this.activeReasons.add(reason)
-    
+    this.reasonLevels[reason] = level
+
     if (level > this.currentLevel) {
       this.currentLevel = level
       if (!this.degradationStartTime) {
@@ -42,9 +103,9 @@ export class DegradedModeService {
    * Clear degradation for a specific reason
    */
   clearDegradation(reason: string): void {
-    this.activeReasons.delete(reason)
-    
-    if (this.activeReasons.size === 0) {
+    delete this.reasonLevels[reason]
+
+    if (Object.keys(this.reasonLevels).length === 0) {
       this.currentLevel = DegradationLevel.NORMAL
       this.degradationStartTime = undefined
       console.info('System recovered to normal operation')
@@ -59,10 +120,76 @@ export class DegradedModeService {
   getState(): DegradationState {
     return {
       level: this.currentLevel,
-      activeReasons: Array.from(this.activeReasons),
+      activeReasons: Object.keys(this.reasonLevels),
       startedAt: this.degradationStartTime || new Date(),
       expectedRecovery: this.estimateRecovery()
     }
+  }
+
+  /**
+   * Return the data status for a named endpoint at the current degradation level.
+   * Endpoints not in the matrix use a generic mapping.
+   */
+  endpointStatus(endpoint: string): DataStatus {
+    const matrix = ENDPOINT_STATUS_MATRIX[endpoint]
+    if (matrix) {
+      const status = matrix[this.currentLevel]
+      if (status !== undefined) return status
+    }
+    // Generic fallback
+    switch (this.currentLevel) {
+      case DegradationLevel.NORMAL: return "fresh"
+      case DegradationLevel.SLIGHT: return "cached"
+      case DegradationLevel.MODERATE: return "cached"
+      case DegradationLevel.SEVERE: return "degraded"
+      case DegradationLevel.CRITICAL: return "unavailable"
+      default: return "fresh"
+    }
+  }
+
+  /**
+   * Merge serialised reason map from another replica.
+   * Existing reasons with a higher level are kept.
+   */
+  mergeReasonLevels(remote: Record<string, DegradationLevel>): void {
+    for (const [reason, level] of Object.entries(remote)) {
+      if ((this.reasonLevels[reason] ?? -1) < level) {
+        this.triggerDegradation(reason, level)
+      }
+    }
+  }
+
+  /**
+   * Serialise the current reason map for cross-replica propagation.
+   */
+  exportReasonLevels(): Record<string, DegradationLevel> {
+    return { ...this.reasonLevels }
+  }
+
+  // ── Replay / dedup ──────────────────────────────────────────────────────
+
+  /**
+   * Returns true if `cursor` has NOT yet been replayed and marks it as seen.
+   * Call this for every event cursor during reconnect replay; events that
+   * return false have already been processed and must be skipped.
+   */
+  shouldReplay(cursor: string): boolean {
+    if (this.replayedCursors.has(cursor)) return false
+    this.replayedCursors.add(cursor)
+    return true
+  }
+
+  /**
+   * Explicitly mark a cursor as replayed (for callers that handle the event
+   * outside `shouldReplay`).
+   */
+  markReplayed(cursor: string): void {
+    this.replayedCursors.add(cursor)
+  }
+
+  /** Clear the replay dedup set (call after a full reconnect cycle completes). */
+  clearReplayState(): void {
+    this.replayedCursors.clear()
   }
 
   /**
@@ -146,18 +273,12 @@ export class DegradedModeService {
   }
 
   private recalculateLevel(): void {
-    // In a real implementation, would evaluate all active reasons
-    // and determine appropriate degradation level
-    const reasons = Array.from(this.activeReasons)
-    if (reasons.length === 0) {
+    const levels = Object.values(this.reasonLevels)
+    if (levels.length === 0) {
       this.currentLevel = DegradationLevel.NORMAL
-    } else if (reasons.some(r => r.includes('panic') || r.includes('critical'))) {
-      this.currentLevel = DegradationLevel.CRITICAL
-    } else if (reasons.some(r => r.includes('rotation') || r.includes('surge'))) {
-      this.currentLevel = DegradationLevel.SEVERE
-    } else {
-      this.currentLevel = DegradationLevel.MODERATE
+      return
     }
+    this.currentLevel = Math.max(...levels) as DegradationLevel
   }
 
   private estimateRecovery(): Date | undefined {
