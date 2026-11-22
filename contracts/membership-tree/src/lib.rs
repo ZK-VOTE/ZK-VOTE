@@ -135,9 +135,9 @@ pub enum DataKey {
     CommitmentSaltHash(u64, BytesN<32>), // (dao_id, hash) -> true (replay guard)
 
     // --- Epoch checkpointing (revocation-epoch pinning) ---
-    Epoch(u64),                    // dao_id -> current epoch (u32)
-    EpochRoot(u64, u32),           // (dao_id, epoch) -> U256 root
-    EpochAdvancedAt(u64, u32),     // (dao_id, epoch) -> ledger timestamp
+    Epoch(u64),                // dao_id -> current epoch (u32)
+    EpochRoot(u64, u32),       // (dao_id, epoch) -> U256 root
+    EpochAdvancedAt(u64, u32), // (dao_id, epoch) -> ledger timestamp
 }
 
 #[contracttype]
@@ -978,11 +978,7 @@ impl MembershipTree {
     /// enough on its own when the salt is low-entropy or reused. Committing to
     /// the *salted hash* means a mempool observer cannot front-run the
     /// commitment before the reveal ledger.
-    pub fn hash_registration(
-        env: Env,
-        commitment: U256,
-        salt: BytesN<32>,
-    ) -> BytesN<32> {
+    pub fn hash_registration(env: Env, commitment: U256, salt: BytesN<32>) -> BytesN<32> {
         Self::bump_instance(&env);
         let mut input = Bytes::new(&env);
         input.append(&commitment.to_be_bytes());

@@ -3147,7 +3147,14 @@ fn test_activate_halt_blocks_vote_submission_tier_only() {
     assert!(!client.is_tier_halted(&HALT_TIER_TALLY_FINALIZATION));
 
     let proposal = client.get_proposal(&1u64, &proposal_id);
-    let res = client.try_vote(&1u64, &proposal_id, &true, &nullifier, &proposal.eligible_root, &proof);
+    let res = client.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
     assert!(res.is_err());
 }
 
@@ -3168,7 +3175,14 @@ fn test_fast_halt_expires_automatically_if_not_ratified() {
 
     // And voting actually works again - the gate, not just the getter, sees the expiry.
     let proposal = client.get_proposal(&1u64, &proposal_id);
-    client.vote(&1u64, &proposal_id, &true, &nullifier, &proposal.eligible_root, &proof);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
 }
 
 #[test]
@@ -3185,13 +3199,19 @@ fn test_fast_halt_resumed_early_by_its_activator() {
     assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
 
     let proposal = client.get_proposal(&1u64, &proposal_id);
-    client.vote(&1u64, &proposal_id, &true, &nullifier, &proposal.eligible_root, &proof);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
 }
 
 #[test]
 fn test_fast_halt_cannot_be_resumed_by_a_non_activator() {
-    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) =
-        setup_halt_vote_env();
+    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) = setup_halt_vote_env();
     client.activate_halt(
         &HALT_TIER_VOTE_SUBMISSION,
         &String::from_str(&env, "x"),
@@ -3236,7 +3256,14 @@ fn test_ratified_halt_survives_fast_expiry_and_requires_quorum_to_resume() {
     assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
 
     let proposal = client.get_proposal(&1u64, &proposal_id);
-    let res = client.try_vote(&1u64, &proposal_id, &true, &nullifier, &proposal.eligible_root, &proof);
+    let res = client.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
     assert!(res.is_err());
 
     // The original activator alone cannot resume a ratified halt.
@@ -3250,17 +3277,31 @@ fn test_ratified_halt_survives_fast_expiry_and_requires_quorum_to_resume() {
     assert!(client.resume_halt(&signer_c));
     assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
 
-    client.vote(&1u64, &proposal_id, &true, &nullifier, &proposal.eligible_root, &proof);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
 }
 
 #[test]
 fn test_halt_ratification_rejects_duplicate_and_unknown_signer() {
-    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) =
-        setup_halt_vote_env();
+    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) = setup_halt_vote_env();
     let signer_a = Address::generate(&env);
     let signer_b = Address::generate(&env);
-    client.set_halt_quorum(&soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone()], &2u32, &guardian);
-    client.activate_halt(&HALT_TIER_VOTE_SUBMISSION, &String::from_str(&env, "x"), &guardian);
+    client.set_halt_quorum(
+        &soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone()],
+        &2u32,
+        &guardian,
+    );
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "x"),
+        &guardian,
+    );
 
     assert!(!client.ratify_halt(&signer_a));
     let dup = client.try_ratify_halt(&signer_a);
@@ -3276,7 +3317,9 @@ fn test_invalid_halt_tier_and_quorum_rejected() {
     let (env, client, guardian, ..) = setup_halt_vote_env();
 
     // Zero tiers / a bit outside the known mask.
-    assert!(client.try_activate_halt(&0u32, &String::from_str(&env, "x"), &guardian).is_err());
+    assert!(client
+        .try_activate_halt(&0u32, &String::from_str(&env, "x"), &guardian)
+        .is_err());
     assert!(client
         .try_activate_halt(&0x8u32, &String::from_str(&env, "x"), &guardian)
         .is_err());
@@ -3769,7 +3812,13 @@ fn setup_universal_tally_proposal(
         &VoteMode::Fixed,
     );
 
-    client.set_proposal_semantics(&dao_id, &proposal_id, &semantics_id, &semantics_version, &admin);
+    client.set_proposal_semantics(
+        &dao_id,
+        &proposal_id,
+        &semantics_id,
+        &semantics_version,
+        &admin,
+    );
     client.set_semantics_vk(
         &dao_id,
         &semantics_id,
@@ -3906,13 +3955,8 @@ fn test_set_proposal_semantics_is_one_shot() {
     // Proposal was already activated by the fixture, so even a repeat call
     // with the same tuple is now also rejected for being past Registration;
     // this just confirms pinning is not silently idempotent either way.
-    let res = client.try_set_proposal_semantics(
-        &dao_id,
-        &proposal_id,
-        &SEMANTICS_YES_NO,
-        &1u32,
-        &admin,
-    );
+    let res =
+        client.try_set_proposal_semantics(&dao_id, &proposal_id, &SEMANTICS_YES_NO, &1u32, &admin);
     assert!(res.is_err());
 }
 

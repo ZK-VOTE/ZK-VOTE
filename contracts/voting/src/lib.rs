@@ -703,13 +703,13 @@ pub enum DataKey {
 
     // ── Encrypted-tally path (vote-choice privacy) ─────────────────────────
     /// Verification key for `vote_encrypted.circom` (15 public signals).
-    EncryptedVk(u64),          // dao_id -> VerificationKey
-    EncryptedVkVersion(u64),   // dao_id -> u32
+    EncryptedVk(u64), // dao_id -> VerificationKey
+    EncryptedVkVersion(u64), // dao_id -> u32
     /// Per-proposal encryption configuration + ceremony authorities.
     EncryptedConfig(u64, u64), // (dao_id, proposal_id) -> EncryptedTallyConfig
     /// One encrypted ballot, keyed by election-scoped nullifier.
     EncryptedBallot(u64, u64, U256), // (dao_id, proposal_id, nullifier) -> EncryptedBallot
-    EncryptedBallotCount(u64, u64),  // (dao_id, proposal_id) -> u64
+    EncryptedBallotCount(u64, u64), // (dao_id, proposal_id) -> u64
     /// Finalized decrypted aggregate.
     EncryptedTally(u64, u64), // (dao_id, proposal_id) -> EncryptedTallyResult
 
@@ -1948,9 +1948,10 @@ impl Voting {
             reason: reason.clone(),
         };
         env.storage().instance().set(&DataKey::HaltState, &info);
-        env.storage()
-            .instance()
-            .set(&DataKey::HaltRatificationApprovals, &Vec::<Address>::new(&env));
+        env.storage().instance().set(
+            &DataKey::HaltRatificationApprovals,
+            &Vec::<Address>::new(&env),
+        );
         env.storage()
             .instance()
             .set(&DataKey::HaltResumeApprovals, &Vec::<Address>::new(&env));
@@ -2309,7 +2310,11 @@ impl Voting {
         env.storage().persistent().set(&version_key, &new_version);
         Self::bump_persistent(&env, &version_key);
 
-        EncryptedVKSetEvent { dao_id, version: new_version }.publish(&env);
+        EncryptedVKSetEvent {
+            dao_id,
+            version: new_version,
+        }
+        .publish(&env);
     }
 
     pub fn encrypted_vk_version(env: Env, dao_id: u64) -> u32 {
@@ -3611,7 +3616,9 @@ impl Voting {
         Self::bump_persistent(&env, &curve_key);
 
         let end_time_key = DataKey::ProposalEndTime(dao_id, proposal_id);
-        env.storage().persistent().set(&end_time_key, &params.end_time);
+        env.storage()
+            .persistent()
+            .set(&end_time_key, &params.end_time);
         Self::bump_persistent(&env, &end_time_key);
 
         let config = EncryptedTallyConfig {

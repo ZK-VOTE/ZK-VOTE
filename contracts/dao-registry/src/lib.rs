@@ -1685,7 +1685,7 @@ impl DaoRegistry {
         let now_ledger = env.ledger().sequence();
 
         // If a reservation already exists and has not expired, reject.
-        if let Some(existing): Option<NameReservation> = env.storage().temporary().get(&key) {
+        if let Some(existing) = env.storage().temporary().get::<_, NameReservation>(&key) {
             if existing.expires_at >= now_ledger {
                 panic_with_error!(&env, RegistryError::NameAlreadyReserved);
             }
@@ -1699,9 +1699,11 @@ impl DaoRegistry {
         };
         env.storage().temporary().set(&key, &reservation);
         // Extend TTL so the entry survives until expiry.
-        env.storage()
-            .temporary()
-            .extend_ttl(&key, RESERVATION_TTL_LEDGERS, RESERVATION_TTL_LEDGERS);
+        env.storage().temporary().extend_ttl(
+            &key,
+            RESERVATION_TTL_LEDGERS,
+            RESERVATION_TTL_LEDGERS,
+        );
     }
 
     /// Read back a name reservation (for frontend UX / availability checks).
