@@ -693,7 +693,10 @@ fn test_epoch_zero_is_the_initial_root() {
     tree_client.init_tree(&1u64, &5u32, &Symbol::new(&env, "BN254"), &_admin);
 
     assert_eq!(tree_client.current_epoch(&1u64), 0);
-    assert_eq!(tree_client.epoch_root(&1u64, &0u32), tree_client.current_root(&1u64));
+    assert_eq!(
+        tree_client.epoch_root(&1u64, &0u32),
+        tree_client.current_root(&1u64)
+    );
     assert!(tree_client.epoch_root_ok(&1u64, &0u32, &tree_client.current_root(&1u64)));
 }
 

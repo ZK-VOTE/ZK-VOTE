@@ -123,6 +123,30 @@ not proof that all cross-family routes reject a wrong key.
 artifacts, differential math tests, mixed-ballot rejection evidence,
 on-chain tally integration and cost measurements.
 
+**Follow-up (ZV-112 / Issue #952):** implements the tuple and verification
+gates and on-chain integration as an *additive* path alongside the existing
+yes/no-only `submit_recursive_tally`/`verify_tally_proof`, which are
+untouched:
+
+- `circuits/tally_universal.circom` - one template per semantics (yes/no,
+  QV, weighted), each exposing `(semanticsId, semanticsVersion)` as public
+  signals.
+- `contracts/voting/src/lib.rs` - `set_proposal_semantics` (pin the tuple
+  pre-vote), `set_semantics_vk` (one VK per `(dao_id, semanticsId,
+  semanticsVersion)` - "mixed proof families" have no VK to verify against
+  under each other's tuple), `submit_universal_tally` (rejects a mismatched
+  tuple before attempting Groth16 verification).
+- `circuits/universal-tally-reference.js` / `circuits/universal-tally.test.js`
+  - the differential math tests and mixed-proof-family rejection evidence,
+  runnable as pure JS.
+- `circuits/universal-tally.benchmark.js` - a *static constraint-count
+  estimate*, explicitly not a measured proving/verification cost; the
+  circom 2.1.8 compiler was not available in the environment this was
+  written in (see `circuits/COMPILATION.md`), so the circuit itself has not
+  been compiled or witness-tested, and no trusted setup / VK exists yet.
+  **#699 is therefore still not acceptance-complete** - see
+  `docs/recursive-proof-architecture.md` §8 for the full remaining list.
+
 ## #698 — BN254 verifier boundary
 
 The reported absence of adversarial coverage is partly outdated:

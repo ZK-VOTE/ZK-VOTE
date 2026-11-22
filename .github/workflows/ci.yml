@@ -179,6 +179,8 @@ jobs:
           VOTING_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
           TREE_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
           COMMENTS_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+      - name: SDK circuit-compatibility matrix check (ZV-113 / #953)
+        run: npx tsx ../scripts/ci/verify-sdk-compatibility-matrix.mjs
       - name: Report test counts
         if: always()
         run: |

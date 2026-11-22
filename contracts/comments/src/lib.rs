@@ -1965,7 +1965,13 @@ mod test {
 
         // Admin deletes member's comment (supply a non-zero reason hash)
         let reason_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-        comments_client.admin_delete_comment(&dao_id, &proposal_id, &comment_id, &admin, &reason_hash);
+        comments_client.admin_delete_comment(
+            &dao_id,
+            &proposal_id,
+            &comment_id,
+            &admin,
+            &reason_hash,
+        );
 
         let comment = comments_client.get_comment(&dao_id, &proposal_id, &comment_id);
         assert!(comment.deleted);
@@ -2136,7 +2142,13 @@ mod test {
 
         // Non-admin tries to admin-delete
         let reason_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-        comments_client.admin_delete_comment(&dao_id, &proposal_id, &comment_id, &non_admin, &reason_hash);
+        comments_client.admin_delete_comment(
+            &dao_id,
+            &proposal_id,
+            &comment_id,
+            &non_admin,
+            &reason_hash,
+        );
     }
 
     // ========================================================================

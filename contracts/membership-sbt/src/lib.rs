@@ -324,7 +324,9 @@ impl MembershipSbt {
         if epoch_count >= MAX_MINTS_PER_EPOCH {
             panic_with_error!(&env, SbtError::MintRateLimitExceeded);
         }
-        env.storage().temporary().set(&epoch_key, &(epoch_count + 1));
+        env.storage()
+            .temporary()
+            .set(&epoch_key, &(epoch_count + 1));
         env.storage()
             .temporary()
             .extend_ttl(&epoch_key, EPOCH_LEDGERS, EPOCH_LEDGERS * 2);
@@ -1118,7 +1120,12 @@ impl MembershipSbt {
     /// Off-chain tooling MUST simulate this call and scan the resulting
     /// diagnostic events for `SbtInvariantViolation` before submitting the
     /// upgrade transaction.  See `docs/contract-upgrade-framework.md`.
-    pub fn upgrade(env: Env, registry: Address, wasm_hash: soroban_sdk::BytesN<32>, to_version: u32) {
+    pub fn upgrade(
+        env: Env,
+        registry: Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+        to_version: u32,
+    ) {
         Self::bump_instance(&env);
         registry.require_auth();
 

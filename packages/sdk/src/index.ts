@@ -9,4 +9,14 @@ export * from './derive'
 export * from './keys'
 export * from './cache'
 export * from './types'
-export { VERSION, CIRCUIT_COMPATIBILITY } from './version'
+export * from './registry'
+export {
+  VERSION,
+  CIRCUIT_COMPATIBILITY,
+  isCircuitCompatible,
+  getVersion,
+  getSupportedCircuitVersions,
+  checkCircuitVersion,
+  UnsupportedCircuitVersionError,
+  type CircuitVersionCheck,
+} from './version'

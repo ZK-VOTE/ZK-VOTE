@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
 import { getZkVoteClient } from "../lib/client";
 import { extractTxHash } from "../lib/utils";
-import { notifyEvent } from "../lib/api";
+import { notifyEvent, relayerFetch } from "../lib/api";
 import { Button } from "./ui/Button";
 import {
   Card,
@@ -14,7 +14,20 @@ import {
 // LoadingSpinner is imported but currently unused (may be used for future loading states)
 import { ConfirmModal } from "./ui/ConfirmModal";
 import DAOProfileEditor from "./DAOProfileEditor";
-import { Settings, Users, FileText, Loader2 } from "lucide-react";
+import { Settings, Users, FileText, Loader2, ShieldAlert } from "lucide-react";
+
+/** Mirrors backend/src/services/haltStatus.ts's HALT_TIERS (ZV-114 / #954). */
+interface HaltTierStatus {
+  tier: number;
+  name: string;
+  halted: boolean | null;
+}
+
+const HALT_TIER_LABELS: Record<string, string> = {
+  vote_submission: "Vote Submission",
+  tally_finalization: "Tally Finalization",
+  treasury_execution: "Treasury Execution",
+};
 
 interface DAOSettingsProps {
   daoId: number;
@@ -43,6 +56,29 @@ export default function DAOSettings({
     type: "membership" | "proposals";
     newValue: boolean;
   } | null>(null);
+  const [haltTiers, setHaltTiers] = useState<HaltTierStatus[] | null>(null);
+  const [haltStatusError, setHaltStatusError] = useState(false);
+
+  // Tiered emergency halt status (ZV-114 / #954): read-only, public
+  // endpoint - this is display only, there is no in-app action to
+  // activate/ratify/resume a halt (those are guardian/quorum contract
+  // calls, see backend/src/services/haltStatus.ts).
+  useEffect(() => {
+    let cancelled = false;
+    relayerFetch("/voting/halt/status")
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled && Array.isArray(data?.tiers)) {
+          setHaltTiers(data.tiers);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setHaltStatusError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleToggleMembership = async () => {
     if (!confirmModal) return;
@@ -202,6 +238,62 @@ export default function DAOSettings({
               )}
             </Button>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Emergency Halt Status (ZV-114 / #954) - read-only; activation is a
+          guardian/quorum contract call, not an in-app action here. */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldAlert className="w-5 h-5" />
+            Emergency Halt Status
+          </CardTitle>
+          <CardDescription>
+            Live status of the protocol's tiered emergency halt. A halted
+            tier blocks only its own operations; it is activated and
+            resumed by the guardian/quorum directly against the contract,
+            not from this page.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {haltStatusError && (
+            <p className="text-sm text-muted-foreground">
+              Could not load halt status.
+            </p>
+          )}
+          {!haltStatusError && !haltTiers && (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          )}
+          {haltTiers && (
+            <ul className="space-y-2">
+              {haltTiers.map((tier) => (
+                <li
+                  key={tier.name}
+                  className="flex items-center justify-between p-3 rounded-lg border bg-muted/30"
+                >
+                  <span className="text-sm font-medium">
+                    {HALT_TIER_LABELS[tier.name] ?? tier.name}
+                  </span>
+                  <span
+                    className={
+                      tier.halted === true
+                        ? "text-sm font-medium text-destructive"
+                        : tier.halted === false
+                          ? "text-sm font-medium text-muted-foreground"
+                          : "text-sm font-medium text-muted-foreground italic"
+                    }
+                  >
+                    {tier.halted === true
+                      ? "Halted"
+                      : tier.halted === false
+                        ? "Active"
+                        : "Unknown"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
         </CardContent>
       </Card>
 

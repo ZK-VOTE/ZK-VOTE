@@ -762,14 +762,7 @@ fn test_create_dao_idempotent_replays_same_dao() {
     let key = BytesN::from_array(&env, &[9u8; 32]);
     let name = String::from_str(&env, "Idempotent DAO");
 
-    let (dao_id, created) = client.create_dao_idempotent(
-        &key,
-        &name,
-        &admin,
-        &true,
-        &true,
-        &None,
-    );
+    let (dao_id, created) = client.create_dao_idempotent(&key, &name, &admin, &true, &true, &None);
     assert_eq!(dao_id, 1);
     assert!(created);
     assert_eq!(client.dao_count(), 1);

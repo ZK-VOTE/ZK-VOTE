@@ -15,11 +15,45 @@ import {
   cancelVkUpgrade,
   getVkProposal,
   getDaoVkProposal,
+  getCompatibilityMatrix,
 } from "../services/circuit-registry.js";
 import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();
+
+/**
+ * GET /circuits/compatibility-matrix - the SDK circuit-compatibility
+ * matrix enforcement endpoint (ZV-113 / #953).
+ *
+ * EPIC-004 promises "SDK version N supports circuits version N and N-1",
+ * but until this endpoint existed there was nothing an SDK could check
+ * that promise against at runtime - CIRCUIT_COMPATIBILITY in
+ * packages/sdk/src/version.ts was a static, offline table. This returns,
+ * for every circuit this registry knows about, its current version and
+ * the N/N-1 window a client may still use - see
+ * packages/sdk/src/registry.ts (`createHttpRegistryClient`) and
+ * packages/sdk/src/version.ts (`checkCircuitVersion`) for the consumer
+ * side, and scripts/ci/verify-sdk-compatibility-matrix.mjs for the CI
+ * check that runs this on every release. The matrix-building logic itself
+ * lives in circuit-registry.ts's `getCompatibilityMatrix()`, which is
+ * unit-tested directly (test/di/circuit-registry.test.ts) without going
+ * through this route.
+ */
+router.get("/circuits/compatibility-matrix", queryLimiter, (async (
+  _req: Request,
+  res: Response,
+) => {
+  try {
+    const matrix = await getCompatibilityMatrix();
+    res.json({ matrix, generatedAt: new Date().toISOString() });
+  } catch (error) {
+    log("error", "compatibility_matrix_error", {
+      error: (error as Error).message,
+    });
+    res.status(500).json({ error: "Failed to build compatibility matrix" });
+  }
+}) as AsyncHandler);
 
 // Existing: circuit status for DAO migration
 router.get("/circuits/:dao/:type/status", queryLimiter, (async (
