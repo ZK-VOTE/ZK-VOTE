@@ -32,6 +32,7 @@ import crypto from "node:crypto";
 let vaultConfig: VaultConfig | undefined;
 let encryptionKey: string;
 let backend: SecretBackend = "env";
+let _environment: string = "development"; // set by initSecretManager; gates fail-closed behaviour
 const rotationMetadata: Record<
   string,
   { metadata: import("./types.js").SecretMetadata | undefined }
@@ -48,7 +49,7 @@ const pendingFetches: Map<string, Promise<string | undefined>> = new Map();
  * Initialize the secrets manager with configuration options.
  * Must be called before any secret is retrieved.
  */
-export function initSecretManager(options: SecretManagerOptions): void {
+export function initSecretManager(options: SecretManagerOptions & { environment?: string }): void {
   if (options.vault) {
     vaultConfig = options.vault;
     backend = "vault";
@@ -58,6 +59,7 @@ export function initSecretManager(options: SecretManagerOptions): void {
   }
 
   encryptionKey = options.encryptionKey ?? generateMasterKey();
+  _environment = options.environment ?? process.env.NODE_ENV ?? "development";
 
   log("info", "secret_manager_initialized", {
     backend,
@@ -225,10 +227,15 @@ async function fetchSecretValue(key: string): Promise<string | undefined> {
     if (vaultValue !== null) {
       return vaultValue;
     }
+    if (_environment === "production") {
+      throw new Error(
+        `[secrets] Vault unavailable in production for key "${key}". Configure a reachable Vault or remove the Vault configuration to allow env fallback.`,
+      );
+    }
     log("warn", "vault_fallback_to_env", { key });
   }
 
-  // Fallback to environment variables (Fly.io secrets or .env)
+  // Fallback to environment variables (Fly.io secrets or .env — allowed outside production)
   const envValue = process.env[key];
   if (envValue) {
     backend =
@@ -341,6 +348,19 @@ export async function checkRotationHealth(): Promise<
     vaultAvailable: !!vaultConfig,
     lastCheckedAt: new Date().toISOString(),
   };
+}
+
+// ============================================
+// READINESS
+
+/**
+ * Returns false when any tracked secret is overdue for rotation.
+ * Wire into the `/healthz/ready` response so load-balancers can drain the
+ * replica before its secrets expire (#919 acceptance criterion 3).
+ */
+export async function isReadinessHealthy(): Promise<boolean> {
+  const health = await checkRotationHealth();
+  return health.overall !== "critical" && health.overall !== "degraded";
 }
 
 // ============================================
