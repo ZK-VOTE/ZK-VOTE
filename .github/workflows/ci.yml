@@ -36,6 +36,14 @@ jobs:
           bash scripts/deploy/verify-wasm-signature.sh target/wasm32v1-none/release/dao_registry.wasm
       - name: Run unit tests (workspace, excluding integration)
         run: cargo test --workspace --exclude zkvote-integration-tests --locked
+      - name: Property-based tests — nova-aggregator (ZV-047 / #896)
+        # Runs proptest suites with a fixed seed (PROPTEST_SEED) for
+        # reproducibility. Failures are shrunk and saved to
+        # crates/nova-aggregator/proptest-regressions/ for rerun.
+        # 1,000 cases per property; bounded to stay within CI time budget.
+        run: cargo test -p nova-aggregator proptest -- --nocapture
+        env:
+          PROPTEST_CASES: "1000"
       - name: Run integration tests (explicit, #575)
         # zkvote-integration-tests is a workspace member but excluded from
         # default-members, so it must be invoked explicitly — otherwise
@@ -181,6 +189,21 @@ jobs:
           COMMENTS_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
       - name: SDK circuit-compatibility matrix check (ZV-113 / #953)
         run: npx tsx ../scripts/ci/verify-sdk-compatibility-matrix.mjs
+      - name: Property-based tests — ZKV1 proof serialization (ZV-047 / #896)
+        # Runs fast-check suites with a fixed seed for reproducibility.
+        # Each suite exercises ≥1,000 generated cases; failures print the
+        # minimal counterexample. The seed can be overridden with FAST_CHECK_SEED.
+        run: npm run test:property 2>&1 | tee property-test-output.log
+        env:
+          RELAYER_TEST_MODE: "true"
+          FAST_CHECK_SEED: "5a4b3c2d"
+      - name: Upload property-test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: property-test-results
+          path: backend/property-test-output.log
+          retention-days: 30
       - name: Report test counts
         if: always()
         run: |
