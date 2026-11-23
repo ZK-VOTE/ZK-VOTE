@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "circomVersion": "2.1.8",
   "description": "Circom circuits for ZKVote anonymous voting",
+  "engines": {
+    "node": "24.x",
+    "npm": "10.x"
+  },
   "main": "index.js",
   "scripts": {
     "compile": "../scripts/compile-circuits.sh",
