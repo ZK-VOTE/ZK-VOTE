@@ -34,6 +34,7 @@ export interface ArchiveRecord {
   archive_id: string;
   dao_id: number;
   proposal_id: number | null;
+  storage_category: string; // "governance" | "voting" | "membership" | "auxiliary"
   file_name: string;
   file_path: string;
   event_count: number;
@@ -43,7 +44,20 @@ export interface ArchiveRecord {
   max_ledger: number | null;
   size_bytes: number;
   checksum: string;
+  commitment: string; // Cryptographic Merkle / canonical state commitment
+  status: "archived" | "restored" | "recommitted";
+  recommitted_at?: string;
   created_at?: string;
+}
+
+export interface RestorationResult {
+  success: boolean;
+  archiveId: string;
+  restoredEventsCount: number;
+  commitmentVerified: boolean;
+  recommitted: boolean;
+  status: string;
+  error?: string;
 }
 
 export interface ArchivalJobResult {
@@ -70,6 +84,32 @@ export function ensureArchiveDir(): string {
 }
 
 /**
+ * Deterministically compute a cryptographic state commitment (Merkle-like digest)
+ * across an array of archived events.
+ */
+export function computeStateCommitment(events: any[]): string {
+  const sorted = [...events].sort((a, b) => {
+    const lA = Number(a.ledger ?? 0);
+    const lB = Number(b.ledger ?? 0);
+    if (lA !== lB) return lA - lB;
+    const tA = String(a.timestamp ?? "");
+    const tB = String(b.timestamp ?? "");
+    if (tA !== tB) return tA.localeCompare(tB);
+    return String(a.id ?? "").localeCompare(String(b.id ?? ""));
+  });
+
+  const leafHashes = sorted.map((ev) => {
+    const canonical = JSON.stringify(ev, Object.keys(ev).sort());
+    return crypto.createHash("sha256").update(canonical).digest("hex");
+  });
+
+  return crypto
+    .createHash("sha256")
+    .update(leafHashes.join(":"))
+    .digest("hex");
+}
+
+/**
  * Ensure archive_records tracking table exists in database
  */
 export function initArchiveRegistry(db: DatabaseType): void {
@@ -78,6 +118,7 @@ export function initArchiveRegistry(db: DatabaseType): void {
       archive_id TEXT PRIMARY KEY,
       dao_id INTEGER NOT NULL,
       proposal_id INTEGER,
+      storage_category TEXT NOT NULL DEFAULT 'voting',
       file_name TEXT NOT NULL,
       file_path TEXT NOT NULL,
       event_count INTEGER NOT NULL,
@@ -87,10 +128,34 @@ export function initArchiveRegistry(db: DatabaseType): void {
       max_ledger INTEGER,
       size_bytes INTEGER NOT NULL,
       checksum TEXT NOT NULL,
+      commitment TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'archived',
+      recommitted_at TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_archive_records_dao ON archive_records(dao_id);
+    CREATE INDEX IF NOT EXISTS idx_archive_records_category ON archive_records(storage_category);
   `);
+
+  // Migrate older tables missing columns
+  try {
+    const tableInfo = db.pragma("table_info(archive_records)") as Array<{ name: string }>;
+    const existingCols = new Set(tableInfo.map((c) => c.name));
+    if (!existingCols.has("storage_category")) {
+      db.exec("ALTER TABLE archive_records ADD COLUMN storage_category TEXT NOT NULL DEFAULT 'voting'");
+    }
+    if (!existingCols.has("commitment")) {
+      db.exec("ALTER TABLE archive_records ADD COLUMN commitment TEXT NOT NULL DEFAULT ''");
+    }
+    if (!existingCols.has("status")) {
+      db.exec("ALTER TABLE archive_records ADD COLUMN status TEXT NOT NULL DEFAULT 'archived'");
+    }
+    if (!existingCols.has("recommitted_at")) {
+      db.exec("ALTER TABLE archive_records ADD COLUMN recommitted_at TEXT");
+    }
+  } catch (_) {
+    // Ignore migration pragma errors if already present
+  }
 }
 
 /**
@@ -219,6 +284,7 @@ export async function runArchivalJob(
         .update(compressedBuffer)
         .digest("hex");
       const sizeBytes = compressedBuffer.length;
+      const commitment = computeStateCommitment(eventsToArchive);
 
       const timestamps = eventsToArchive.map((e) => e.timestamp).sort();
       const ledgers = eventsToArchive
@@ -229,6 +295,7 @@ export async function runArchivalJob(
         archive_id: archiveId,
         dao_id: daoId,
         proposal_id: null,
+        storage_category: "voting",
         file_name: fileName,
         file_path: filePath,
         event_count: eventsToArchive.length,
@@ -238,18 +305,25 @@ export async function runArchivalJob(
         max_ledger: ledgers.length > 0 ? Math.max(...ledgers) : null,
         size_bytes: sizeBytes,
         checksum,
+        commitment,
+        status: "archived",
       };
 
       // Register archive record in index
       db.prepare(
         `
-        INSERT INTO archive_records (archive_id, dao_id, proposal_id, file_name, file_path, event_count, min_timestamp, max_timestamp, min_ledger, max_ledger, size_bytes, checksum)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO archive_records (
+          archive_id, dao_id, proposal_id, storage_category,
+          file_name, file_path, event_count, min_timestamp, max_timestamp,
+          min_ledger, max_ledger, size_bytes, checksum, commitment, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       ).run(
         record.archive_id,
         record.dao_id,
         record.proposal_id,
+        record.storage_category,
         record.file_name,
         record.file_path,
         record.event_count,
@@ -259,6 +333,8 @@ export async function runArchivalJob(
         record.max_ledger,
         record.size_bytes,
         record.checksum,
+        record.commitment,
+        record.status,
       );
 
       createdRecords.push(record);
@@ -371,6 +447,228 @@ export function readArchivedEvents(archiveId: string): any[] {
       error: (err as Error).message,
     });
     return [];
+  }
+}
+
+/**
+ * Verify cryptographic integrity and commitment of an archived state file.
+ */
+export function verifyArchivedState(archiveId: string): {
+  valid: boolean;
+  reason?: string;
+  record?: ArchiveRecord;
+  events?: any[];
+} {
+  const db = getDb();
+  if (!db) return { valid: false, reason: "Database not available" };
+  initArchiveRegistry(db);
+
+  const record = db
+    .prepare("SELECT * FROM archive_records WHERE archive_id = ?")
+    .get(archiveId) as ArchiveRecord | undefined;
+  if (!record) {
+    return { valid: false, reason: `Archive record not found: ${archiveId}` };
+  }
+
+  if (!fs.existsSync(record.file_path)) {
+    return {
+      valid: false,
+      reason: `Archive file missing on disk: ${record.file_path}`,
+      record,
+    };
+  }
+
+  let compressedBuffer: Buffer;
+  try {
+    compressedBuffer = fs.readFileSync(record.file_path);
+  } catch (err) {
+    return {
+      valid: false,
+      reason: `Failed to read archive file: ${(err as Error).message}`,
+      record,
+    };
+  }
+
+  const checksum = crypto
+    .createHash("sha256")
+    .update(compressedBuffer)
+    .digest("hex");
+  if (checksum !== record.checksum) {
+    return {
+      valid: false,
+      reason: `Checksum mismatch: expected ${record.checksum}, got ${checksum}`,
+      record,
+    };
+  }
+
+  let decompressed: string;
+  let events: any[];
+  try {
+    decompressed = zlib.gunzipSync(compressedBuffer).toString("utf-8");
+    events = decompressed
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line));
+  } catch (err) {
+    return {
+      valid: false,
+      reason: `Corrupted gzip/json content: ${(err as Error).message}`,
+      record,
+    };
+  }
+
+  if (events.length !== record.event_count) {
+    return {
+      valid: false,
+      reason: `Event count mismatch: record has ${record.event_count}, file has ${events.length}`,
+      record,
+    };
+  }
+
+  const computedCommitment = computeStateCommitment(events);
+  if (record.commitment && computedCommitment !== record.commitment) {
+    return {
+      valid: false,
+      reason: `Commitment verification failed: expected ${record.commitment}, computed ${computedCommitment}`,
+      record,
+    };
+  }
+
+  return { valid: true, record, events };
+}
+
+/**
+ * Restore cold archived state back to active SQLite partition.
+ * Enforces cryptographic verification against original commitment,
+ * prevents duplicate execution, and supports recommitting state.
+ */
+export async function restoreArchivedState(
+  archiveId: string,
+  options: {
+    recommit?: boolean;
+  } = {},
+): Promise<RestorationResult> {
+  const db = getDb();
+  if (!db) {
+    return {
+      success: false,
+      archiveId,
+      restoredEventsCount: 0,
+      commitmentVerified: false,
+      recommitted: false,
+      status: "failed",
+      error: "Database instance not available",
+    };
+  }
+  initArchiveRegistry(db);
+
+  // 1. Verify archive file and cryptographic commitment first
+  const verification = verifyArchivedState(archiveId);
+  if (!verification.valid || !verification.record || !verification.events) {
+    log("error", "archive_restoration_verification_failed", {
+      archiveId,
+      reason: verification.reason,
+    });
+    return {
+      success: false,
+      archiveId,
+      restoredEventsCount: 0,
+      commitmentVerified: false,
+      recommitted: false,
+      status: "verification_failed",
+      error: verification.reason || "Cryptographic verification failed",
+    };
+  }
+
+  const record = verification.record;
+  const events = verification.events;
+  const tableName = `events_${record.dao_id}`;
+
+  // Safe against duplicate execution
+  if (record.status === "restored" && !options.recommit) {
+    return {
+      success: true,
+      archiveId,
+      restoredEventsCount: events.length,
+      commitmentVerified: true,
+      recommitted: false,
+      status: "already_restored",
+    };
+  }
+
+  // 2. Transactional restoration
+  const restoreTx = db.transaction(() => {
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        id INTEGER PRIMARY KEY,
+        dao_id INTEGER,
+        type TEXT,
+        data TEXT,
+        timestamp TEXT,
+        ledger INTEGER
+      )
+    `).run();
+
+    const insertStmt = db.prepare(`
+      INSERT OR IGNORE INTO ${tableName} (id, dao_id, type, data, timestamp, ledger)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
+    for (const ev of events) {
+      insertStmt.run(
+        ev.id,
+        ev.dao_id ?? record.dao_id,
+        ev.type,
+        typeof ev.data === "string" ? ev.data : JSON.stringify(ev.data),
+        ev.timestamp,
+        ev.ledger,
+      );
+    }
+
+    const newStatus = options.recommit ? "recommitted" : "restored";
+    const recommittedAt = options.recommit
+      ? new Date().toISOString()
+      : record.recommitted_at;
+
+    db.prepare(`
+      UPDATE archive_records
+      SET status = ?, recommitted_at = ?
+      WHERE archive_id = ?
+    `).run(newStatus, recommittedAt, archiveId);
+  });
+
+  try {
+    restoreTx();
+    log("info", "archive_restored_successfully", {
+      archiveId,
+      daoId: record.dao_id,
+      eventCount: events.length,
+      recommitted: !!options.recommit,
+    });
+
+    return {
+      success: true,
+      archiveId,
+      restoredEventsCount: events.length,
+      commitmentVerified: true,
+      recommitted: !!options.recommit,
+      status: options.recommit ? "recommitted" : "restored",
+    };
+  } catch (err) {
+    const errorMsg = (err as Error).message;
+    log("error", "archive_restoration_transaction_failed", {
+      archiveId,
+      error: errorMsg,
+    });
+    return {
+      success: false,
+      archiveId,
+      restoredEventsCount: 0,
+      commitmentVerified: true,
+      recommitted: false,
+      status: "transaction_failed",
+      error: errorMsg,
+    };
   }
 }
 

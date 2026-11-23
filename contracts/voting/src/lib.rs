@@ -121,6 +121,29 @@ const TEMPORARY_TTL_THRESHOLD: u32 = 51_840; // ~3 days
                                              // in Temporary storage at all.)
 const TEMPORARY_TTL_EXTEND_BASE: u32 = 259_200;
 
+// ── Storage TTL and rent enforcement (ZV-032 / #881) ───────────────────────
+pub const DEFAULT_TTL_BUDGET_PER_PERIOD: u32 = 10_000;
+pub const DEFAULT_TTL_PERIOD_LEDGERS: u32 = 17_280; // ~24h at 5s/ledger
+pub const MIN_TTL_BUMP_COST: u32 = 10;
+
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum TtlPriority {
+    Critical = 0, // Governance & Active Voting State
+    Standard = 1, // Settled proposals, checkpoints, tallies
+    Low = 2,      // Archival & auxiliary state
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlExtensionBudget {
+    pub max_budget: u32,
+    pub consumed_budget: u32,
+    pub period_start_ledger: u32,
+    pub period_length_ledgers: u32,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum VotingError {
@@ -354,6 +377,11 @@ pub enum VotingError {
     /// A fast (unratified) halt may only be stood down by the guardian who
     /// activated it, not by an arbitrary quorum signer.
     NotHaltActivator = 124,
+    // ── Storage TTL and rent enforcement (ZV-032 / #881) ───────────────────
+    /// TTL extension budget for this DAO is exhausted or insufficient for this priority.
+    TtlBudgetExceeded = 125,
+    /// Invalid TTL priority level supplied.
+    InvalidTtlPriority = 126,
 }
 
 impl VotingError {
@@ -755,6 +783,8 @@ pub enum DataKey {
     HaltRatificationApprovals,
     /// Signers who have approved resuming the current ratified halt.
     HaltResumeApprovals,
+    /// Per-DAO TTL extension budget and consumption tracker (#881).
+    TtlBudget(u64), // dao_id -> TtlExtensionBudget
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -1529,6 +1559,37 @@ pub struct ElectionStatusChangedEvent {
     pub updated_at: u64,
 }
 
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlExtensionRejectedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub priority: u32,
+    pub requested_cost: u32,
+    pub consumed_budget: u32,
+    pub max_budget: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlExtensionAppliedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub priority: u32,
+    pub cost: u32,
+    pub consumed_budget: u32,
+    pub remaining_budget: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlBudgetConfiguredEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub max_budget: u32,
+    pub period_length_ledgers: u32,
+}
+
 #[contract]
 pub struct Voting;
 
@@ -1552,6 +1613,218 @@ impl Voting {
             TEMPORARY_TTL_THRESHOLD,
             TEMPORARY_TTL_EXTEND_BASE,
         );
+    }
+
+    fn consume_dao_ttl_budget(
+        env: &Env,
+        dao_id: u64,
+        priority: TtlPriority,
+        cost: u32,
+    ) -> bool {
+        let effective_cost = cost.max(MIN_TTL_BUMP_COST);
+        let key = DataKey::TtlBudget(dao_id);
+        let current_ledger = env.ledger().sequence();
+
+        let mut budget = if let Some(b) = env.storage().persistent().get::<_, TtlExtensionBudget>(&key) {
+            b
+        } else {
+            TtlExtensionBudget {
+                max_budget: DEFAULT_TTL_BUDGET_PER_PERIOD,
+                consumed_budget: 0,
+                period_start_ledger: current_ledger,
+                period_length_ledgers: DEFAULT_TTL_PERIOD_LEDGERS,
+            }
+        };
+
+        let period_len = if budget.period_length_ledgers == 0 {
+            DEFAULT_TTL_PERIOD_LEDGERS
+        } else {
+            budget.period_length_ledgers
+        };
+
+        if current_ledger >= budget.period_start_ledger.saturating_add(period_len) {
+            budget.period_start_ledger = current_ledger;
+            budget.consumed_budget = 0;
+        }
+
+        // Priority evaluation against remaining budget
+        let allowed = match priority {
+            TtlPriority::Low => {
+                let limit = budget.max_budget / 2;
+                budget.consumed_budget.saturating_add(effective_cost) <= limit
+            }
+            TtlPriority::Standard => {
+                let limit = (budget.max_budget * 85) / 100;
+                budget.consumed_budget.saturating_add(effective_cost) <= limit
+            }
+            TtlPriority::Critical => {
+                budget.consumed_budget.saturating_add(effective_cost) <= budget.max_budget
+            }
+        };
+
+        if !allowed {
+            TtlExtensionRejectedEvent {
+                dao_id,
+                priority: priority as u32,
+                requested_cost: effective_cost,
+                consumed_budget: budget.consumed_budget,
+                max_budget: budget.max_budget,
+            }
+            .publish(env);
+            return false;
+        }
+
+        budget.consumed_budget = budget.consumed_budget.saturating_add(effective_cost);
+        env.storage().persistent().set(&key, &budget);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+
+        TtlExtensionAppliedEvent {
+            dao_id,
+            priority: priority as u32,
+            cost: effective_cost,
+            consumed_budget: budget.consumed_budget,
+            remaining_budget: budget.max_budget.saturating_sub(budget.consumed_budget),
+        }
+        .publish(env);
+
+        true
+    }
+
+    fn bump_dao_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+        env: &Env,
+        dao_id: u64,
+        priority: TtlPriority,
+        key: &K,
+    ) -> bool {
+        if Self::consume_dao_ttl_budget(env, dao_id, priority, MIN_TTL_BUMP_COST) {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_ttl_budget(env: Env, dao_id: u64) -> TtlExtensionBudget {
+        Self::bump_instance(&env);
+        let key = DataKey::TtlBudget(dao_id);
+        let current_ledger = env.ledger().sequence();
+        if let Some(mut budget) = env.storage().persistent().get::<_, TtlExtensionBudget>(&key) {
+            let period_len = if budget.period_length_ledgers == 0 {
+                DEFAULT_TTL_PERIOD_LEDGERS
+            } else {
+                budget.period_length_ledgers
+            };
+            if current_ledger >= budget.period_start_ledger.saturating_add(period_len) {
+                budget.period_start_ledger = current_ledger;
+                budget.consumed_budget = 0;
+            }
+            budget
+        } else {
+            TtlExtensionBudget {
+                max_budget: DEFAULT_TTL_BUDGET_PER_PERIOD,
+                consumed_budget: 0,
+                period_start_ledger: current_ledger,
+                period_length_ledgers: DEFAULT_TTL_PERIOD_LEDGERS,
+            }
+        }
+    }
+
+    pub fn set_ttl_budget(
+        env: Env,
+        dao_id: u64,
+        max_budget: u32,
+        period_length_ledgers: u32,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+        let guardian: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Guardian)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::NotGuardian));
+        if caller != guardian {
+            panic_with_error!(&env, VotingError::Unauthorized);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let period_len = if period_length_ledgers == 0 {
+            DEFAULT_TTL_PERIOD_LEDGERS
+        } else {
+            period_length_ledgers
+        };
+        let budget = TtlExtensionBudget {
+            max_budget,
+            consumed_budget: 0,
+            period_start_ledger: current_ledger,
+            period_length_ledgers: period_len,
+        };
+        let key = DataKey::TtlBudget(dao_id);
+        env.storage().persistent().set(&key, &budget);
+        Self::bump_persistent(&env, &key);
+
+        TtlBudgetConfiguredEvent {
+            dao_id,
+            max_budget,
+            period_length_ledgers: period_len,
+        }
+        .publish(&env);
+    }
+
+    pub fn extend_dao_entry_ttl(
+        env: Env,
+        dao_id: u64,
+        priority: u32,
+        key_type: u32,
+        id: u64,
+    ) -> bool {
+        Self::bump_instance(&env);
+        let prio = match priority {
+            0 => TtlPriority::Critical,
+            1 => TtlPriority::Standard,
+            2 => TtlPriority::Low,
+            _ => panic_with_error!(&env, VotingError::InvalidTtlPriority),
+        };
+
+        match key_type {
+            0 => {
+                let k = DataKey::Proposal(dao_id, id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            1 => {
+                let k = DataKey::VotingKey(dao_id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            2 => {
+                let k = DataKey::ElectionConfig(dao_id, id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            3 => {
+                let k = DataKey::BalanceSnapshot(dao_id, id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Give a nullifier record a TTL that outlives the election it belongs to.
@@ -1594,9 +1867,17 @@ impl Voting {
                 .min(PERSISTENT_TTL_EXTEND)
         };
         let ttl_extend = ttl_extend.max(NULLIFIER_GRACE_LEDGERS);
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, ttl_extend);
+        let allowed = Self::consume_dao_ttl_budget(
+            env,
+            dao_id,
+            TtlPriority::Critical,
+            MIN_TTL_BUMP_COST,
+        );
+        if allowed {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, ttl_extend);
+        }
     }
 
     /// Whether this election's nullifier has already been spent.
@@ -5295,7 +5576,13 @@ impl Voting {
             .persistent()
             .get(&key)
             .expect("proposal not found");
-        Self::bump_persistent(&env, &key);
+        let is_active = proposal.end_time == 0 || env.ledger().timestamp() <= proposal.end_time;
+        let prio = if is_active {
+            TtlPriority::Critical
+        } else {
+            TtlPriority::Standard
+        };
+        Self::bump_dao_persistent(&env, dao_id, prio, &key);
         proposal
     }
 
