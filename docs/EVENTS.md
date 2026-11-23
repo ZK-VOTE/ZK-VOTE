@@ -314,6 +314,46 @@ and can corrupt tallies.
 
 ---
 
+## Bridge relayer: EVM → Soroban (ZV-038 / #887)
+
+### `VoteForwarded` (Bridge.sol, EVM)
+
+Emitted by `Bridge.castVote` once a Groth16 proof verifies. It is the only event the relayer reads.
+
+| Field | Type | Indexed | Description |
+|-------|------|---------|-------------|
+| `daoId` | uint256 | ✓ | DAO identifier |
+| `proposalId` | uint256 | ✓ | Proposal identifier |
+| `nullifier` | uint256 | | Vote nullifier (relayed as `U256`) |
+| `voteChoice` | uint256 | | 0 = against, 1 = for |
+| `voteRoot` | uint256 | | Anchored vote root the proof was checked against |
+| `memberAddr` | uint256 | | Field-encoded Stellar member address (not relayed) |
+| `chainId` | uint256 | | EVM chain id bound into the proof (#649) |
+
+The relayer filters on topic `0xfdfc70c1…16ef` and reads the views `getSbtRoot`, `getVoteRoot` and `sbtRootBlock`. `contracts/bridge/evm/test/RelayerAbi.test.js` pins these constants to the compiled ABI.
+
+### Finality and reorgs
+
+1. **Confirmations.** The relayer reads only blocks at least `BRIDGE_EVM_CONFIRMATIONS` deep (default 12). Choose it for the chain's finality: 12 suits Ethereum mainnet probabilistic finality; use 64 or more for "finalized" semantics, and 0 only on a local dev chain.
+2. **Checkpoint.** After each scan the last block's number and hash are stored (`bridge_relay_checkpoints`). Scanning resumes there after a restart.
+3. **Reorg detection.** If the chain's hash at the checkpoint height no longer matches, a reorg deeper than the confirmation depth happened. The relayer rewinds by twice the confirmation depth and rescans:
+   - votes from the orphaned blocks that were not yet relayed become `rolled_back`; if the vote reappears on the canonical chain it returns to `pending` and is relayed once;
+   - a vote already relayed becomes `orphaned` and is logged at error level (`bridge_evm_reorg`). It is never relayed again; an operator decides whether the Soroban side needs action. If it reappears on the canonical chain it returns to `relayed`.
+4. **Exactly once.** Votes are keyed by (DAO, proposal, nullifier), the same key the Soroban bridge uses, so no vote is relayed twice.
+
+### Status
+
+Each vote has a status: `pending`, `relayed` (with the Stellar transaction hash), `failed` (after `BRIDGE_RELAY_MAX_ATTEMPTS`), `rolled_back` or `orphaned`.
+
+| Route | Purpose |
+|---|---|
+| `GET /bridge/relay/status` | Checkpoint and per-status counts |
+| `GET /bridge/relay/:daoId/:proposalId/:nullifier` | One vote's status and hashes |
+| `POST /bridge/relay` (auth) | Run one relay pass now |
+| `GET /bridge/roots/:daoId/:proposalId` | Roots anchored on Bridge.sol; the bridge panel shows and submits these |
+
+Configuration: `BRIDGE_EVM_RPC_URL`, `BRIDGE_EVM_CONTRACT_ADDRESS`, `BRIDGE_EVM_CONFIRMATIONS`, `BRIDGE_EVM_START_BLOCK`, `BRIDGE_EVM_MAX_BLOCK_RANGE` and `BRIDGE_RELAY_MAX_ATTEMPTS`. The relay loop runs only when the RPC URL and contract address are set.
+
 ## Notification delivery (ZV-037 / #886)
 
 Some events are also delivered to people who asked for them, by email or browser push. This is opt-in and anonymous.

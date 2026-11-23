@@ -5,7 +5,10 @@
  * - POST /bridge/vote - Submit a cross-chain vote (EVM -> Soroban)
  * - GET /bridge/nullifier/:daoId/:proposalId/:nullifier - Check nullifier status
  * - GET /bridge/sbt-root/:daoId - Get current SBT root for a DAO
- * - POST /bridge/relay - Manually trigger event relay
+ * - POST /bridge/relay - Run one relay pass now
+ * - GET /bridge/relay/status - Relayer checkpoint and vote counts
+ * - GET /bridge/relay/:daoId/:proposalId/:nullifier - Relay status of one vote
+ * - GET /bridge/roots/:daoId/:proposalId - SBT and vote roots anchored on Bridge.sol
  */
 
 import { Router, type Request, type Response } from "express";
@@ -23,6 +26,8 @@ import {
   u256ToScVal,
 } from "../services/stellar.js";
 import { verifyBridgeProof } from "../services/bridgeProof.js";
+import { getRelayedVote, getRelayStatus, processEvents } from "../services/bridge.js";
+import { createEvmRpc, readBridgeRoots } from "../services/bridge-evm.js";
 import {
   recordLock,
   getLock,
@@ -320,23 +325,93 @@ router.get(
 );
 
 /**
- * POST /bridge/relay - Manually trigger event relay
+ * POST /bridge/relay - Run one relay pass now (#887)
  *
- * Admin endpoint to manually process EVM events
+ * Admin endpoint: reorg check, scan of finalized EVM blocks, and Soroban
+ * submission of pending votes. Returns what the pass did.
  */
 router.post("/bridge/relay", authGuard, (async (
-  req: Request,
+  _req: Request,
   res: Response,
 ) => {
   try {
-    // Trigger relay processing
     log("info", "manual_relay_triggered");
-    res.json({ success: true, message: "Relay triggered" });
+    if (!getRelayStatus().configured) {
+      // Nothing to watch: set BRIDGE_EVM_RPC_URL and BRIDGE_EVM_CONTRACT_ADDRESS.
+      return res.json({ success: true, configured: false, result: null });
+    }
+    const result = await processEvents();
+    if (!result) {
+      return res.status(409).json({ success: false, error: "A relay pass is already running" });
+    }
+    res.json({ success: true, configured: true, result });
   } catch (err) {
     log("error", "manual_relay_error", { error: (err as Error).message });
     res.status(500).json({ error: "Failed to trigger relay" });
   }
 }) as AsyncHandler);
+
+/** GET /bridge/relay/status - checkpoint and per-status vote counts (#887) */
+router.get("/bridge/relay/status", queryLimiter, (_req: Request, res: Response) => {
+  res.json(getRelayStatus());
+});
+
+/**
+ * GET /bridge/relay/:daoId/:proposalId/:nullifier - where one forwarded vote
+ * is: pending, relayed (with its Stellar tx hash), failed, rolled_back
+ * (orphaned by a reorg before relay) or orphaned (reorged after relay).
+ */
+router.get(
+  "/bridge/relay/:daoId/:proposalId/:nullifier",
+  queryLimiter,
+  (req: Request, res: Response) => {
+    const { daoId, proposalId } = req.params;
+    let nullifier: string;
+    try {
+      if (!/^\d+$/.test(daoId) || !/^\d+$/.test(proposalId)) throw new Error("ids");
+      nullifier = `0x${BigInt(req.params.nullifier).toString(16).padStart(64, "0")}`;
+    } catch {
+      return res.status(400).json({ error: "Invalid daoId, proposalId or nullifier" });
+    }
+    const record = getRelayedVote(daoId, proposalId, nullifier);
+    if (!record) return res.status(404).json({ error: "Vote not seen by the relayer" });
+    res.json(record);
+  },
+);
+
+/**
+ * GET /bridge/roots/:daoId/:proposalId - the SBT and vote roots Bridge.sol
+ * has anchored, read from the chain (#887). These are the values castVote
+ * checks a proof against, so the UI shows and uses exactly them.
+ */
+router.get(
+  "/bridge/roots/:daoId/:proposalId",
+  queryLimiter,
+  (async (req: Request, res: Response) => {
+    const { daoId, proposalId } = req.params;
+    if (!/^\d+$/.test(daoId) || !/^\d+$/.test(proposalId)) {
+      return res.status(400).json({ error: "Invalid daoId or proposalId" });
+    }
+    const { rpcUrl, contractAddress } = config.bridgeEvm;
+    if (!rpcUrl || !contractAddress) {
+      return res.status(503).json({ error: "EVM bridge is not configured" });
+    }
+    try {
+      const roots = await readBridgeRoots(createEvmRpc(rpcUrl), contractAddress, BigInt(daoId), BigInt(proposalId));
+      const zero = `0x${"0".repeat(64)}`;
+      res.json({
+        daoId,
+        proposalId,
+        ...roots,
+        anchored: roots.sbtRoot !== zero && roots.voteRoot !== zero,
+        source: { contractAddress },
+      });
+    } catch (err) {
+      log("error", "bridge_roots_read_failed", { daoId, proposalId, error: (err as Error).message });
+      res.status(502).json({ error: "Failed to read roots from the EVM bridge" });
+    }
+  }) as AsyncHandler,
+);
 
 // ============================================
 // SATELLITE TREASURY ESCROW (ZV-107)

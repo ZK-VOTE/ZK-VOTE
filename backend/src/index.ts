@@ -83,6 +83,7 @@ import {
 } from "./services/sync.js";
 import { startIndexer, stopIndexer } from "./services/indexer.js";
 import { startNotificationWorker } from "./services/notifications/index.js";
+import { startRelay, stopRelay } from "./services/bridge.js";
 import { startTTLRenewal, stopTTLRenewal } from "./services/ttl.js";
 import {
   startSbtTransferWatch,
@@ -710,6 +711,8 @@ async function startBackgroundServices(): Promise<void> {
   services.scheduler.start();
   // Drains the notification outbox (#886); independent of SSE connections.
   stopNotificationWorker = startNotificationWorker();
+  // EVM → Soroban vote relay (#887); a no-op unless Bridge.sol is configured.
+  if (!config.testMode) startRelay();
 
   try {
     const database = getDb();
@@ -779,6 +782,7 @@ async function stopBackgroundServices(): Promise<void> {
   services.scheduler.stop();
   stopAuthScheduler();
   stopNotificationWorker?.();
+  stopRelay();
   stopEndpointHealthMonitor();
 
   // Drain any outstanding confirmation waits so callers never hang on exit.

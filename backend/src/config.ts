@@ -170,6 +170,17 @@ const envSchema = z.object({
   BRIDGE_CONTRACT_ID: z.string().min(1).optional(),
   /** Path to bridge circuit verification_key.json used by POST /bridge/vote */
   BRIDGE_VKEY_PATH: z.string().min(1).optional(),
+  // EVM side of the bridge relayer (ZV-038 / #887). The relay loop runs only
+  // when both the RPC URL and the Bridge.sol address are set.
+  BRIDGE_EVM_RPC_URL: z.string().url().optional(),
+  BRIDGE_EVM_CONTRACT_ADDRESS: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 20-byte address")
+    .optional(),
+  BRIDGE_EVM_CONFIRMATIONS: z.coerce.number().int().min(0).default(12),
+  BRIDGE_EVM_START_BLOCK: z.coerce.number().int().min(0).default(0),
+  BRIDGE_EVM_MAX_BLOCK_RANGE: z.coerce.number().int().positive().default(2000),
+  BRIDGE_RELAY_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   /** Salt mixed into IP hashes so truncated SHA-256 is not rainbow-tableable */
   IP_HASH_SALT: z.string().default(""),
   CIRCUIT_REGISTRY_CONTRACT_ID: z.string().min(1).optional(),
@@ -689,6 +700,14 @@ export const config = {
   membershipSbtContractId: process.env.MEMBERSHIP_SBT_CONTRACT_ID,
   bridgeContractId: process.env.BRIDGE_CONTRACT_ID,
   bridgeVkeyPath: validatedEnv.BRIDGE_VKEY_PATH,
+  bridgeEvm: {
+    rpcUrl: validatedEnv.BRIDGE_EVM_RPC_URL ?? null,
+    contractAddress: validatedEnv.BRIDGE_EVM_CONTRACT_ADDRESS ?? null,
+    confirmations: validatedEnv.BRIDGE_EVM_CONFIRMATIONS,
+    startBlock: validatedEnv.BRIDGE_EVM_START_BLOCK,
+    maxBlockRange: validatedEnv.BRIDGE_EVM_MAX_BLOCK_RANGE,
+    relayMaxAttempts: validatedEnv.BRIDGE_RELAY_MAX_ATTEMPTS,
+  },
   ipHashSalt: validatedEnv.IP_HASH_SALT,
   circuitRegistryContractId: process.env.CIRCUIT_REGISTRY_CONTRACT_ID,
   rewardsContractId: process.env.REWARDS_CONTRACT_ID,

@@ -9,6 +9,8 @@ on:
       - "contracts/bridge/**"
       - "backend/src/routes/bridge.ts"
       - "backend/src/services/bridge.ts"
+      - "backend/src/services/bridge-evm.ts"
+      - "backend/tests/bridge-relayer.test.ts"
       - "tests/bridge/**"
       - ".github/workflows/bridge.yml"
   pull_request:
@@ -18,7 +20,11 @@ on:
       - "contracts/bridge/**"
       - "backend/src/routes/bridge.ts"
       - "backend/src/services/bridge.ts"
+      - "backend/src/services/bridge-evm.ts"
+      - "backend/tests/bridge-relayer.test.ts"
       - "tests/bridge/**"
+      # A change to this workflow must run it too.
+      - ".github/workflows/bridge.yml"
 
 jobs:
   bridge-circuits:
@@ -63,6 +69,8 @@ jobs:
         run: npm ci --legacy-peer-deps
       - name: Compile contracts
         run: npx hardhat compile
+      # Includes RelayerAbi.test.js, which pins the backend relayer's topic and
+      # selector constants to the compiled Bridge ABI (#887).
       - name: Run tests
         run: npx hardhat test
       - name: Gas report
@@ -108,6 +116,10 @@ jobs:
         run: npm ci
       - name: Type check bridge files
         run: npx tsc --noEmit src/routes/bridge.ts src/services/bridge.ts || true
+      - name: Bridge relayer tests (log polling, checkpoint, reorg rollback)
+        run: npx tsx --test --test-force-exit tests/bridge-relayer.test.ts
+        env:
+          RELAYER_TEST_MODE: "true"
       - name: Run backend tests
         run: npm test
         env:

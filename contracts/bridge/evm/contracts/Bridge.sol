@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./IGroth16Verifier.sol";
+
 /**
  * @title ZKVote Bridge Contract
  * @notice Verifies Groth16 proofs for cross-chain voting from Ethereum
@@ -349,14 +351,13 @@ contract Bridge {
         uint256[2] memory c,
         uint256[9] memory publicSignals
     ) internal view returns (bool) {
+        // abi.encodeCall type-checks this call against IGroth16Verifier at
+        // compile time, so the verifier interface (and its 9 public signals,
+        // matching bridge.circom) cannot drift from what Bridge sends (#887).
+        // A low-level staticcall keeps the check fail-closed: a reverting or
+        // malformed verifier yields "invalid", never a revert path.
         (bool success, bytes memory result) = verifier.staticcall(
-            abi.encodeWithSignature(
-                "verifyProof(uint256[2],uint256[2][2],uint256[2],uint256[9])",
-                a,
-                b,
-                c,
-                publicSignals
-            )
+            abi.encodeCall(IGroth16Verifier.verifyProof, (a, b, c, publicSignals))
         );
 
         if (!success || result.length < 32) return false;
