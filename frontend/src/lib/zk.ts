@@ -2,6 +2,7 @@
 import { buildPoseidon } from "circomlibjs";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
 import { CONTRACTS, NETWORK_CONFIG } from "../config/contracts";
+import { relayerFetch } from "./api";
 
 // Domain separation tag for commitment scheme
 // SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
@@ -323,28 +324,64 @@ export async function getOrRegenerateZKCredentials(
     return null;
   }
 
-  // Regenerate from wallet signature
+  // Regenerate from wallet signature and discover leaf index via relayer (ZV-060 / #906).
   if (import.meta.env.DEV)
     console.log(
       `[ZK] Regenerating credentials from wallet signature for DAO ${daoId}...`,
     );
   try {
-    // Credentials generated but not used - leaf index lookup not yet implemented
-    await generateDeterministicZKCredentials(kit, daoId);
+    const credentials = await generateDeterministicZKCredentials(kit, daoId);
 
-    // Get leaf index from contract (this requires on-chain lookup)
-    // For now, return null and require explicit registration
-    // In the future, we could query the tree contract to find the leaf index
+    // Look up the commitment's leaf index from the relayer, which reads it
+    // from the on-chain membership tree. This avoids re-registration for
+    // members who lost local state (fresh install, cleared storage, new device).
     if (import.meta.env.DEV)
-      console.log(
-        `[ZK] Credentials regenerated, but leaf index unknown. User must re-register.`,
-      );
-    return null;
+      console.log(`[ZK] Looking up leaf index for commitment ${credentials.commitment.slice(0, 12)}…`);
 
-    // Future enhancement: Query contract for leaf index
-    // const leafIndex = await queryLeafIndexFromContract(commitment, daoId);
-    // storeZKCredentials(daoId, publicKey, credentials, leafIndex);
-    // return { ...credentials, leafIndex };
+    const resp = await relayerFetch(
+      `/api/v1/membership/leaf-index/${daoId}/${credentials.commitment}`,
+    );
+
+    if (resp.status === 404) {
+      // Commitment not in the tree — member must register first.
+      if (import.meta.env.DEV)
+        console.log(`[ZK] Commitment not found on-chain; re-registration required.`);
+      return null;
+    }
+
+    if (resp.status === 410) {
+      // Commitment was revoked — credentials cannot be used.
+      if (import.meta.env.DEV)
+        console.log(`[ZK] Commitment is revoked; credentials cannot be recovered.`);
+      return null;
+    }
+
+    if (!resp.ok) {
+      if (import.meta.env.DEV)
+        console.warn(`[ZK] Leaf index lookup failed (${resp.status}); cannot recover without re-registration.`);
+      return null;
+    }
+
+    const data = (await resp.json()) as {
+      leafIndex: number;
+      daoId: number;
+      commitment: string;
+      root: string;
+    };
+
+    if (typeof data.leafIndex !== "number" || data.leafIndex < 0) {
+      if (import.meta.env.DEV)
+        console.warn(`[ZK] Unexpected leaf index value from relayer:`, data.leafIndex);
+      return null;
+    }
+
+    // Cache the recovered credentials so subsequent calls hit the fast path.
+    storeZKCredentials(daoId, publicKey, credentials, data.leafIndex);
+
+    if (import.meta.env.DEV)
+      console.log(`[ZK] Credentials recovered; leaf index = ${data.leafIndex}`);
+
+    return { ...credentials, leafIndex: data.leafIndex };
   } catch (err) {
     console.error(`[ZK] Failed to regenerate credentials:`, err);
     return null;
