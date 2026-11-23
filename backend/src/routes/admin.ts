@@ -41,6 +41,12 @@ import {
 import { relayerKeyManager } from "../services/relayerKeyManager.js";
 import { server, relayerRotation } from "../services/stellar.js";
 import { listHolds, getHold, reviewHold } from "../services/abuseDetection.js";
+import {
+  approvalMessage,
+  treasuryMultisig,
+  TreasuryMultisigError,
+  type SessionStatus,
+} from "../services/treasury-multisig.js";
 
 const router = Router();
 
@@ -1201,6 +1207,94 @@ router.post(
         });
         res.status(500).json({ error: (err as Error).message });
       });
+  }) as AsyncHandler,
+);
+
+// ── Treasury multisig signing sessions (ZV-039 / #888) ───────────────────────
+//
+// Coordination for on-chain treasury proposals (contracts/threshold-crypto):
+// open a session for a proposal, collect each signer's SEP-53 signature over
+// its digest, and record the execution. Every step is audit-logged.
+
+const TREASURY_ERROR_STATUS: Record<TreasuryMultisigError["code"], number> = {
+  invalid_input: 400,
+  not_found: 404,
+  expired: 410,
+  not_signer: 403,
+  already_signed: 409,
+  bad_signature: 401,
+  insufficient_signatures: 409,
+  already_executed: 409,
+  duplicate_session: 409,
+};
+
+function treasuryError(res: Response, err: unknown): Response {
+  if (err instanceof TreasuryMultisigError) {
+    return res.status(TREASURY_ERROR_STATUS[err.code]).json({ error: err.message, code: err.code });
+  }
+  log("error", "treasury_session_error", { error: (err as Error).message });
+  return res.status(500).json({ error: "Treasury session error" });
+}
+
+const auditContext = (req: Request) => ({
+  actor: (req as Request & { authTokenId?: string }).authTokenId ?? null,
+  endpoint: req.path,
+  requestId: (req.headers["x-request-id"] as string | undefined) ?? null,
+});
+
+/** POST /admin/treasury/sessions — { proposalId, digest, expiresAt, action, config } */
+router.post("/admin/treasury/sessions", authGuard, bodyLimit("20kb"), queryLimiter, ((req: Request, res: Response) => {
+  try {
+    const session = treasuryMultisig.open(req.body ?? {}, auditContext(req));
+    res.status(201).json({ session, message: approvalMessage(session.proposalId, session.digest, session.expiresAt) });
+  } catch (err) {
+    treasuryError(res, err);
+  }
+}) as AsyncHandler);
+
+/** GET /admin/treasury/sessions?status=collecting|ready|executed|expired */
+router.get("/admin/treasury/sessions", authGuard, queryLimiter, ((req: Request, res: Response) => {
+  const status = req.query.status as SessionStatus | undefined;
+  res.json({ sessions: treasuryMultisig.list(status) });
+}) as AsyncHandler);
+
+/** GET /admin/treasury/sessions/:id — the session and the exact message signers sign */
+router.get("/admin/treasury/sessions/:id", authGuard, queryLimiter, ((req: Request, res: Response) => {
+  const session = treasuryMultisig.get(req.params.id);
+  if (!session) return res.status(404).json({ error: "Signing session not found" });
+  res.json({ session, message: approvalMessage(session.proposalId, session.digest, session.expiresAt) });
+}) as AsyncHandler);
+
+/** POST /admin/treasury/sessions/:id/signatures — { signer, signature } (base64 SEP-53) */
+router.post(
+  "/admin/treasury/sessions/:id/signatures",
+  authGuard,
+  bodyLimit("10kb"),
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    try {
+      const { signer, signature } = req.body ?? {};
+      res.json({ session: treasuryMultisig.sign(req.params.id, String(signer), String(signature), auditContext(req)) });
+    } catch (err) {
+      treasuryError(res, err);
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/treasury/sessions/:id/executed — { stellarTxHash } of the on-chain treasury_execute */
+router.post(
+  "/admin/treasury/sessions/:id/executed",
+  authGuard,
+  bodyLimit("10kb"),
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    try {
+      res.json({
+        session: treasuryMultisig.markExecuted(req.params.id, String(req.body?.stellarTxHash ?? ""), auditContext(req)),
+      });
+    } catch (err) {
+      treasuryError(res, err);
+    }
   }) as AsyncHandler,
 );
 

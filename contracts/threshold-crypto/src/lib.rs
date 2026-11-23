@@ -37,6 +37,25 @@ pub enum ThresholdError {
     AnalyticsBelowMinCohort = 15,
     /// Invalid minimum cohort (must be >= 1)
     InvalidCohort = 16,
+    // Multisig treasury (#888)
+    /// Treasury signer set not configured via `treasury_init`
+    TreasuryNotInitialized = 17,
+    /// Caller is not in the treasury signer set
+    NotTreasurySigner = 18,
+    /// Empty, oversized or duplicate signer set
+    InvalidSignerSet = 19,
+    ProposalNotFound = 20,
+    ProposalAlreadyExecuted = 21,
+    /// Expiry passed, or an expiry outside (now, now + MAX_PROPOSAL_LIFETIME]
+    ProposalExpired = 22,
+    /// The proposal was opened under a signer set that has since rotated
+    StaleSignerSet = 23,
+    /// The approval names a different digest than the proposal's
+    DigestMismatch = 24,
+    AlreadyApproved = 25,
+    /// Fewer approvals than the action requires
+    InsufficientApprovals = 26,
+    InvalidAmount = 27,
 }
 
 #[contracttype]
@@ -72,6 +91,9 @@ pub struct AnalyticsAggregate {
 
 #[contract]
 pub struct ThresholdCrypto;
+
+pub mod treasury;
+pub use treasury::{TreasuryAction, TreasuryConfig, TreasuryProposal};
 
 #[contractimpl]
 impl ThresholdCrypto {
@@ -427,3 +449,5 @@ impl ThresholdCrypto {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod treasury_test;

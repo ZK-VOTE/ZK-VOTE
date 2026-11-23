@@ -345,3 +345,37 @@ for the halt quorum's own semantics.
 - Difficulty: ADVANCED
 - Complexity: L (2 weeks)
 - Scope: contracts/dao-registry/, voting/, backend/src/routes/admin.ts, frontend/
+
+## Treasury multisig (ZV-039 / Issue #888)
+
+The DAO admin multisig above governs registry actions. Treasury spending and treasury signer changes have their own M-of-N set, enforced on chain in `contracts/threshold-crypto` (`src/treasury.rs`).
+
+### On chain
+
+| Call | Who | Notes |
+|---|---|---|
+| `treasury_init(signers, threshold, large_amount, large_threshold)` | DKG admin, once | `large_threshold` ≥ max(2, `threshold`): dual control for large transfers |
+| `treasury_propose(proposer, action, expires_at)` → id | a signer | `action` is `Spend(token, to, amount)` or `Rotate(signers, threshold, large_amount, large_threshold)`; expiry at most 30 days out |
+| `treasury_approve(signer, id, digest)` | each signer | `digest` must equal the proposal's digest |
+| `treasury_execute(executor, id)` | a signer | needs `large_threshold` approvals for a spend above `large_amount`, otherwise `threshold` (rotations always use the current `threshold`) |
+
+- **Binding.** The digest is `sha256(xdr(TreasuryDigest { contract, nonce, config_version, action, expires_at }))`, so an approval cannot be reused for another proposal, amount, signer set or expiry.
+- **Replay.** Execution consumes the nonce: a proposal runs at most once. Expired proposals can be neither approved nor executed.
+- **Rotation.** A rotation bumps `config_version`, so approvals collected under the old set become stale (`StaleSignerSet`). It emits `SignerSetRotatedEvent` as the audit record. Spends emit `TreasurySpendExecutedEvent`.
+- **Errors.** Codes 17–27 of `ThresholdError` (`TreasuryNotInitialized` … `InvalidAmount`).
+
+### Off chain
+
+`backend/src/services/treasury-multisig.ts` coordinates signers around one proposal. Each signer signs, with their wallet's SEP-53 `signMessage`, a message naming the proposal id, its digest and its expiry. The service verifies each signature against the signer's key and applies the contract's threshold rule. It refuses to record an execution below threshold or twice, and writes every step to the hash-chained audit log (`treasury.session.opened`, `.signed`, `.ready`, `treasury.spend.executed`, `treasury.signer_set.rotated`).
+
+| Route (auth) | Purpose |
+|---|---|
+| `POST /admin/treasury/sessions` | Open a session for an on-chain proposal (`proposalId`, `digest`, `expiresAt`, `action`, `config`) |
+| `GET /admin/treasury/sessions[?status=]` | List sessions |
+| `GET /admin/treasury/sessions/:id` | A session and the exact message to sign |
+| `POST /admin/treasury/sessions/:id/signatures` | `{ signer, signature }` |
+| `POST /admin/treasury/sessions/:id/executed` | `{ stellarTxHash }` of the `treasury_execute` transaction |
+
+`frontend/src/components/TreasurySignerDashboard.tsx` lists sessions and lets the connected signer sign. The admin console passes the operator session headers; no credential is bundled (#647).
+
+Tests: `contracts/threshold-crypto/src/treasury_test.rs` (including the end-to-end propose → collect → execute → audit flow) and `backend/tests/treasury-multisig.test.ts`.
