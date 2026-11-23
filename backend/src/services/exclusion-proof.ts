@@ -10,6 +10,11 @@
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import type { Database as DatabaseType } from "better-sqlite3";
+import {
+  verifyExclusionGroth16,
+  ExclusionDepthError,
+  type SnarkjsProof,
+} from "./exclusion-verifier.js";
 
 let _deps: { getDb?: () => DatabaseType; log?: (...args: any[]) => void } | null = null;
 export function initExclusionProof(deps: { getDb: () => DatabaseType; log: (...args: any[]) => void }) {
@@ -89,6 +94,8 @@ export const MAX_EXCLUSION_REGISTRY_LEAVES = 1 << 18;
 export async function verifyExclusionProof(
   proof: ExclusionProof,
   _treeContractId: string,
+  /** Merkle depth for the exclusion circuit; 0 means the default depth (18). */
+  circuitDepth = 0,
 ): Promise<{ valid: boolean; reason?: string }> {
   try {
     const { commitment, daoId, leafIndex, historicalRoot, currentRoot } =
@@ -112,7 +119,45 @@ export async function verifyExclusionProof(
     deps().log("info", "exclusion_proof_verification_started", {
       commitment: commitment.slice(0, 10),
       daoId: Number(daoId),
+      circuitDepth,
     });
+
+    // ── Groth16 cryptographic verification ───────────────────────────────
+    // This is the gate that was previously missing. A forged exclusion proof
+    // must be rejected here before any DB work is done (ZV-051 / #899).
+    // ExclusionDepthError is a typed error — callers should return 422 to
+    // signal a misconfigured election, not 400 (bad proof) or 500.
+    const snarkjsProof: SnarkjsProof = {
+      pi_a: proof.pi_a,
+      pi_b: proof.pi_b,
+      pi_c: proof.pi_c,
+      protocol: proof.protocol,
+      curve: proof.curve,
+    };
+    try {
+      const cryptoResult = await verifyExclusionGroth16(
+        snarkjsProof,
+        { historicalRoot, currentRoot, daoId, leafIndex, commitment },
+        circuitDepth,
+      );
+      if (!cryptoResult.valid) {
+        deps().log("warn", "exclusion_proof_crypto_rejected", {
+          commitment: commitment.slice(0, 10),
+          reason: cryptoResult.reason,
+        });
+        return cryptoResult;
+      }
+    } catch (err) {
+      if (err instanceof ExclusionDepthError) {
+        deps().log("warn", "exclusion_proof_depth_mismatch", {
+          requestedDepth: err.requestedDepth,
+          supportedDepths: err.supportedDepths,
+        });
+        return { valid: false, reason: err.message };
+      }
+      throw err;
+    }
+    // ─────────────────────────────────────────────────────────────────────
 
     // 1. Verify historical proof (was in the tree at some point)
     if (!historicalRoot || historicalRoot.length === 0) {
