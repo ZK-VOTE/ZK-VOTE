@@ -314,6 +314,48 @@ and can corrupt tallies.
 
 ---
 
+## Notification delivery (ZV-037 / #886)
+
+Some events are also delivered to people who asked for them, by email or browser push. This is opt-in and anonymous.
+
+### Events
+
+| Notification | Source |
+|---|---|
+| `election_started` | `ProposalEvent` (indexed as `proposal_created`) |
+| `election_ended` | `ProposalClosedEvent` (indexed as `proposal_closed`) |
+| `dispute_outcome` | A dispute case resolved by the second reviewer of a payment hold |
+
+Only named, non-identifying fields reach a notification: the DAO id, the proposal id and its closing time, and a dispute's resolution text. Creator addresses, nullifiers and vote choices are never copied.
+
+### Preferences and privacy
+
+- `POST /api/v1/notifications/subscriptions` with `{ channel, destination, eventTypes?, daoIds? }` returns a random contact token. The token is the only handle on the subscription: it is not linked to a wallet, a membership or a vote.
+- `GET`/`PATCH`/`DELETE /api/v1/notifications/subscriptions/:token` reads, changes (and renews) or removes it. `GET /api/v1/notifications/channels` lists the configured channels and the VAPID public key.
+- Every email carries a one-click unsubscribe link (`/api/v1/notifications/unsubscribe?token=…`) and `List-Unsubscribe` / `List-Unsubscribe-Post` headers.
+- Subscriptions expire after `NOTIFY_SUBSCRIPTION_TTL_DAYS` (default 180) unless renewed; expired rows are skipped and purged hourly. A push subscription the push service reports gone (404/410) is removed.
+- Templates HTML-escape user content and redact every Stellar account, muxed or contract address, so no wallet address appears in a message.
+
+### Delivery
+
+Publishing an event writes one job per matching destination into the durable `jobs` outbox (ZV-069) and returns. A worker drains it in batches of `NOTIFY_BATCH_SIZE`. Delivery does not depend on the SSE stream or any open connection, and survives restarts. The business key (event id, channel, destination hash) means a re-indexed event or a duplicate subscription is delivered once.
+
+Provider failures are retried with exponential back-off. After `NOTIFY_MAX_ATTEMPTS` the job moves to the dead-letter state (`status = 'dead'`).
+
+| Metric | Labels |
+|---|---|
+| `zkvote_notification_deliveries_total` | `channel`, `result` (`sent`, `retry`, `gone`, `skipped`) |
+| `zkvote_notification_dead_letter_total` | `channel` |
+
+### Providers
+
+| Channel | Provider | Configuration |
+|---|---|---|
+| `email` | HTTP relay: the message is POSTed as JSON (`from`, `to`, `subject`, `text`, `html`, `headers`) | `NOTIFY_EMAIL_RELAY_URL`, `NOTIFY_EMAIL_RELAY_TOKEN`, `NOTIFY_EMAIL_FROM` |
+| `webpush` | RFC 8291 payload encryption (`aes128gcm`) and RFC 8292 VAPID | `NOTIFY_VAPID_PUBLIC_KEY`, `NOTIFY_VAPID_PRIVATE_KEY`, `NOTIFY_VAPID_SUBJECT` |
+
+An unconfigured channel is not offered. Other providers plug in with `registerProvider()` from `backend/src/services/notifications`. `generateVapidKeys()` there creates a VAPID key pair. `NOTIFY_PUBLIC_URL` sets the base of the links in messages.
+
 ## Indexing Guide
 
 To efficiently consume these events:

@@ -100,6 +100,18 @@ const envSchema = z.object({
     .default("true")
     .transform((v) => v !== "false"),
   // Relayer key lifecycle (#746)
+  // Notification delivery (ZV-037 / #886). Every provider is optional: an
+  // unconfigured channel is simply not offered, and nothing is sent.
+  NOTIFY_EMAIL_RELAY_URL: z.string().url().optional(),
+  NOTIFY_EMAIL_RELAY_TOKEN: z.string().min(1).optional(),
+  NOTIFY_EMAIL_FROM: z.string().min(3).default("ZK-VOTE <no-reply@zkvote.local>"),
+  NOTIFY_VAPID_PUBLIC_KEY: z.string().min(1).optional(),
+  NOTIFY_VAPID_PRIVATE_KEY: z.string().min(1).optional(),
+  NOTIFY_VAPID_SUBJECT: z.string().min(1).default("mailto:ops@zkvote.local"),
+  NOTIFY_PUBLIC_URL: z.string().url().default("http://localhost:3000"),
+  NOTIFY_SUBSCRIPTION_TTL_DAYS: z.coerce.number().int().positive().default(180),
+  NOTIFY_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  NOTIFY_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
   RELAYER_ROTATION_DRAIN_WINDOW_MS: z.coerce.number().int().min(0).default(300000),
   RELAYER_ROTATION_MIN_FUNDING_XLM: z.coerce.number().min(0).default(10),
   RELAYER_KEY_MAX_AGE_DAYS: z.coerce.number().positive().default(90),
@@ -612,6 +624,19 @@ export const config = {
   relayerMinBalanceXlm: validatedEnv.RELAYER_MIN_BALANCE_XLM,
   relayerAutoRotateLowBalance: validatedEnv.RELAYER_AUTO_ROTATE_LOW_BALANCE,
   // Relayer key lifecycle (#746)
+  // Notification delivery (ZV-037 / #886)
+  notifications: {
+    emailRelayUrl: validatedEnv.NOTIFY_EMAIL_RELAY_URL ?? null,
+    emailRelayToken: validatedEnv.NOTIFY_EMAIL_RELAY_TOKEN ?? null,
+    emailFrom: validatedEnv.NOTIFY_EMAIL_FROM,
+    vapidPublicKey: validatedEnv.NOTIFY_VAPID_PUBLIC_KEY ?? null,
+    vapidPrivateKey: validatedEnv.NOTIFY_VAPID_PRIVATE_KEY ?? null,
+    vapidSubject: validatedEnv.NOTIFY_VAPID_SUBJECT,
+    publicUrl: validatedEnv.NOTIFY_PUBLIC_URL,
+    subscriptionTtlDays: validatedEnv.NOTIFY_SUBSCRIPTION_TTL_DAYS,
+    batchSize: validatedEnv.NOTIFY_BATCH_SIZE,
+    maxAttempts: validatedEnv.NOTIFY_MAX_ATTEMPTS,
+  },
   relayerRotationDrainWindowMs: validatedEnv.RELAYER_ROTATION_DRAIN_WINDOW_MS,
   relayerRotationMinFundingXlm: validatedEnv.RELAYER_ROTATION_MIN_FUNDING_XLM,
   relayerKeyMaxAgeDays: validatedEnv.RELAYER_KEY_MAX_AGE_DAYS,

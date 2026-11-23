@@ -18,14 +18,14 @@ CREATE TABLE IF NOT EXISTS relayer_approval_records (
   
   -- Audit fields
   issuer_identity TEXT,
-  request_id TEXT,
-  
-  -- Indexes for lookups
-  INDEX idx_approval_tx_hash (tx_hash),
-  INDEX idx_approval_expires (expires_at),
-  INDEX idx_approval_cosigner (cosigner_id),
-  INDEX idx_approval_secret_version (secret_version)
+  request_id TEXT
 );
+
+-- Indexes for lookups (SQLite has no inline INDEX clause in CREATE TABLE)
+CREATE INDEX IF NOT EXISTS idx_approval_tx_hash ON relayer_approval_records (tx_hash);
+CREATE INDEX IF NOT EXISTS idx_approval_expires ON relayer_approval_records (expires_at);
+CREATE INDEX IF NOT EXISTS idx_approval_cosigner ON relayer_approval_records (cosigner_id);
+CREATE INDEX IF NOT EXISTS idx_approval_secret_version ON relayer_approval_records (secret_version);
 
 -- Approval secret versions table
 -- Tracks approval secret rotation with overlap windows
@@ -39,11 +39,11 @@ CREATE TABLE IF NOT EXISTS relayer_approval_secrets (
   revocation_reason TEXT,
   
   -- Overlap window for in-flight transactions
-  overlap_window_ms INTEGER NOT NULL DEFAULT 300000, -- 5 minutes
-  
-  INDEX idx_secret_cosigner (cosigner_id),
-  INDEX idx_secret_active (cosigner_id, activated_at, deprecated_at)
+  overlap_window_ms INTEGER NOT NULL DEFAULT 300000 -- 5 minutes
 );
+
+CREATE INDEX IF NOT EXISTS idx_secret_cosigner ON relayer_approval_secrets (cosigner_id);
+CREATE INDEX IF NOT EXISTS idx_secret_active ON relayer_approval_secrets (cosigner_id, activated_at, deprecated_at);
 
 -- Approval audit events table
 -- Records all approval lifecycle events for security monitoring
@@ -64,12 +64,12 @@ CREATE TABLE IF NOT EXISTS relayer_approval_audit (
   timestamp TEXT NOT NULL DEFAULT (datetime('now')),
   actor TEXT,
   reason TEXT,
-  metadata TEXT, -- JSON blob for additional context
-  
-  INDEX idx_audit_timestamp (timestamp),
-  INDEX idx_audit_event_type (event_type),
-  INDEX idx_audit_cosigner (cosigner_id)
+  metadata TEXT -- JSON blob for additional context
 );
+
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON relayer_approval_audit (timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_event_type ON relayer_approval_audit (event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_cosigner ON relayer_approval_audit (cosigner_id);
 
 -- View for active approvals
 CREATE VIEW IF NOT EXISTS active_relayer_approvals AS
