@@ -38,6 +38,22 @@ const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntry
 /// paginate by advancing `start`.
 pub const SWEEP_MAX_DAOS: u32 = 50;
 
+/// Durable receipt for an idempotent DAO creation.
+///
+/// The backend provisioner can safely retry `create_dao_idempotent` after a
+/// crash: the key is the idempotency token, and the receipt records the DAO it
+/// produced. Later bootstrap steps still need their own idempotency (the
+/// backend saga records checkpoints), but a retried registry step can never
+/// create a duplicate DAO.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DaoCreationReceipt {
+    pub dao_id: u64,
+    pub idempotency_key: BytesN<32>,
+    pub creator: Address,
+    pub created_at: u64,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum RegistryError {

@@ -32,7 +32,9 @@ jobs:
 
       - name: Run stress tests
         run: |
-          cargo test --test stress -- --ignored --nocapture --test-threads=1
+          # The stress target lives in tests/integration, which is a workspace
+          # member but not a default member, so name its package explicitly.
+          cargo test -p zkvote-integration-tests --test stress -- --ignored --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: info
