@@ -2,6 +2,7 @@
 // ZV-127: Now uses versioned schema with migration support
 
 import { relayerFetch } from "./api";
+import { RELAYER_URL } from "../config/env";
 import { safeClone } from "./safeMerge";
 import {
   type DaoMetadataV2,
@@ -141,9 +142,7 @@ export async function uploadImage(file: File): Promise<{ cid: string }> {
  * Get the URL for an IPFS image
  */
 export function getImageUrl(cid: string): string {
-  const relayerUrl =
-    import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
-  return `${relayerUrl}/ipfs/image/${cid}`;
+  return `${RELAYER_URL}/ipfs/image/${cid}`;
 }
 
 // URL validation helpers

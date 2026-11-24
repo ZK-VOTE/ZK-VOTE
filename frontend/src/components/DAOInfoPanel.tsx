@@ -24,9 +24,9 @@ import {
 import defaultVK from "../lib/verification_key_soroban.json";
 import ProfileChangesModal from "./ProfileChangesModal";
 import { getExplorerUrl } from "../lib/utils";
+import { RELAYER_URL } from "../config/env";
 
-// Relayer URL for fetching events
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+// Relayer URL comes from the single config source (frontend/src/config/env.ts).
 
 interface DAOInfoPanelProps {
   daoId: number;

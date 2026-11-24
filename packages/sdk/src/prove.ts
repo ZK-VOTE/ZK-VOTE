@@ -3,6 +3,13 @@
  */
 
 import { assertCircuitReady } from './keys'
+import {
+  assertSignalCount,
+  serializeProofBytes,
+  snarkjsToZkv1,
+  type SnarkjsProof,
+  type Zkv1Proof,
+} from './generated/zkv1'
 
 export interface VoteProofParams {
   identitySecret: Uint8Array
@@ -34,16 +41,22 @@ export interface ClaimProofParams {
   circuitName?: string
 }
 
+/**
+ * The SDK's public proof object is ZKV1 end-to-end. Legacy snarkjs objects are
+ * accepted only inside `snarkjsToZkv1` (the single adapter boundary), never at
+ * this API surface.
+ */
 export interface Proof {
-  proof: {
-    pi_a: string[]
-    pi_b: string[][]
-    pi_c: string[]
-    protocol: string
-    curve: string
-  }
-  publicSignals: string[]
+  /** Canonical ZKV1 A/B/C payload (big-endian hex). */
+  proof: Zkv1Proof
+  /** Versioned ZKV1 wire bytes, ready for transport or on-chain decoding. */
+  proofBytes: Uint8Array
+  /** Public signals in canonical registry order. */
+  publicSignals: readonly string[]
 }
+
+/** Internal snarkjs-shaped objects emitted by the local prover. */
+type LegacyProof = SnarkjsProof
 
 /**
  * Generate a zero-knowledge proof for voting
@@ -67,20 +80,26 @@ export async function generateVoteProof(params: VoteProofParams): Promise<Proof>
   // For now, return a mock structure
   console.log('Generating vote proof for poll:', params.pollId)
 
-  return {
-    proof: {
-      pi_a: ['0x...', '0x...', '0x1'],
-      pi_b: [['0x...', '0x...'], ['0x...', '0x...'], ['0x1', '0x0']],
-      pi_c: ['0x...', '0x...', '0x1'],
-      protocol: 'groth16',
-      curve: 'bn128'
-    },
-    publicSignals: [
-      params.pollId,
-      params.choice,
-      params.merkleProof.root
-    ]
+  // snarkjs-shaped prover output is converted exactly once, at this boundary.
+  const legacy: LegacyProof = {
+    pi_a: ['1', '2', '1'],
+    pi_b: [['3', '4'], ['5', '6']],
+    pi_c: ['7', '8', '1'],
+    protocol: 'groth16',
+    curve: 'bn128',
   }
+  const proof = snarkjsToZkv1(legacy)
+  // Vote signals are canonical: [root, nullifier, daoId, proposalId, choice, numCandidates].
+  const publicSignals: readonly string[] = [
+    params.merkleProof.root,
+    '0',
+    params.pollId,
+    '0',
+    params.choice,
+    '2',
+  ]
+  assertSignalCount('vote_v1', publicSignals)
+  return { proof, proofBytes: serializeProofBytes(proof), publicSignals }
 }
 
 /**
@@ -99,19 +118,16 @@ export async function generateClaimProof(params: ClaimProofParams): Promise<Proo
 
   console.log('Generating claim proof for DAO:', params.daoId)
 
-  return {
-    proof: {
-      pi_a: ['0x...', '0x...', '0x1'],
-      pi_b: [['0x...', '0x...'], ['0x...', '0x...'], ['0x1', '0x0']],
-      pi_c: ['0x...', '0x...', '0x1'],
-      protocol: 'groth16',
-      curve: 'bn128'
-    },
-    publicSignals: [
-      params.daoId,
-      params.membershipProof.root
-    ]
+  const legacy: LegacyProof = {
+    pi_a: ['1', '2', '1'],
+    pi_b: [['3', '4'], ['5', '6']],
+    pi_c: ['7', '8', '1'],
+    protocol: 'groth16',
+    curve: 'bn128',
   }
+  const proof = snarkjsToZkv1(legacy)
+  const publicSignals: readonly string[] = [params.membershipProof.root, params.daoId]
+  return { proof, proofBytes: serializeProofBytes(proof), publicSignals }
 }
 
 /**

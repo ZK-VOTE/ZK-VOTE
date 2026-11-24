@@ -5,6 +5,7 @@
 import type { Proof } from './prove'
 import { groth16 } from 'snarkjs'
 import type { VerificationKey } from './types'
+import { zkv1ToSnarkjs } from './generated/zkv1'
 
 export interface TallyVerifyParams {
   proof: Proof
@@ -35,8 +36,8 @@ export async function verifyTally(params: TallyVerifyParams): Promise<boolean> {
   try {
     return await groth16.verify(
       params.verificationKey,
-      params.proof.publicSignals,
-      params.proof.proof,
+      [...params.proof.publicSignals],
+      zkv1ToSnarkjs(params.proof.proof),
     )
   } catch {
     return false
@@ -55,7 +56,7 @@ export async function verifyVoteProof(
   if (!sameSignals(proof.publicSignals, expectedSignals)) return false
 
   try {
-    return await groth16.verify(verificationKey, proof.publicSignals, proof.proof)
+    return await groth16.verify(verificationKey, [...proof.publicSignals], zkv1ToSnarkjs(proof.proof))
   } catch {
     return false
   }
