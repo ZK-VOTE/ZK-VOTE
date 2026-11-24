@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "1.0.0",
+  "packageName": "@zkvote/sdk",
+  "version": "1.0.0",
+  "generatedAt": "2026-11-24T13:30:22.193Z",
+  "circuitCompatibility": {
+    "1.0.0": [
+      "1.0",
+      "0.9"
+    ],
+    "0.9.0": [
+      "0.9",
+      "0.8"
+    ]
+  },
+  "artifacts": {
+    "src/cache.ts": {
+      "sha256": "45d7dcb1578a1adc8c7c2f76eb386ea353f62b82adb8b96b60ec44ae0e247232",
+      "sha512": "5c20f42c05ed227eed86ea6981a681958b33529126de4d246ede37f9cb8abbd3975d150738ad4692dd64a075ffd178eeeff121b1427642daafedf71c5c652124",
+      "size": 4428
+    },
+    "src/derive.ts": {
+      "sha256": "427b3bcc16f9e09b30df418bc2dc8e81c5676b0b0f6e9b64a48152ccde497df1",
+      "sha512": "740e055cfde034fccdebe037e0d3de553867e1d3af528827d2ad7ec6d34a86cbbe0084393d68c63f9601a2ec42517246c0d1e3eba3898505f7f67bc2d1096a35",
+      "size": 1695
+    },
+    "src/index.ts": {
+      "sha256": "a45ec4c288b1ca591c8b6fd91211d15f79b78f5dd2715507bbfd128054ca42e7",
+      "sha512": "89a910d7d22a26ba80e78e07d80054f994055a10a060b958f46a28901ac9e6d41685e428b4e752234895ebf3f62858626f17935f54875f0ed02b19a31faff18a",
+      "size": 515
+    },
+    "src/keys.ts": {
+      "sha256": "6ae281af6a2453d4f1659d8b6e2eba3620063d3e2df8d402effbbe7955b9cb41",
+      "sha512": "61f8404382ee2b6907bd0951300111256b1bba4812586efa54f0ef883bfc8e80fe11897ce1a98c43a53a0f9379048178fa301222cefb7dc7b6348f72e8865e56",
+      "size": 11129
+    },
+    "src/prove.ts": {
+      "sha256": "50c744ec5cfc4c3ec19db9670d5c0683fc2a86c2928665d4ba696335b040d225",
+      "sha512": "758f5fcae95f4fa0530088ffe71ccf97238f7923e1f14974109f05413aa4b1391796a9e0a2265060b59190fd41d4f970918e36533121b017db09c78b8e215fda",
+      "size": 3451
+    },
+    "src/registry.ts": {
+      "sha256": "1e89c2da4c404ab5bdfee6bbc692e60a580ccf28c41c3d9b79133e1309c80634",
+      "sha512": "3cb169da03090c3846c0abacaa364c9800f02026ac5e3fec4e39ef0472db2b128a2ca3c19b407ed8b7479cc5d8beb7a749e09b12eab3bd591baeef2271d8f256",
+      "size": 2324
+    },
+    "src/snarkjs.d.ts": {
+      "sha256": "931afeee2e5049422bbadf2b5da15eacaf7a818db12613d5838819b79ba7ae4a",
+      "sha512": "f06096adfca5440ef7c665225f57c7acafa6686a5659886110be4fdd42dc91fab00291c82b13d39ce6e71b95b34a8478a10b6c3bba79289e0d0ba34e5f263cb0",
+      "size": 189
+    },
+    "src/types.ts": {
+      "sha256": "0838c032a0b41eeffcec7d3712e14c91193511d9a6836548e3c43712856a9988",
+      "sha512": "1d80d9c7e8728d0ecad643c9361d6655751e6c74fec16737ba6464c6faa0ed7f310efbd81a6845285c878f2c49ae59e1cb12ff4848485b0770aecce0d498b7ad",
+      "size": 819
+    },
+    "src/verify.ts": {
+      "sha256": "a3ff46fcc11e4f3bae57e6807b09b6f944478dc333d938b56b6f34ff4345d55f",
+      "sha512": "22c538d838246d62816aad6741d02e291308f4e68041fca812a626d4de6470b7227fea76a0b337c7b6e76080b0f270becbbc5289786f8e6e90fc8e09d432c4f3",
+      "size": 1945
+    },
+    "src/version.ts": {
+      "sha256": "1a545ef03175090b6747961dfe81d20b0868cbd3011b75186cdb5085d1875fbe",
+      "sha512": "bc088912c6be3502800a206fbe6453a4d18dea5f600008b37ae13a0476fa26ad09d5e7ec504b93c0cf37bb1feb1364221ddf7a57f34bd32fdd69fa9479be0da3",
+      "size": 4986
+    }
+  },
+  "provenance": {
+    "builder": "GitHub Actions / Sigstore Cosign OIDC",
+    "signatureType": "npm --provenance",
+    "verificationPolicy": "https://docs.npmjs.com/generating-provenance-statements"
+  }
+}
