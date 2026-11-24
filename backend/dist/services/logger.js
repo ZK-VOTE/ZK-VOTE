@@ -16,10 +16,23 @@ const DEFAULT_POLICY = {
         "proof",
         "nullifier",
         "commitment",
+        "commitment_hash",
+        "blinding_factor",
+        "blindingfactor",
+        "blinding",
+        "salt",
         "secret",
+        "secret_key",
+        "relayer_secret_key",
+        "relayer_auth_token",
+        "x-relayer-auth",
+        "master_key",
+        "auth_token",
         "token",
         "password",
         "jwt",
+        "pinata_jwt",
+        "web3_storage_token",
         "refresh_token",
         "access_token",
         "api_key",
@@ -210,9 +223,11 @@ export function generateRequestId() {
     return crypto.randomBytes(6).toString("hex");
 }
 export function hashIp(ip) {
+    // Salt prevents rainbow-table recovery of IPv4 from truncated SHA-256 (#644).
+    const salt = process.env.IP_HASH_SALT || "";
     return crypto
         .createHash("sha256")
-        .update(ip || "")
+        .update(`${salt}|${ip || ""}`)
         .digest("hex")
         .slice(0, 12);
 }

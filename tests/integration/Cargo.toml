@@ -7,15 +7,41 @@ edition = "2021"
 crate-type = ["rlib"]
 doctest = false
 
+# `src/lib.rs` exposes a `testkit` module used by the binaries under `tests/`.
+# Those link this crate as a normal dependency, so the crates that module needs
+# have to be real dependencies rather than dev-dependencies — a `#[cfg(test)]`
+# item would not be compiled for them.
 [dependencies]
+# The crate's `test_support` module (see src/lib.rs) is compiled into the *lib*
+# target so every test binary under tests/ can share one mock transcript
+# registry. That means the contracts are genuine library dependencies now, not
+# just test ones. Safe because this crate is test-only — its `src/` is entirely
+# `#[cfg(test)]` plus the mock — and it is excluded from the workspace
+# `default-members`, so it is never linked into a deployable artifact.
+soroban-sdk = { workspace = true, features = ["testutils"] }
+dao-registry = { path = "../../contracts/dao-registry", features = ["testutils"] }
+membership-sbt = { path = "../../contracts/membership-sbt", features = ["testutils"] }
+membership-tree = { path = "../../contracts/membership-tree", features = ["testutils"] }
+voting = { path = "../../contracts/voting", features = ["testutils"] }
+circuit-registry = { path = "../../contracts/circuit-registry", features = ["testutils"] }
+
+# The one place in the tree where the Groth16 verifier stub is enabled.
+#
+# This crate is test-only and never linked into a deployable artifact. Unlike
+# `voting`'s own unit tests, the integration tests compile `voting` as a
+# *dependency*, where voting's `#[cfg(test)]` proof-verification override is
+# inactive — so without this the suite would run real pairing arithmetic against
+# dummy proofs and fail with "point not on curve".
+#
+# Enabling it is safe because `zkvote-groth16` now refuses to compile at all
+# when `testutils` is set for a wasm32 target (`compile_error!` in its lib.rs),
+# and no contract forwards the feature from its own `testutils` list.
+#
+# Tests that need REAL verification belong in `zkvote-groth16`'s own test suite
+# (`tests/verifier_stub_gate.rs`), not here.
+zkvote-groth16 = { path = "../../contracts/zkvote-groth16", features = ["testutils"] }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
 hex = "0.4"
 
-# Import all contract crates with testutils enabled
-dao_registry = { path = "../../contracts/dao-registry", package = "dao-registry", features = ["testutils"] }
-membership_sbt = { path = "../../contracts/membership-sbt", package = "membership-sbt", features = ["testutils"] }
-membership_tree = { path = "../../contracts/membership-tree", package = "membership-tree", features = ["testutils"] }
-voting = { path = "../../contracts/voting", package = "voting", features = ["testutils"] }
-circuit_registry = { path = "../../contracts/circuit-registry", package = "circuit-registry", features = ["testutils"] }
+

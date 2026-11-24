@@ -10,6 +10,8 @@ import {
 import { Badge, LoadingSpinner } from "./ui";
 import { Button } from "./ui/Button";
 import { Card, CardContent } from "./ui/Card";
+import { BidiSafe } from "../lib/bidiSafe";
+import { stripBidiOverrides } from "../lib/bidi";
 import {
   Shield,
   Users,
@@ -77,7 +79,7 @@ function SocialLinks({ links, variant }: SocialLinksProps) {
 
   const isCover = variant === "cover";
   const containerClass = isCover
-    ? "absolute top-3 right-3 flex items-center gap-1"
+    ? "absolute top-3 end-3 flex items-center gap-1"
     : "flex items-center gap-2 mb-4";
   const linkClass = isCover
     ? "p-2 rounded-lg bg-background/80 hover:bg-background transition-colors text-muted-foreground hover:text-foreground"
@@ -425,7 +427,7 @@ export default function DAOHeader({
             </div>
             {/* Profile Image - positioned outside the overflow-hidden container */}
             {metadata?.profileImageCid && (
-              <div className="absolute -bottom-12 left-4">
+              <div className="absolute -bottom-12 start-4">
                 <div className="w-24 h-24 md:w-28 md:h-28 rounded-xl border-4 border-background overflow-hidden bg-muted shadow-lg">
                   <img
                     src={getImageUrl(metadata.profileImageCid)}
@@ -464,7 +466,7 @@ export default function DAOHeader({
                 className={`text-2xl font-bold tracking-tight ${themeColor ? "" : "text-foreground"}`}
                 style={themeColor ? { color: "var(--dao-accent)" } : undefined}
               >
-                {dao.name}
+                <BidiSafe>{dao.name}</BidiSafe>
               </h2>
               {dao.isAdmin ? (
                 <Badge variant="blue" className="gap-1">
@@ -495,8 +497,10 @@ export default function DAOHeader({
               </span>
               <span>•</span>
               <span>
-                Created by {dao.creator?.slice(0, 4) ?? "..."}...
-                {dao.creator?.slice(-4) ?? "..."}
+                Created by{" "}
+                <BidiSafe className="font-mono">
+                  {`${dao.creator?.slice(0, 4) ?? "..."}...${dao.creator?.slice(-4) ?? "..."}`}
+                </BidiSafe>
               </span>
             </p>
           </div>
@@ -723,9 +727,12 @@ export default function DAOHeader({
             </button>
             {showDescription && (
               <div className="mt-3 p-4 rounded-lg bg-muted/30">
-                <div className="prose prose-sm dark:prose-invert max-w-none">
+                <div
+                  dir="auto"
+                  className="prose prose-sm dark:prose-invert max-w-none"
+                >
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {metadata.description}
+                    {stripBidiOverrides(metadata.description)}
                   </ReactMarkdown>
                 </div>
               </div>

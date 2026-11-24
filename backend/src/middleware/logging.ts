@@ -33,7 +33,7 @@ declare global {
 }
 import crypto from "crypto";
 import { config } from "../config.js";
-import { log, hashIp, getRedactionPolicy } from "../services/logger.js";
+import { log, hashIp, getRedactionPolicy, runWithContext } from "../services/logger.js";
 import {
   createSpanContext,
   formatTraceparent,
@@ -506,7 +506,12 @@ export function requestLogger(
   // never request bodies, config, or secrets — so exporters cannot leak
   // RELAYER_SECRET_KEY / blindingFactor through trace attributes.
   const spanContext: SpanContext = { traceId, spanId, traceFlags: "01" };
-  runWithSpanContext(spanContext, next);
+  // Also open the log-correlation context, so every log written while
+  // handling this request (including metric_drilldown records, #749)
+  // carries ctx + traceId — the metric → log → trace join key.
+  runWithContext({ ctx, traceId, path: req.path, method: req.method }, () =>
+    runWithSpanContext(spanContext, next),
+  );
 }
 
 /**

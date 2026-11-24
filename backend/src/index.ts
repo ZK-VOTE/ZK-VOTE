@@ -8,7 +8,12 @@
  */
 
 import cluster from "node:cluster";
-import express, { type Express } from "express";
+import express, {
+  type Express,
+  type Request,
+  type Response,
+  type NextFunction,
+} from "express";
 import cors from "cors";
 import helmet from "helmet";
 
@@ -30,6 +35,7 @@ import swaggerUi from "swagger-ui-express";
 import { ServiceSupervisor } from "./services/supervisor.js";
 import { closeDb } from "./services/db.js";
 import { buildOpenApiDocument } from "./openapi.js";
+import { priorityMiddleware } from "./priority/priorityMiddleware.js";
 
 import {
   startClusterMaster,
@@ -43,12 +49,44 @@ import { log, logger } from "./services/logger.js";
 import {
   getPendingSequenceLockOps,
   waitForSequenceLockIdle,
+  stopCoverTraffic,
 } from "./services/stellar.js";
+import {
+  startConfirmationWorker,
+  stopConfirmationWorker,
+} from "./services/confirmation-queue.js";
+import {
+  startEndpointHealthMonitor,
+  stopEndpointHealthMonitor,
+} from "./services/endpoint-pool.js";
 import {
   attachConfirmationHub,
   closeConfirmationHub,
 } from "./services/confirmation-hub.js";
-import { triggerDaoMembershipSync } from "./services/sync.js";
+import {
+  startDaoSync,
+  stopDaoSync,
+  startMembershipSync,
+  stopMembershipSync,
+  triggerDaoMembershipSync,
+} from "./services/sync.js";
+import { startIndexer, stopIndexer } from "./services/indexer.js";
+import { startNotificationWorker } from "./services/notifications/index.js";
+import { startRelay, stopRelay } from "./services/bridge.js";
+import { startTTLRenewal, stopTTLRenewal } from "./services/ttl.js";
+import {
+  startSbtTransferWatch,
+  stopSbtTransferWatch,
+} from "./services/sbt-guard.js";
+import {
+  startAuthScheduler,
+  stopAuthScheduler,
+  ensureLegacyTokenMigrated,
+} from "./services/authScheduler.js";
+import {
+  startMemoryMonitor,
+  stopMemoryMonitor,
+} from "./services/memory-monitor.js";
 
 // Middleware
 import {
@@ -60,13 +98,35 @@ import {
   graduatedSlowDown,
   degradationContext,
   metricsMiddleware,
+  sharedRateLimiter,
 } from "./middleware/index.js";
 
 import {
   initHealthRoutes,
   initIndexerRoutes,
+  bridgeRoutes,
+  circuitRoutes,
+  transactionRoutes,
+  authRoutes,
+  quadraticRoutes,
+  metricsRoutes,
+  remediationRoutes,
+  novaRoutes,
+  adminRoutes,
+  thresholdRoutes,
+  auditRoutes,
+  randomnessRoutes,
+  factoryRoutes,
+  payRoutes,
+  swapRoutes,
+  rampRoutes,
+  onboardingRoutes,
+  notificationRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
+
+/** Set once the notification worker starts; called on shutdown. */
+let stopNotificationWorker: (() => void) | null = null;
 import openApiSpec from "./openapi.js";
 
 // ============================================
@@ -124,6 +184,37 @@ for (const origin of allowedCorsOrigins) {
 const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
 
 const app: Express = express();
+
+const isProduction = process.env.NODE_ENV === "production";
+
+// Security: CORS configuration
+function parseCorsOrigins(value: string | string[]): string[] {
+  if (Array.isArray(value)) return value;
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins as unknown as string | string[]);
+
+if (allowedCorsOrigins.length === 0) {
+  throw new Error("CORS_ORIGIN must specify at least one origin");
+}
+
+if (isProduction && allowedCorsOrigins.includes("*")) {
+  throw new Error(
+    "CORS_ORIGIN must not be '*' in production; configure exact origins",
+  );
+}
+
+for (const origin of allowedCorsOrigins) {
+  if (origin !== "*" && /[*?]/.test(origin)) {
+    throw new Error(
+      "CORS_ORIGIN origins must be exact URLs, not wildcard patterns",
+    );
+  }
+}
 
 // Security: HTTP headers with CSP
 // This is a pure JSON API (no HTML is served outside /api-docs), so the CSP
@@ -190,10 +281,19 @@ app.use((_req, res, next) => {
 // Metrics middleware (before other middleware to capture all requests)
 app.use(metricsMiddleware);
 
+// Reserve per-tier capacity (vote, admin/dispute, payment, comment) before
+// global throttling or any route mount (ZV-110). The classifier normalizes
+// /, /api/v1, and /api/v2 so every public mount gets the same scheduling
+// guarantee, and each tier has its own worker pool: a payment burst can
+// fill the NORMAL pool but can never occupy an admin/dispute (HIGH) worker
+// or a vote (CRITICAL) worker, regardless of arrival order.
+app.use(priorityMiddleware());
+
 // Request-scoped degradation tracking (#204)
 app.use(degradationContext);
 
-// Security: CORS configuration (origins parsed in the infrastructure phase)
+const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
+
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
     if (!origin || allowAllCors || allowedCorsOrigins.includes(origin)) {
@@ -214,6 +314,10 @@ const corsOptions: cors.CorsOptions = {
     "X-Client-Id",
     "X-Master-Key",
     "X-CSRF-Token",
+    // Wallet-session binding for /vote (#750)
+    "X-Vote-Session",
+    "X-Vote-Session-Mac",
+    "X-Vote-Network",
   ],
   exposedHeaders: [
     "X-Token-Id",
@@ -235,6 +339,16 @@ app.use(requestLogger);
 
 // Graduated throttling (delays before a client is hard rate-limited)
 app.use(graduatedSlowDown);
+
+// Shared, cross-replica bucket for privileged auth/admin key endpoints (#511).
+// Keyed by signed membership token / client id with IP as a weak fallback.
+const authBucketLimiter = sharedRateLimiter("auth");
+app.use((req, res, next) => {
+  if (/^\/(api\/v[12]\/)?(auth|admin|factory)(\/|$)/.test(req.path)) {
+    return authBucketLimiter(req, res, next);
+  }
+  next();
+});
 
 // Audit middleware - must be after body parsing and requestLogger, before routes
 // Audits every mutating route (POST/PUT/PATCH/DELETE) with PII redaction, append-only
@@ -269,25 +383,75 @@ startupPhases.checkpoint("infrastructure");
 // Build and wire every service's dependencies explicitly. Consumer services
 // get their deps from this container, not from module-level globals.
 
-const services = await startupPhases.run("services", () => buildAppServices());
+// Initialize routes that need dependencies
+initHealthRoutes(
+  services.stellar.server,
+  services.stellar.relayerKeypair.publicKey(),
+);
+initIndexerRoutes(triggerDaoMembershipSync);
 
-// The memory-monitor worker (declared in the composition root) triggers the
-// entry point's graceful shutdown without importing it (avoids a cycle).
-setMemoryThresholdHandler(() => {
-  void gracefulShutdown("memory_threshold");
-});
+// Mount route handlers (metrics first, before CSRF/auth middleware)
+app.use(metricsRoutes);
+app.use(healthRoutes);
+app.use(analyticsRoutes);
+app.use(remediationRoutes);
+app.use(adminRoutes);
+app.use(noStore, votingRoutes);
+app.use(daoRoutes);
+app.use(ipfsRoutes);
+app.use(commentsRoutes);
+app.use(claimRoutes);
+app.use(indexerRoutes);
+app.use(bridgeRoutes);
+app.use(circuitRoutes);
+app.use(transactionRoutes);
+app.use(authRoutes);
+app.use(quadraticRoutes);
+app.use("/api/v1/nova", novaRoutes);
+app.use(noStore, adminRoutes);
+app.use(noStore, thresholdRoutes);
+app.use(auditRoutes);
+app.use(noStore, randomnessRoutes);
+app.use(noStore, factoryRoutes);
+app.use(payRoutes);
+app.use(swapRoutes);
+app.use(rampRoutes);
+app.use(onboardingRoutes);
+app.use(noStore, notificationRoutes);
 
 // ============================================
 // ROUTES PHASE — DECLARATIVE REGISTRY
 // ============================================
 
-await startupPhases.run("routes", () => {
-  // Initialize the two routers that need dependencies from the root.
-  initHealthRoutes(
-    services.stellar.server,
-    services.stellar.relayerKeypair.publicKey(),
-  );
-  initIndexerRoutes(triggerDaoMembershipSync);
+const v1Router = express.Router();
+
+function mountV1(): void {
+  v1Router.use(metricsRoutes);
+  v1Router.use(healthRoutes);
+  v1Router.use(analyticsRoutes);
+  v1Router.use(remediationRoutes);
+  v1Router.use(noStore, votingRoutes);
+  v1Router.use(daoRoutes);
+  v1Router.use(ipfsRoutes);
+  v1Router.use(commentsRoutes);
+  v1Router.use(claimRoutes);
+  v1Router.use(indexerRoutes);
+  v1Router.use(bridgeRoutes);
+  v1Router.use(circuitRoutes);
+  v1Router.use(transactionRoutes);
+  v1Router.use(authRoutes);
+  v1Router.use(quadraticRoutes);
+  v1Router.use(noStore, adminRoutes);
+  v1Router.use(noStore, thresholdRoutes);
+  v1Router.use(auditRoutes);
+  v1Router.use(noStore, randomnessRoutes);
+  v1Router.use(noStore, factoryRoutes);
+  v1Router.use(payRoutes);
+  v1Router.use(swapRoutes);
+  v1Router.use(rampRoutes);
+  v1Router.use(onboardingRoutes);
+  v1Router.use(noStore, notificationRoutes);
+}
 
   // The registry validates required services before mounting anything.
   mountRoutes(app, services, services.profile, { variant: "unversioned" });
@@ -298,15 +462,31 @@ await startupPhases.run("routes", () => {
     next();
   });
 
-  // URL-based versioning (#139): the same registry populates both versioned
-  // routers, so mount order and prerequisites cannot drift between variants.
-  const v1Router = express.Router();
-  v1Router.use((_req, res, next) => {
-    res.setHeader("API-Version", "v1");
-    next();
-  });
-  mountRoutes(v1Router, services, services.profile, { variant: "v1" });
-  app.use("/api/v1", v1Router);
+function mountV2(): void {
+  v2Router.use(metricsRoutes);
+  v2Router.use(healthRoutes);
+  v2Router.use(analyticsRoutes);
+  v2Router.use(remediationRoutes);
+  v2Router.use(noStore, votingRoutes);
+  v2Router.use(daoRoutes);
+  v2Router.use(ipfsRoutes);
+  v2Router.use(commentsRoutes);
+  v2Router.use(claimRoutes);
+  v2Router.use(indexerRoutes);
+  v2Router.use(bridgeRoutes);
+  v2Router.use(circuitRoutes);
+  v2Router.use(transactionRoutes);
+  v2Router.use(authRoutes);
+  v2Router.use(quadraticRoutes);
+  v2Router.use(noStore, adminRoutes);
+  v2Router.use(noStore, thresholdRoutes);
+  v2Router.use(auditRoutes);
+  v2Router.use(noStore, randomnessRoutes);
+  v2Router.use(noStore, factoryRoutes);
+  v2Router.use(payRoutes);
+  v2Router.use(swapRoutes);
+  v2Router.use(rampRoutes);
+}
 
   // API v2 Router with explicit multi-tenant isolation (#307)
   const v2Router = express.Router();
@@ -362,6 +542,7 @@ const supervisor = new ServiceSupervisor();
 async function gracefulShutdown(reason: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopCoverTraffic();
 
   const DRAIN_TIMEOUT_MS = config.shutdownDrainTimeoutMs;
   log("info", "shutdown_start", {
@@ -468,8 +649,16 @@ async function startBackgroundServices(): Promise<void> {
     console.log("  POST /daos/sync           - Trigger DAO sync (admin)");
   }
 
-  // All loops/timers are now workers owned by the composition root. Profile
-  // flags and config switches live in the worker definitions themselves.
+  startTTLRenewal();
+
+  ensureLegacyTokenMigrated();
+  startAuthScheduler();
+  services.scheduler.start();
+  // Drains the notification outbox (#886); independent of SSE connections.
+  stopNotificationWorker = startNotificationWorker();
+  // EVM → Soroban vote relay (#887); a no-op unless Bridge.sol is configured.
+  if (!config.testMode) startRelay();
+
   try {
     await services.workers.startAll();
   } catch (err) {
@@ -477,6 +666,26 @@ async function startBackgroundServices(): Promise<void> {
       error: err instanceof Error ? err.message : String(err),
     });
   }
+
+  // Triggers a graceful restart if usage crosses the critical threshold (#191).
+  startMemoryMonitor(() => {
+    log("warn", "memory_threshold_exceeded_triggering_shutdown", {
+      pid: process.pid,
+    });
+    void gracefulShutdown("memory_threshold");
+  });
+
+  // Dedicated confirmation worker (#172): single poller for all outstanding
+  // transaction-confirmation waits, with exponential backoff + jitter.
+  startConfirmationWorker();
+
+  // Probe Horizon, Soroban RPC and anchor pools on one cadence so routing,
+  // finality-lag bounds and /health reflect live endpoint state (#745).
+  if (!config.testMode) {
+    startEndpointHealthMonitor(config.endpointHealthIntervalMs);
+  }
+  // Closes relayer drain windows on time even when no admin call polls (#746).
+  relayerRotation.startTicker();
 }
 
 /**
@@ -497,7 +706,25 @@ async function stopBackgroundServices(): Promise<void> {
   // Stop supervised services first, then drain every worker in reverse order
   // with a bounded timeout (WorkerRegistry handles both).
   void supervisor.stopAll();
-  await services.workers.stopAll();
+
+  // Legacy stop calls (kept for services not yet fully migrated to supervisor)
+  stopIndexer();
+  stopDaoSync();
+  stopMembershipSync();
+  stopTTLRenewal();
+  stopSbtTransferWatch();
+  stopPinMonitor();
+  stopMemoryMonitor();
+  stopScheduledBackups();
+  services.scheduler.stop();
+  stopAuthScheduler();
+  stopNotificationWorker?.();
+  stopRelay();
+  stopEndpointHealthMonitor();
+
+  // Drain any outstanding confirmation waits so callers never hang on exit.
+  void stopConfirmationWorker();
+  relayerRotation.stopTicker();
 }
 
 /**

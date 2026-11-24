@@ -35,6 +35,9 @@ import {
 } from "./services/stellar.js";
 import type { StellarContext } from "./services/interfaces.js";
 import { initCircuitRegistry } from "./services/circuit-registry.js";
+import { LedgerService } from "./services/ledger.js";
+import { bootDualWrite } from "./services/dualWriteBoot.js";
+import { initHaltStatus } from "./services/haltStatus.js";
 import { initAntiSpam } from "./services/anti-spam.js";
 import { initTtlService } from "./services/ttl.js";
 import { initSbtGuard } from "./services/sbt-guard.js";
@@ -59,6 +62,8 @@ import { initAnchor } from "./services/anchor.js";
 import { initTtlChecker } from "./services/ttl-checker.js";
 import { initSyncService } from "./services/sync.js";
 import { initBridgeRelay } from "./services/bridge.js";
+import { createEvmRpc } from "./services/bridge-evm.js";
+import { initOnboardingFunnel } from "./services/onboardingFunnel.js";
 import * as indexer from "./services/indexer.js";
 import { kysely } from "./services/kysely.js";
 import * as dbService from "./services/db.js";
@@ -152,17 +157,8 @@ export interface AppServices {
   stellar: StellarContext;
   /** Background job scheduler for maintenance and session cleanup. */
   scheduler: JobScheduler;
-  /** Resolved startup profile (role flags). */
-  startup: ResolvedStartupProfile;
-  /** Alias for `startup.profile`, convenient for route/worker gating. */
-  profile: StartupProfile;
-  enableRelayer: boolean;
-  enableIndexer: boolean;
-  enableApi: boolean;
-  /** Names of DI services initialized by this root instance. */
-  initializedServices: readonly InitializedServiceName[];
-  /** All background workers, wired but NOT started. */
-  workers: WorkerRegistry;
+  /** Double-entry ledger. Uses the shared Kysely handle; previously unwired. */
+  ledger: LedgerService;
 }
 
 /**
@@ -171,19 +167,10 @@ export interface AppServices {
  * foundational services (logger/stellar/db); consumer services get their
  * dependencies from here instead.
  */
-export function buildAppServices(
-  profile?: StartupProfileInput | StartupProfile,
-): AppServices {
-  // Resolve the startup profile first so every downstream wiring decision
-  // (routes, workers) can be tagged with the enabled roles.
-  const startup = resolveStartupProfile(
-    profile ?? {
-      profile: config.startupProfile,
-      enableRelayer: config.enableRelayer,
-      enableIndexer: config.enableIndexer,
-      enableApi: config.enableApi,
-    },
-  );
+export function buildAppServices(): AppServices {
+  // Attach the shadow writer once, at boot. Off by default; a missing URL or a
+  // failed pool construction leaves the primary store untouched.
+  void bootDualWrite();
 
   const stellar: StellarContext = {
     server,
@@ -208,9 +195,24 @@ export function buildAppServices(
     logger,
   });
 
+  // Tiered emergency halt status (ZV-114 / #954): read-only, same DI
+  // convention as circuit-registry above.
+  initHaltStatus({
+    server,
+    relayerKeypair,
+    callWithTimeout,
+    votingContractId: config.votingContractId,
+    networkPassphrase: config.networkPassphrase,
+    logger,
+  });
+
   // Wire the anti-spam service with explicit dependencies (#358): the write
   // DB handle, the Kysely query builder and the structured logger.
   initAntiSpam({ getDb: dbService.getWriteDb, kysely, logger });
+
+  // Wire the onboarding funnel metrics service (ZV-108) with the shared
+  // Kysely query builder.
+  initOnboardingFunnel({ kysely });
 
   // Wire the TTL renewal service with explicit dependencies (#358): the RPC
   // surface, config flags, contract IDs, persistence, TTL introspection,
@@ -302,6 +304,18 @@ export function buildAppServices(
     withSequenceLock,
     u256ToScVal,
     log: logger.log.bind(logger),
+    // EVM side of the relayer (#887): only when Bridge.sol is configured.
+    evm:
+      config.bridgeEvm.rpcUrl && config.bridgeEvm.contractAddress
+        ? {
+            rpc: createEvmRpc(config.bridgeEvm.rpcUrl),
+            contractAddress: config.bridgeEvm.contractAddress,
+            confirmations: config.bridgeEvm.confirmations,
+            startBlock: config.bridgeEvm.startBlock,
+            maxBlockRange: config.bridgeEvm.maxBlockRange,
+            maxAttempts: config.bridgeEvm.relayMaxAttempts,
+          }
+        : undefined,
   });
 
   // Wire the SBT transfer-watch service with explicit dependencies (#358):
@@ -377,168 +391,9 @@ export function buildAppServices(
     workers: services.workers.list().map((worker: BackgroundWorker) => worker.name),
   });
 
-  return services;
-}
+  // The ledger is Kysely-native; routing it through the shared handle makes
+  // its writes use the same dialect as every other repository-backed path.
+  const ledger = new LedgerService(kysely as unknown as ConstructorParameters<typeof LedgerService>[0]);
 
-/**
- * Optional callback used by the memory-monitor worker. The composition root
- * defaults to a no-op; `index.ts` injects `gracefulShutdown` into it to avoid a
- * circular import between the entry point and the composition root.
- */
-let onMemoryThreshold: () => void = () => undefined;
-
-export function setMemoryThresholdHandler(handler: () => void): void {
-  onMemoryThreshold = handler;
-}
-
-/**
- * Declare every background loop/timer as a worker. Nothing is started here —
- * the entry point starts the registry (or a subset, per profile) in its
- * `workers` startup phase. Extracting these from `index.ts` keeps their exact
- * start/stop behavior while making them individually testable.
- */
-export function buildWorkerRegistry(services: AppServices): WorkerRegistry {
-  const registry = new WorkerRegistry({
-    drainTimeoutMs: config.shutdownDrainTimeoutMs,
-    onEvent: (event) => {
-      if (event.type === "error" || event.type === "timeout") {
-        log("warn", "worker_registry_event", {
-          type: event.type,
-          worker: event.worker,
-          error: event.error instanceof Error ? event.error.message : event.error,
-        });
-      }
-    },
-  });
-
-  const hasContractId = (id: string | undefined): boolean =>
-    !!id && isValidContractId(id);
-  const contractIdsForIndexer = (): string[] => {
-    const ids = [config.votingContractId!, config.treeContractId!];
-    if (hasContractId(config.daoRegistryContractId))
-      ids.push(config.daoRegistryContractId!);
-    if (hasContractId(config.membershipSbtContractId))
-      ids.push(config.membershipSbtContractId!);
-    return ids;
-  };
-
-  const pinMonitorEnabled =
-    services.enableApi && config.ipfsEnabled && !!config.pinataJwt;
-  const indexerWorkerEnabled = services.enableIndexer && config.indexerEnabled;
-  const daoRegistryEnabled = hasContractId(config.daoRegistryContractId);
-  const membershipEnabled = hasContractId(config.membershipSbtContractId);
-
-  registry.registerAll([
-    createWorker({
-      name: "ipfs-pin-monitor",
-      enabled: pinMonitorEnabled,
-      start: () => {
-        ipfsService.initPinata(config.pinataJwt!, config.pinataGateway);
-        initPinManager(config.ipfsBackupDir, config.web3StorageToken);
-        startPinMonitor({
-          scanIntervalMs: config.pinVerifyIntervalMs,
-          alertThreshold: config.pinAlertThreshold,
-          autoRepin: config.pinAutoRepin,
-          repinFn: ipfsService.repinCallback,
-        });
-      },
-      stop: () => stopPinMonitor(),
-    }),
-    createWorker({
-      name: "indexer",
-      enabled: indexerWorkerEnabled,
-      start: async () => {
-        await indexer.startIndexer(
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          services.stellar.server as any,
-          contractIdsForIndexer(),
-          config.indexerPollIntervalMs,
-        );
-      },
-      stop: () => indexer.stopIndexer(),
-    }),
-    createWorker({
-      name: "dao-sync",
-      enabled: services.enableRelayer && daoRegistryEnabled,
-      start: () => startDaoSync(),
-      stop: () => stopDaoSync(),
-    }),
-    createWorker({
-      name: "membership-sync",
-      enabled: services.enableRelayer && membershipEnabled,
-      start: () => startMembershipSync(),
-      stop: () => stopMembershipSync(),
-    }),
-    createWorker({
-      name: "sbt-transfer-watch",
-      enabled: services.enableRelayer && membershipEnabled,
-      start: () => startSbtTransferWatch(),
-      stop: () => stopSbtTransferWatch(),
-    }),
-    createWorker({
-      name: "ttl-renewal",
-      enabled: services.enableRelayer,
-      start: () => startTTLRenewal(),
-      stop: () => stopTTLRenewal(),
-    }),
-    createWorker({
-      name: "auth-scheduler",
-      enabled: services.enableApi,
-      start: () => {
-        ensureLegacyTokenMigrated();
-        startAuthScheduler();
-      },
-      stop: () => stopAuthScheduler(),
-    }),
-    createWorker({
-      name: "job-scheduler",
-      enabled: services.enableRelayer,
-      start: () => services.scheduler.start(),
-      stop: () => services.scheduler.stop(),
-    }),
-    createWorker({
-      name: "wal-resilience",
-      enabled: services.enableApi,
-      start: () => {
-        const database = dbService.getDb();
-        const dbPath = database.name;
-        performInitialCheckpoint(database);
-        detectAndHandleWalIssue(database, dbPath);
-        startWalCheckpointing(database);
-        startWalMonitor(database, dbPath);
-        startPeriodicBackups(database, dbPath);
-        if (config.backupEncryptionEnabled) {
-          startScheduledBackups(config.backupIntervalMs);
-        }
-      },
-      stop: () => {
-        stopWalResilience();
-        stopScheduledBackups();
-      },
-    }),
-    createWorker({
-      name: "memory-monitor",
-      enabled: services.enableRelayer,
-      start: () => {
-        startMemoryMonitor(() => {
-          log("warn", "memory_threshold_exceeded_triggering_shutdown", {
-            pid: process.pid,
-          });
-          // The entry point injects the shutdown callback (see index.ts) so
-          // this worker keeps the original behavior without importing it.
-          onMemoryThreshold();
-        });
-      },
-      stop: () => stopMemoryMonitor(),
-    }),
-    createWorker({
-      name: "confirmation-worker",
-      enabled: services.enableApi,
-      start: () => startConfirmationWorker(),
-      stop: () => stopConfirmationWorker(),
-      health: () => ({ queue: "confirmation" }),
-    }),
-  ]);
-
-  return registry;
+  return { config, logger, stellar, scheduler: defaultJobScheduler, ledger };
 }

@@ -6,6 +6,11 @@
  */
 
 import rateLimit from "express-rate-limit";
+import type {
+  Store,
+  ClientRateLimitInfo,
+  Options as RateLimitOptions,
+} from "express-rate-limit";
 import slowDown from "express-slow-down";
 import crypto from "crypto";
 import cluster from "node:cluster";
@@ -13,15 +18,138 @@ import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
 import { ClusterRateLimitStore } from "../services/cluster.js";
-import { membershipRegistrationLimited } from "../services/metrics.js";
+import {
+  membershipRegistrationLimited,
+  rate_limit_store_size,
+} from "../services/metrics.js";
+import { isCriticalRequest } from "../priority/priorityConfig.js";
 
 const isTestMode = process.env.RELAYER_TEST_MODE === "true";
+
+// Maximum tracked keys per limiter before LRU eviction (#598). Bounded so a
+// per-IP flood cannot grow the default MemoryStore without limit and OOM the
+// relayer; the oldest idle buckets are evicted first.
+export const RATE_LIMIT_MAX_KEYS =
+  Number(process.env.RATE_LIMIT_MAX_KEYS ?? 10000) || 10000;
+
+const boundedStores = new Map<string, BoundedMemoryStore>();
+
+/**
+ * Bounded in-process rate-limit store with LRU eviction (#598).
+ *
+ * express-rate-limit's default MemoryStore never evicts keys, so a flood of
+ * distinct IPs (or hashed wallet buckets) grows memory without bound. This
+ * store mirrors the MemoryStore semantics (sliding window hit counts) but
+ * caps the key count and reports its size to `zkvote_rate_limit_store_size`.
+ */
+export class BoundedMemoryStore implements Store {
+  readonly limiterName: string;
+  private options!: RateLimitOptions;
+  private hits = new Map<string, { totalHits: number; resetTime: Date }>();
+  private readonly maxKeys: number;
+
+  constructor(limiterName: string, maxKeys: number = RATE_LIMIT_MAX_KEYS) {
+    this.limiterName = limiterName;
+    this.maxKeys = maxKeys;
+  }
+
+  init(options: RateLimitOptions): void {
+    this.options = options;
+  }
+
+  private touch(key: string): void {
+    // Refresh LRU order: re-insert so the oldest entry is always first.
+    const entry = this.hits.get(key);
+    if (entry) {
+      this.hits.delete(key);
+      this.hits.set(key, entry);
+    }
+  }
+
+  private evictIfNeeded(): number {
+    let evicted = 0;
+    while (this.hits.size > this.maxKeys) {
+      const oldest = this.hits.keys().next();
+      if (oldest.done) break;
+      this.hits.delete(oldest.value);
+      evicted++;
+    }
+    return evicted;
+  }
+
+  private syncGauge(): void {
+    try {
+      let total = 0;
+      for (const s of boundedStores.values()) total += s.size;
+      rate_limit_store_size.set(total);
+    } catch {
+      // metrics registry may be unavailable in unit tests
+    }
+  }
+
+  get size(): number {
+    return this.hits.size;
+  }
+
+  async increment(key: string): Promise<ClientRateLimitInfo> {
+    const windowMs = this.options?.windowMs ?? 60_000;
+    const now = Date.now();
+    const existing = this.hits.get(key);
+    if (existing && existing.resetTime.getTime() > now) {
+      existing.totalHits++;
+      this.touch(key);
+      this.syncGauge();
+      return { totalHits: existing.totalHits, resetTime: existing.resetTime };
+    }
+    if (existing) this.hits.delete(key);
+    const resetTime = new Date(now + windowMs);
+    this.hits.set(key, { totalHits: 1, resetTime });
+    const evicted = this.evictIfNeeded();
+    if (evicted > 0) {
+      log("warn", "rate_limit_store_evicted", {
+        limiter: this.limiterName,
+        evicted,
+        size: this.hits.size,
+        maxKeys: this.maxKeys,
+      });
+    }
+    this.syncGauge();
+    return { totalHits: 1, resetTime };
+  }
+
+  async decrement(key: string): Promise<void> {
+    const entry = this.hits.get(key);
+    if (entry && entry.totalHits > 0) entry.totalHits--;
+  }
+
+  async resetKey(key: string): Promise<void> {
+    this.hits.delete(key);
+    this.syncGauge();
+  }
+}
+
+/** Total tracked keys across all bounded in-process limiters. */
+export function getBoundedRateLimitStoreSize(): number {
+  let total = 0;
+  for (const s of boundedStores.values()) total += s.size;
+  return total;
+}
+
+// Exposed for JobScheduler's `rate_limit:maintenance` tick without creating
+// a middleware <-> scheduler import cycle.
+(globalThis as { __rateLimitStoreSize?: () => number }).__rateLimitStoreSize =
+  getBoundedRateLimitStoreSize;
 
 function getStore(name: string) {
   if (config.clusterEnabled && cluster.isWorker) {
     return new ClusterRateLimitStore(name);
   }
-  return undefined;
+  let store = boundedStores.get(name);
+  if (!store) {
+    store = new BoundedMemoryStore(name);
+    boundedStores.set(name, store);
+  }
+  return store;
 }
 
 // N11 hardening: RELAYER_TEST_MODE neuters auth + rate limits AND stubs the
@@ -42,7 +170,9 @@ const corsOriginList = String(config.corsOrigins || "*")
   .filter(Boolean);
 
 if (process.env.NODE_ENV === "production" && corsOriginList.includes("*")) {
-  console.error("[fatal] CORS_ORIGIN='*' is forbidden when NODE_ENV=production");
+  console.error(
+    "[fatal] CORS_ORIGIN='*' is forbidden when NODE_ENV=production",
+  );
   process.exit(1);
 }
 
@@ -361,6 +491,9 @@ export const graduatedSlowDown = isTestMode
       store: getStore("slowDown") as any,
       keyGenerator,
       validate: { delayMs: false },
+      // A comment/query burst must not consume a vote's global slowdown
+      // budget. Vote endpoints retain their stricter wallet + vote limiters.
+      skip: (req) => isCriticalRequest(req.method, req.path),
     });
 
 /**
@@ -464,7 +597,8 @@ export const commitmentRegistrationLimiter = isTestMode
       windowMs: config.commitmentRegistrationRateWindowMs,
       message:
         "Too many commitment registrations for this member, please try again later",
-      onBlocked: () => membershipRegistrationLimited.inc({ reason: "api_rate_limit" }),
+      onBlocked: () =>
+        membershipRegistrationLimited.inc({ reason: "api_rate_limit" }),
     });
 
 /**
@@ -509,11 +643,7 @@ export function costBasedLimiter(opts: {
   windowMs: number;
   message: string;
 }): RequestHandler {
-  const store = getStore(opts.name);
-  // Keep the store alive for this limiter instance (it registers metrics and
-  // is shared with the other limiter factories) even though this particular
-  // limiter tracks cost locally.
-  void store;
+  getStore(opts.name);
   const costTracking = new Map<string, { cost: number; resetTime: number }>();
 
   return (req: Request, res: Response, next: NextFunction) => {

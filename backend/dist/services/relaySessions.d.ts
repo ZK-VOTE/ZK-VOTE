@@ -24,7 +24,7 @@ export interface RelaySessionTokenPayload {
     capabilities: string[];
     publicKeyPem: string;
 }
-export declare function createSignedSessionToken(clientId: string, privateKeyPem: string, options?: {
+export declare function createSignedSessionToken(clientId: string, _privateKeyPem?: string, options?: {
     daoId?: number;
     nonce?: string;
     capabilities?: string[];

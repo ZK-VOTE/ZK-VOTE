@@ -7,12 +7,73 @@ use soroban_sdk::{
     Bytes, BytesN, Env, IntoVal, TryFromVal, Val, Vec, U256,
 };
 
+// ── Verifier stub gate ───────────────────────────────────────────────────────
+//
+// `verify_groth16`, `verify_groth16_bls381` and `verify_groth16_batch` return
+// `true` without performing any pairing when the `testutils` FEATURE is on.
+// That is only ever acceptable inside a test harness, so:
+//
+//   * `cfg(test)` alone would NOT be sufficient, and is not what we use. It is
+//     per-crate: `cargo test -p voting` compiles this crate as a *dependency*,
+//     where `cfg(test)` is false. A `cfg(test)` gate therefore either never
+//     fires or pushes the bypass into the consumer contract, and in neither
+//     case says anything about what ships.
+//   * `testutils` is a cargo FEATURE, which propagates through a dependency
+//     graph. So the gate is paired with two structural guarantees:
+//       1. the `compile_error!` below makes a stubbed wasm32 build impossible
+//          to compile, and wasm32 is the only target a contract is deployed to;
+//       2. no consumer contract forwards `zkvote-groth16/testutils` from its own
+//          `testutils` feature, so `cargo build --all-features` cannot reach it
+//          either. Consumer tests get their bypass from a `#[cfg(test)]`-only,
+//          setter-less override in the contract itself.
+//
+// A stub cfg must be written literally as `#[cfg(feature = "testutils")]` paired
+// with `#[cfg(not(feature = "testutils"))]`. Do NOT route it through a `const`
+// such as `#[cfg(STUB_ACTIVE)]`: `cfg` treats a bare identifier as a *cfg key
+// name*, not as a const value, so such a gate silently evaluates to `false` and
+// the stub simply never turns on — which looks like a passing test suite.
+//
+// `contracts/zkvote-groth16/tests/verifier_stub_gate.rs` asserts the gate is
+// closed in a default build, and CI asserts a `--all-features` wasm build fails.
+
+// Tripwire. `scripts/deploy/deploy-hosted-futurenet.sh` currently builds without
+// `--all-features` by luck, not by construction; without this, an
+// `--all-features` WASM build would link a verifier that accepts every proof.
+#[cfg(all(feature = "testutils", target_arch = "wasm32"))]
+compile_error!(
+    "the `testutils` feature replaces Groth16 verification with `true` and must \
+     never be enabled for a wasm32 build. Remove it from the build (or from the \
+     dependency chain that pulls it in) and rebuild."
+);
+
 // Batch verification for proofs sharing one verification key (#90)
 pub mod batch;
 // Proof canonicalization module for malleability prevention
 pub mod proof_canonicalization;
 // Audit-friendly, versioned proof serialization format (ZKV1)
 pub mod serialization;
+
+// Constants generated from shared/protocol-manifest.json. Keep the Rust wire
+// format and the TS bindings byte-for-byte identical.
+pub mod generated;
+
+/// Whether the no-op verifier is compiled in. Always `false` in any build that
+/// could be deployed; exposed so tests can assert the invariant directly
+/// instead of inferring it from behaviour.
+pub const fn verifier_is_stubbed() -> bool {
+    cfg!(feature = "testutils")
+}
+
+/// Marker string linked into the binary **only** when the stub is active, so a
+/// release `.wasm` can be grepped for it. `#[used]` stops the linker from
+/// discarding a symbol nothing references.
+///
+/// Defence in depth rather than the primary control: the `compile_error!` above
+/// already makes a stubbed wasm impossible to build. This catches the case
+/// where a future change downgrades that `compile_error!` to a warning.
+#[cfg(feature = "testutils")]
+#[used]
+pub static VERIFIER_STUB_MARKER: [u8; 26] = *b"ZKVOTE_GROTH16_STUB_ACTIVE";
 
 pub const BN254_FR_MODULUS: [u8; 32] = [
     0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
@@ -115,6 +176,11 @@ pub trait Groth16Curve {
 
 pub struct Bn254Curve;
 
+/// A Groth16 verification equation has exactly four pairing terms. Rejecting
+/// any other cardinality before entering the host function prevents callers
+/// from turning an oversized vector into a Protocol-25 budget exhaustion path.
+pub const GROTH16_PAIRING_TERMS: u32 = 4;
+
 impl Groth16Curve for Bn254Curve {
     type G1 = Bn254G1Affine;
     type G2 = Bn254G2Affine;
@@ -149,6 +215,14 @@ impl Groth16Curve for Bn254Curve {
         -point.clone()
     }
     fn pairing_check(env: &Env, g1: Vec<Self::G1>, g2: Vec<Self::G2>) -> bool {
+        // Fail before crossing the host boundary: metering the host pairing
+        // primitive is intentionally not our first line of DoS defence.
+        if g1.len() != GROTH16_PAIRING_TERMS
+            || g2.len() != GROTH16_PAIRING_TERMS
+            || g1.len() != g2.len()
+        {
+            return false;
+        }
         env.crypto().bn254().pairing_check(g1, g2)
     }
 }
@@ -274,7 +348,7 @@ pub fn is_identity_bls381_g2(bytes: &BytesN<192>) -> bool {
     constant_time_eq(&bytes.to_array(), &id)
 }
 
-#[cfg(not(any(test, feature = "testutils")))]
+#[cfg(not(feature = "testutils"))]
 fn verify_groth16_impl<C: Groth16Curve>(
     env: &Env,
     vk: &VerificationKey,
@@ -313,7 +387,7 @@ fn verify_groth16_impl<C: Groth16Curve>(
     C::pairing_check(env, g1_vec, g2_vec)
 }
 
-#[cfg(not(any(test, feature = "testutils")))]
+#[cfg(not(feature = "testutils"))]
 fn compute_vk_x<C: Groth16Curve>(
     env: &Env,
     vk: &VerificationKey,
@@ -344,21 +418,21 @@ pub fn verify_groth16(
         return false;
     }
 
-    // Test-mode bypass: return true without crypto
-    // WARNING: Does not exercise the production verification path
-    #[cfg(any(test, feature = "testutils"))]
+    // See the stub gate at the top of this file: active only under the
+    // `testutils` feature, which a wasm32 build cannot have (compile_error!).
+    #[cfg(feature = "testutils")]
     {
         let _ = (env, vk, proof, pub_signals);
         true
     }
 
-    #[cfg(not(any(test, feature = "testutils")))]
+    #[cfg(not(feature = "testutils"))]
     verify_groth16_impl::<Bn254Curve>(env, vk, proof, pub_signals)
 }
 
 // --- BLS12-381 verification ---
 
-#[cfg(not(any(test, feature = "testutils")))]
+#[cfg(not(feature = "testutils"))]
 fn verify_groth16_impl_bls381(
     env: &Env,
     vk: &VerificationKeyBls381,
@@ -397,7 +471,7 @@ fn verify_groth16_impl_bls381(
     Bls12381Curve::pairing_check(env, g1_vec, g2_vec)
 }
 
-#[cfg(not(any(test, feature = "testutils")))]
+#[cfg(not(feature = "testutils"))]
 fn compute_vk_x_impl_bls381(
     env: &Env,
     vk: &VerificationKeyBls381,
@@ -428,13 +502,14 @@ pub fn verify_groth16_bls381(
         return false;
     }
 
-    #[cfg(any(test, feature = "testutils"))]
+    // See the stub gate at the top of this file.
+    #[cfg(feature = "testutils")]
     {
         let _ = (env, vk, proof, pub_signals);
         true
     }
 
-    #[cfg(not(any(test, feature = "testutils")))]
+    #[cfg(not(feature = "testutils"))]
     verify_groth16_impl_bls381(env, vk, proof, pub_signals)
 }
 

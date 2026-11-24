@@ -9,6 +9,8 @@ Scope: current multi-tenant Soroban contracts (registry, membership-sbt, members
 - **Relay (malicious)**: may drop/delay/reorder/alter submissions; holds its own key to sign transactions.
 - **Contract admin (per DAO)**: can set VK, manage membership (via SBT/tree), and create proposals; not trusted with anonymity or vote integrity beyond defined controls.
 - **Chain validators**: assumed honest in execution; P25 host functions enforce cryptography.
+- **Financial abuse actor (NEW - SPIKE-147)**: attempts wash payments, structuring, mule convergence, or rapid cycling through `/pay`, `/pay/batch`, `/ramp` endpoints to launder funds, farm rewards, or evade thresholds. Operates at metadata level (payment timing, amounts, destinations) without accessing vote linkage.
+- **KYC data leakage actor (NEW - SPIKE-146)**: attempts to deanonymize voters by correlating anchor KYC data (from `/ramp` flows) with voting activity. Targets over-collected identity data, verbose anchor responses, or cross-subsystem joins (ramp identity ↔ ballot commitments).
 
 ## What Relays Learn / Can Do
 
@@ -631,3 +633,30 @@ In an unmitigated "single-laptop setup", a single ceremony runner evaluates Phas
    - State-machine verification in `formal-model/TranscriptRegistry.tla` formally proves:
      - `UnattestedVKNeverActive`: An unattested verification key can never be set as active in voting.
      - `MinContributorsEnforced`: No transcript with $< 3$ contributors can ever be verified.
+
+---
+
+## Cross-DAO Observer & Secret Reuse Threat Model
+
+### Adversary Profile: Global Cross-DAO Observer
+The global observer is an adversary (such as an analytics firm, indexer, or compromised DAO admin) monitoring public state across multiple DAOs on Stellar:
+- Reads all on-chain `MembershipTree` commitments: `Poseidon(DOMAIN_TAG, secret, salt, blindingFactor)`.
+- Reads all submitted `Voting` nullifiers: `Poseidon(secret, daoId, proposalId)`.
+- Observes voting timestamps and tree insertion sequence.
+
+### Attack Vector: Identity Linkage via Shared Preimage
+When voters reuse raw `(secret, salt)` pairs across multiple DAOs:
+1. **Commitment Unification**: Identical leaf hashes appear in multiple DAO trees. An observer immediately intersects the trees and concludes that the exact same person is a member of DAOs A, B, and C.
+2. **Targeted Nullifier Testing**: If a malicious DAO admin acquires or forces exposure of the voter's raw secret in DAO A, the admin can compute `Poseidon(secret, daoId_B, proposalId_B)` to deanonymize the voter's ballot choices in DAO B.
+3. **Behavioral Timing Correlation**: Correlating leaf registration and vote submission times across trees with shared credentials deanonymizes complete governance portfolios.
+
+### Mitigations & Cryptographic Guarantees
+1. **Strict Per-DAO KDF Standard**:
+   `secret_dao = BigInt(SHA-256("zkvote:secret:" || daoId || masterSecret))`
+   `salt_dao = BigInt(SHA-256("zkvote:salt:" || daoId || masterSecret))`
+   `blinding_dao = BigInt(SHA-256("zkvote:blinding:" || daoId || masterSecret))`
+2. **Blast Radius Isolation**:
+   Because `secret_dao` is computationally decoupled between distinct `daoId`s under the random oracle model (SHA-256), compromise of any single DAO admin reveals zero information regarding the voter's nullifiers or commitments in any other DAO.
+3. **Client-Side Enforcement & Migration**:
+   Frontend `derivePerDaoCredentials` derives credentials per DAO automatically, while standalone un-bound generation is marked deprecated. Rotation protocols allow members to register fresh per-DAO commitments without linkability carryover.
+

@@ -1,6 +1,9 @@
-import { useState, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "./ui/Button";
 import { relayerFetch, generateIdempotencyKey } from "../lib/api";
+import { isAllowedMessageOrigin } from "../lib/messageOrigin";
+import { canonicalizeStellarAmount } from "../lib/stellarAmount";
+import { useSessionBoundForm } from "../hooks/useWalletSession";
 
 type Asset = "XLM" | "USDC" | "EURC";
 
@@ -16,8 +19,12 @@ export default function PayPanel() {
   const [amount, setAmount] = useState("5");
   const [memo, setMemo] = useState("");
   const [loading, setLoading] = useState(false);
+  const [trustlineMessage, setTrustlineMessage] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingPayment | null>(null);
   const pendingPaymentRef = useRef<PendingPayment | null>(null);
+  // A payment filled in under one wallet session must be reviewed again
+  // after an account or network switch before it is sent (#750).
+  const { blockReason } = useSessionBoundForm([asset, dest, amount, memo]);
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -50,8 +57,48 @@ export default function PayPanel() {
     return () => window.removeEventListener("message", handleMessage);
   }, []);
 
+  const checkDestinationTrustline = async (): Promise<boolean> => {
+    if (asset === "XLM") {
+      setTrustlineMessage("XLM does not require a trustline.");
+      return true;
+    }
+    if (!dest) {
+      setTrustlineMessage("Enter a destination before checking its trustline.");
+      return false;
+    }
+
+    try {
+      const res = await relayerFetch(
+        `/pay/trustline?account=${encodeURIComponent(dest)}&asset=${asset}`,
+      );
+      const text = await res.text();
+      const status = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        setTrustlineMessage(status.error || "Unable to verify trustline.");
+        return false;
+      }
+      if (status.ready) {
+        setTrustlineMessage(`${asset} trustline is ready.`);
+        return true;
+      }
+      const detail =
+        status.reason === "issuer_authorization_required"
+          ? `The ${asset} trustline exists but issuer authorization is still required.`
+          : `Destination must create a ${asset} trustline to ${status.issuer}.`;
+      setTrustlineMessage(detail);
+      return false;
+    } catch (error: any) {
+      setTrustlineMessage(error.message || "Unable to verify trustline.");
+      return false;
+    }
+  };
+
   const send = async () => {
     if (!dest) return alert("Destination required (G... or M...)");
+    const sessionBlock = blockReason();
+    if (sessionBlock) return alert(sessionBlock);
+    const canonicalAmount = canonicalizeStellarAmount(amount);
+    if (!(await checkDestinationTrustline())) return;
     
     // Check if there's already a pending payment
     if (pendingPaymentRef.current) {
@@ -61,7 +108,6 @@ export default function PayPanel() {
         return;
       }
     }
-    
     setLoading(true);
     const idempotencyKey = generateIdempotencyKey("pay");
     const pendingPayment: PendingPayment = { idempotencyKey, timestamp: Date.now() };
@@ -73,7 +119,7 @@ export default function PayPanel() {
       const res = await relayerFetch("/pay", { 
         method: "POST", 
         headers: { "Content-Type": "application/json" }, 
-        body: JSON.stringify({ asset, destination: dest, amount, memo }),
+        body: JSON.stringify({ asset, destination: dest, amount: canonicalAmount, memo }),
         idempotencyKey,
       });
       const text = await res.text();
@@ -100,7 +146,16 @@ export default function PayPanel() {
   };
 
   const sendBatch = async () => {
-    const ops = Array.from({ length: 3 }, (_, i) => ({ destination: dest || "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", asset, amount }));
+    if (!dest) return alert("Destination required (G... or M...)");
+    const sessionBlock = blockReason();
+    if (sessionBlock) return alert(sessionBlock);
+    const canonicalAmount = canonicalizeStellarAmount(amount);
+    if (!(await checkDestinationTrustline())) return;
+    const ops = Array.from({ length: 3 }, () => ({
+      destination: dest,
+      asset,
+      amount: canonicalAmount,
+    }));
     
     // Check if there's already a pending batch
     if (pendingPaymentRef.current) {
@@ -119,22 +174,7 @@ export default function PayPanel() {
     pendingPaymentRef.current = pendingPayment;
     
     try {
-      const res = await relayerFetch("/pay/batch", { 
-        method: "POST", 
-        headers: { "Content-Type": "application/json" }, 
-        body: JSON.stringify({ ops }),
-        idempotencyKey,
-      });
-      const text = await res.text();
-      let j: any = {};
-      try { j = text ? JSON.parse(text) : {}; } catch { j = { raw: text }; }
-      if (!res.ok) throw new Error(j.error || `HTTP ${res.status}: ${text.slice(0, 200)}`);
-      
-      // Update pending with hash
-      const updatedPending = { ...pendingPayment, hash: j.hash };
-      setPending(updatedPending);
-      pendingPaymentRef.current = updatedPending;
-      
+      const j = await sendBatchPayment(ops);
       alert(j.hash ? `Batch ${j.ops} sent: ${j.hash}` : JSON.stringify(j));
     } catch (e: any) { 
       alert(e.message); 
@@ -158,13 +198,27 @@ export default function PayPanel() {
         </div>
       )}
       <div className="grid grid-cols-2 gap-3">
-        <select value={asset} onChange={e => setAsset(e.target.value as Asset)} className="border rounded px-3 py-2 bg-background">
+        <select aria-label="Asset" value={asset} onChange={e => { setAsset(e.target.value as Asset); setTrustlineMessage(null); }} className="border rounded px-3 py-2 bg-background">
           <option>XLM</option><option>USDC</option><option>EURC</option>
         </select>
-        <input value={amount} onChange={e => setAmount(e.target.value)} placeholder="Amount (7 decimals)" className="border rounded px-3 py-2 bg-background" />
+        <input aria-label="Amount" inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} placeholder="Amount (7 decimals)" className="border rounded px-3 py-2 bg-background" />
       </div>
-      <input value={dest} onChange={e => setDest(e.target.value)} placeholder="Destination G... or M... (muxed for inflow)" className="w-full border rounded px-3 py-2 bg-background font-mono text-sm" />
-      <input value={memo} onChange={e => setMemo(e.target.value)} placeholder="Memo (optional)" className="w-full border rounded px-3 py-2 bg-background" />
+      <input aria-label="Destination address" value={dest} onChange={e => { setDest(e.target.value); setTrustlineMessage(null); }} placeholder="Destination G... or M... (muxed for inflow)" className="w-full border rounded px-3 py-2 bg-background font-mono text-sm" />
+      <input aria-label="Memo (optional)" value={memo} onChange={e => setMemo(e.target.value)} placeholder="Memo (optional)" className="w-full border rounded px-3 py-2 bg-background" />
+      {asset !== "XLM" && (
+        <div className="rounded border p-3 text-sm space-y-2">
+          <Button
+            onClick={checkDestinationTrustline}
+            disabled={loading || !dest}
+            variant="outline"
+          >
+            Check {asset} trustline
+          </Button>
+          {trustlineMessage && (
+            <div role="status" className="text-xs text-muted-foreground">{trustlineMessage}</div>
+          )}
+        </div>
+      )}
       <div className="flex gap-2">
         <Button onClick={send} disabled={loading || !!pending} className="flex-1">{loading ? "..." : "Send (withSequenceLock)"}</Button>
         <Button onClick={sendBatch} disabled={loading || !!pending} variant="outline" className="flex-1">Batch 3× (100/tx)</Button>

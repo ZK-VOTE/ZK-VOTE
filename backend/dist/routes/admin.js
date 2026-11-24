@@ -7,7 +7,7 @@
  * privileged graceful-shutdown trigger for controlled restarts.
  */
 import { Router } from "express";
-import { authGuard, queryLimiter, bodyLimit, validateBody, validateQuery, } from "../middleware/index.js";
+import { authGuard, masterKeyGuard, queryLimiter, bodyLimit, validateBody, validateQuery, } from "../middleware/index.js";
 import { getAuditLogs, verifyAuditChain, formatAsCef, } from "../services/audit.js";
 import { getEventsForDao } from "../services/db.js";
 import { log } from "../services/logger.js";
@@ -454,7 +454,7 @@ router.get("/admin/relayer/health", authGuard, queryLimiter, (async (_req, res) 
 /**
  * POST /admin/relayer/rotate - Hot key rotation without server restart (admin only).
  */
-router.post("/admin/relayer/rotate", bodyLimit("10kb"), authGuard, queryLimiter, validateBody(adminRelayerRotateSchema), (async (req, res) => {
+router.post("/admin/relayer/rotate", bodyLimit("10kb"), masterKeyGuard, queryLimiter, validateBody(adminRelayerRotateSchema), (async (req, res) => {
     try {
         const { targetKeyId, targetPublicKey, reason } = req.body || {};
         const target = targetKeyId || targetPublicKey;
@@ -477,7 +477,7 @@ router.post("/admin/relayer/rotate", bodyLimit("10kb"), authGuard, queryLimiter,
 /**
  * POST /admin/relayer/keys - Register a new secondary / standby relayer key (admin only).
  */
-router.post("/admin/relayer/keys", bodyLimit("10kb"), authGuard, queryLimiter, validateBody(adminRelayerRegisterKeySchema), (async (req, res) => {
+router.post("/admin/relayer/keys", bodyLimit("10kb"), masterKeyGuard, queryLimiter, validateBody(adminRelayerRegisterKeySchema), (async (req, res) => {
     try {
         const { id, secretKey, publicKey, signerType, kmsKeyId, kmsRegion, role, makeActive, } = req.body || {};
         const key = relayerKeyManager.registerKey({
@@ -516,7 +516,7 @@ router.post("/admin/relayer/keys", bodyLimit("10kb"), authGuard, queryLimiter, v
 /**
  * POST /admin/relayer/generate - Generate a fresh keypair and register it (admin only).
  */
-router.post("/admin/relayer/generate", bodyLimit("10kb"), authGuard, queryLimiter, validateBody(adminRelayerGenerateKeySchema), (async (req, res) => {
+router.post("/admin/relayer/generate", bodyLimit("10kb"), masterKeyGuard, queryLimiter, validateBody(adminRelayerGenerateKeySchema), (async (req, res) => {
     try {
         const { role, makeActive } = req.body || {};
         const key = relayerKeyManager.generateKey(role, makeActive);
@@ -543,7 +543,7 @@ router.post("/admin/relayer/generate", bodyLimit("10kb"), authGuard, queryLimite
 /**
  * POST /admin/relayer/fund - Fund a relayer key via Friendbot (admin only).
  */
-router.post("/admin/relayer/fund", bodyLimit("10kb"), authGuard, queryLimiter, validateBody(adminRelayerFundKeySchema), (async (req, res) => {
+router.post("/admin/relayer/fund", bodyLimit("10kb"), masterKeyGuard, queryLimiter, validateBody(adminRelayerFundKeySchema), (async (req, res) => {
     try {
         const { publicKey, friendbotUrl } = req.body || {};
         const result = await relayerKeyManager.fundKey(publicKey, friendbotUrl);
@@ -575,7 +575,7 @@ router.post("/admin/relayer/fund", bodyLimit("10kb"), authGuard, queryLimiter, v
 /**
  * POST /admin/relayer/check-balances - Trigger balance checks and low-balance failover (admin only).
  */
-router.post("/admin/relayer/check-balances", authGuard, queryLimiter, (async (_req, res) => {
+router.post("/admin/relayer/check-balances", masterKeyGuard, queryLimiter, (async (_req, res) => {
     try {
         const balances = await relayerKeyManager.checkAllBalances(server);
         const failoverResult = await relayerKeyManager.checkAndHandleLowBalance(undefined, server);

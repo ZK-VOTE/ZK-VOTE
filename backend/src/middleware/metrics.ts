@@ -28,6 +28,73 @@ import { normalizeRoute } from "../services/metrics.js";
  * `req.route.path`). Response-side metrics continue to use the resolved route
  * from `req.route.path` on the `finish` event, giving low-cardinality labels.
  */
+/**
+ * Top-level path segments the app serves (route files + index.ts mounts).
+ * Anything else is "/other", so a path-spraying scanner cannot mint series.
+ */
+const KNOWN_ROUTE_ROOTS = new Set([
+  "admin",
+  "aggregate",
+  "analytics",
+  "api",
+  "api-docs",
+  "audit",
+  "auth",
+  "bridge",
+  "circuits",
+  "claim",
+  "comment",
+  "comments",
+  "config",
+  "csp-report",
+  "csrf-token",
+  "dao",
+  "daos",
+  "db",
+  "debug",
+  "delegation",
+  "events",
+  "health",
+  "healthz",
+  "indexer",
+  "ipfs",
+  "log",
+  "membership",
+  "metrics",
+  "nullifier",
+  "openapi",
+  "pay",
+  "proposal",
+  "proposals",
+  "public-stats",
+  "qv",
+  "ramp",
+  "randomness",
+  "ready",
+  "readyz",
+  "receipt",
+  "relay-test",
+  "relayer",
+  "remediation",
+  "root",
+  "root-history",
+  "sequence",
+  "services",
+  "swap",
+  "sybil",
+  "threshold",
+  "tx",
+  "vdf",
+  "verify",
+  "vote",
+]);
+
+export function routeFamily(path: string): string {
+  const first = (path || "").split("?")[0].split("/").filter(Boolean)[0];
+  if (!first) return "/";
+  return KNOWN_ROUTE_ROOTS.has(first) ? `/${first}` : "/other";
+}
+
 export function metricsMiddleware(
   req: Request,
   res: Response,
@@ -42,7 +109,9 @@ export function metricsMiddleware(
   // This is intentionally separate from the finish-event route label so that
   // the observation is not lost for requests that never complete normally.
   const contentLength = parseInt(req.headers["content-length"] || "0", 10);
-  const inboundRoute = normalizeRoute(req.path);
+  // Before routing only the raw path is known, and it is attacker-chosen:
+  // label by the top-level segment if it is one the app serves (#749).
+  const inboundRoute = routeFamily(req.path);
   if (contentLength > 0) {
     httpRequestSize.observe({ method, route: inboundRoute }, contentLength);
   }
@@ -62,9 +131,12 @@ export function metricsMiddleware(
   const originalEnd = res.end;
   res.end = function (this: Response, ...args: Parameters<typeof originalEnd>) {
     const duration = Number(process.hrtime.bigint() - start) / 1e9;
-    const route = normalizeRoute(
-      typeof req.route?.path === "string" ? req.route.path : req.path,
-    );
+    // Matched requests use their route template; unmatched paths (404 scans)
+    // all share one series instead of minting one per probed path (#749).
+    const route =
+      typeof req.route?.path === "string"
+        ? normalizeRoute(req.route.path)
+        : "unmatched";
     const status = String(res.statusCode);
 
     release();

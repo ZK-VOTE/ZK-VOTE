@@ -1,163 +1,350 @@
-# Operations Runbook: Zero-Downtime Relayer Key Rotation & Multi-Key Management
+# Relayer Key Rotation Runbook
 
-**Issue:** #177  
-**Type:** Security & Operational Architecture Runbook  
-**Status:** Production Ready  
+This document describes the operational procedures for rotating relayer signing keys and co-signer approval secrets.
 
----
+## Overview
 
-## 1. Overview & Objectives
+The ZK-VOTE relayer uses a tiered signing policy with co-signer approvals:
 
-The ZKVote Relayer submits zero-knowledge vote transactions on behalf of users on Stellar/Soroban. The relayer key manager supports:
-- **Multiple Relayer Keys**: Primary active key alongside secondary/standby keys.
-- **Zero-Downtime Hot Key Rotation**: Swapping signing keys dynamically without restarting the server or dropping in-flight transactions.
-- **Automated Low-Balance Failover**: Monitoring XLM gas reserves and automatically failing over to funded secondary keys when the active balance drops below the threshold.
-- **Automated Key Generation & Funding**: Generating new keypairs and funding them via Friendbot (testnet/futurenet) or on-chain transfer.
-- **Privileged Admin API**: Protected administrative endpoints to manage, rotate, fund, and inspect relayer keys.
-- **Health Monitoring & Prometheus Metrics**: Key age, transaction counts, balance tracking, and rotation auditing.
+- **Hot tier**: Low-value transactions, hot key alone
+- **Warm tier**: Medium value, requires 1 co-signer approval
+- **Cold tier**: High value or privileged operations, requires 2 co-signer approvals
 
----
+Co-signer approvals are HMACs bound to transaction hash and tier, signed with secrets that must be rotated periodically and can be revoked in case of compromise.
 
-## 2. Multi-Key Architecture
+## Approval Secret Rotation
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   ZKVote Relayer Process                    │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                 RelayerKeyManager                     │  │
-│  │                                                       │  │
-│  │  ┌───────────────────────┐ ┌───────────────────────┐  │  │
-│  │  │   Primary Active Key  │ │  Secondary / Standby  │  │  │
-│  │  │ (Active Signing Key)  │ │ (Funded Failover Key) │  │  │
-│  │  └───────────┬───────────┘ └───────────▲───────────┘  │  │
-│  │              │                         │              │  │
-│  │              │   Zero-Downtime Hot     │              │  │
-│  │              └─── Swap / Failover ─────┘              │  │
-│  └──────────────────────┬────────────────────────────────┘  │
-│                         │                                   │
-│                         ▼ (Active Signer)                   │
-│             ┌───────────────────────┐                       │
-│             │   Transaction Builder │                       │
-│             └───────────────────────┘                       │
-└─────────────────────────────────────────────────────────────┘
-```
+### Regular Rotation (Every 90 Days)
 
----
+1. **Pre-rotation Check**
 
-## 3. Configuration & Environment Variables
+   ```bash
+   # Verify current secret status
+   curl -X GET http://localhost:3000/admin/approval-secrets \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
 
-| Variable | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `RELAYER_SECRET_KEY` | `string` | *(Required)* | Primary Stellar secret key (`S...`) |
-| `RELAYER_PUBLIC_KEY` | `string` | `""` | Primary Stellar public address (`G...`) |
-| `RELAYER_SECONDARY_SECRET_KEY` | `string` | `""` | Optional pre-configured secondary secret key |
-| `RELAYER_SECONDARY_PUBLIC_KEY` | `string` | `""` | Optional secondary public address |
-| `RELAYER_MIN_BALANCE_XLM` | `number` | `5` | Minimum XLM balance before low-balance warning/failover |
-| `RELAYER_AUTO_ROTATE_LOW_BALANCE`| `boolean`| `true` | Automatically hot-swap to secondary key on low balance |
-| `FRIENDBOT_URL` | `string` | Futurenet | Friendbot endpoint for testnet funding |
-| `RELAYER_AUTH_TOKEN` | `string` | *(Required)* | Master admin bearer token for privileged API operations |
+2. **Initiate Rotation**
 
----
+   ```bash
+   # Rotate with 5-minute overlap window
+   curl -X POST http://localhost:3000/admin/approval-secrets/rotate \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "cosignerId": "cosigner-1",
+       "overlapWindowMs": 300000,
+       "reason": "scheduled_rotation"
+     }'
+   ```
 
-## 4. Operational Procedures
+3. **Monitor Overlap Period**
+   - Old secret remains valid for 5 minutes
+   - In-flight transactions can complete with old approvals
+   - New approvals use new secret immediately
 
-### 4.1. Manual Zero-Downtime Key Rotation via Admin API
+4. **Verify Rotation**
 
-To rotate from the current active key to the standby key:
+   ```bash
+   # Check that new version is active
+   curl -X GET http://localhost:3000/admin/approval-secrets/status \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
+
+5. **Update Co-signer Systems**
+   - Distribute new secret to co-signer services
+   - Test approval generation with new secret
+   - Confirm approvals verify correctly
+
+### Emergency Rotation (Compromise Response)
+
+If a co-signer approval secret is compromised:
+
+1. **Immediate Revocation**
+
+   ```bash
+   # Revoke compromised secret
+   curl -X POST http://localhost:3000/admin/approval-secrets/revoke \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "cosignerId": "cosigner-1",
+       "version": 5,
+       "reason": "suspected_compromise",
+       "actor": "security-team"
+     }'
+   ```
+
+   This will:
+   - Immediately invalidate the compromised secret
+   - Revoke all pending approvals signed with it
+   - Log audit event for investigation
+
+2. **Issue New Secret**
+
+   ```bash
+   # Generate new secret immediately
+   curl -X POST http://localhost:3000/admin/approval-secrets/rotate \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "cosignerId": "cosigner-1",
+       "overlapWindowMs": 0,
+       "reason": "compromise_recovery"
+     }'
+   ```
+
+3. **Audit Trail Review**
+
+   ```bash
+   # Check recent approvals with compromised secret
+   curl -X GET "http://localhost:3000/admin/audit-log?action=approval_issued" \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
+
+4. **Incident Response**
+   - Review all transactions approved with compromised secret
+   - Check for unauthorized transactions
+   - Update incident response log
+   - Notify stakeholders if necessary
+
+## Relayer Hot Key Rotation
+
+### Preparation
+
+1. **Generate New Key**
+
+   ```bash
+   stellar keys generate --network testnet
+   # Save: Public Key, Secret Key
+   ```
+
+2. **Fund New Key**
+
+   ```bash
+   # Transfer minimum operating reserve
+   stellar payment --source $OLD_KEY --destination $NEW_KEY --amount 100
+   ```
+
+3. **Register New Key**
+   ```bash
+   curl -X POST http://localhost:3000/admin/relayer/register-key \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "id": "relayer-key-v2",
+       "publicKey": "$NEW_PUBLIC_KEY",
+       "secretKey": "$NEW_SECRET_KEY",
+       "role": "primary",
+       "makeActive": false
+     }'
+   ```
+
+### Activation
+
+1. **Gradual Rollout**
+
+   ```bash
+   # Set new key as active
+   curl -X POST http://localhost:3000/admin/relayer/activate-key \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "keyId": "relayer-key-v2"
+     }'
+   ```
+
+2. **Monitor Health**
+   - Check transaction success rate
+   - Monitor error logs
+   - Verify account balances
+
+3. **Sweep Old Key** (after 24 hours)
+
+   ```bash
+   # Move remaining funds from old key
+   curl -X POST http://localhost:3000/admin/relayer/sweep \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "fromKeyId": "relayer-key-v1",
+       "sweepSafeAccount": "$SAFE_ACCOUNT_ADDRESS"
+     }'
+   ```
+
+4. **Retire Old Key**
+   ```bash
+   # Mark old key as retired
+   curl -X POST http://localhost:3000/admin/relayer/retire-key \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "keyId": "relayer-key-v1"
+     }'
+   ```
+
+## Approval Record Persistence
+
+### Querying Approval History
 
 ```bash
-curl -X POST http://localhost:3001/admin/relayer/rotate \
-  -H "Authorization: Bearer $RELAYER_AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"reason": "routine_monthly_rotation"}'
+# Get approvals for a specific transaction
+curl -X GET "http://localhost:3000/admin/approvals?txHash=$TX_HASH" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Get all approvals by cosigner
+curl -X GET "http://localhost:3000/admin/approvals?cosignerId=cosigner-1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Get expired approvals
+curl -X GET "http://localhost:3000/admin/approvals?status=expired" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-**Response (200 OK):**
-```json
-{
-  "status": "success",
-  "message": "Relayer key rotated successfully with zero downtime",
-  "activeKey": {
-    "id": "relayer-secondary",
-    "publicKey": "GBX...SECONDARY",
-    "role": "primary",
-    "status": "active",
-    "balanceXlm": 100.0,
-    "txCount": 0
-  },
-  "previousKey": {
-    "id": "relayer-primary",
-    "publicKey": "GA1...PRIMARY",
-    "role": "secondary",
-    "status": "standby"
-  }
-}
-```
+### Audit Trail
 
-### 4.2. Inspecting Relayer Key Health & Balances
+All approval lifecycle events are logged:
+
+- `approval_issued` - When co-signer creates approval
+- `approval_used` - When approval is consumed by transaction
+- `approval_revoked` - When approval is manually revoked
+- `secret_rotated` - When approval secret is rotated
+- `secret_compromised` - When secret is revoked due to compromise
 
 ```bash
-curl -X GET http://localhost:3001/admin/relayer/health \
-  -H "Authorization: Bearer $RELAYER_AUTH_TOKEN"
+# Review audit trail
+curl -X GET "http://localhost:3000/admin/audit-log?action=approval_*" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-**Response (200 OK):**
-```json
-{
-  "status": "healthy",
-  "activeKey": {
-    "id": "relayer-primary",
-    "publicKey": "GA1...PRIMARY",
-    "role": "primary",
-    "status": "active",
-    "balanceXlm": 45.2,
-    "ageDays": 12,
-    "txCount": 1420
-  },
-  "secondaryKey": {
-    "id": "relayer-secondary",
-    "publicKey": "GBX...SECONDARY",
-    "role": "secondary",
-    "status": "standby",
-    "balanceXlm": 50.0
-  },
-  "totalKeys": 2,
-  "availableStandbyKeys": 2,
-  "minBalanceThresholdXlm": 5,
-  "autoRotateEnabled": true,
-  "alerts": []
-}
-```
+## Automated Rotation Drill
 
-### 4.3. Generating & Registering a New Secondary Key
+For automated testing of rotation procedures:
 
 ```bash
-# 1. Generate a new keypair
-curl -X POST http://localhost:3001/admin/relayer/generate \
-  -H "Authorization: Bearer $RELAYER_AUTH_TOKEN" \
+# Run rotation drill (no actual rotation)
+curl -X POST http://localhost:3000/admin/approval-secrets/drill \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"role": "secondary", "makeActive": false}'
-
-# 2. Fund the newly generated key on testnet/futurenet
-curl -X POST http://localhost:3001/admin/relayer/fund \
-  -H "Authorization: Bearer $RELAYER_AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"publicKey": "GNEW...PUBLICKEY"}'
+  -d '{
+    "cosignerId": "cosigner-1",
+    "dryRun": true
+  }'
 ```
 
-### 4.4. Automated Low-Balance Failover
+This will:
 
-1. The service periodically checks the active key's native XLM balance.
-2. If `balanceXlm < RELAYER_MIN_BALANCE_XLM` (e.g. < 5 XLM), a `relayer_low_balance_detected` warning is logged.
-3. If `RELAYER_AUTO_ROTATE_LOW_BALANCE=true` and a funded secondary key is available, `relayerKeyManager` automatically executes a hot-swap.
-4. Nonce tracking is updated via `sequenceManager.markDirty()`, ensuring no transactions fail.
+- Validate current secret configuration
+- Simulate rotation process
+- Check overlap window handling
+- Verify new secret generation
+- Test approval verification with both secrets
+- Report any issues
 
----
+## Monitoring & Alerts
 
-## 5. Prometheus Metrics
+### Key Metrics
 
-- `zkvote_relayer_key_balance_xlm`: Current XLM balance by key ID, public key, and role.
-- `zkvote_relayer_key_rotations_total`: Counter for rotation events by trigger (`manual`, `low_balance`, `api`, `scheduled`).
-- `zkvote_relayer_key_age_seconds`: Age in seconds since key activation.
-- `zkvote_relayer_key_transactions_total`: Cumulative transaction count signed by each key.
+1. **Approval Age**
+   - Alert if any approval > 24 hours old and unused
+   - Check for stale approvals blocking transactions
+
+2. **Secret Rotation Status**
+   - Alert if secret > 90 days old
+   - Warn if rotation overdue
+
+3. **Approval Verification Failures**
+   - Alert on repeated verification failures
+   - May indicate secret mismatch or compromise
+
+4. **Overlap Window Usage**
+   - Monitor approvals using deprecated secrets
+   - Should drop to zero after overlap window
+
+### Dashboard Queries
+
+```sql
+-- Approvals awaiting use
+SELECT COUNT(*) FROM relayer_approval_records
+WHERE used_at IS NULL
+  AND revoked_at IS NULL
+  AND datetime(expires_at) > datetime('now');
+
+-- Secret rotation status
+SELECT
+  cosigner_id,
+  version,
+  activated_at,
+  deprecated_at,
+  julianday('now') - julianday(activated_at) as age_days
+FROM relayer_approval_secrets
+WHERE revoked_at IS NULL
+ORDER BY activated_at DESC;
+
+-- Recent audit events
+SELECT * FROM relayer_approval_audit
+WHERE timestamp > datetime('now', '-24 hours')
+ORDER BY timestamp DESC;
+```
+
+## Troubleshooting
+
+### Approval Verification Fails
+
+1. Check secret version mismatch
+
+   ```bash
+   # Verify active secret version
+   SELECT * FROM relayer_approval_secrets
+   WHERE cosigner_id = 'cosigner-1'
+     AND revoked_at IS NULL
+   ORDER BY version DESC LIMIT 1;
+   ```
+
+2. Verify overlap window hasn't expired
+   - Check `deprecated_at + overlap_window_ms`
+   - Extend if needed for emergency
+
+3. Check audit log for revocations
+   ```bash
+   # Look for recent revocations
+   SELECT * FROM relayer_approval_audit
+   WHERE event_type = 'secret_compromised'
+     AND cosigner_id = 'cosigner-1'
+   ORDER BY timestamp DESC LIMIT 5;
+   ```
+
+### High Approval Rejection Rate
+
+- Review signing policy tier limits
+- Check co-signer secret synchronization
+- Verify network time synchronization (for expiry)
+- Check for pending secret rotation
+
+## Security Considerations
+
+1. **Secret Storage**
+   - Approval secrets stored in managed secret backend (Vault)
+   - Encrypted at rest
+   - Access logged and audited
+
+2. **Separation of Duties**
+   - Co-signers should be operated by different entities
+   - No single operator should have all co-signer secrets
+
+3. **Compromise Detection**
+   - Monitor for unusual approval patterns
+   - Alert on approval reuse attempts
+   - Track failed verification attempts
+
+4. **Rotation Frequency**
+   - Regular: Every 90 days
+   - Emergency: Immediately upon suspected compromise
+   - After personnel changes
+
+## References
+
+- Issue #962: Relayer co-signer approval secret lifecycle
+- Issue ZV-123: Approval persistence and rotation
+- Issue ZV-075: Secret management integration
+- Issue ZV-144: Automated rotation drills

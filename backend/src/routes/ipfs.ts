@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import sharp from "sharp";
+import { fileTypeFromBuffer } from "file-type";
 
 import { config, LIMITS, ALLOWED_IMAGE_MIMES } from "../config.js";
 import { log } from "../services/logger.js";
@@ -35,7 +36,12 @@ import {
   enqueueDegradedWrite,
   drainIpfsPinQueue,
 } from "../services/service-health.js";
-import { detectMimeType, validationLock } from "../utils/magic-bytes.js";
+import {
+  detectMimeType,
+  hasSafeImageDimensions,
+  validationLock,
+} from "../utils/magic-bytes.js";
+import { assertMalwareFree } from "../services/malwareScanner.js";
 
 const router = Router();
 
@@ -65,6 +71,7 @@ router.use(["/ipfs/:cid", "/ipfs/image/:cid"], (req, res, next) => {
 // ============================================
 
 const MAX_IMAGE_DIMENSION = 4096;
+const MAX_IMAGE_PIXELS = MAX_IMAGE_DIMENSION * MAX_IMAGE_DIMENSION;
 
 const ALLOWED_IMAGE_MIME_SET = new Set<string>(ALLOWED_IMAGE_MIMES);
 
@@ -159,9 +166,13 @@ interface ProcessedImage {
   width: number;
   height: number;
   hash: string;
+  scan: Awaited<ReturnType<typeof assertMalwareFree>>;
 }
 
-function invalidUpload(message: string, code: string): Error & { code: string } {
+function invalidUpload(
+  message: string,
+  code: string,
+): Error & { code: string } {
   const err = new Error(message) as Error & { code: string };
   err.code = code;
   return err;
@@ -181,13 +192,23 @@ async function processImageUpload(file: {
     );
   }
 
-  const detectedMime = detectMimeType(file.buffer);
-  if (!detectedMime || !isAllowedImageMime(detectedMime)) {
+  const magicMime = detectMimeType(file.buffer);
+  const libraryType = await fileTypeFromBuffer(file.buffer);
+  if (!magicMime || !libraryType || !isAllowedImageMime(libraryType.mime)) {
     throw invalidUpload(
-      `File content is not a supported image (detected: ${detectedMime || "unknown"}).`,
+      `File content is not a supported image (detected: ${libraryType?.mime || magicMime || "unknown"}).`,
       "INVALID_FILE_TYPE",
     );
   }
+
+  if (magicMime !== libraryType.mime) {
+    throw invalidUpload(
+      `Image detectors disagreed (${magicMime} vs ${libraryType.mime}).`,
+      "MIME_MISMATCH",
+    );
+  }
+
+  const detectedMime = libraryType.mime;
 
   if (detectedMime !== declaredMime) {
     throw invalidUpload(
@@ -204,9 +225,23 @@ async function processImageUpload(file: {
     );
   }
 
+  const scan = await assertMalwareFree(file.buffer);
+
+  if (
+    !hasSafeImageDimensions(file.buffer, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS)
+  ) {
+    throw invalidUpload(
+      `Image dimensions exceed maximum allowed ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}.`,
+      "IMAGE_DIMENSIONS_EXCEEDED",
+    );
+  }
+
   let metadata;
   try {
-    metadata = await sharp(file.buffer, { failOn: "error" }).metadata();
+    metadata = await sharp(file.buffer, {
+      failOn: "error",
+      limitInputPixels: MAX_IMAGE_PIXELS,
+    }).metadata();
   } catch {
     throw invalidUpload("Unable to read image metadata.", "INVALID_IMAGE");
   }
@@ -225,12 +260,18 @@ async function processImageUpload(file: {
 
   let sanitizedBuffer: Buffer;
   try {
-    sanitizedBuffer = await sharp(file.buffer, { failOn: "error" })
+    sanitizedBuffer = await sharp(file.buffer, {
+      failOn: "error",
+      limitInputPixels: MAX_IMAGE_PIXELS,
+    })
       .rotate()
       .withMetadata(false)
       .toBuffer();
   } catch {
-    throw invalidUpload("Image sanitization failed.", "IMAGE_SANITIZATION_FAILED");
+    throw invalidUpload(
+      "Image sanitization failed.",
+      "IMAGE_SANITIZATION_FAILED",
+    );
   }
 
   const sanitizedThreats = scanFileForThreats({
@@ -250,6 +291,7 @@ async function processImageUpload(file: {
     width: metadata.width,
     height: metadata.height,
     hash: createHash("sha256").update(file.buffer).digest("hex"),
+    scan,
   };
 }
 
@@ -436,7 +478,9 @@ router.post(
         (req as any).auth?.sub ??
         "authenticated";
 
-      const initialHash = createHash("sha256").update(req.file.buffer).digest("hex");
+      const initialHash = createHash("sha256")
+        .update(req.file.buffer)
+        .digest("hex");
 
       const { processed, result } = await validationLock.acquire(
         initialHash,
@@ -477,6 +521,7 @@ router.post(
         originalSize: req.file.size,
         filename: req.file.originalname,
         mimeType: processed.mimeType,
+        scan: { scanner: processed.scan.scanner, status: processed.scan.status },
       });
     } catch (err) {
       log("error", "ipfs_upload_failed", {
@@ -484,6 +529,9 @@ router.post(
         code: (err as any).code,
         type: "image",
       });
+      if ((err as any).code === "SCANNER_UNAVAILABLE") {
+        return res.status(503).json({ error: "IPFS malware scanner unavailable; upload was not pinned" });
+      }
       if (
         (err as any).code &&
         [
@@ -543,6 +591,9 @@ router.post(
     }
 
     try {
+      // Scan the raw payload before sanitization or pinning so malicious bytes
+      // cannot enter the CID registry through the metadata upload path.
+      const scan = await assertMalwareFree(Buffer.from(JSON.stringify(metadata)));
       // Sanitize metadata to prevent XSS attacks
       const sanitizedMetadata = ipfsService.sanitizeMetadata(metadata);
 
@@ -559,9 +610,16 @@ router.post(
       res.json({
         cid: result.cid,
         size: result.size,
+        scan: { scanner: scan.scanner, status: scan.status },
       });
     } catch (err) {
       const message = (err as Error).message;
+      if ((err as any).code === "SCANNER_UNAVAILABLE") {
+        return res.status(503).json({ error: "IPFS malware scanner unavailable; upload was not pinned" });
+      }
+      if ((err as any).code === "MALICIOUS_CONTENT") {
+        return res.status(400).json({ error: "Upload rejected and quarantined by malware scanner" });
+      }
       log("error", "ipfs_upload_failed", {
         error: message,
         type: "metadata",

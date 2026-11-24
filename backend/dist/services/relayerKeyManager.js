@@ -66,12 +66,13 @@ export class KmsSigner {
         tx.signatures.push(decoratedSig);
     }
     async signHash(hash) {
-        logger.info("kms_sign_request", {
+        logger.error("kms_sign_not_implemented", {
             keyId: this.keyId,
             region: this.region,
             hashLength: hash.length,
         });
-        return Buffer.alloc(64);
+        throw new Error(`KMS signing not implemented: integrate with AWS KMS SDK for key ${this.keyId} in ${this.region}. ` +
+            `Refusing to return dummy signature.`);
     }
 }
 export class HsmSigner {
@@ -96,11 +97,12 @@ export class HsmSigner {
         tx.signatures.push(decoratedSig);
     }
     async signHash(hash) {
-        logger.info("hsm_pkcs11_sign_request", {
+        logger.error("hsm_sign_not_implemented", {
             slotId: this.slotId,
             hashLength: hash.length,
         });
-        return Buffer.alloc(64);
+        throw new Error(`HSM PKCS#11 signing not implemented: integrate with PKCS#11 module for slot ${this.slotId}. ` +
+            `Refusing to return dummy signature.`);
     }
 }
 // ============================================
@@ -616,8 +618,10 @@ export class RelayerKeyManager {
      * In testnet/futurenet/local, uses Friendbot.
      */
     async fundKey(publicKey, friendbotUrl) {
-        const url = friendbotUrl ||
-            config.friendbotUrl ||
+        // SECURITY: Ignore user-supplied friendbotUrl to prevent SSRF.
+        // An attacker could pass http://169.254.169.254/... to exfiltrate
+        // cloud metadata via the error response. Only use server-configured URLs.
+        const url = config.friendbotUrl ||
             "https://friendbot-futurenet.stellar.org";
         if (config.testMode) {
             const key = Array.from(this.keys.values()).find((k) => k.publicKey === publicKey);
@@ -640,10 +644,16 @@ export class RelayerKeyManager {
                 return { success: true, message: `Successfully funded ${publicKey}` };
             }
             else {
-                const text = await response.text();
+                // Do not echo the response body — it may contain sensitive
+                // information if the URL was misconfigured or pointed at an
+                // internal service.
+                logger.warn("friendbot_funding_failed", {
+                    publicKey,
+                    status: response.status,
+                });
                 return {
                     success: false,
-                    message: `Friendbot returned status ${response.status}: ${text}`,
+                    message: `Friendbot returned status ${response.status}`,
                 };
             }
         }
@@ -743,11 +753,11 @@ export class RelayerKeyManager {
     updateMetrics() {
         for (const key of this.keys.values()) {
             if (key.balanceXlm !== null) {
-                relayerKeyBalance.set({ key_id: key.id, public_key: key.publicKey, role: key.role }, key.balanceXlm);
+                relayerKeyBalance.set({ key_id: key.id, role: key.role }, key.balanceXlm);
             }
             if (key.activatedAt) {
                 const ageSec = Math.max(0, Math.floor((Date.now() - new Date(key.activatedAt).getTime()) / 1000));
-                relayerKeyAgeSeconds.set({ key_id: key.id, public_key: key.publicKey }, ageSec);
+                relayerKeyAgeSeconds.set({ key_id: key.id }, ageSec);
             }
         }
     }

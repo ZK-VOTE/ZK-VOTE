@@ -31,9 +31,22 @@ import {
   adminRelayerRegisterKeySchema,
   adminRelayerGenerateKeySchema,
   adminRelayerFundKeySchema,
+  adminRelayerRotationActionSchema,
+  adminRelayerCompromiseSchema,
+  adminRelayerSweepSchema,
+  adminRelayerHaltSchema,
+  adminAbuseHoldsQuerySchema,
+  adminAbuseHoldReviewSchema,
 } from "../validation/schemas.js";
 import { relayerKeyManager } from "../services/relayerKeyManager.js";
-import { server } from "../services/stellar.js";
+import { server, relayerRotation } from "../services/stellar.js";
+import { listHolds, getHold, reviewHold } from "../services/abuseDetection.js";
+import {
+  approvalMessage,
+  treasuryMultisig,
+  TreasuryMultisigError,
+  type SessionStatus,
+} from "../services/treasury-multisig.js";
 
 const router = Router();
 
@@ -209,7 +222,11 @@ router.post(
       }
 
       if (typeof role !== "number" || ![0, 1, 2].includes(role)) {
-        res.status(400).json({ error: "role must be 0 (Admin), 1 (Member), or 2 (Auditor)" });
+        res
+          .status(400)
+          .json({
+            error: "role must be 0 (Admin), 1 (Member), or 2 (Auditor)",
+          });
         return;
       }
 
@@ -228,7 +245,9 @@ router.post(
         role: roleNames[role],
       });
     } catch (err) {
-      log("error", "admin_role_assignment_failed", { error: (err as Error).message });
+      log("error", "admin_role_assignment_failed", {
+        error: (err as Error).message,
+      });
       res.status(500).json({ error: "Failed to assign role" });
     }
   }) as AsyncHandler,
@@ -239,43 +258,43 @@ router.post(
  *
  * Returns role information if member has been assigned a role.
  */
-router.get(
-  "/admin/dao/:daoId/roles/:member",
-  authGuard,
-  queryLimiter,
-  (async (req: Request, res: Response) => {
-    try {
-      const daoId = Number(req.params.daoId);
-      const member = req.params.member;
+router.get("/admin/dao/:daoId/roles/:member", authGuard, queryLimiter, (async (
+  req: Request,
+  res: Response,
+) => {
+  try {
+    const daoId = Number(req.params.daoId);
+    const member = req.params.member;
 
-      if (!Number.isInteger(daoId) || daoId < 1) {
-        res.status(400).json({ error: "Invalid daoId" });
-        return;
-      }
-
-      if (!member || typeof member !== "string") {
-        res.status(400).json({ error: "Invalid member address" });
-        return;
-      }
-
-      log("info", "admin_get_member_role_requested", {
-        daoId,
-        member: `${member.slice(0, 8)}...`,
-      });
-
-      // Placeholder response - actual implementation would query the contract
-      res.json({
-        daoId,
-        member,
-        role: null, // null means no role assigned yet
-        message: "Query recorded for chain verification",
-      });
-    } catch (err) {
-      log("error", "admin_get_member_role_failed", { error: (err as Error).message });
-      res.status(500).json({ error: "Failed to get member role" });
+    if (!Number.isInteger(daoId) || daoId < 1) {
+      res.status(400).json({ error: "Invalid daoId" });
+      return;
     }
-  }) as AsyncHandler,
-);
+
+    if (!member || typeof member !== "string") {
+      res.status(400).json({ error: "Invalid member address" });
+      return;
+    }
+
+    log("info", "admin_get_member_role_requested", {
+      daoId,
+      member: `${member.slice(0, 8)}...`,
+    });
+
+    // Placeholder response - actual implementation would query the contract
+    res.json({
+      daoId,
+      member,
+      role: null, // null means no role assigned yet
+      message: "Query recorded for chain verification",
+    });
+  } catch (err) {
+    log("error", "admin_get_member_role_failed", {
+      error: (err as Error).message,
+    });
+    res.status(500).json({ error: "Failed to get member role" });
+  }
+}) as AsyncHandler);
 
 /**
  * DELETE /admin/dao/:daoId/roles/:member - Revoke a member's role (admin only).
@@ -311,7 +330,9 @@ router.delete(
         member,
       });
     } catch (err) {
-      log("error", "admin_role_revocation_failed", { error: (err as Error).message });
+      log("error", "admin_role_revocation_failed", {
+        error: (err as Error).message,
+      });
       res.status(500).json({ error: "Failed to revoke role" });
     }
   }) as AsyncHandler,
@@ -346,11 +367,17 @@ router.post(
       }
 
       if (!Array.isArray(signers) || signers.length === 0) {
-        res.status(400).json({ error: "signers array is required and must not be empty" });
+        res
+          .status(400)
+          .json({ error: "signers array is required and must not be empty" });
         return;
       }
 
-      if (typeof threshold !== "number" || threshold < 1 || threshold > signers.length) {
+      if (
+        typeof threshold !== "number" ||
+        threshold < 1 ||
+        threshold > signers.length
+      ) {
         res.status(400).json({
           error: `threshold must be a number between 1 and ${signers.length}`,
         });
@@ -371,7 +398,9 @@ router.post(
         threshold,
       });
     } catch (err) {
-      log("error", "admin_multisig_config_failed", { error: (err as Error).message });
+      log("error", "admin_multisig_config_failed", {
+        error: (err as Error).message,
+      });
       res.status(500).json({ error: "Failed to configure multisig" });
     }
   }) as AsyncHandler,
@@ -403,7 +432,9 @@ router.get(
         message: "Query recorded for chain verification",
       });
     } catch (err) {
-      log("error", "admin_get_multisig_config_failed", { error: (err as Error).message });
+      log("error", "admin_get_multisig_config_failed", {
+        error: (err as Error).message,
+      });
       res.status(500).json({ error: "Failed to get multisig configuration" });
     }
   }) as AsyncHandler,
@@ -460,7 +491,9 @@ router.post(
         expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
       });
     } catch (err) {
-      log("error", "admin_multisig_proposal_failed", { error: (err as Error).message });
+      log("error", "admin_multisig_proposal_failed", {
+        error: (err as Error).message,
+      });
       res.status(500).json({ error: "Failed to create multisig proposal" });
     }
   }) as AsyncHandler,
@@ -554,56 +587,75 @@ router.post(
 /**
  * GET /admin/relayer/keys - List all relayer keys and metadata (admin only).
  */
-router.get(
-  "/admin/relayer/keys",
-  authGuard,
-  queryLimiter,
-  (async (_req: Request, res: Response) => {
-    try {
-      const keys = relayerKeyManager.getAllKeys();
-      const activeKey = relayerKeyManager.getActiveKey();
-      res.json({
-        status: "success",
-        total: keys.length,
-        activeKeyId: activeKey?.id,
-        activePublicKey: activeKey?.publicKey,
-        keys,
-      });
-    } catch (err) {
-      log("error", "admin_get_relayer_keys_failed", {
-        error: (err as Error).message,
-      });
-      res.status(500).json({ error: "Failed to fetch relayer keys" });
-    }
-  }) as AsyncHandler,
-);
+router.get("/admin/relayer/keys", authGuard, queryLimiter, (async (
+  _req: Request,
+  res: Response,
+) => {
+  try {
+    const keys = relayerKeyManager.getAllKeys();
+    const activeKey = relayerKeyManager.getActiveKey();
+    res.json({
+      status: "success",
+      total: keys.length,
+      activeKeyId: activeKey?.id,
+      activePublicKey: activeKey?.publicKey,
+      keys,
+    });
+  } catch (err) {
+    log("error", "admin_get_relayer_keys_failed", {
+      error: (err as Error).message,
+    });
+    res.status(500).json({ error: "Failed to fetch relayer keys" });
+  }
+}) as AsyncHandler);
 
 /**
  * GET /admin/relayer/health - Get relayer keys health status and balances (admin only).
  */
-router.get(
-  "/admin/relayer/health",
-  authGuard,
-  queryLimiter,
-  (async (_req: Request, res: Response) => {
-    try {
-      if (server) {
-        await relayerKeyManager.checkAllBalances(server as any);
-      }
-      const health = relayerKeyManager.getKeyHealth();
-      const statusCode = health.status === "critical" ? 503 : 200;
-      res.status(statusCode).json(health);
-    } catch (err) {
-      log("error", "admin_relayer_health_failed", {
-        error: (err as Error).message,
-      });
-      res.status(500).json({ error: "Failed to check relayer key health" });
+router.get("/admin/relayer/health", authGuard, queryLimiter, (async (
+  _req: Request,
+  res: Response,
+) => {
+  try {
+    if (server) {
+      await relayerKeyManager.checkAllBalances(server as any);
     }
-  }) as AsyncHandler,
-);
+    const health = relayerKeyManager.getKeyHealth();
+    const statusCode = health.status === "critical" ? 503 : 200;
+    res.status(statusCode).json(health);
+  } catch (err) {
+    log("error", "admin_relayer_health_failed", {
+      error: (err as Error).message,
+    });
+    res.status(500).json({ error: "Failed to check relayer key health" });
+  }
+}) as AsyncHandler);
+
+/** Map orchestrator errors to HTTP: conflicts are 409, the rest 400. */
+function sendRotationError(res: Response, err: unknown, event: string): void {
+  const error = err as Error & { code?: string; record?: unknown };
+  log("error", event, { error: error.message, code: error.code });
+  const conflict = [
+    "rotation_in_progress",
+    "drain_in_progress",
+    "not_quiescent",
+    "cooldown_requires_confirmation",
+  ].includes(error.code ?? "");
+  res.status(conflict ? 409 : 400).json({
+    error: error.message,
+    code: error.code,
+    rotation: error.record,
+  });
+}
+
+function summarize(keyId: string | null) {
+  if (!keyId) return null;
+  return relayerKeyManager.getAllKeys().find((k) => k.id === keyId) ?? null;
+}
 
 /**
- * POST /admin/relayer/rotate - Hot key rotation without server restart (admin only).
+ * POST /admin/relayer/rotate - Planned rotation with a bounded dual-identity
+ * window (#746): funding preflight, fenced cutover, old identity drains.
  */
 router.post(
   "/admin/relayer/rotate",
@@ -613,24 +665,156 @@ router.post(
   validateBody(adminRelayerRotateSchema),
   (async (req: Request, res: Response) => {
     try {
-      const { targetKeyId, targetPublicKey, reason } = req.body || {};
+      const { targetKeyId, targetPublicKey, reason, actor } = req.body || {};
       const target = targetKeyId || targetPublicKey;
 
       log("info", "admin_relayer_rotate_requested", { target, reason });
 
-      const result = await relayerKeyManager.rotateActiveKey(target, "api");
+      const rotation = await relayerRotation.rotate({
+        target,
+        actor: actor || "admin-api",
+        reason,
+      });
       res.json({
         status: "success",
-        message: "Relayer key rotated successfully with zero downtime",
-        activeKey: result.activeKey,
-        previousKey: result.previousKey,
+        message:
+          rotation.phase === "draining"
+            ? "Relayer key rotated; previous identity is draining"
+            : "Relayer key rotated",
+        activeKey: summarize(rotation.toKeyId),
+        previousKey: summarize(rotation.fromKeyId),
+        rotation,
       });
     } catch (err) {
-      log("error", "admin_relayer_rotate_failed", {
-        error: (err as Error).message,
-      });
-      res.status(400).json({ error: (err as Error).message });
+      sendRotationError(res, err, "admin_relayer_rotate_failed");
     }
+  }) as AsyncHandler,
+);
+
+/** GET /admin/relayer/rotation - Current rotation, history, readiness. */
+router.get("/admin/relayer/rotation", masterKeyGuard, queryLimiter, ((
+  _req: Request,
+  res: Response,
+) => {
+  res.json({ status: "success", ...relayerRotation.getStatus() });
+}) as AsyncHandler);
+
+/** POST /admin/relayer/rotation/rollback - Return to the draining identity. */
+router.post(
+  "/admin/relayer/rotation/rollback",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotationActionSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const rotation = await relayerRotation.rollback({
+        actor: req.body.actor || "admin-api",
+        reason: req.body.reason,
+      });
+      res.json({
+        status: "success",
+        rotation,
+        activeKey: summarize(rotation.fromKeyId),
+      });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_rollback_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/rotation/finalize - Close the drain window early. */
+router.post(
+  "/admin/relayer/rotation/finalize",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotationActionSchema),
+  ((req: Request, res: Response) => {
+    try {
+      const rotation = relayerRotation.finalize({
+        actor: req.body.actor || "admin-api",
+      });
+      res.json({ status: "success", rotation });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_finalize_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/relayer/compromise - Incident response: revoke now, rotate to a
+ * funded standby (or halt), report invalidated signatures, time vs SLO.
+ */
+router.post(
+  "/admin/relayer/compromise",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerCompromiseSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const rotation = await relayerRotation.declareCompromise({
+        key: req.body.key,
+        declaredBy: req.body.declaredBy,
+        confirmation: req.body.confirmation,
+        reason: req.body.reason,
+      });
+      res.json({
+        status: rotation.halted ? "halted" : "success",
+        rotation,
+        activeKey: summarize(rotation.toKeyId),
+      });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_compromise_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/sweep - Two-person sweep of a compromised account. */
+router.post(
+  "/admin/relayer/sweep",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerSweepSchema),
+  (async (req: Request, res: Response) => {
+    try {
+      const result = await relayerRotation.sweep({
+        key: req.body.key,
+        requestedBy: req.body.requestedBy,
+        confirmation: req.body.confirmation,
+      });
+      res.json({ status: "success", ...result });
+    } catch (err) {
+      sendRotationError(res, err, "admin_relayer_sweep_failed");
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/halt - Co-signer stop signal: refuse all non-sweep signing. */
+router.post(
+  "/admin/relayer/halt",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerHaltSchema),
+  ((req: Request, res: Response) => {
+    relayerRotation.halt(req.body.reason, req.body.actor || "admin-api");
+    res.json({ status: "halted", reason: req.body.reason });
+  }) as AsyncHandler,
+);
+
+/** POST /admin/relayer/resume - Lift a signing halt. */
+router.post(
+  "/admin/relayer/resume",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminRelayerRotationActionSchema),
+  ((req: Request, res: Response) => {
+    relayerRotation.resume(req.body.actor || "admin-api");
+    res.json({ status: "resumed" });
   }) as AsyncHandler,
 );
 
@@ -776,12 +960,12 @@ router.post(
   queryLimiter,
   (async (_req: Request, res: Response) => {
     try {
-      const balances = await relayerKeyManager.checkAllBalances(
-        server as any,
-      );
+      const balances = await relayerKeyManager.checkAllBalances(server as any);
       const failoverResult = await relayerKeyManager.checkAndHandleLowBalance(
         undefined,
         server as any,
+        () =>
+          relayerRotation.rotate({ actor: "system", reason: "low_balance" }),
       );
 
       res.json({
@@ -795,6 +979,321 @@ router.post(
         error: (err as Error).message,
       });
       res.status(500).json({ error: "Failed to check balances" });
+    }
+  }) as AsyncHandler,
+);
+
+// ============================================
+// FEE GOVERNANCE REPORTING (#960)
+// ============================================
+
+/**
+ * GET /admin/fee-governance - Live fee governance report (admin only).
+ *
+ * Provides current fee estimates, reserve status, and actionable recommendations
+ * based on live relayer account state and recent fee metrics.
+ *
+ * Query params:
+ *   relayerAccountId - Stellar account ID of the relayer (required)
+ *   horizonUrl       - Horizon API URL (optional, defaults to config)
+ */
+router.get("/admin/fee-governance", authGuard, queryLimiter, (async (
+  req: Request,
+  res: Response,
+) => {
+  try {
+    const relayerAccountId = req.query.relayerAccountId as string;
+    const horizonUrl =
+      (req.query.horizonUrl as string) ||
+      process.env.HORIZON_URL ||
+      "https://horizon-testnet.stellar.org";
+
+    if (!relayerAccountId) {
+      res.status(400).json({
+        error: "relayerAccountId query parameter is required",
+      });
+      return;
+    }
+
+    const { getFeeGovernanceReport } =
+      await import("../services/relayer-fee-economics.js");
+
+    const report = await getFeeGovernanceReport({
+      relayerAccountId,
+      horizonUrl,
+    });
+
+    log("info", "admin_fee_governance_report_generated", {
+      relayerAccountId,
+      reserveStatus: report.reserveStatus.status,
+      networkStatus: report.currentEstimate.networkStatus,
+      confidence: report.confidence,
+    });
+
+    res.json(report);
+  } catch (err) {
+    log("error", "admin_fee_governance_report_failed", {
+      error: (err as Error).message,
+    });
+    res.status(500).json({
+      error: "Failed to generate fee governance report",
+      details: (err as Error).message,
+    });
+  }
+}) as AsyncHandler);
+
+// ============================================
+// ABUSE-DETECTION ENFORCEMENT REVIEW (ZV-111)
+// ============================================
+
+/**
+ * GET /admin/abuse/holds - review queue for held/blocked payments.
+ *
+ * Query params: tenantId, status (held | pending_release | released | escalated)
+ */
+router.get(
+  "/admin/abuse/holds",
+  authGuard,
+  queryLimiter,
+  validateQuery(adminAbuseHoldsQuerySchema),
+  ((req: Request, res: Response) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { tenantId, status } = (req as any).validatedQuery;
+    const holds = listHolds({ tenantId, status });
+    res.json({ holds, total: holds.length });
+  }) as AsyncHandler,
+);
+
+/** GET /admin/abuse/holds/:id - fetch a single hold with its evidence bundle. */
+router.get("/admin/abuse/holds/:id", authGuard, queryLimiter, ((
+  req: Request,
+  res: Response,
+) => {
+  const hold = getHold(req.params.id);
+  if (!hold) {
+    res.status(404).json({ error: "Hold not found" });
+    return;
+  }
+  res.json({ hold });
+}) as AsyncHandler);
+
+/**
+ * POST /admin/abuse/holds/:id/review - dual-control review step.
+ *
+ * The first call (by reviewerA) moves the hold to pending_release. A
+ * second call by a *different* reviewer actually releases it and resolves
+ * the linked dispute case. Requires the master key, since this is the
+ * action that lets a previously held/blocked payment be treated as cleared.
+ */
+router.post(
+  "/admin/abuse/holds/:id/review",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  validateBody(adminAbuseHoldReviewSchema),
+  ((req: Request, res: Response) => {
+    try {
+      const hold = reviewHold(
+        req.params.id,
+        req.body.reviewerId,
+        req.body.reason,
+      );
+      res.json({ status: "success", hold });
+    } catch (err) {
+      log("error", "admin_abuse_hold_review_failed", {
+        holdId: req.params.id,
+        error: (err as Error).message,
+      });
+      res.status(409).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+// ── Blackout calendar status (ZV-059) ────────────────────────────────────────
+
+import {
+  computeBlackoutStatus,
+  issueOverrideToken,
+  validateOverrideToken,
+} from "../services/blackout-calendar.js";
+import { getDb } from "../services/db.js";
+
+/**
+ * GET /admin/blackout-status
+ *
+ * Returns the current blackout status derived from active proposals stored in
+ * the local database cache.  Operators can supply `X-Blackout-Override` to
+ * show that they hold a valid override token; this is validated and reflected
+ * in the response but does NOT consume the token.
+ */
+router.get(
+  "/admin/blackout-status",
+  authGuard,
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      // Pull active proposals from the local DAO cache.  Each row must have
+      // dao_id, proposal_id, end_time (unix seconds).
+      const proposals: Array<{
+        daoId: number;
+        proposalId: number;
+        endTime: number;
+      }> = (
+        db
+          .prepare(
+            `SELECT dao_id AS daoId, proposal_id AS proposalId, end_time AS endTime
+               FROM dao_proposal_cache
+              WHERE end_time > 0
+              ORDER BY end_time ASC`,
+          )
+          .all() as any[]
+      ).map((r) => ({
+        daoId: r.daoId,
+        proposalId: r.proposalId,
+        endTime: r.endTime,
+      }));
+
+      const status = computeBlackoutStatus(proposals);
+
+      const overrideHeader = req.headers["x-blackout-override"] as
+        | string
+        | undefined;
+      const overrideValid = overrideHeader
+        ? validateOverrideToken(overrideHeader) !== null
+        : false;
+
+      res.json({ ...status, overridePresent: !!overrideHeader, overrideValid });
+    } catch (err) {
+      log("error", "admin_blackout_status_failed", {
+        error: (err as Error).message,
+      });
+      res.status(500).json({ error: (err as Error).message });
+    }
+  }) as AsyncHandler,
+);
+
+/**
+ * POST /admin/blackout-override
+ *
+ * Issue an emergency override token that permits a deploy during a blackout.
+ * Requires the master key.  The issuance is written to the audit log.
+ */
+router.post(
+  "/admin/blackout-override",
+  bodyLimit("10kb"),
+  masterKeyGuard,
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    const { issuedBy, reason } = req.body as {
+      issuedBy?: string;
+      reason?: string;
+    };
+    if (!issuedBy || !reason) {
+      res.status(400).json({ error: "issuedBy and reason are required" });
+      return;
+    }
+    issueOverrideToken(issuedBy, reason)
+      .then((override) => {
+        res.json({
+          token: override.token,
+          issuedAt: override.issuedAt,
+          expiresAt: override.expiresAt,
+        });
+      })
+      .catch((err) => {
+        log("error", "admin_blackout_override_failed", {
+          error: (err as Error).message,
+        });
+        res.status(500).json({ error: (err as Error).message });
+      });
+  }) as AsyncHandler,
+);
+
+// ── Treasury multisig signing sessions (ZV-039 / #888) ───────────────────────
+//
+// Coordination for on-chain treasury proposals (contracts/threshold-crypto):
+// open a session for a proposal, collect each signer's SEP-53 signature over
+// its digest, and record the execution. Every step is audit-logged.
+
+const TREASURY_ERROR_STATUS: Record<TreasuryMultisigError["code"], number> = {
+  invalid_input: 400,
+  not_found: 404,
+  expired: 410,
+  not_signer: 403,
+  already_signed: 409,
+  bad_signature: 401,
+  insufficient_signatures: 409,
+  already_executed: 409,
+  duplicate_session: 409,
+};
+
+function treasuryError(res: Response, err: unknown): Response {
+  if (err instanceof TreasuryMultisigError) {
+    return res.status(TREASURY_ERROR_STATUS[err.code]).json({ error: err.message, code: err.code });
+  }
+  log("error", "treasury_session_error", { error: (err as Error).message });
+  return res.status(500).json({ error: "Treasury session error" });
+}
+
+const auditContext = (req: Request) => ({
+  actor: (req as Request & { authTokenId?: string }).authTokenId ?? null,
+  endpoint: req.path,
+  requestId: (req.headers["x-request-id"] as string | undefined) ?? null,
+});
+
+/** POST /admin/treasury/sessions — { proposalId, digest, expiresAt, action, config } */
+router.post("/admin/treasury/sessions", authGuard, bodyLimit("20kb"), queryLimiter, ((req: Request, res: Response) => {
+  try {
+    const session = treasuryMultisig.open(req.body ?? {}, auditContext(req));
+    res.status(201).json({ session, message: approvalMessage(session.proposalId, session.digest, session.expiresAt) });
+  } catch (err) {
+    treasuryError(res, err);
+  }
+}) as AsyncHandler);
+
+/** GET /admin/treasury/sessions?status=collecting|ready|executed|expired */
+router.get("/admin/treasury/sessions", authGuard, queryLimiter, ((req: Request, res: Response) => {
+  const status = req.query.status as SessionStatus | undefined;
+  res.json({ sessions: treasuryMultisig.list(status) });
+}) as AsyncHandler);
+
+/** GET /admin/treasury/sessions/:id — the session and the exact message signers sign */
+router.get("/admin/treasury/sessions/:id", authGuard, queryLimiter, ((req: Request, res: Response) => {
+  const session = treasuryMultisig.get(req.params.id);
+  if (!session) return res.status(404).json({ error: "Signing session not found" });
+  res.json({ session, message: approvalMessage(session.proposalId, session.digest, session.expiresAt) });
+}) as AsyncHandler);
+
+/** POST /admin/treasury/sessions/:id/signatures — { signer, signature } (base64 SEP-53) */
+router.post(
+  "/admin/treasury/sessions/:id/signatures",
+  authGuard,
+  bodyLimit("10kb"),
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    try {
+      const { signer, signature } = req.body ?? {};
+      res.json({ session: treasuryMultisig.sign(req.params.id, String(signer), String(signature), auditContext(req)) });
+    } catch (err) {
+      treasuryError(res, err);
+    }
+  }) as AsyncHandler,
+);
+
+/** POST /admin/treasury/sessions/:id/executed — { stellarTxHash } of the on-chain treasury_execute */
+router.post(
+  "/admin/treasury/sessions/:id/executed",
+  authGuard,
+  bodyLimit("10kb"),
+  queryLimiter,
+  ((req: Request, res: Response) => {
+    try {
+      res.json({
+        session: treasuryMultisig.markExecuted(req.params.id, String(req.body?.stellarTxHash ?? ""), auditContext(req)),
+      });
+    } catch (err) {
+      treasuryError(res, err);
     }
   }) as AsyncHandler,
 );

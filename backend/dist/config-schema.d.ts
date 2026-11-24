@@ -24,6 +24,7 @@ export declare const configSchema: z.ZodObject<{
     BRIDGE_CONTRACT_ID: z.ZodOptional<z.ZodString>;
     CIRCUIT_REGISTRY_CONTRACT_ID: z.ZodOptional<z.ZodString>;
     VOTING_VK_VERSION: z.ZodEffects<z.ZodOptional<z.ZodString>, number, string | undefined>;
+    CORS_ORIGINS: z.ZodOptional<z.ZodString>;
     CORS_ORIGIN: z.ZodOptional<z.ZodString>;
     LOG_CLIENT_IP: z.ZodOptional<z.ZodEnum<["plain", "hash"]>>;
     LOG_REQUEST_BODY: z.ZodEffects<z.ZodOptional<z.ZodString>, boolean, string | undefined>;
@@ -98,6 +99,7 @@ export declare const configSchema: z.ZodObject<{
     BRIDGE_CONTRACT_ID: z.ZodOptional<z.ZodString>;
     CIRCUIT_REGISTRY_CONTRACT_ID: z.ZodOptional<z.ZodString>;
     VOTING_VK_VERSION: z.ZodEffects<z.ZodOptional<z.ZodString>, number, string | undefined>;
+    CORS_ORIGINS: z.ZodOptional<z.ZodString>;
     CORS_ORIGIN: z.ZodOptional<z.ZodString>;
     LOG_CLIENT_IP: z.ZodOptional<z.ZodEnum<["plain", "hash"]>>;
     LOG_REQUEST_BODY: z.ZodEffects<z.ZodOptional<z.ZodString>, boolean, string | undefined>;
@@ -172,6 +174,7 @@ export declare const configSchema: z.ZodObject<{
     BRIDGE_CONTRACT_ID: z.ZodOptional<z.ZodString>;
     CIRCUIT_REGISTRY_CONTRACT_ID: z.ZodOptional<z.ZodString>;
     VOTING_VK_VERSION: z.ZodEffects<z.ZodOptional<z.ZodString>, number, string | undefined>;
+    CORS_ORIGINS: z.ZodOptional<z.ZodString>;
     CORS_ORIGIN: z.ZodOptional<z.ZodString>;
     LOG_CLIENT_IP: z.ZodOptional<z.ZodEnum<["plain", "hash"]>>;
     LOG_REQUEST_BODY: z.ZodEffects<z.ZodOptional<z.ZodString>, boolean, string | undefined>;

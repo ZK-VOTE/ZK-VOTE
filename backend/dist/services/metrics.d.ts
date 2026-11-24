@@ -14,7 +14,7 @@ export declare const httpResponseSize: Histogram<"method" | "route" | "status">;
 export declare const coalescingHitsTotal: Counter<"key">;
 export declare const coalescingMissesTotal: Counter<"key">;
 export declare const coalescingWaitTime: Histogram<"key">;
-export declare const membershipRegistrationTotal: Counter<"dao_id">;
+export declare const membershipRegistrationTotal: Counter<"status">;
 export declare const membershipRegistrationLimited: Counter<"reason">;
 export declare const rpcCallsTotal: Counter<"method" | "status">;
 export declare const rpcCallDuration: Histogram<"method" | "status">;
@@ -50,6 +50,7 @@ export declare const indexerLag: Gauge<string>;
 export declare const indexerWatermarkLedger: Gauge<string>;
 export declare const indexerPollDuration: Histogram<string>;
 export declare const indexerOverrunSkips: Counter<string>;
+export declare const indexerPollMissesTotal: Counter<string>;
 export declare const indexerQueueDepth: Gauge<string>;
 export declare const indexerRpcStreamReconnectsTotal: Counter<string>;
 export declare const indexerGapRecoveriesTotal: Counter<string>;
@@ -69,13 +70,16 @@ export declare const txConfirmationCacheSize: Gauge<string>;
 export declare const txConfirmationPollTotal: Counter<string>;
 export declare const wsConnections: Gauge<string>;
 export declare const wsMessagesSent: Counter<string>;
-export declare const relayerKeyBalance: Gauge<"key_id" | "public_key" | "role">;
+export declare const wsAuthDuration: Histogram<string>;
+export declare const wsMessageDuration: Histogram<string>;
+export declare const wsRateLimitTotal: Counter<"ip">;
+export declare const relayerKeyBalance: Gauge<"key_id" | "role">;
 export declare const relayerKeyRotationsTotal: Counter<"status" | "trigger">;
-export declare const relayerKeyAgeSeconds: Gauge<"key_id" | "public_key">;
-export declare const relayerKeyTransactionsTotal: Counter<"key_id" | "public_key">;
+export declare const relayerKeyAgeSeconds: Gauge<"key_id">;
+export declare const relayerKeyTransactionsTotal: Counter<"key_id">;
 /**
  * Normalise Express route path to a low-cardinality label.
- * Strips parameter values (e.g. /dao/123 -> /dao/:daoId)
+ * Strips parameter values, hashes, addresses, and query strings.
  */
 export declare function normalizeRoute(path: string): string;
 export declare const archivalRunsTotal: Counter<"status">;
@@ -86,4 +90,16 @@ export declare const reconciliation_mismatch_total: Counter<"component" | "misma
 export declare const rate_limit_store_size: Gauge<string>;
 export declare const session_store_size: Gauge<string>;
 export declare const batch_partial_failure_total: Counter<"reason" | "batch_type">;
+export declare const paymentOpsPerMinute: Histogram<string>;
+export declare const costRateLimitExceeded: Counter<"limiter" | "cost">;
+export declare const backupAge: Gauge<string>;
+export declare const backupTamperDetected: Counter<"keyId">;
+export declare const backupRestoreSuccess: Counter<"keyId">;
+export declare const backupRestoreFailed: Counter<"reason">;
+export declare const backupEncryptionDuration: Histogram<string>;
+export declare const backupDecryptionDuration: Histogram<string>;
+export declare const daoReconciliationRunsTotal: Counter<"status">;
+export declare const daoReconciliationLastOk: Gauge<string>;
+export declare const offlineRetryTotal: Counter<"status" | "type">;
+export declare const outboxLagGauge: Gauge<"channel">;
 //# sourceMappingURL=metrics.d.ts.map

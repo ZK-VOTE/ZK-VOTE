@@ -40,6 +40,40 @@ export function getExplorerUrl(
   return `https://stellar.expert/explorer/${pathNet}/${type}/${id}`;
 }
 
+export type StellarNetworkName = "testnet" | "futurenet" | "public";
+
+/** Normalise a network name/passphrase to the short form used in links. */
+export function normalizeNetworkName(net: string | null | undefined): StellarNetworkName {
+  const n = (net || "testnet").toLowerCase();
+  if (n.includes("future")) return "futurenet";
+  if (n.includes("main") || n.includes("public")) return "public";
+  return "testnet";
+}
+
+/**
+ * Qualify a shareable path with the network it was created on (#758), so a
+ * testnet link opened on a futurenet frontend can be detected instead of
+ * silently resolving the same ID on the wrong chain.
+ */
+export function withNetworkParam(path: string, network: string): string {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}network=${normalizeNetworkName(network)}`;
+}
+
+/**
+ * Returns the link's network when it differs from the app's network, or null
+ * when they agree or the link carries no network (legacy links stay valid).
+ */
+export function getLinkNetworkMismatch(
+  search: string,
+  appNetwork: string,
+): StellarNetworkName | null {
+  const raw = new URLSearchParams(search).get("network");
+  if (!raw) return null;
+  const linkNet = normalizeNetworkName(raw);
+  return linkNet === normalizeNetworkName(appNetwork) ? null : linkNet;
+}
+
 /**
  * Truncate text to a maximum length
  * @param text Text to truncate

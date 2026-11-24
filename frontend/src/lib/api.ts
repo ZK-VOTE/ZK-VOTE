@@ -5,8 +5,10 @@ import type {
   ContentType,
   KeyEpoch,
 } from "./groupEncryption";
+// Issue #556 — single config source: RELAYER_URL is now the canonical export
+// from config/env.ts so all three service URLs stay in one place.
+import { RELAYER_URL } from "../config/env";
 
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
 // Relayer shared secrets must NEVER be baked into the public JS bundle (#647).
 // Browser writes authenticate via CSRF + origin checks; server-to-server
 // clients supply X-Relayer-Auth from a private environment.
@@ -147,6 +149,55 @@ export function subscribeToServiceDegradation(
 
 export function getDegradedServices(): string[] {
   return [...lastDegradedServices];
+}
+
+/**
+ * User-facing impact of degraded upstream sources (#745). The relayer reports
+ * external dependencies by name in X-Service-Degraded; money-path ones need a
+ * specific message rather than the generic "reduced functionality" line.
+ */
+export interface DegradedSourceImpact {
+  service: string;
+  /** Whether the dependency sits on a vote or money path. */
+  critical: boolean;
+  message: string;
+}
+
+const DEGRADED_SOURCE_IMPACT: Record<string, Omit<DegradedSourceImpact, "service">> = {
+  soroban_rpc: {
+    critical: true,
+    message: "Voting may be slower or briefly unavailable while the network connection recovers.",
+  },
+  horizon: {
+    critical: true,
+    message: "Payments and swaps may be delayed or temporarily unavailable.",
+  },
+  dao_sync: {
+    critical: false,
+    message: "DAO directory data is cached and may be stale. An empty list does not confirm there are no DAOs.",
+  },
+  indexer: {
+    critical: false,
+    message: "Blockchain indexing is delayed; listings and activity may be stale until synchronization recovers.",
+  },
+  swap_quotes: {
+    critical: false,
+    message: "Swap prices come from a backup source and may differ at execution.",
+  },
+  anchor_usdc: {
+    critical: false,
+    message: "USDC deposits and withdrawals may be delayed.",
+  },
+  anchor_eurc: {
+    critical: false,
+    message: "EURC deposits and withdrawals may be delayed.",
+  },
+};
+
+export function describeDegradedSources(services: string[]): DegradedSourceImpact[] {
+  return services
+    .filter((service) => service in DEGRADED_SOURCE_IMPACT)
+    .map((service) => ({ service, ...DEGRADED_SOURCE_IMPACT[service] }));
 }
 
 function notifyDegradation(services: string[]) {

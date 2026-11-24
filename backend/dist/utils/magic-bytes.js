@@ -169,4 +169,38 @@ export function containsEmbeddedScript(buffer) {
     const sample = buffer.subarray(0, 4096).toString("utf8");
     return dangerousScriptPatterns.some((re) => re.test(sample));
 }
+/**
+ * Validation TOCTOU lock to ensure file validation, sanitization, and Pinata pinning
+ * execute as an atomic, serialized unit without allowing concurrent buffer modification
+ * or swapped file race conditions.
+ */
+export class ValidationLockManager {
+    activeLocks = new Map();
+    async acquire(key, fn) {
+        while (this.activeLocks.has(key)) {
+            try {
+                await this.activeLocks.get(key);
+            }
+            catch {
+                // Ignore previous operation failure
+            }
+        }
+        let release = () => { };
+        const lockPromise = new Promise((resolve) => {
+            release = resolve;
+        });
+        this.activeLocks.set(key, lockPromise);
+        try {
+            return await fn();
+        }
+        finally {
+            this.activeLocks.delete(key);
+            release();
+        }
+    }
+    isLocked(key) {
+        return this.activeLocks.has(key);
+    }
+}
+export const validationLock = new ValidationLockManager();
 //# sourceMappingURL=magic-bytes.js.map

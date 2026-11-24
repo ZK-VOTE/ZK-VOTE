@@ -246,3 +246,68 @@ Categories:
 - Proof format conversion
 - VK structure conversion
 - Edge cases (zero values, field max)
+
+---
+
+## Promotion Gates (SPIKE-050)
+
+The following gates must be green before code is merged or deployed.
+Failure at any gate blocks the corresponding action.
+
+### Merge Gate (PR → master/main)
+
+All of these must pass in CI before a PR may be merged:
+
+| Gate | Command | Required result |
+|------|---------|-----------------|
+| Rust unit tests | `cargo test --workspace --exclude zkvote-integration-tests` | All pass |
+| Rust integration tests | `cargo test -p zkvote-integration-tests -- --test-threads=1` | All pass |
+| Backend tests | `cd backend && npm test` | All pass |
+| Frontend tests | `cd frontend && npm test` | All pass |
+| Circuit tests | `cd circuits && npm test` | All pass |
+| Clippy lint | `cargo clippy --workspace --all-targets -- -D warnings` | Zero warnings |
+| Format check | `cargo fmt --all -- --check` | Clean |
+
+A red merge gate blocks the PR; exceptions require a documented waiver in the
+PR description referencing a follow-up issue.
+
+### Futurenet Deploy Gate
+
+All merge-gate checks plus:
+
+| Gate | Command / method | Required result |
+|------|-----------------|-----------------|
+| E2E smoke suite | `cd tests/e2e && npm test` (hosted futurenet RPC) | All pass |
+| Deploy dry-run | `bash scripts/deploy/deploy-hosted-futurenet.sh --dry-run` | Exit 0 |
+| WASM signature verify | `bash scripts/deploy/verify-wasm-signature.sh` | All WASMs verified |
+| Stress tests (subset) | `cargo test --test stress -- stress_many_members_and_proposals --ignored` | Pass |
+
+### Testnet Deploy Gate
+
+All futurenet-gate checks plus:
+
+| Gate | Required result |
+|------|----------------|
+| Full stress suite | All 6 stress tests pass (un-ignored, recorded) |
+| Nightly soak (latest run) | No degradation curve regression vs baseline |
+| Parity matrix review | Local / futurenet / testnet per-env expectations documented and green |
+
+### Stress Tests (currently `#[ignore]`)
+
+The 6 stress tests are excluded from the default CI run to avoid
+unbounded wall-clock time. They must pass before a testnet deploy and
+are run nightly on the `nightly-stress` workflow.
+
+To promote from "ignored" to always-on, a test must:
+1. Complete in under 60 s on CI hardware.
+2. Be deterministic (no flake in 10 consecutive runs).
+3. Have a filed issue tracking any remaining non-determinism.
+
+### Flake Policy
+
+A test that fails intermittently (< 100 % pass rate over 10 runs) must be:
+- Quarantined with a `#[ignore]` annotation referencing a new issue within
+  one business day of first observation.
+- Fixed or replaced within 30 days; the quarantine issue is the blocker.
+
+Skips without a linked issue are not permitted after the next release cut.

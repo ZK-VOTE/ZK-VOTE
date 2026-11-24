@@ -10,11 +10,18 @@ import {
 import type { ISupportedWallet } from "@creit.tech/stellar-wallets-kit";
 import { NETWORK_CONFIG } from "../config/contracts";
 import {
+  getFreighterNetworkDetails,
   listenToAccountChange,
   listenToNetworkChange,
   persistConnectionIntent,
 } from "../services/freighter";
 import { clearAllStores } from "../store";
+import {
+  APP_NETWORK_PASSPHRASE,
+  networkLabel,
+  resolveWalletPassphrase,
+  walletSession,
+} from "../lib/walletSession";
 
 export interface WalletState {
   publicKey: string | null;
@@ -58,6 +65,21 @@ const safeLocalStorageRemove = (key: string): void => {
   }
 };
 
+/**
+ * Read the wallet's network and fold it into the wallet session (#750).
+ * Returns the warning to show, or null when the networks match.
+ */
+async function syncWalletNetwork(account: string | null): Promise<string | null> {
+  const passphrase = resolveWalletPassphrase(await getFreighterNetworkDetails());
+  walletSession.sync(account, passphrase);
+  return networkWarningFor(passphrase);
+}
+
+function networkWarningFor(passphrase: string | null): string | null {
+  if (!passphrase || passphrase === APP_NETWORK_PASSPHRASE) return null;
+  return `Your wallet is on ${networkLabel(passphrase)}, but this app uses ${networkLabel(APP_NETWORK_PASSPHRASE)}. Voting and payments are blocked until you switch networks in your wallet.`;
+}
+
 const inferWalletNetwork = (passphrase: string): WalletNetwork | null => {
   if (passphrase === "Public Global Stellar Network ; September 2015")
     return WalletNetwork.PUBLIC;
@@ -84,6 +106,9 @@ export function useWallet() {
 
     if (wallet.isConnected) {
       unlistenAccount = listenToAccountChange((newAccount) => {
+        // The wallet session bumps its generation and clears the query
+        // caches, so data for the previous account cannot leak (#755, #750).
+        walletSession.sync(newAccount);
         if (!newAccount) {
           setWallet((prev) => ({
             ...prev,
@@ -99,23 +124,21 @@ export function useWallet() {
         }
       });
 
+      // Compare passphrases, not names: Freighter reports "TESTNET", which no
+      // passphrase contains, so the old substring check warned on the right
+      // network and was dismissed as noise (#750).
       unlistenNetwork = listenToNetworkChange((net) => {
-        if (
-          net &&
-          !NETWORK_CONFIG.networkPassphrase
-            .toLowerCase()
-            .includes(net.toLowerCase())
-        ) {
+        void (async () => {
+          const details = await getFreighterNetworkDetails();
+          const passphrase = resolveWalletPassphrase(
+            details ?? (net ? { network: net } : null),
+          );
+          walletSession.sync(walletSession.getState().account, passphrase);
           setWallet((prev) => ({
             ...prev,
-            networkWarning: `Wallet network is set to "${net}", but app expects target network. Please switch networks in wallet.`,
+            networkWarning: networkWarningFor(passphrase),
           }));
-        } else {
-          setWallet((prev) => ({
-            ...prev,
-            networkWarning: null,
-          }));
-        }
+        })();
       });
     }
 
@@ -173,11 +196,13 @@ export function useWallet() {
               address,
               "isInitializing -> false",
             );
+          const networkWarning = await syncWalletNetwork(address);
           setWallet({
             publicKey: address,
             isConnected: true,
             isInitializing: false,
             kit: globalKit,
+            networkWarning,
           });
         }
       } catch {
@@ -208,13 +233,14 @@ export function useWallet() {
           // Store wallet selection in localStorage for persistence
           safeLocalStorageSet("selectedWalletId", option.id);
           persistConnectionIntent(true);
+          const networkWarning = await syncWalletNetwork(address);
 
           setWallet({
             publicKey: address,
             isConnected: true,
             isInitializing: false,
             kit: globalKit,
-            networkWarning: null,
+            networkWarning,
           });
         },
       });
@@ -228,6 +254,8 @@ export function useWallet() {
     // Clear stored wallet selection
     safeLocalStorageRemove("selectedWalletId");
     persistConnectionIntent(false);
+    // Ends the session: revokes the relayer session and clears query caches.
+    walletSession.end();
     clearAllStores();
 
     // Clear all identity and cryptographic secrets from localStorage

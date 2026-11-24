@@ -5,8 +5,7 @@ import {
   Play,
   Image as ImageIcon,
 } from "lucide-react";
-
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+import { RELAYER_URL } from "../../config/env";
 
 // Helper to extract YouTube video ID
 function getYouTubeId(url: string): string | null {
@@ -97,16 +96,13 @@ export function MediaSlider({ image, videoUrl }: MediaSliderProps) {
 
   if (videoUrl) {
     const youtubeId = getYouTubeId(videoUrl);
-    const vimeoId = getVimeoId(videoUrl);
 
     mediaItems.push({
       type: "video",
       src: videoUrl,
       thumbnail: youtubeId
         ? `https://img.youtube.com/vi/${youtubeId}/mqdefault.jpg`
-        : vimeoId
-          ? `https://vumbnail.com/${vimeoId}.jpg`
-          : undefined,
+        : undefined,
       alt: "Video",
     });
   }
@@ -161,14 +157,14 @@ export function MediaSlider({ image, videoUrl }: MediaSliderProps) {
           <>
             <button
               onClick={goToPrevious}
-              className="absolute left-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-black/50 hover:bg-black/70 text-white flex items-center justify-center transition-colors"
+              className="absolute start-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-black/50 hover:bg-black/70 text-white flex items-center justify-center transition-colors"
               aria-label="Previous"
             >
               <ChevronLeft className="w-5 h-5" />
             </button>
             <button
               onClick={goToNext}
-              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-black/50 hover:bg-black/70 text-white flex items-center justify-center transition-colors"
+              className="absolute end-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-black/50 hover:bg-black/70 text-white flex items-center justify-center transition-colors"
               aria-label="Next"
             >
               <ChevronRight className="w-5 h-5" />

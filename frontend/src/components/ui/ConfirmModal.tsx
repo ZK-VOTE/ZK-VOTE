@@ -67,6 +67,7 @@ export function ConfirmModal({
             size="sm"
             onClick={onClose}
             disabled={isLoading}
+            aria-label="Close"
             className="h-10 w-10 p-2 sm:h-8 sm:w-8"
           >
             <X className="w-4 h-4" />

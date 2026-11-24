@@ -14,7 +14,7 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "../config.js";
 import { log } from "./logger.js";
-import { wsConnections, wsMessagesSent } from "./metrics.js";
+import { wsConnections, wsMessagesSent, wsAuthDuration, wsMessageDuration, wsRateLimitTotal } from "./metrics.js";
 let wss = null;
 let attachFailed = false;
 /**
@@ -30,17 +30,54 @@ export function attachConfirmationHub(httpServer) {
         wss = new WebSocketServer({
             server: httpServer,
             path: config.confirmationWsPath,
+            // Apply rate limiting at the WebSocket level
+            clientTracking: true,
+            maxPayload: 1 * 1024 * 1024, // 1MB max payload
         });
-        wss.on("connection", (socket) => {
+        // Track connection attempts for rate limiting
+        const connectionAttempts = new Map();
+        wss.on("connection", (socket, req) => {
+            const ip = req.socket.remoteAddress || "unknown";
+            const now = Date.now();
+            // Simple rate limiting per IP
+            const lastAttempt = connectionAttempts.get(ip);
+            if (lastAttempt && now - lastAttempt < 2000) {
+                // More than 1 connection per 2 seconds
+                log("warn", "ws_rate_limit_exceeded", { ip });
+                wsRateLimitTotal.inc({ ip });
+                socket.close(1008, "Rate limit exceeded");
+                return;
+            }
+            connectionAttempts.set(ip, now);
+            // Clean up old entries
+            if (connectionAttempts.size > 1000) {
+                for (const [key, timestamp] of connectionAttempts.entries()) {
+                    if (now - timestamp > 60000) {
+                        connectionAttempts.delete(key);
+                    }
+                }
+            }
+            const authStart = performance.now();
             wsConnections.inc();
-            socket.on("close", () => wsConnections.dec());
+            socket.on("close", () => {
+                wsConnections.dec();
+            });
             socket.on("error", () => {
                 // Per-socket errors (e.g. client dropped mid-frame) are expected; the
                 // `close` handler already decrements the gauge.
             });
+            socket.on("message", (data) => {
+                const msgStart = performance.now();
+                // Process message...
+                const msgDuration = performance.now() - msgStart;
+                wsMessageDuration.observe(msgDuration);
+            });
+            const authDuration = performance.now() - authStart;
+            wsAuthDuration.observe(authDuration);
         });
         log("info", "confirmation_ws_attached", {
             path: config.confirmationWsPath,
+            rateLimitEnabled: true,
         });
     }
     catch (err) {

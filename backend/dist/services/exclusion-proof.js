@@ -111,7 +111,7 @@ export async function verifyExclusionProof(proof, _treeContractId) {
  * Check if a member has been revoked via the membership tree contract
  */
 async function checkRevocationStatus(commitment, daoId, _treeContractId) {
-    const db = getDb();
+    const db = deps().getDb();
     ensureRevocationsTable(db);
     const row = db
         .prepare(`SELECT revoked_at, reinstated_at
@@ -124,8 +124,10 @@ async function checkRevocationStatus(commitment, daoId, _treeContractId) {
             commitment,
         };
     }
+    // A reinstated member is back in the tree and must not be able to present
+    // an exclusion proof as if still revoked (#566).
     return {
-        isRevoked: true,
+        isRevoked: row.reinstated_at == null,
         revokedAt: row.revoked_at,
         reinstatedAt: row.reinstated_at ?? undefined,
         commitment,
@@ -142,7 +144,7 @@ function isValidFieldElement(value) {
     }
 }
 export async function recordRevocation(commitment, daoId, timestamp) {
-    const db = getDb();
+    const db = deps().getDb();
     ensureRevocationsTable(db);
     try {
         db.prepare(`INSERT OR IGNORE INTO member_revocations
@@ -150,14 +152,14 @@ export async function recordRevocation(commitment, daoId, timestamp) {
        VALUES (?, ?, ?, ?)`).run(commitment, daoId, timestamp, new Date().toISOString());
     }
     catch (err) {
-        log("error", "revocation_record_failed", {
+        deps().log("error", "revocation_record_failed", {
             commitment: commitment.slice(0, 10),
             error: err.message,
         });
     }
 }
 export async function recordReinstatement(commitment, daoId, timestamp) {
-    const db = getDb();
+    const db = deps().getDb();
     ensureRevocationsTable(db);
     try {
         db.prepare(`UPDATE member_revocations
@@ -165,7 +167,7 @@ export async function recordReinstatement(commitment, daoId, timestamp) {
        WHERE commitment = ? AND dao_id = ?`).run(timestamp, commitment, daoId);
     }
     catch (err) {
-        log("error", "reinstatement_record_failed", {
+        deps().log("error", "reinstatement_record_failed", {
             commitment: commitment.slice(0, 10),
             error: err.message,
         });

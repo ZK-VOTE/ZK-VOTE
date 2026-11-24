@@ -117,5 +117,31 @@ export declare const commitmentRegistrationLimiter: (_req: Request, _res: Respon
  * endpoint performs expensive SNARK/pairing checks, so it is still capped.
  */
 export declare const verifyTallyProofLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+/**
+ * Cost-based rate limiter for batch operations that amplify a single HTTP
+ * request into multiple operations. Prevents bypass of per-IP limits via
+ * batch endpoints (e.g., POST /pay/batch with 100 ops counts as 100 cost).
+ *
+ * Usage:
+ *   router.post('/pay/batch', costBasedLimiter({ maxCost: 100 }), handler)
+ *
+ * The handler must call req.rateLimit.cost(n) to set the cost for the request.
+ */
+export declare function costBasedLimiter(opts: {
+    name: string;
+    maxCost: number;
+    windowMs: number;
+    message: string;
+}): RequestHandler;
+/**
+ * Cost-based limiter for payment batch operations.
+ * Max 100 operations per minute per IP (each op counts as 1 cost).
+ */
+export declare const paymentBatchCostLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+/**
+ * WebSocket rate limiter for WS connections.
+ * Limits connections per IP to prevent WebSocket flooding.
+ */
+export declare const wsConnectionLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
 export {};
 //# sourceMappingURL=rateLimit.d.ts.map

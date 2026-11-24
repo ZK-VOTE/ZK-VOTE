@@ -20,6 +20,9 @@ use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{Proof, VerificationKey, VoteMode, VotingClient};
 
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 fn hex_to_bytes<const N: usize>(env: &Env, hex: &str) -> BytesN<N> {
     let bytes = hex::decode(hex).expect("invalid hex");
     assert_eq!(bytes.len(), N, "hex string wrong length");
@@ -139,6 +142,9 @@ fn test_pairing_security_boundary() {
             admin.clone(),
         ),
     );
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_address);
     let voting_client = VotingClient::new(&env, &voting_address);
 
     println!("Creating DAO...\n");

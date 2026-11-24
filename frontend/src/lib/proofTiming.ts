@@ -33,6 +33,61 @@ export const TIMING_QUANTUM_MS = 250;
 export const MAX_JITTER_MS = 150;
 
 /**
+ * Timing budgets per device class and circuit depth.
+ * PLACEHOLDER: These values need validation through measurement (SPIKE-029).
+ *
+ * #714 - Measured duration distributions required for:
+ * - Choice indistinguishability (AUC ~0.5)
+ * - Depth-variant timing
+ * - Device class segmentation
+ */
+export const TIMING_BUDGETS_MS = {
+  /** Desktop/laptop (high-end CPU) */
+  desktop: {
+    depth10: 1500,
+    depth15: 2500,
+    depth20: 4000,
+    claim: 800,
+  },
+  /** Mobile (mid-range) */
+  mobile: {
+    depth10: 3000,
+    depth15: 5000,
+    depth20: 8000,
+    claim: 1500,
+  },
+  /** Low-end mobile */
+  lowEnd: {
+    depth10: 5000,
+    depth15: 9000,
+    depth20: 15000,
+    claim: 2500,
+  },
+} as const;
+
+/**
+ * Device class detection for timing budgets.
+ * Simple heuristic; real implementation needs telemetry.
+ */
+export function detectDeviceClass(): keyof typeof TIMING_BUDGETS_MS {
+  // Placeholder heuristic - real detection needs measurement
+  if (typeof navigator === "undefined") return "desktop";
+
+  const ua = navigator.userAgent.toLowerCase();
+  const isMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(ua);
+
+  // Rough RAM proxy (navigator.deviceMemory requires COOP/COEP)
+  const memory = (navigator as { deviceMemory?: number }).deviceMemory;
+
+  if (isMobile) {
+    if (memory !== undefined && memory < 4) return "lowEnd";
+    return "mobile";
+  }
+
+  return "desktop";
+}
+
+/**
  * Random jitter in [0, MAX_JITTER_MS).
  *
  * Uses `crypto.getRandomValues` rather than `Math.random`: `Math.random` is
@@ -104,4 +159,160 @@ export function isCrossOriginIsolated(): boolean {
   return typeof globalThis.crossOriginIsolated === "boolean"
     ? globalThis.crossOriginIsolated
     : false;
+}
+
+/**
+ * Timing measurement for distinguishability analysis (#714).
+ *
+ * Collects duration samples to validate masking effectiveness.
+ * NOT for production telemetry - measurement mode only.
+ */
+export interface TimingSample {
+  /** Circuit type: 'vote' | 'claim' */
+  circuitType: string;
+  /** Merkle tree depth */
+  depth?: number;
+  /** Raw elapsed time (ms) before masking */
+  rawDuration: number;
+  /** Masked duration (ms) after quantization + jitter */
+  maskedDuration: number;
+  /** Device class */
+  deviceClass: string;
+  /** Timestamp */
+  timestamp: number;
+}
+
+let timingSamples: TimingSample[] = [];
+let measurementMode = false;
+
+/**
+ * Enable timing measurement mode (dev/test only).
+ * Collects samples for statistical analysis.
+ */
+export function enableTimingMeasurement(): void {
+  measurementMode = true;
+  timingSamples = [];
+}
+
+/**
+ * Disable timing measurement and clear samples.
+ */
+export function disableTimingMeasurement(): void {
+  measurementMode = false;
+  timingSamples = [];
+}
+
+/**
+ * Get collected timing samples (measurement mode only).
+ */
+export function getTimingSamples(): readonly TimingSample[] {
+  return [...timingSamples];
+}
+
+/**
+ * Record a timing sample (if measurement mode enabled).
+ *
+ * @param sample Timing measurement to record
+ * @internal
+ */
+function recordTimingSample(sample: TimingSample): void {
+  if (measurementMode) {
+    timingSamples.push(sample);
+  }
+}
+
+/**
+ * Enhanced timing mask with measurement support.
+ *
+ * Wrapper around withMaskedTiming that optionally records samples
+ * for statistical validation.
+ */
+export async function withMaskedTimingAndMeasurement<T>(
+  work: () => Promise<T>,
+  context: {
+    circuitType: string;
+    depth?: number;
+  },
+  now: () => number = () => performance.now(),
+): Promise<T> {
+  const started = now();
+  const deviceClass = detectDeviceClass();
+
+  try {
+    const result = await withMaskedTiming(work, now);
+    const elapsed = now() - started;
+
+    recordTimingSample({
+      circuitType: context.circuitType,
+      depth: context.depth,
+      rawDuration: elapsed - paddingMs(elapsed, jitterMs()),
+      maskedDuration: elapsed,
+      deviceClass,
+      timestamp: Date.now(),
+    });
+
+    return result;
+  } catch (err) {
+    const elapsed = now() - started;
+
+    recordTimingSample({
+      circuitType: context.circuitType,
+      depth: context.depth,
+      rawDuration: elapsed - paddingMs(elapsed, jitterMs()),
+      maskedDuration: elapsed,
+      deviceClass,
+      timestamp: Date.now(),
+    });
+
+    throw err;
+  }
+}
+
+/**
+ * Statistical summary of timing samples.
+ * Placeholder for full analysis (SPIKE-029 acceptance criteria).
+ */
+export interface TimingStatistics {
+  count: number;
+  mean: number;
+  median: number;
+  stdDev: number;
+  min: number;
+  max: number;
+  p95: number;
+  p99: number;
+}
+
+/**
+ * Compute basic statistics from timing samples.
+ * Real implementation needs proper quantile estimation.
+ */
+export function computeTimingStatistics(
+  samples: readonly TimingSample[],
+  filter: (s: TimingSample) => boolean = () => true,
+): TimingStatistics | null {
+  const filtered = samples.filter(filter);
+  if (filtered.length === 0) return null;
+
+  const durations = filtered.map((s) => s.rawDuration).sort((a, b) => a - b);
+  const sum = durations.reduce((a, b) => a + b, 0);
+  const mean = sum / durations.length;
+
+  const variance = durations.reduce((acc, d) => acc + (d - mean) ** 2, 0) / durations.length;
+  const stdDev = Math.sqrt(variance);
+
+  const median = durations[Math.floor(durations.length / 2)];
+  const p95 = durations[Math.floor(durations.length * 0.95)];
+  const p99 = durations[Math.floor(durations.length * 0.99)];
+
+  return {
+    count: durations.length,
+    mean,
+    median,
+    stdDev,
+    min: durations[0],
+    max: durations[durations.length - 1],
+    p95,
+    p99,
+  };
 }

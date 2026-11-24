@@ -1,19 +1,20 @@
 //! # ZKVote Bridge Contract (Soroban)
 //!
-//! Receives forwarded votes from the EVM bridge contract via a relayer,
-//! checks nullifiers against the voting contract, and records votes.
+//! Receives forwarded votes from the EVM bridge contract via an authorized
+//! relayer, checks nullifiers against the voting contract, and records votes
+//! via `record_bridged_vote` on the voting contract.
 //!
 //! ## Flow
 //! 1. User generates Groth16 proof on EVM side
 //! 2. EVM Bridge contract verifies proof, emits VoteForwarded event
-//! 3. Relayer watches EVM, calls this contract to relay the vote
+//! 3. Authorized relayer watches EVM, calls this contract to relay the vote
 //! 4. This contract checks nullifier against voting contract
-//! 5. If valid, records the vote in the voting contract
+//! 5. If valid, invokes voting.record_bridged_vote to update tallies
 //!
 //! ## Security
 //! - Nullifier check prevents double-voting across chains
-//! - Only authorized relayers can submit votes (or anyone if open relay)
-//! - Vote is recorded in the voting contract for consistency
+//! - Only allowlisted relayers can submit votes (#648)
+//! - Vote is recorded in the voting contract for consistency (#648)
 
 #![no_std]
 use soroban_sdk::{
@@ -22,6 +23,7 @@ use soroban_sdk::{
 };
 
 const VOTING_CONTRACT: Symbol = symbol_short!("voting");
+const ADMIN: Symbol = symbol_short!("admin");
 const VERSION: u32 = 1;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
@@ -41,6 +43,7 @@ pub enum BridgeError {
     InvalidVoteChoice = 5,
     VoteRecordingFailed = 6,
     NullifierCheckFailed = 7,
+    UnauthorizedRelayer = 8,
 }
 
 #[contracttype]
@@ -48,6 +51,7 @@ pub enum BridgeError {
 pub enum DataKey {
     Nullifier(u64, u64, U256),    // (dao_id, proposal_id, nullifier) -> bool
     VoteRecorded(u64, u64, U256), // (dao_id, proposal_id, nullifier) -> bool
+    Relayer(Address),             // authorized relayer -> bool
 }
 
 // Typed Events
@@ -71,6 +75,13 @@ pub struct ContractUpgraded {
     pub to: u32,
 }
 
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelayerUpdatedEvent {
+    pub relayer: Address,
+    pub authorized: bool,
+}
+
 #[contract]
 pub struct Bridge;
 
@@ -88,8 +99,28 @@ impl Bridge {
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     }
 
-    /// Constructor: Initialize with voting contract address
-    pub fn __constructor(env: Env, voting_contract: Address) {
+    fn assert_admin(env: &Env, admin: &Address) {
+        admin.require_auth();
+        let configured: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotAdmin));
+        if admin != &configured {
+            panic_with_error!(env, BridgeError::NotAdmin);
+        }
+    }
+
+    fn assert_authorized_relayer(env: &Env, relayer: &Address) {
+        let key = DataKey::Relayer(relayer.clone());
+        let authorized: bool = env.storage().persistent().get(&key).unwrap_or(false);
+        if !authorized {
+            panic_with_error!(env, BridgeError::UnauthorizedRelayer);
+        }
+    }
+
+    /// Constructor: Initialize with voting contract, admin, and initial relayer
+    pub fn __constructor(env: Env, voting_contract: Address, admin: Address, relayer: Address) {
         if env.storage().instance().has(&VERSION_KEY) {
             panic_with_error!(&env, BridgeError::AlreadyInitialized);
         }
@@ -103,26 +134,40 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&VOTING_CONTRACT, &voting_contract);
+        env.storage().instance().set(&ADMIN, &admin);
+
+        let relayer_key = DataKey::Relayer(relayer.clone());
+        env.storage().persistent().set(&relayer_key, &true);
+        Self::bump_persistent(&env, &relayer_key);
+        RelayerUpdatedEvent {
+            relayer,
+            authorized: true,
+        }
+        .publish(&env);
+    }
+
+    /// Admin: authorize or revoke a relayer (#648)
+    pub fn set_relayer(env: Env, admin: Address, relayer: Address, authorized: bool) {
+        Self::bump_instance(&env);
+        Self::assert_admin(&env, &admin);
+        let key = DataKey::Relayer(relayer.clone());
+        if authorized {
+            env.storage().persistent().set(&key, &true);
+            Self::bump_persistent(&env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        RelayerUpdatedEvent {
+            relayer,
+            authorized,
+        }
+        .publish(&env);
     }
 
     /// Relay a vote from EVM to Soroban
     ///
-    /// Called by relayer after observing VoteForwarded event on EVM.
-    /// The relayer passes the same parameters from the EVM event.
-    ///
-    /// Cross-chain double-vote prevention: checks the **voting contract's**
-    /// nullifier state (not just the bridge's local map). Without this
-    /// cross-contract call a voter could cast natively on Soroban and then
-    /// replay the same nullifier through the EVM bridge — the bridge's
-    /// isolated storage would never see the native vote.
-    ///
-    /// # Arguments
-    /// * `dao_id` - DAO identifier
-    /// * `proposal_id` - Proposal identifier
-    /// * `vote_choice` - true = yes, false = no
-    /// * `nullifier` - Domain-separated nullifier
-    /// * `vote_root` - Merkle root (for reference/logging)
-    /// * `relayer` - Address of the relayer submitting this vote
+    /// Called by an authorized relayer after observing VoteForwarded on EVM.
+    /// Records the vote in the voting contract via `record_bridged_vote` (#648).
     pub fn relay_vote(
         env: Env,
         dao_id: u64,
@@ -134,6 +179,7 @@ impl Bridge {
     ) {
         Self::bump_instance(&env);
         relayer.require_auth();
+        Self::assert_authorized_relayer(&env, &relayer);
 
         // Validate nullifier is non-zero
         if nullifier == U256::from_u32(&env, 0) {
@@ -146,18 +192,13 @@ impl Bridge {
             panic_with_error!(&env, BridgeError::NullifierAlreadyUsed);
         }
 
-        // Verify voting contract is configured
         let voting_addr: Address = env
             .storage()
             .instance()
             .get(&VOTING_CONTRACT)
             .unwrap_or_else(|| panic_with_error!(&env, BridgeError::VotingContractNotSet));
 
-        // CRITICAL: Check nullifier against the VOTING CONTRACT's state.
-        // The voting contract stores nullifiers in temporary/persistent
-        // storage keyed by (dao_id, proposal_id, nullifier). We call
-        // is_nullifier_used on the voting contract to prevent a voter
-        // who already cast natively from replaying via the bridge.
+        // Cross-check voting-contract nullifier to prevent native+bridge double vote
         let already_used: bool = env.invoke_contract(
             &voting_addr,
             &Symbol::new(&env, "is_nullifier_used"),
@@ -172,17 +213,29 @@ impl Bridge {
             panic_with_error!(&env, BridgeError::NullifierAlreadyUsed);
         }
 
-        // Mark nullifier as used in bridge state before recording vote
-        // This prevents re-entrancy attacks
+        // Mark bridge nullifier BEFORE cross-contract write (checks-effects)
         env.storage().persistent().set(&null_key, &true);
         Self::bump_persistent(&env, &null_key);
 
-        // Store vote record
         let record_key = DataKey::VoteRecorded(dao_id, proposal_id, nullifier.clone());
         env.storage().persistent().set(&record_key, &true);
         Self::bump_persistent(&env, &record_key);
 
-        // Emit relay event
+        // Record the vote in the voting contract (updates tallies + voting nullifier)
+        // If this panics, the whole tx rolls back including bridge nullifier write.
+        let _: () = env.invoke_contract(
+            &voting_addr,
+            &Symbol::new(&env, "record_bridged_vote"),
+            soroban_sdk::vec![
+                &env,
+                dao_id.into_val(&env),
+                proposal_id.into_val(&env),
+                vote_choice.into_val(&env),
+                nullifier.clone().into_val(&env),
+                vote_root.clone().into_val(&env),
+            ],
+        );
+
         VoteRelayedEvent {
             dao_id,
             proposal_id,
@@ -208,6 +261,14 @@ impl Bridge {
             .instance()
             .get(&VOTING_CONTRACT)
             .unwrap_or_else(|| panic_with_error!(&env, BridgeError::VotingContractNotSet))
+    }
+
+    pub fn is_relayer(env: Env, relayer: Address) -> bool {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::Relayer(relayer))
+            .unwrap_or(false)
     }
 
     /// Contract version for upgrade tracking

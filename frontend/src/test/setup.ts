@@ -1,5 +1,6 @@
 /// <reference types="vitest/globals" />
 import "@testing-library/jest-dom/vitest";
+import { webcrypto } from "node:crypto";
 
 // Mock window.matchMedia
 Object.defineProperty(window, "matchMedia", {
@@ -54,6 +55,8 @@ Object.defineProperty(globalThis, "crypto", {
       }
       return arr;
     },
-    subtle: {},
+    // Real WebCrypto: the wallet session hashes account tags and MACs votes
+    // with SHA-256 / HMAC (#750).
+    subtle: webcrypto.subtle,
   },
 });

@@ -8,10 +8,48 @@ export interface DownloadProgress {
   totalBytes: number;
 }
 
+interface NetworkInformationLike {
+  saveData?: boolean;
+  type?: string;
+  effectiveType?: string;
+}
+
+/**
+ * Best-effort check for a metered or very slow connection (#757). Uses the
+ * Network Information API where available (Chrome/Android); Safari does not
+ * expose it, so this returns false there.
+ */
+export function isMeteredConnection(
+  connection: NetworkInformationLike | undefined = typeof navigator !== "undefined"
+    ? (navigator as Navigator & { connection?: NetworkInformationLike }).connection
+    : undefined,
+): boolean {
+  if (!connection) return false;
+  if (connection.saveData) return true;
+  if (connection.type === "cellular") return true;
+  return connection.effectiveType === "2g" || connection.effectiveType === "slow-2g";
+}
+
+export class MeteredConnectionError extends Error {
+  constructor(url: string) {
+    super(`Download of ${url} deferred: connection looks metered. Switch to Wi-Fi or confirm to continue.`);
+    this.name = "MeteredConnectionError";
+  }
+}
+
+export interface FetchWithProgressOptions {
+  /** Refuse large downloads on metered connections until the user confirms. */
+  blockOnMetered?: boolean;
+}
+
 export async function fetchWithProgress(
   url: string,
   onProgress?: (progress: DownloadProgress) => void,
+  options: FetchWithProgressOptions = {},
 ): Promise<Uint8Array> {
+  if (options.blockOnMetered && isMeteredConnection()) {
+    throw new MeteredConnectionError(url);
+  }
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(

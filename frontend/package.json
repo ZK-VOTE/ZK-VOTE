@@ -3,8 +3,14 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-    "scripts": {
-    "sync:circuits": "mkdir -p public/circuits/comment && [ -f ../circuits/build/vote_js/vote.wasm ] && cp ../circuits/build/vote_js/vote.wasm public/circuits/vote.wasm; [ -f ../circuits/build/comment_js/comment.wasm ] && cp ../circuits/build/comment_js/comment.wasm public/circuits/comment/comment.wasm; echo 'circuits synced'",
+  "engines": {
+    "node": "24.x",
+    "npm": "10.x"
+  },
+  "scripts": {
+    "sync:circuits": "node scripts/sync-circuits.mjs",
+    "csp:generate": "node scripts/sync-csp.mjs",
+    "csp:check": "node scripts/sync-csp.mjs --check",
     "predev": "npm run sync:circuits",
     "dev": "vite",
     "prebuild": "npm run sync:circuits",
@@ -18,13 +24,15 @@
     "test:coverage": "vitest run --coverage",
     "type-check": "tsc --noEmit",
     "drift:check": "node ../scripts/drift-guard.mjs",
+    "drift:fix": "node ../scripts/drift-guard.mjs --fix",
+    "protocol:check": "node ../scripts/generate-bindings.mjs --check",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "e2e": "playwright test",
     "e2e:headed": "playwright test --headed"
   },
   "dependencies": {
-    "@creit.tech/stellar-wallets-kit": "^1.9.5",
+    "@creit.tech/stellar-wallets-kit": "1.9.5",
     "@radix-ui/react-label": "^2.1.8",
     "@radix-ui/react-slot": "^1.2.4",
     "@stellar/design-system": "^3.2.5",
@@ -43,7 +51,7 @@
     "rehype-external-links": "^3.0.0",
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
-    "snarkjs": "^0.7.5",
+    "snarkjs": "0.7.5",
     "tailwind-merge": "^3.4.0",
     "tweetnacl": "^1.0.3",
     "tweetnacl-util": "^0.15.1"
@@ -58,7 +66,7 @@
     "@types/node": "^24.10.0",
     "@types/react": "^18.3.27",
     "@types/react-dom": "^18.3.7",
-    "@types/snarkjs": "^0.7.9",
+    "@types/snarkjs": "0.7.9",
     "@vitejs/plugin-react": "^5.1.0",
     "@vitest/coverage-v8": "^4.1.2",
     "autoprefixer": "^10.4.20",
@@ -79,5 +87,12 @@
     "typescript-eslint": "^8.46.3",
     "vite": "^7.2.2",
     "vitest": "^4.0.14"
+  },
+  "overrides": {
+    "snarkjs": "0.7.5",
+    "circom_runtime": "0.1.28",
+    "ffjavascript": "0.2.63",
+    "wasmcurves": "0.2.2",
+    "@stellar/stellar-sdk": "15.1.0"
   }
 }

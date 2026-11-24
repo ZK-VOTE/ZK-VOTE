@@ -1,6 +1,11 @@
 # Litestream configuration for ZK-VOTE SQLite Database Replication
 # Streams WAL changes continuously to S3 or compatible object storage (e.g. Tigris, Cloudflare R2, MinIO, GCS)
-# Enable this by setting LITESTREAM_S3ucket and related environment variables
+# Security (#600): snapshots replicated here are AES-256-GCM envelope-encrypted
+# (see services/backupCrypto.ts). Each backup carries its own DEK wrapped under
+# the CURRENT KEK keyId; rotation archives the old KEK for historical decrypts
+# only, and createBackup asserts new snapshots carry the current keyId so a
+# compromised old key cannot decrypt the future (forward secrecy). Verify with
+# `npm run backup:restore-test` and watch zkvote_backup_age_seconds.
 
 dbs:
   - path: ./data/zkvote.db

@@ -18,11 +18,15 @@ export * from "./submissionQueue";
 configureDevtools();
 
 /**
- * Clears all store states and sensitive data (on logout/disconnect)
+ * Clears all store states and sensitive data (on logout/disconnect).
+ *
+ * Unsent vote proofs are kept: they hold no secrets (only the formatted
+ * proof and public signals), are bound to the account that built them, and
+ * resume when that account reconnects (#750).
  */
 export function clearAllStores(): void {
   userStore.clearUser();
   electionStore.clearElectionStore();
   uiStore.clearUIStore();
-  submissionQueue.clearAll();
+  submissionQueue.clearSettled();
 }

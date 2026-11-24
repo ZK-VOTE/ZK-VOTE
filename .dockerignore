@@ -1,0 +1,15 @@
+# Root build context for frontend/Dockerfile (#645)
+**/node_modules
+**/.git
+**/dist
+**/target
+**/.env
+**/.env.*
+**/coverage
+**/*.log
+backend
+contracts
+monitoring
+scripts
+docs
+**/.DS_Store

@@ -15,6 +15,12 @@ const MIN_MAX_ROOTS: u32 = 10;
 const MAX_MAX_ROOTS: u32 = 100;
 // Circuit depth must match vote.circom. Supports ~262K members (2^18 = 262,144)
 const MAX_TREE_DEPTH: u32 = 18;
+// #541 rent economics: Persistent ~10x Temporary. Roots + config are the only
+// Persistent/Instance keys (long-lived, TTL-extended via extend_ttl); leaves
+// (LeafValue/FilledSubtrees bulk) belong in Temporary. See backend stellar.ts
+// rentTierFor()/shouldExtendTtl() and formal-model rent budget.
+const RENT_ROOT_PERSISTENT: bool = true;
+const RENT_LEAF_TEMPORARY: bool = true;
 // Per-member registration cooldown: minimum seconds a member must wait before
 // registering another commitment in the tree. Prevents tree spam from members
 // churning commitments (e.g. re-registering after reinstate) (#371).
@@ -25,10 +31,30 @@ const VERSION: u32 = 2;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
 // TTL management: bump on every interaction to keep contract alive
+//
+// SECURITY (#audit-H1): the previous persistent window was 535_680 ledgers
+// (~31 days), refreshed only on the individual record being read or written.
+// `MemberLeafIndex(dao, member)` is the guard that makes one address map to at
+// most one Merkle leaf, so a member inactive for a full window came back able
+// to pass the duplicate check in `register_with_caller` / `self_register` and
+// insert a *second* commitment into the tree. The original leaf is never zeroed
+// on that path, so both leaves stayed provable — two nullifiers, and therefore
+// two ballots, from one identity. `LastRegistrationAt` lapsing in the same
+// window silently reset the 1h registration cooldown that exists to slow the
+// same thing down.
+//
+// Soroban has no non-expiring storage, so the cure is the full window the
+// protocol allows plus an explicit keepalive: `maxEntryTTL` is 6_312_000
+// ledgers (~365 days at 5s/ledger), which is what we now extend to, and
+// `sweep_dao` tops up members who are not otherwise active.
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
-const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
+const INSTANCE_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
-const PERSISTENT_TTL_EXTEND: u32 = 535_680;
+const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
+/// Upper bound on how many leaf/member records one `sweep_dao` call refreshes,
+/// so a large DAO cannot push the call past the transaction budget. Callers
+/// paginate by advancing `start`.
+pub const SWEEP_MAX_RECORDS: u32 = 50;
 
 // Poseidon params cache keys (BN254 — stored in persistent storage)
 const POSEIDON_MDS: Symbol = symbol_short!("pos_mds");
@@ -63,6 +89,18 @@ pub enum TreeError {
     Sha3TreeNotInitialized = 20,
     /// C_PQ commitment already stored
     PqCommitmentExists = 21,
+    /// Poseidon field symbol is not a supported field
+    InvalidField = 22,
+    /// Registration is already pending commit-reveal for this member
+    CommitmentPending = 23,
+    /// No pending commit-reveal registration for this member
+    CommitmentNotPending = 24,
+    /// Reveal attempted before the one-ledger commit delay elapsed
+    CommitmentRevealTooEarly = 25,
+    /// Revealed commitment/salt does not match the committed hash
+    CommitmentHashMismatch = 26,
+    /// Epoch is in the future or was never checkpointed
+    UnknownEpoch = 27,
 }
 
 #[contracttype]
@@ -91,6 +129,31 @@ pub enum DataKey {
     Sha3NextRootIdx(u64),     // dao_id -> next PQ root index counter
     Sha3RootIndex(u64, U256), // (dao_id, pq_root) -> root index
     PqCommitment(U256),       // C_PQ -> (dao_id, proposal_id, member)
+
+    // --- Commit-reveal membership registration (anti-front-running) ---
+    PendingRegistration(u64, Address), // (dao_id, member) -> PendingRegistration
+    CommitmentSaltHash(u64, BytesN<32>), // (dao_id, hash) -> true (replay guard)
+
+    // --- Epoch checkpointing (revocation-epoch pinning) ---
+    Epoch(u64),                // dao_id -> current epoch (u32)
+    EpochRoot(u64, u32),       // (dao_id, epoch) -> U256 root
+    EpochAdvancedAt(u64, u32), // (dao_id, epoch) -> ledger timestamp
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingRegistration {
+    pub commitment_hash: BytesN<32>,
+    pub committed_at_ledger: u32,
+    pub committed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpochInfo {
+    pub epoch: u32,
+    pub root: U256,
+    pub advanced_at: u64,
 }
 
 // Typed Events
@@ -172,6 +235,38 @@ pub struct RootEvictedEvent {
     pub dao_id: u64,
     pub evicted_root: U256,
     pub roots_len_after: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentCommittedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub member: Address,
+    pub commitment_hash: BytesN<32>,
+    pub committed_at_ledger: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentRevealedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub member: Address,
+    pub commitment: U256,
+    pub index: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpochAdvancedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub epoch: u32,
+    pub root: U256,
+    pub advanced_at: u64,
 }
 
 #[contract]
@@ -375,6 +470,12 @@ impl MembershipTree {
             panic_with_error!(&env, TreeError::InvalidDepth);
         }
 
+        // SECURITY: reject anything that is not an exact supported field symbol.
+        // An unrecognised symbol would silently fall through to the BN254
+        // parameter table in hash_pair/zero_at_level_for_field, producing a DAO
+        // that hashes differently from its circuits — permanently and invisibly.
+        Self::assert_valid_field(&env, &field);
+
         let depth_key = DataKey::TreeDepth(dao_id);
         if env.storage().persistent().has(&depth_key) {
             panic_with_error!(&env, TreeError::TreeInitialized);
@@ -418,6 +519,10 @@ impl MembershipTree {
         let root_idx_key = DataKey::RootIndex(dao_id, empty_root.clone());
         env.storage().persistent().set(&root_idx_key, &0u32);
         Self::bump_persistent(&env, &root_idx_key);
+
+        // Epoch 0 is the empty-tree checkpoint. Voting contracts pin proofs to
+        // an epoch root, so the genesis epoch must be a real entry.
+        Self::init_epoch_zero(&env, dao_id, empty_root.clone());
 
         TreeInitEvent {
             dao_id,
@@ -446,6 +551,10 @@ impl MembershipTree {
             panic_with_error!(&env, TreeError::InvalidDepth);
         }
 
+        // SECURITY: same field validation as init_tree — a typo here would
+        // permanently pin the DAO to the wrong parameter table.
+        Self::assert_valid_field(&env, &field);
+
         let depth_key = DataKey::TreeDepth(dao_id);
         if env.storage().persistent().has(&depth_key) {
             panic_with_error!(&env, TreeError::TreeInitialized);
@@ -490,6 +599,10 @@ impl MembershipTree {
         env.storage().persistent().set(&root_idx_key, &0u32);
         Self::bump_persistent(&env, &root_idx_key);
 
+        // Epoch 0 is the empty-tree checkpoint. Voting contracts pin proofs to
+        // an epoch root, so the genesis epoch must be a real entry.
+        Self::init_epoch_zero(&env, dao_id, empty_root.clone());
+
         TreeInitEvent {
             dao_id,
             depth,
@@ -497,6 +610,25 @@ impl MembershipTree {
             root_index: 0,
         }
         .publish(&env);
+    }
+
+    /// A tree starts at epoch 0 with its empty root checkpointed. The first
+    /// `advance_epoch` moves to epoch 1; consumers can therefore treat epoch 0
+    /// as a real, pinned root rather than an "unset" sentinel.
+    fn init_epoch_zero(env: &Env, dao_id: u64, root: U256) {
+        let epoch_key = DataKey::Epoch(dao_id);
+        env.storage().persistent().set(&epoch_key, &0u32);
+        Self::bump_persistent(env, &epoch_key);
+
+        let root_key = DataKey::EpochRoot(dao_id, 0u32);
+        env.storage().persistent().set(&root_key, &root);
+        Self::bump_persistent(env, &root_key);
+
+        let at_key = DataKey::EpochAdvancedAt(dao_id, 0u32);
+        env.storage()
+            .persistent()
+            .set(&at_key, &env.ledger().timestamp());
+        Self::bump_persistent(env, &at_key);
     }
 
     fn reserve_commitment(env: &Env, dao_id: u64, commitment: &U256) {
@@ -515,7 +647,14 @@ impl MembershipTree {
     /// elapsed since their previous registration in this DAO.
     fn enforce_registration_cooldown(env: &Env, dao_id: u64, member: &Address) {
         let key = DataKey::LastRegistrationAt(dao_id, member.clone());
-        if let Some(last) = env.storage().persistent().get::<_, u64>(&key) {
+        // Read through a bumping helper: a cooldown check that silently failed to
+        // refresh the record it consults let the record lapse, at which point
+        // `if let Some(..)` fell through and the cooldown silently reset (#audit-H1).
+        let last: Option<u64> = env.storage().persistent().get(&key);
+        if last.is_some() {
+            Self::bump_persistent(env, &key);
+        }
+        if let Some(last) = last {
             if env.ledger().timestamp() < last.saturating_add(MIN_REGISTRATION_INTERVAL_SECS) {
                 panic_with_error!(env, TreeError::RateLimited);
             }
@@ -618,8 +757,24 @@ impl MembershipTree {
 
     /// Register a commitment with explicit caller (requires SBT membership)
     pub fn register_with_caller(env: Env, dao_id: u64, commitment: U256, caller: Address) {
+        Self::register_with_caller_internal(env, dao_id, commitment, caller, true);
+    }
+
+    /// Shared registration body. `require_auth = false` is used by
+    /// `reveal_registration`, which has already authorized the caller in the
+    /// outer frame (re-requiring auth in the same frame traps with
+    /// Error(Auth, ExistingValue) on Soroban).
+    fn register_with_caller_internal(
+        env: Env,
+        dao_id: u64,
+        commitment: U256,
+        caller: Address,
+        require_auth: bool,
+    ) {
         Self::bump_instance(&env);
-        caller.require_auth();
+        if require_auth {
+            caller.require_auth();
+        }
 
         // Verify caller has SBT for this DAO
         let sbt_contract: Address = Self::sbt_contract(&env);
@@ -813,6 +968,275 @@ impl MembershipTree {
         Self::record_registration(&env, dao_id, &member);
     }
 
+    // ============================================
+    // COMMIT-REVEAL REGISTRATION (anti-front-running)
+    // ============================================
+
+    /// Hash a commitment for the commit phase: SHA256(commitment || salt).
+    ///
+    /// The commitment itself is Poseidon(secret, salt), which is not hiding
+    /// enough on its own when the salt is low-entropy or reused. Committing to
+    /// the *salted hash* means a mempool observer cannot front-run the
+    /// commitment before the reveal ledger.
+    pub fn hash_registration(env: Env, commitment: U256, salt: BytesN<32>) -> BytesN<32> {
+        Self::bump_instance(&env);
+        let mut input = Bytes::new(&env);
+        input.append(&commitment.to_be_bytes());
+        input.append(&Bytes::from_array(&env, &salt.to_array()));
+        env.crypto().sha256(&input).into()
+    }
+
+    /// Phase 1: commit to a salted registration hash.
+    ///
+    /// The tree does not change yet, so front-running the reveal cannot claim
+    /// the commitment: the attacker would need the preimage (commitment+ salt).
+    pub fn commit_registration(
+        env: Env,
+        dao_id: u64,
+        commitment_hash: BytesN<32>,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+
+        // SBT membership and tree initialization are checked now so an
+        // uneligible member cannot occupy a pending slot.
+        let sbt_contract: Address = Self::sbt_contract(&env);
+        let has_sbt: bool = env.invoke_contract(
+            &sbt_contract,
+            &symbol_short!("has"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env), caller.clone().into_val(&env)],
+        );
+        if !has_sbt {
+            panic_with_error!(&env, TreeError::NoSbt);
+        }
+
+        let depth_key = DataKey::TreeDepth(dao_id);
+        if !env.storage().persistent().has(&depth_key) {
+            panic_with_error!(&env, TreeError::TreeNotInitialized);
+        }
+
+        let pending_key = DataKey::PendingRegistration(dao_id, caller.clone());
+        if env.storage().persistent().has(&pending_key) {
+            panic_with_error!(&env, TreeError::CommitmentPending);
+        }
+
+        let replay_key = DataKey::CommitmentSaltHash(dao_id, commitment_hash.clone());
+        if env.storage().persistent().has(&replay_key) {
+            panic_with_error!(&env, TreeError::CommitmentAlreadyUsed);
+        }
+
+        let pending = PendingRegistration {
+            commitment_hash: commitment_hash.clone(),
+            committed_at_ledger: env.ledger().sequence(),
+            committed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&pending_key, &pending);
+        Self::bump_persistent(&env, &pending_key);
+
+        env.storage().persistent().set(&replay_key, &true);
+        Self::bump_persistent(&env, &replay_key);
+
+        CommitmentCommittedEvent {
+            dao_id,
+            member: caller,
+            commitment_hash,
+            committed_at_ledger: env.ledger().sequence(),
+        }
+        .publish(&env);
+    }
+
+    /// Phase 2: reveal the commitment and salt after at least one ledger.
+    ///
+    /// Re-uses the normal registration path, so SBT checks, duplicate guards,
+    /// cooldown, tree insertion and root history all behave identically to
+    /// `register_with_caller`.
+    pub fn reveal_registration(
+        env: Env,
+        dao_id: u64,
+        commitment: U256,
+        salt: BytesN<32>,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+
+        let pending_key = DataKey::PendingRegistration(dao_id, caller.clone());
+        let pending: PendingRegistration = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::CommitmentNotPending));
+
+        if env.ledger().sequence() <= pending.committed_at_ledger {
+            panic_with_error!(&env, TreeError::CommitmentRevealTooEarly);
+        }
+
+        let expected = Self::hash_registration(env.clone(), commitment.clone(), salt);
+        if expected != pending.commitment_hash {
+            panic_with_error!(&env, TreeError::CommitmentHashMismatch);
+        }
+
+        // Consume the pending slot before the external SBT call below.
+        env.storage().persistent().remove(&pending_key);
+        let replay_key = DataKey::CommitmentSaltHash(dao_id, pending.commitment_hash.clone());
+        env.storage().persistent().remove(&replay_key);
+
+        // Existing registration path performs SBT verification, cooldown,
+        // duplicate-commitment checks and Merkle insertion.
+        Self::register_with_caller_internal(
+            env.clone(),
+            dao_id,
+            commitment.clone(),
+            caller.clone(),
+            false,
+        );
+
+        let index: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LeafIndex(dao_id, commitment.clone()))
+            .unwrap_or(0);
+
+        CommitmentRevealedEvent {
+            dao_id,
+            member: caller,
+            commitment,
+            index,
+        }
+        .publish(&env);
+    }
+
+    /// Read the pending commit for a member, if any.
+    pub fn pending_registration(
+        env: Env,
+        dao_id: u64,
+        member: Address,
+    ) -> Option<PendingRegistration> {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingRegistration(dao_id, member))
+    }
+
+    // ============================================
+    // EPOCH CHECKPOINTING (revocation-epoch pinning)
+    // ============================================
+
+    /// Advance the registry epoch, checkpointing the current root.
+    ///
+    /// Only the DAO admin can advance. Votes built against an older epoch are
+    /// rejected by `voting` once the grace window elapses (see
+    /// `EPOCH_GRACE_SECS` there), closing the "revoked member votes with a
+    /// stale proof" hole.
+    pub fn advance_epoch(env: Env, dao_id: u64, admin: Address) -> u32 {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        let sbt_contract: Address = Self::sbt_contract(&env);
+        let registry: Address = env.invoke_contract(
+            &sbt_contract,
+            &symbol_short!("registry"),
+            soroban_sdk::vec![&env],
+        );
+        let dao_admin: Address = env.invoke_contract(
+            &registry,
+            &symbol_short!("get_admin"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env)],
+        );
+        if dao_admin != admin {
+            panic_with_error!(&env, TreeError::NotAdmin);
+        }
+
+        let current: u32 = Self::current_epoch(env.clone(), dao_id);
+        let next = current
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::InvalidDepth));
+
+        let root = Self::current_root(env.clone(), dao_id);
+        let at_key = DataKey::EpochAdvancedAt(dao_id, next);
+        env.storage()
+            .persistent()
+            .set(&at_key, &env.ledger().timestamp());
+        Self::bump_persistent(&env, &at_key);
+
+        let root_key = DataKey::EpochRoot(dao_id, next);
+        env.storage().persistent().set(&root_key, &root);
+        Self::bump_persistent(&env, &root_key);
+
+        let epoch_key = DataKey::Epoch(dao_id);
+        env.storage().persistent().set(&epoch_key, &next);
+        Self::bump_persistent(&env, &epoch_key);
+
+        EpochAdvancedEvent {
+            dao_id,
+            epoch: next,
+            root,
+            advanced_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        next
+    }
+
+    pub fn current_epoch(env: Env, dao_id: u64) -> u32 {
+        Self::bump_instance(&env);
+        Self::current_epoch_internal(&env, dao_id)
+    }
+
+    fn current_epoch_internal(env: &Env, dao_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Epoch(dao_id))
+            .unwrap_or(0)
+    }
+
+    /// Root checkpointed for `epoch`. Panics if the epoch was never advanced.
+    pub fn epoch_root(env: Env, dao_id: u64, epoch: u32) -> U256 {
+        Self::bump_instance(&env);
+        let key = DataKey::EpochRoot(dao_id, epoch);
+        let root: U256 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::UnknownEpoch));
+        Self::bump_persistent(&env, &key);
+        root
+    }
+
+    /// Ledger timestamp when `epoch` was checkpointed.
+    pub fn epoch_advanced_at(env: Env, dao_id: u64, epoch: u32) -> u64 {
+        Self::bump_instance(&env);
+        let key = DataKey::EpochAdvancedAt(dao_id, epoch);
+        let at: u64 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::UnknownEpoch));
+        Self::bump_persistent(&env, &key);
+        at
+    }
+
+    pub fn get_epoch_info(env: Env, dao_id: u64) -> EpochInfo {
+        Self::bump_instance(&env);
+        let epoch = Self::current_epoch_internal(&env, dao_id);
+        EpochInfo {
+            epoch,
+            root: Self::epoch_root(env.clone(), dao_id, epoch),
+            advanced_at: Self::epoch_advanced_at(env, dao_id, epoch),
+        }
+    }
+
+    pub fn epoch_root_ok(env: Env, dao_id: u64, epoch: u32, root: U256) -> bool {
+        Self::bump_instance(&env);
+        let key = DataKey::EpochRoot(dao_id, epoch);
+        env.storage()
+            .persistent()
+            .get::<_, U256>(&key)
+            .map(|stored| stored == root)
+            .unwrap_or(false)
+    }
+
     /// Get current root for a DAO
     pub fn current_root(env: Env, dao_id: u64) -> U256 {
         Self::bump_instance(&env);
@@ -856,6 +1280,50 @@ impl MembershipTree {
             }
         }
         false
+    }
+
+    /// Is `root` an acceptable root to prove membership against, for an
+    /// election that will not accept roots older than `earliest_root_index`?
+    ///
+    /// Answers the whole question in one hop. The three facts it needs — is the
+    /// root still in the retained window, what index does it have, and where the
+    /// revocation floor sits — all live in this contract, so a caller that asks
+    /// for them separately pays three cross-contract invocations per vote and
+    /// has three chances to implement the rule slightly differently. The
+    /// revocation floor in particular is the whole of Fixed-mode revocation, so
+    /// a caller that forgets to ask for it silently accepts removed members
+    /// (#audit-H3).
+    ///
+    /// Returns a code rather than a bool so callers can still report *which*
+    /// condition failed:
+    ///   0 = eligible
+    ///   1 = not in root history (evicted, or never published)
+    ///   2 = index predates the election's `earliest_root_index`
+    ///   3 = index predates the last member removal (`min_root`)
+    pub fn root_eligibility(env: Env, dao_id: u64, root: U256, earliest_root_index: u32) -> u32 {
+        Self::bump_instance(&env);
+        let index_key = DataKey::RootIndex(dao_id, root);
+        // `RootIndex` presence *is* the history test, in O(1).
+        //
+        // `root_ok` answers the same question with a linear scan of the
+        // retained `Roots` vector, but eviction (`evict_oldest_root`) deletes
+        // exactly this `RootIndex` key when a root ages out, so the two agree by
+        // construction — and since this runs on the hot `vote` path, an O(30)
+        // scan per vote is real cost for no extra information. A root that was
+        // never published has no index key either, so it is rejected here too.
+        let root_index: Option<u32> = env.storage().persistent().get(&index_key);
+        let Some(root_index) = root_index else {
+            return 1;
+        };
+        Self::bump_persistent(&env, &index_key);
+
+        if root_index < earliest_root_index {
+            return 2;
+        }
+        if root_index < Self::min_root(env.clone(), dao_id) {
+            return 3;
+        }
+        0
     }
 
     /// Get root index for a specific root (for vote mode validation)
@@ -1200,6 +1668,140 @@ impl MembershipTree {
         result
     }
 
+    // ── Keepalive (#audit-H1) ───────────────────────────────────────────────
+    //
+    // The persistent window is now the protocol ceiling, but Soroban still
+    // archives any entry that goes a full `maxEntryTTL` without being touched,
+    // and the entries that lapse first are precisely the ones that carry the
+    // security invariants: `MemberLeafIndex` is what makes one address map to
+    // one leaf, `CommitmentUsed` is what makes a commitment unique, and the
+    // root history is what makes `root_ok` answer at all.
+    //
+    // This is permissionless by design. A keepalive gated behind the DAO admin
+    // is not a keepalive — the failure being defended against is a DAO whose
+    // admin has gone away, and putting the refresh behind that same key
+    // reproduces the outage. It only extends TTLs and never writes membership,
+    // so there is nothing for a caller to gain and nothing to roll back.
+
+    /// Refresh one page of a DAO's tree records back to the protocol ceiling.
+    ///
+    /// Walks leaf indices from `start`, refreshing each leaf's value, its
+    /// commitment reservation, and (via the SBT's member enumeration) the
+    /// per-member leaf binding and registration timestamp, then refreshes the
+    /// DAO's structural records and retained root history. Returns the number of
+    /// leaves refreshed; call again with `start += SWEEP_MAX_RECORDS` until it
+    /// returns 0.
+    ///
+    /// The member-keyed records are reached by asking the SBT contract for the
+    /// member at each index, because the tree keys those records by address and
+    /// only the SBT holds an address enumeration. Both enumerations are dense
+    /// over the same membership, so the same index window covers both.
+    pub fn sweep_dao(env: Env, dao_id: u64, start: u64, limit: u32) -> u32 {
+        Self::bump_instance(&env);
+        let limit = if limit == 0 || limit > SWEEP_MAX_RECORDS {
+            SWEEP_MAX_RECORDS
+        } else {
+            limit
+        };
+
+        // Structural records: small, fixed set, always refreshed.
+        for key in [
+            DataKey::TreeDepth(dao_id),
+            DataKey::NextLeafIndex(dao_id),
+            DataKey::NextRootIndex(dao_id),
+            DataKey::Roots(dao_id),
+            DataKey::MaxRoots(dao_id),
+            DataKey::MinValidRootIdx(dao_id),
+        ] {
+            if env.storage().persistent().has(&key) {
+                Self::bump_persistent(&env, &key);
+            }
+        }
+
+        // Retained root history, including the index map `root_idx` reads.
+        if let Some(roots) =
+            Self::read_persistent::<_, soroban_sdk::Vec<U256>>(&env, &DataKey::Roots(dao_id))
+        {
+            for i in 0..roots.len() {
+                if let Some(root) = roots.get(i) {
+                    let idx_key = DataKey::RootIndex(dao_id, root);
+                    if env.storage().persistent().has(&idx_key) {
+                        Self::bump_persistent(&env, &idx_key);
+                    }
+                }
+            }
+        }
+
+        let next_leaf: u32 =
+            Self::read_persistent(&env, &DataKey::NextLeafIndex(dao_id)).unwrap_or(0);
+        let end = (next_leaf as u64).min(start.saturating_add(limit as u64));
+
+        // Addresses for the whole window, fetched once. See the note below on
+        // why the tree has to borrow the SBT's enumeration.
+        let sbt_contract: Option<Address> = env.storage().instance().get(&SBT_CONTRACT);
+        let members: soroban_sdk::Vec<Address> = match &sbt_contract {
+            Some(sbt) => env.invoke_contract(
+                sbt,
+                &Symbol::new(&env, "get_members"),
+                soroban_sdk::vec![
+                    &env,
+                    dao_id.into_val(&env),
+                    start.into_val(&env),
+                    (end - start).into_val(&env),
+                ],
+            ),
+            None => soroban_sdk::Vec::new(&env),
+        };
+
+        let mut swept = 0u32;
+        let mut i = start;
+        while i < end {
+            let leaf_key = DataKey::LeafValue(dao_id, i as u32);
+            if let Some(commitment) = Self::read_persistent::<_, U256>(&env, &leaf_key) {
+                for key in [
+                    DataKey::CommitmentUsed(dao_id, commitment.clone()),
+                    DataKey::LeafIndex(dao_id, commitment.clone()),
+                ] {
+                    if env.storage().persistent().has(&key) {
+                        Self::bump_persistent(&env, &key);
+                    }
+                }
+            }
+
+            // Per-member records, walked alongside the leaf window. These are
+            // keyed by address and the tree keeps no address enumeration of its
+            // own, so the addresses are borrowed from the SBT contract; both
+            // enumerations are dense over the same membership, so one index
+            // window covers leaves and members together.
+            if let Some(member) = members.get((i - start) as u32) {
+                for key in [
+                    DataKey::MemberLeafIndex(dao_id, member.clone()),
+                    DataKey::LastRegistrationAt(dao_id, member),
+                ] {
+                    if env.storage().persistent().has(&key) {
+                        Self::bump_persistent(&env, &key);
+                    }
+                }
+            }
+            swept += 1;
+            i += 1;
+        }
+        swept
+    }
+
+    /// Read a record and, if it exists, refresh its TTL.
+    fn read_persistent<K, V>(env: &Env, key: &K) -> Option<V>
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+        V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        let value: Option<V> = env.storage().persistent().get(key);
+        if value.is_some() {
+            Self::bump_persistent(env, key);
+        }
+        value
+    }
+
     /// Verify exclusion proof: check if a commitment is NOT in the current tree
     /// Used by voting contract to enforce that revoked members cannot vote
     /// Returns true if commitment has been revoked and is not in tree
@@ -1314,10 +1916,42 @@ impl MembershipTree {
                 let zero_at_level = Self::zero_at_level_for_field(env, level, &field);
                 current_hash = Self::hash_pair(env, &current_hash, &zero_at_level, &field);
             } else {
-                // Right child - use filled subtree from left
-                let left = filled
-                    .get(level)
-                    .unwrap_or_else(|| Self::zero_at_level_for_field(env, level, &field));
+                // Right child - the left sibling's authoritative hash.
+                //
+                // Do NOT read this straight out of the `filled` cache: the cache
+                // is only a mirror, and any write path that forgets to refresh it
+                // (e.g. an update/reinstatement) would silently splice a stale
+                // subtree into a brand-new root — a root that `root_ok` accepts
+                // but that no `get_merkle_path` can reproduce, bricking ZK voting.
+                // NodeHash/LeafValue is the source of truth and is rewritten
+                // bottom-up by every path that mutates a leaf, so it is always
+                // current. `filled` remains a fallback for the not-yet-written
+                // (all-zero) case.
+                let left_index = current_index - 1;
+                let cached = || {
+                    filled
+                        .get(level)
+                        .unwrap_or_else(|| Self::zero_at_level_for_field(env, level, &field))
+                };
+                let left: U256 = if level == 0 {
+                    // Level 0: sibling is a leaf; hash it the same way its own
+                    // insertion did (LeafValue holds the raw commitment).
+                    match env
+                        .storage()
+                        .persistent()
+                        .get::<_, U256>(&DataKey::LeafValue(dao_id, left_index))
+                    {
+                        Some(raw_sibling) => Self::hash_leaf(env, &raw_sibling, &field),
+                        None => cached(),
+                    }
+                } else {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::NodeHash(dao_id, level, left_index))
+                        .unwrap_or_else(cached)
+                };
+                // Keep the cache a faithful mirror of the value we just used.
+                filled.set(level, left.clone());
                 current_hash = Self::hash_pair(env, &left, &current_hash, &field);
             }
             // Store intermediate node hash at level+1 (since level 0 is leaves)
@@ -1386,6 +2020,17 @@ impl MembershipTree {
         env.storage().persistent().set(&leaf_val_key, &new_value);
         Self::bump_persistent(env, &leaf_val_key);
 
+        // Load the cached left-sibling subtrees so they can be kept in sync
+        // with the recomputed path. `insert_leaf` reads `filled[level]` when the
+        // incoming node is a *right* child, so leaving this cache stale after a
+        // removal/reinstatement silently mixes a pre-update subtree hash into a
+        // fresh root (C-class: irreversible ZK-voting brick).
+        let mut filled: Vec<U256> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FilledSubtrees(dao_id))
+            .unwrap_or_else(|| panic_with_error!(env, TreeError::TreeNotInitialized));
+
         // Recompute path from leaf to root
         // Domain-separate the leaf before it becomes a tree node value (#167).
         let mut current_index = leaf_index;
@@ -1398,6 +2043,14 @@ impl MembershipTree {
             } else {
                 current_index - 1
             };
+
+            // Mirror `insert_leaf`: when the recomputed node is a left child it
+            // *is* the completed left subtree for this level, so it must replace
+            // the cached value. Writing it here is what keeps a later insert that
+            // forms a right child at this level consistent with this root.
+            if is_left {
+                filled.set(level, current_hash.clone());
+            }
 
             // Get sibling hash from stored NodeHash or use zero if doesn't exist
             let sibling: U256 = if level == 0 {
@@ -1437,6 +2090,11 @@ impl MembershipTree {
             current_index = parent_index;
         }
 
+        // Persist the refreshed left-sibling cache before publishing the new root.
+        let filled_key = DataKey::FilledSubtrees(dao_id);
+        env.storage().persistent().set(&filled_key, &filled);
+        Self::bump_persistent(env, &filled_key);
+
         // Update root history with FIFO cap
         let roots_key = DataKey::Roots(dao_id);
         let mut roots: Vec<U256> = env
@@ -1474,13 +2132,38 @@ impl MembershipTree {
         (current_hash, root_index)
     }
 
+    // Internal: Reject any field symbol that is not exactly "BN254" or "BLS12_381".
+    //
+    // Every dispatch below (`ensure_poseidon_params_cached`, `hash_pair`,
+    // `zero_at_level_for_field`) uses `if field == "BLS12_381" { .. } else { .. }`,
+    // so an unrecognised symbol silently takes the BN254 branch. Pinning the
+    // value at init time turns that silent mismatch into a startup error instead
+    // of a DAO whose on-chain roots never match its circuits.
+    fn assert_valid_field(env: &Env, field: &Symbol) {
+        if field != &Symbol::new(env, "BN254") && field != &Symbol::new(env, "BLS12_381") {
+            panic_with_error!(env, TreeError::InvalidField);
+        }
+    }
+
+    /// Public getter for the DAO's Poseidon field.
+    /// Fails if the tree was never initialised, matching `dao_field`.
+    pub fn get_field(env: Env, dao_id: u64) -> Symbol {
+        Self::bump_instance(&env);
+        Self::dao_field(&env, dao_id)
+    }
+
     // Internal: Get Poseidon field for a DAO
+    //
+    // Fail-closed: an uninitialised tree has no field on record, and defaulting
+    // to BN254 here would let a DAO hash against a field it never registered
+    // with. `init_tree`/`init_tree_from_registry` always write the field
+    // alongside the depth, so this only fires for a tree that was never created.
     fn dao_field(env: &Env, dao_id: u64) -> Symbol {
         let field_key = DataKey::PoseidonField(dao_id);
         env.storage()
             .persistent()
             .get(&field_key)
-            .unwrap_or_else(|| Symbol::new(env, "BN254"))
+            .unwrap_or_else(|| panic_with_error!(env, TreeError::TreeNotInitialized))
     }
 
     // Internal: Ensure Poseidon params are cached for the given field

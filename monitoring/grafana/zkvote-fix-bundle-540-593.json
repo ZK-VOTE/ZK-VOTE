@@ -1,0 +1,9 @@
+{
+  "title": "ZK-VOTE fix bundle #540/#541/#592/#593",
+  "panels": [
+    { "title": "sponsorship_reserve_xlm", "alert": "reserve > 400 XLM warn, depletion counter > 0 critical" },
+    { "title": "unauthenticated_rejection_total / cross_tenant_denial_total", "alert": "spoof attempt > 0 critical" },
+    { "title": "reconciliation_mismatch_total", "alert": "mismatch > 0 warn" },
+    { "title": "sbt_xss_blocked_total", "alert": "blocked > 0 info" }
+  ]
+}

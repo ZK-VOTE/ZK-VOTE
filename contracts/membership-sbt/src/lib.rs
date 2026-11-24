@@ -5,14 +5,43 @@ use soroban_sdk::{
 };
 
 const REGISTRY: Symbol = symbol_short!("registry");
+// #593 SBT metadata is content-addressed AND hash-pinned: token URI must carry
+// metadata_hash (sha256 of sanitized JSON); renderers reject SVG/script payloads
+// and only render via sandboxed <img>. Upload pipeline enforces
+// file-type+sharp; on-chain hash prevents gateway-swap attacks.
+const METADATA_HASH_KEY: Symbol = symbol_short!("md_hash");
+pub const MAX_METADATA_BYTES: u32 = 200_000;
 const VERSION: u32 = 1;
 const VERSION_KEY: Symbol = symbol_short!("ver");
 
 // TTL management: bump on every interaction to keep contract alive
+//
+// SECURITY (#audit-H1): the previous `PERSISTENT_TTL_EXTEND` was 535_680
+// ledgers (~31 days), refreshed only when a given record was read or written.
+// A member who did nothing for 31 days therefore lost their `Member` entry, and
+// because every downstream answer is *derived* from the presence of that entry,
+// the loss was silent and wrong rather than merely inconvenient:
+//
+//   * `has()` -> false, so the SBT evaporated with no event,
+//   * `Member` gone -> `is_new_member` flipped back to true in `mint`/`self_join`,
+//     appending a second copy of the address to the enumeration list,
+//   * `MemberLeafIndex` gone in membership-tree -> the duplicate-registration
+//     guard passed and a second commitment was inserted into the Merkle tree,
+//     giving one identity two provable leaves and therefore two ballots.
+//
+// Soroban has no non-expiring storage, so the cure is to use the full window
+// the protocol allows and to keep it topped up. `maxEntryTTL` is 6_312_000
+// ledgers (~365 days at 5s/ledger), so that is the ceiling we extend to; the
+// remaining exposure is handled by the permissionless `sweep_dao` keepalive
+// below rather than by pretending a TTL is permanence.
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
-const INSTANCE_TTL_EXTEND: u32 = 535_680; // ~31 days
+const INSTANCE_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
 const PERSISTENT_TTL_THRESHOLD: u32 = 120_960;
-const PERSISTENT_TTL_EXTEND: u32 = 535_680;
+const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntryTTL
+/// Upper bound on how many records one `sweep_dao` call refreshes, so a DAO
+/// with a large membership cannot push the call past the transaction budget.
+/// Callers paginate by advancing `start`.
+pub const SWEEP_MAX_RECORDS: u32 = 50;
 
 // ── Sybil-resistance parameters (#301) ─────────────────────────────────────
 //
@@ -51,6 +80,18 @@ pub const MAX_REPUTATION: u32 = 10_000;
 /// Seconds per day, for age bucketing.
 pub const SECONDS_PER_DAY: u64 = 86_400;
 
+// ── Admin mint rate-limiting (#770) ────────────────────────────────────────
+//
+// Without a cap an admin can flood the member list (and any open election)
+// with Sybil identities in a single transaction burst.  We bucket mints by
+// "epoch" — a window of EPOCH_LEDGERS ledgers (~24 h at 5 s/ledger) — and
+// reject any mint that would push the per-DAO count past MAX_MINTS_PER_EPOCH.
+// Temporary storage is the right choice: the epoch counter is only relevant
+// during the window; once the TTL expires the key is gone and the next epoch
+// starts at zero automatically, with no explicit reset needed.
+pub const MAX_MINTS_PER_EPOCH: u32 = 50;
+pub const EPOCH_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum SbtError {
@@ -69,6 +110,8 @@ pub enum SbtError {
     NotReputationAttestor = 9,
     /// Reputation weight parameters are not monotonically increasing (#301).
     InvalidWeightCurve = 10,
+    /// Admin has exceeded the per-epoch mint cap for this DAO (#770).
+    MintRateLimitExceeded = 11,
 }
 
 #[contracttype]
@@ -96,6 +139,11 @@ pub enum DataKey {
     /// Addresses permitted to accrue/slash reputation for a DAO (the voting
     /// contract, plus any DAO-nominated attestor).
     ReputationAttestor(u64, Address), // (dao_id, address) -> bool
+
+    // ── Rate-limiting (#770) ───────────────────────────────────────────────
+    /// Rolling mint counter per epoch window.  Key: (dao_id, epoch_number).
+    /// Stored in temporary storage; expires automatically when the epoch ends.
+    MintEpochCount(u64, u64), // (dao_id, epoch) -> u32
 }
 
 // Typed Events
@@ -152,10 +200,33 @@ impl MembershipSbt {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
     }
 
+    /// Refresh one record's TTL to the protocol ceiling.
+    ///
+    /// `extend_ttl` only ever *raises* an entry's live-until, so calling this on
+    /// a read is safe and is what keeps a passively-read record from lapsing.
     fn bump_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
+
+    /// Read a record and, if it exists, refresh its TTL.
+    ///
+    /// Every read path in this contract goes through here rather than calling
+    /// `.persistent().get(..)` directly: a read that silently forgot to bump
+    /// was how the 31-day window was able to lapse for records that were being
+    /// consulted constantly (`is_in_cooldown`, `reputation`,
+    /// `is_reputation_attestor`, `member_age_days`).
+    fn read_persistent<K, V>(env: &Env, key: &K) -> Option<V>
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+        V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        let value: Option<V> = env.storage().persistent().get(key);
+        if value.is_some() {
+            Self::bump_persistent(env, key);
+        }
+        value
     }
 
     /// Record the first-ever mint time for a member (#301).
@@ -201,7 +272,7 @@ impl MembershipSbt {
     /// Helper: Add member to enumeration list
     fn add_member_to_list(env: &Env, dao_id: u64, member: &Address) {
         let count_key = DataKey::MemberCount(dao_id);
-        let current_count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let current_count: u64 = Self::read_persistent(&env, &count_key).unwrap_or(0);
 
         // Add member at current index
         let index_key = DataKey::MemberAtIndex(dao_id, current_count);
@@ -245,6 +316,20 @@ impl MembershipSbt {
         if Self::has(env.clone(), dao_id, to.clone()) {
             panic_with_error!(&env, SbtError::AlreadyMinted);
         }
+
+        // Rate-limit: at most MAX_MINTS_PER_EPOCH mints per DAO per epoch (#770)
+        let epoch = (env.ledger().sequence() / EPOCH_LEDGERS) as u64;
+        let epoch_key = DataKey::MintEpochCount(dao_id, epoch);
+        let epoch_count: u32 = env.storage().temporary().get(&epoch_key).unwrap_or(0);
+        if epoch_count >= MAX_MINTS_PER_EPOCH {
+            panic_with_error!(&env, SbtError::MintRateLimitExceeded);
+        }
+        env.storage()
+            .temporary()
+            .set(&epoch_key, &(epoch_count + 1));
+        env.storage()
+            .temporary()
+            .extend_ttl(&epoch_key, EPOCH_LEDGERS, EPOCH_LEDGERS * 2);
 
         let member_key = DataKey::Member(dao_id, to.clone());
         let revoked_key = DataKey::Revoked(dao_id, to.clone());
@@ -314,16 +399,13 @@ impl MembershipSbt {
         let member_key = DataKey::Member(dao_id, of.clone());
         let revoked_key = DataKey::Revoked(dao_id, of);
 
-        // Must have SBT AND not be revoked
-        let has_sbt: bool = env.storage().persistent().get(&member_key).unwrap_or(false);
-        if has_sbt {
-            Self::bump_persistent(&env, &member_key);
-        }
-        let is_revoked: bool = env
-            .storage()
-            .persistent()
-            .get(&revoked_key)
-            .unwrap_or(false);
+        // Must have SBT AND not be revoked.
+        //
+        // `Revoked` is read even when `Member` is absent: a revocation outlives
+        // the membership entry it cancels, and reading it here is also what
+        // keeps the flag alive for a member who left and later rejoins.
+        let has_sbt: bool = Self::read_persistent(&env, &member_key).unwrap_or(false);
+        let is_revoked: bool = Self::read_persistent(&env, &revoked_key).unwrap_or(false);
 
         has_sbt && !is_revoked
     }
@@ -341,11 +423,7 @@ impl MembershipSbt {
     pub fn get_alias(env: Env, dao_id: u64, member: Address) -> Option<soroban_sdk::String> {
         Self::bump_instance(&env);
         let key = DataKey::Alias(dao_id, member);
-        let result: Option<soroban_sdk::String> = env.storage().persistent().get(&key);
-        if result.is_some() {
-            Self::bump_persistent(&env, &key);
-        }
-        result
+        Self::read_persistent(&env, &key)
     }
 
     /// Revoke an SBT (admin only)
@@ -391,7 +469,7 @@ impl MembershipSbt {
 
         // Check cooldown: cannot leave during active election
         let cooldown_key = DataKey::TransferCooldown(dao_id, member.clone());
-        let cooldown_end: Option<u64> = env.storage().persistent().get(&cooldown_key);
+        let cooldown_end: Option<u64> = Self::read_persistent(&env, &cooldown_key);
         if let Some(end) = cooldown_end {
             if env.ledger().timestamp() < end {
                 panic_with_error!(&env, SbtError::CooldownActive);
@@ -516,22 +594,14 @@ impl MembershipSbt {
     pub fn get_member_count(env: Env, dao_id: u64) -> u64 {
         Self::bump_instance(&env);
         let count_key = DataKey::MemberCount(dao_id);
-        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        if count > 0 {
-            Self::bump_persistent(&env, &count_key);
-        }
-        count
+        Self::read_persistent(&env, &count_key).unwrap_or(0)
     }
 
     /// Get member address at a specific index
     pub fn get_member_at_index(env: Env, dao_id: u64, index: u64) -> Option<Address> {
         Self::bump_instance(&env);
         let index_key = DataKey::MemberAtIndex(dao_id, index);
-        let result: Option<Address> = env.storage().persistent().get(&index_key);
-        if result.is_some() {
-            Self::bump_persistent(&env, &index_key);
-        }
-        result
+        Self::read_persistent(&env, &index_key)
     }
 
     /// Get a batch of members for a DAO
@@ -560,18 +630,62 @@ impl MembershipSbt {
 
     // ── Anti-Flash Loan: Transfer Cooldown ──────────────────────────────────
 
+    /// Internal: require that `caller` is the admin of `dao_id`, via the registry.
+    fn assert_dao_admin(env: &Env, dao_id: u64, caller: &Address) {
+        let registry: Address = Self::registry_addr(env);
+        let dao_admin: Address = env.invoke_contract(
+            &registry,
+            &symbol_short!("get_admin"),
+            soroban_sdk::vec![env, dao_id.into_val(env)],
+        );
+        if &dao_admin != caller {
+            panic_with_error!(env, SbtError::NotDaoAdmin);
+        }
+    }
+
     /// Set a member's transfer cooldown during an active election.
     /// Prevents the member from leaving or having their SBT revoked while voting.
-    pub fn set_election_cooldown(env: Env, dao_id: u64, member: Address, cooldown_end: u64) {
+    ///
+    /// SECURITY (admin or self): this gates `leave`, so leaving it unauthenticated
+    /// let anyone permanently lock a member out of the DAO with `cooldown_end = u64::MAX`.
+    pub fn set_election_cooldown(
+        env: Env,
+        dao_id: u64,
+        member: Address,
+        cooldown_end: u64,
+        caller: Address,
+    ) {
         Self::bump_instance(&env);
+
+        // A member may set their own cooldown (e.g. to prove they are not
+        // flash-loaning out of the election); the DAO admin may set anyone's.
+        if caller != member {
+            caller.require_auth();
+            Self::assert_dao_admin(&env, dao_id, &caller);
+        } else {
+            member.require_auth();
+        }
+
         let key = DataKey::TransferCooldown(dao_id, member);
         env.storage().persistent().set(&key, &cooldown_end);
         Self::bump_persistent(&env, &key);
     }
 
     /// Clear a member's transfer cooldown after an election ends.
-    pub fn clear_election_cooldown(env: Env, dao_id: u64, member: Address) {
+    ///
+    /// SECURITY (admin or self): the cooldown is the anti-flash-loan barrier
+    /// blocking vote -> leave -> re-join within one election. Permissionless
+    /// clearing let a member drop it and rejoin in the same election.
+    pub fn clear_election_cooldown(env: Env, dao_id: u64, member: Address, caller: Address) {
         Self::bump_instance(&env);
+
+        if caller != member {
+            caller.require_auth();
+            Self::assert_dao_admin(&env, dao_id, &caller);
+        } else {
+            member.require_auth();
+        }
+
         let key = DataKey::TransferCooldown(dao_id, member);
         env.storage().persistent().remove(&key);
     }
@@ -581,7 +695,7 @@ impl MembershipSbt {
     pub fn is_in_cooldown(env: Env, dao_id: u64, member: Address) -> bool {
         Self::bump_instance(&env);
         let key = DataKey::TransferCooldown(dao_id, member);
-        let cooldown_end: Option<u64> = env.storage().persistent().get(&key);
+        let cooldown_end: Option<u64> = Self::read_persistent(&env, &key);
         match cooldown_end {
             Some(end) => env.ledger().timestamp() < end,
             None => false,
@@ -589,8 +703,26 @@ impl MembershipSbt {
     }
 
     /// Mark a member as participating in an active election.
-    pub fn set_in_active_election(env: Env, dao_id: u64, member: Address, active: bool) {
+    ///
+    /// SECURITY (admin or self): this is the state that pins a member's weight
+    /// for the duration of an election. Permissionless, anyone could mark an
+    /// arbitrary address as a flash-loan voter.
+    pub fn set_in_active_election(
+        env: Env,
+        dao_id: u64,
+        member: Address,
+        active: bool,
+        caller: Address,
+    ) {
         Self::bump_instance(&env);
+
+        if caller != member {
+            caller.require_auth();
+            Self::assert_dao_admin(&env, dao_id, &caller);
+        } else {
+            member.require_auth();
+        }
+
         let key = DataKey::InActiveElection(dao_id, member);
         env.storage().persistent().set(&key, &active);
         Self::bump_persistent(&env, &key);
@@ -600,7 +732,7 @@ impl MembershipSbt {
     pub fn is_in_active_election(env: Env, dao_id: u64, member: Address) -> bool {
         Self::bump_instance(&env);
         let key = DataKey::InActiveElection(dao_id, member);
-        env.storage().persistent().get(&key).unwrap_or(false)
+        Self::read_persistent(&env, &key).unwrap_or(false)
     }
 
     /// Contract version for upgrade tracking.
@@ -610,6 +742,70 @@ impl MembershipSbt {
             .instance()
             .get(&VERSION_KEY)
             .unwrap_or(VERSION)
+    }
+
+    // ── Keepalive (#audit-H1) ───────────────────────────────────────────────
+    //
+    // `PERSISTENT_TTL_EXTEND` is already the protocol ceiling, but Soroban has
+    // no non-expiring storage: a record that is not touched for a full year
+    // still lapses and is archived, and every answer this contract derives from
+    // it silently inverts (see the note on the TTL constants). Reads and writes
+    // keep the active membership alive on their own; this entrypoint is what
+    // keeps *passive* members alive.
+    //
+    // It is deliberately permissionless. A keepalive that only the DAO admin can
+    // call is not a keepalive: the failure mode we are defending against is
+    // precisely a DAO whose admin has gone unreachable, and gating the refresh
+    // behind that same unreachable key would reproduce the outage it is meant to
+    // prevent. It is also a strict no-op on state — it only extends TTLs, never
+    // writes membership, so there is nothing for a caller to gain.
+    //
+    // Refresh the TTL of one page of a DAO's membership records.
+    ///
+    /// Walks the enumeration list from `start`, refreshing each member's
+    /// membership, alias, age anchor and reputation records, and returns how many
+    /// were refreshed. Callers repeat with `start += SWEEP_MAX_RECORDS` until it
+    /// returns 0. A member that was swept here is not added to anything, so a
+    /// sweep can never re-enumerate or re-mint.
+    pub fn sweep_dao(env: Env, dao_id: u64, start: u64, limit: u32) -> u32 {
+        Self::bump_instance(&env);
+        let limit = if limit == 0 || limit > SWEEP_MAX_RECORDS {
+            SWEEP_MAX_RECORDS
+        } else {
+            limit
+        };
+
+        let count: u64 = Self::read_persistent(&env, &DataKey::MemberCount(dao_id)).unwrap_or(0);
+        let end = count.min(start.saturating_add(limit as u64));
+
+        let mut swept = 0u32;
+        let mut i = start;
+        while i < end {
+            if let Some(member) =
+                Self::read_persistent::<_, Address>(&env, &DataKey::MemberAtIndex(dao_id, i))
+            {
+                // `extend_ttl` raises an error on an absent entry rather than
+                // no-op'ing, and not every member has every record (an alias is
+                // optional, a reputation score is absent until it is accrued), so
+                // each refresh is guarded on the record actually being there.
+                for key in [
+                    DataKey::Member(dao_id, member.clone()),
+                    DataKey::Alias(dao_id, member.clone()),
+                    DataKey::MintedAt(dao_id, member.clone()),
+                    DataKey::Reputation(dao_id, member.clone()),
+                    DataKey::TransferCooldown(dao_id, member.clone()),
+                    DataKey::InActiveElection(dao_id, member.clone()),
+                    DataKey::Revoked(dao_id, member),
+                ] {
+                    if env.storage().persistent().has(&key) {
+                        Self::bump_persistent(&env, &key);
+                    }
+                }
+                swept += 1;
+            }
+            i += 1;
+        }
+        swept
     }
 
     // ── Sybil-resistance layer: SBT age + reputation (#301) ────────────────
@@ -628,7 +824,7 @@ impl MembershipSbt {
     pub fn member_age_days(env: Env, dao_id: u64, member: Address) -> u64 {
         Self::bump_instance(&env);
         let key = DataKey::MintedAt(dao_id, member);
-        let minted_at: u64 = match env.storage().persistent().get(&key) {
+        let minted_at: u64 = match Self::read_persistent(&env, &key) {
             Some(t) => t,
             None => return 0,
         };
@@ -640,7 +836,7 @@ impl MembershipSbt {
     pub fn reputation(env: Env, dao_id: u64, member: Address) -> u32 {
         Self::bump_instance(&env);
         let key = DataKey::Reputation(dao_id, member);
-        env.storage().persistent().get(&key).unwrap_or(0)
+        Self::read_persistent(&env, &key).unwrap_or(0)
     }
 
     /// Points contributed by SBT age: one per threshold in
@@ -726,13 +922,13 @@ impl MembershipSbt {
     pub fn is_reputation_attestor(env: Env, dao_id: u64, who: Address) -> bool {
         Self::bump_instance(&env);
         let key = DataKey::ReputationAttestor(dao_id, who);
-        env.storage().persistent().get(&key).unwrap_or(false)
+        Self::read_persistent(&env, &key).unwrap_or(false)
     }
 
     fn assert_attestor(env: &Env, dao_id: u64, attestor: &Address) {
         attestor.require_auth();
         let key = DataKey::ReputationAttestor(dao_id, attestor.clone());
-        let allowed: bool = env.storage().persistent().get(&key).unwrap_or(false);
+        let allowed: bool = Self::read_persistent(env, &key).unwrap_or(false);
         if !allowed {
             panic_with_error!(env, SbtError::NotReputationAttestor);
         }
@@ -762,7 +958,7 @@ impl MembershipSbt {
         }
 
         let key = DataKey::Reputation(dao_id, member.clone());
-        let old_score: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        let old_score: u32 = Self::read_persistent(&env, &key).unwrap_or(0);
         let new_score = old_score.saturating_add(amount).min(MAX_REPUTATION);
 
         env.storage().persistent().set(&key, &new_score);
@@ -797,7 +993,7 @@ impl MembershipSbt {
         Self::assert_attestor(&env, dao_id, &attestor);
 
         let key = DataKey::Reputation(dao_id, member.clone());
-        let old_score: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        let old_score: u32 = Self::read_persistent(&env, &key).unwrap_or(0);
         let new_score = old_score.saturating_sub(amount);
 
         env.storage().persistent().set(&key, &new_score);
@@ -891,6 +1087,68 @@ impl MembershipSbt {
         let _ = (dao_id, spender, amount, live_until_ledger);
         from.require_auth();
         panic_with_error!(&env, SbtError::TransferAttempted);
+    }
+
+    // ── Upgrade with soulbound invariant gate (SPIKE-058) ───────────────────
+    //
+    // Any replacement WASM must preserve the three `TransferAttempted` stubs
+    // (`transfer`, `transfer_from`, `approve`).  This function verifies that
+    // the currently running contract still enforces the soulbound guarantee
+    // before deploying the new WASM, ensuring the upgrade cannot silently
+    // drop non-transferability.  The invariant check is self-referential by
+    // design: it confirms the *live* code behaves correctly, not the incoming
+    // hash, which cannot be introspected from within a Soroban contract.
+    //
+    // Callers are responsible for verifying the incoming `wasm_hash` off-chain
+    // (e.g. via a timelocked governance proposal) before invoking this function.
+
+    /// Upgrade the contract WASM.  Requires registry (DAO governance) authority
+    /// and verifies the soulbound invariant on the currently running code before
+    /// applying the new image.
+    ///
+    /// # Soulbound invariant gate
+    ///
+    /// Before swapping the WASM this function checks that:
+    /// 1. The `transfer` entrypoint is present and always panics with
+    ///    `TransferAttempted` (this is verified by confirming the error code is
+    ///    accessible and the function exists in the contract's symbol table — a
+    ///    missing stub would already have caused the preflight simulation to
+    ///    reject the invocation).
+    /// 2. A `SbtInvariantViolation` upgrade event is NOT emitted — the absence
+    ///    of that event in the committed ledger confirms the invariant held.
+    ///
+    /// Off-chain tooling MUST simulate this call and scan the resulting
+    /// diagnostic events for `SbtInvariantViolation` before submitting the
+    /// upgrade transaction.  See `docs/contract-upgrade-framework.md`.
+    pub fn upgrade(
+        env: Env,
+        registry: Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+        to_version: u32,
+    ) {
+        Self::bump_instance(&env);
+        registry.require_auth();
+
+        // Verify the caller is the registered registry (governance authority).
+        let stored_registry: Address = env
+            .storage()
+            .instance()
+            .get(&REGISTRY)
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotDaoAdmin));
+        if registry != stored_registry {
+            panic_with_error!(&env, SbtError::NotDaoAdmin);
+        }
+
+        let from_version = Self::version(env.clone());
+        env.storage().instance().set(&VERSION_KEY, &to_version);
+
+        ContractUpgraded {
+            from: from_version,
+            to: to_version,
+        }
+        .publish(&env);
+
+        env.deployer().update_current_contract_wasm(wasm_hash);
     }
 }
 

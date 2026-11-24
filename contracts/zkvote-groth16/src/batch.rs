@@ -70,7 +70,7 @@
 use soroban_sdk::{Bytes, BytesN, Env, Vec, U256};
 
 use crate::{is_in_field, Proof, VerificationKey};
-#[cfg(not(any(test, feature = "testutils")))]
+#[cfg(not(feature = "testutils"))]
 use crate::{Bn254Curve, Groth16Curve};
 
 /// Domain separation for the Fiat-Shamir transcript. Bumping this string
@@ -82,10 +82,11 @@ const BATCH_TRANSCRIPT_TAG: &[u8] = b"ZKVOTE-GROTH16-BATCH-V1";
 /// `N / 2^128` while keeping the scalars small.
 const RANDOMIZER_BYTES: u32 = 16;
 
-/// Batches larger than this are rejected outright: the pairing check has to fit
-/// in one transaction's resource budget, and an unbounded batch is a way to
-/// build a transaction that can never succeed.
-pub const MAX_BATCH_SIZE: u32 = 64;
+/// Until Protocol-25 pairing costs can be bounded independently of attacker
+/// input, only a single proof may enter the verification path. A one-proof
+/// "batch" delegates to the normal four-pairing verifier, so no N+3 host
+/// pairing vector can be attacker-amplified.
+pub const MAX_BATCH_SIZE: u32 = 1;
 
 /// Builds the Fiat-Shamir transcript for a batch.
 ///
@@ -210,7 +211,7 @@ fn varying_columns(pub_signals: &Vec<Vec<U256>>, env: &Env) -> Vec<u32> {
     varying
 }
 
-#[cfg(not(any(test, feature = "testutils")))]
+#[cfg(not(feature = "testutils"))]
 fn verify_groth16_batch_impl(
     env: &Env,
     vk: &VerificationKey,
@@ -350,15 +351,17 @@ pub fn verify_groth16_batch(
         );
     }
 
-    // Test-mode bypass, matching `verify_groth16`: returns true without doing
-    // curve arithmetic so contract tests can run without real proofs.
-    // WARNING: does not exercise the production verification path.
-    #[cfg(any(test, feature = "testutils"))]
+    // Test-mode bypass. See the stub gate documented at the top of lib.rs: it
+    // is the `testutils` cargo feature, and a wasm32 build that enables it does
+    // not compile (compile_error!), so this can never be linked into a
+    // contract.
+    #[cfg(feature = "testutils")]
     {
+        let _ = (env, vk, proofs, pub_signals);
         true
     }
 
-    #[cfg(not(any(test, feature = "testutils")))]
+    #[cfg(not(feature = "testutils"))]
     verify_groth16_batch_impl(env, vk, proofs, pub_signals)
 }
 

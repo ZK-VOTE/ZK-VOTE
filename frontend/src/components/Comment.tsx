@@ -1,7 +1,5 @@
 import { useState, useMemo } from "react";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Button } from "./ui/Button";
 import { Badge } from "./ui/Badge";
 import { ConfirmModal, AlertModal } from "./ui/ConfirmModal";
@@ -18,6 +16,8 @@ import {
   Loader2,
 } from "lucide-react";
 import CommentForm from "./CommentForm";
+import SafeMarkdown from "./SafeMarkdown";
+import { SafeAddress } from "../lib/bidiSafe";
 import {
   type CommentWithContent,
   formatRelativeTime,
@@ -185,7 +185,7 @@ export default function Comment({
         {canViewHistory && onShowRevisions && (
           <button
             onClick={() => onShowRevisions(comment)}
-            className="ml-2 text-primary hover:underline"
+            className="ms-2 text-primary hover:underline"
           >
             (view history)
           </button>
@@ -196,7 +196,7 @@ export default function Comment({
 
   return (
     <div
-      className={`${depth > 0 ? "ml-2 sm:ml-4 md:ml-6 border-l-2 border-muted pl-2 sm:pl-4" : ""} ${isPending ? "opacity-60 pointer-events-none" : ""}`}
+      className={`${depth > 0 ? "ms-2 sm:ms-4 md:ms-6 border-s-2 border-muted ps-2 sm:ps-4" : ""} ${isPending ? "opacity-60 pointer-events-none" : ""}`}
     >
       <div className="group py-3">
         {/* Header */}
@@ -220,9 +220,10 @@ export default function Comment({
             {comment.author ? (
               <>
                 <User className="w-3.5 h-3.5 text-muted-foreground" />
-                <span className="text-sm font-medium">
-                  {truncateAddress(comment.author)}
-                </span>
+                <SafeAddress
+                  address={truncateAddress(comment.author)}
+                  className="text-sm font-medium"
+                />
               </>
             ) : (
               <>
@@ -263,7 +264,7 @@ export default function Comment({
 
           {/* Actions */}
           {!comment.deleted && !isPending && (
-            <div className="relative ml-auto">
+            <div className="relative ms-auto">
               <button
                 onClick={() => setShowActions(!showActions)}
                 className="p-2 min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 flex items-center justify-center opacity-100 sm:opacity-0 group-hover:opacity-100 hover:bg-muted rounded-md transition-opacity"
@@ -278,14 +279,14 @@ export default function Comment({
                     className="fixed inset-0 z-10"
                     onClick={() => setShowActions(false)}
                   />
-                  <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[120px]">
+                  <div className="absolute end-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[120px]">
                     {canReply && (
                       <button
                         onClick={() => {
                           setShowReplyForm(true);
                           setShowActions(false);
                         }}
-                        className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted flex items-center gap-2"
+                        className="w-full px-3 py-1.5 text-start text-sm hover:bg-muted flex items-center gap-2"
                       >
                         <MessageSquare className="w-3.5 h-3.5" />
                         Reply
@@ -297,7 +298,7 @@ export default function Comment({
                           setIsEditing(true);
                           setShowActions(false);
                         }}
-                        className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted flex items-center gap-2"
+                        className="w-full px-3 py-1.5 text-start text-sm hover:bg-muted flex items-center gap-2"
                       >
                         <Edit2 className="w-3.5 h-3.5" />
                         Edit
@@ -309,7 +310,7 @@ export default function Comment({
                           onShowRevisions(comment);
                           setShowActions(false);
                         }}
-                        className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted flex items-center gap-2"
+                        className="w-full px-3 py-1.5 text-start text-sm hover:bg-muted flex items-center gap-2"
                       >
                         <History className="w-3.5 h-3.5" />
                         History
@@ -322,7 +323,7 @@ export default function Comment({
                           setShowActions(false);
                         }}
                         disabled={isDeleting}
-                        className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted flex items-center gap-2 text-destructive"
+                        className="w-full px-3 py-1.5 text-start text-sm hover:bg-muted flex items-center gap-2 text-destructive"
                       >
                         {isDeleting ? (
                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -357,7 +358,7 @@ export default function Comment({
                 disabled={isSavingEdit || !editBody.trim()}
               >
                 {isSavingEdit ? (
-                  <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+                  <Loader2 className="w-3.5 h-3.5 me-1 animate-spin" />
                 ) : null}
                 Save
               </Button>
@@ -375,11 +376,7 @@ export default function Comment({
             </div>
           </div>
         ) : (
-          <div className="prose prose-sm dark:prose-invert max-w-none">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {comment.content?.body || "*Failed to load comment content*"}
-            </ReactMarkdown>
-          </div>
+          <SafeMarkdown source={comment.content?.body || "*Failed to load comment content*"} />
         )}
 
         {/* Quick reply button for top-level comments */}
@@ -395,7 +392,7 @@ export default function Comment({
 
         {/* Reply form */}
         {showReplyForm && (
-          <div className="mt-3 pl-4 border-l-2 border-muted">
+          <div className="mt-3 ps-4 border-s-2 border-muted">
             <CommentForm
               daoId={daoId}
               proposalId={proposalId}
@@ -445,7 +442,7 @@ export default function Comment({
       {isCollapsed && comment.replies.length > 0 && (
         <button
           onClick={() => setIsCollapsed(false)}
-          className="ml-6 text-xs text-muted-foreground hover:text-foreground"
+          className="ms-6 text-xs text-muted-foreground hover:text-foreground"
         >
           Show {comment.replies.length}{" "}
           {comment.replies.length === 1 ? "reply" : "replies"}

@@ -24,6 +24,21 @@ export const BN254_FR_MODULUS_HEX =
  * Circuit constants
  */
 export const TREE_DEPTH = 18;
+/**
+ * Public signals of the vote circuit:
+ * [root, nullifier, daoId, proposalId, voteChoice, numCandidates]
+ *
+ * MUST equal `NUM_PUBLIC_SIGNALS` in contracts/voting/src/lib.rs. These two
+ * numbers decide whether a verification key can be registered at all
+ * (`validate_vk` requires `ic.len() === NUM_PUBLIC_SIGNALS + 1`) and whether any
+ * proof verifies (`verify_groth16` returns false when `pub_signals.len() + 1 !==
+ * vk.ic.len()`). They drifted apart while every test stayed green, because the
+ * tests build synthetic keys from the Rust constant and never look at the real
+ * circuit. scripts/drift-guard.mjs now fails the build on any disagreement.
+ */
+// Generated from shared/protocol-manifest.json. Do not change these values by
+// hand: update the manifest, regenerate, and let the drift guard verify the
+// circom/Rust/TS agreement.
 export const NUM_PUBLIC_SIGNALS = 6;
 export const VK_IC_LENGTH = NUM_PUBLIC_SIGNALS + 1; // 7 elements
 

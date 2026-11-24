@@ -24,9 +24,9 @@ import {
 import defaultVK from "../lib/verification_key_soroban.json";
 import ProfileChangesModal from "./ProfileChangesModal";
 import { getExplorerUrl } from "../lib/utils";
+import { RELAYER_URL } from "../config/env";
 
-// Relayer URL for fetching events
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+// Relayer URL comes from the single config source (frontend/src/config/env.ts).
 
 interface DAOInfoPanelProps {
   daoId: number;
@@ -672,7 +672,7 @@ export default function DAOInfoPanel({
                       Object.keys(event.data).length > 0 &&
                       !hasChanges && (
                         <p className="text-xs text-muted-foreground truncate">
-                          {formatEventData(event.data)}
+                          <bdi dir="auto">{formatEventData(event.data)}</bdi>
                         </p>
                       )}
                     {hasChanges && event.data.changes && (
@@ -687,7 +687,7 @@ export default function DAOInfoPanel({
                       </button>
                     )}
                   </div>
-                  <div className="text-xs text-muted-foreground text-right">
+                  <div className="text-xs text-muted-foreground text-end">
                     <p>
                       Ledger{" "}
                       {typeof event.ledger === "number" && !isNaN(event.ledger)

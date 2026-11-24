@@ -26,8 +26,10 @@ import {
   probeBackupFile,
   encryptBackupFile,
   decryptBackupFile,
+  assertBackupUsesCurrentKey,
   BackupCryptoError,
 } from "./backupCrypto.js";
+import { backupAgeSeconds, backupRestoreDrillTotal } from "./metrics.js";
 import {
   ensureBackupEncryptionKey,
   getCandidateBackupKeys,
@@ -104,6 +106,10 @@ export interface BackupStatus {
 
 // In-memory state for backup metrics and status
 let lastBackupAt: string | null = null;
+
+// Exposed for JobScheduler's backup-age tick without an import cycle (#600).
+(globalThis as { __lastBackupAt?: () => string | null }).__lastBackupAt = () =>
+  lastBackupAt;
 let lastBackupStatus: "success" | "failed" | "none" = "none";
 let lastBackupError: string | null = null;
 let lastBackupEncrypted = false;
@@ -225,6 +231,10 @@ export async function createBackup(
       }
       keyId = key.keyId;
       await encryptBackupFile(plainSnapshotPath, backupFilePath, key.key);
+      // Forward secrecy (#600): the fresh snapshot must be bound to the
+      // CURRENT key id. If rotation happened but the writer still used the old
+      // key, fail loudly instead of shipping a future-decryptable backup.
+      assertBackupUsesCurrentKey(backupFilePath, key.keyId);
       // The plaintext snapshot must never be left behind.
       fs.unlinkSync(plainSnapshotPath);
     }
@@ -275,6 +285,13 @@ export async function createBackup(
     lastBackupError = null;
     lastBackupEncrypted = encrypted;
     backupCount++;
+    try {
+      // Fresh backup: age resets to ~0 so the staleness alert can fire when
+      // litestream/S3 replication stalls (#600).
+      backupAgeSeconds.set(0);
+    } catch {
+      /* metrics unavailable in unit tests */
+    }
 
     log("info", "db_backup_complete", {
       fileName: finalName,
@@ -642,11 +659,22 @@ export async function verifyRestore(
       tableCount,
     });
 
+    try {
+      backupRestoreDrillTotal.inc({ status: "ok" });
+    } catch {
+      /* metrics unavailable in unit tests */
+    }
+
     return {
       success: true,
       message: `Restore drill passed: integrity ok, ${tableCount} tables, ${encrypted ? "decrypted" : "plaintext"}`,
     };
   } catch (err) {
+    try {
+      backupRestoreDrillTotal.inc({ status: "error" });
+    } catch {
+      /* metrics unavailable in unit tests */
+    }
     return {
       success: false,
       message: "Restore drill failed",

@@ -5,8 +5,26 @@
  * Provides health, readiness, and configuration endpoints.
  */
 import { Router } from "express";
+import { timingSafeEqual } from "node:crypto";
 import { config } from "../config.js";
 import { extractAuthToken } from "../middleware/auth.js";
+/** Constant-time token comparison to prevent timing attacks on health endpoints. */
+function safeTokenMatch(supplied, expected) {
+    if (!supplied || !expected)
+        return false;
+    const bufA = Buffer.from(supplied);
+    const bufB = Buffer.from(expected);
+    if (bufA.length !== bufB.length) {
+        // Pad to same length so timingSafeEqual doesn't throw
+        const len = Math.max(bufA.length, bufB.length);
+        const padA = Buffer.alloc(len);
+        const padB = Buffer.alloc(len);
+        bufA.copy(padA);
+        bufB.copy(padB);
+        return timingSafeEqual(padA, padB) && bufA.length === bufB.length;
+    }
+    return timingSafeEqual(bufA, bufB);
+}
 import { getRateLimitMetrics } from "../middleware/rateLimit.js";
 import { bodyLimit } from "../middleware/index.js";
 import { getMembershipVerificationMetrics } from "../services/sync.js";
@@ -102,7 +120,7 @@ router.get("/healthz", async (req, res) => {
     };
     if (config.healthExposeDetails) {
         const token = extractAuthToken(req);
-        if (token === config.relayerAuthToken) {
+        if (safeTokenMatch(token, config.relayerAuthToken)) {
             response.services = services;
             response.memory = {
                 rssMb: Math.round(memory.rss / 1024 / 1024),
@@ -163,7 +181,7 @@ router.get("/health", async (req, res) => {
     // Only expose details if auth token provided
     if (config.healthExposeDetails) {
         const token = extractAuthToken(req);
-        if (token === config.relayerAuthToken) {
+        if (safeTokenMatch(token, config.relayerAuthToken)) {
             base.relayer = relayerKeyManager.getPublicKey() || relayerPublicKey;
             base.relayerKeys = relayerKeyManager.getKeyHealth();
             base.votingContract = config.votingContractId;
@@ -217,7 +235,7 @@ router.get("/readyz", async (req, res) => {
         };
         if (config.healthExposeDetails) {
             const token = extractAuthToken(req);
-            if (token === config.relayerAuthToken) {
+            if (safeTokenMatch(token, config.relayerAuthToken)) {
                 base.details = {
                     rpc: rpcStatus,
                     db: dbHealth,
@@ -262,7 +280,7 @@ router.get("/ready", async (req, res) => {
         };
         if (config.healthExposeDetails) {
             const token = extractAuthToken(req);
-            if (token === config.relayerAuthToken) {
+            if (safeTokenMatch(token, config.relayerAuthToken)) {
                 base.relayer = relayerPublicKey;
                 base.votingContract = config.votingContractId;
                 base.treeContract = config.treeContractId;
@@ -286,7 +304,7 @@ router.get("/ready", async (req, res) => {
 router.get("/services", async (req, res) => {
     if (config.healthExposeDetails) {
         const token = extractAuthToken(req);
-        if (token !== config.relayerAuthToken) {
+        if (!safeTokenMatch(token, config.relayerAuthToken)) {
             return res.status(401).json({ error: "Unauthorized" });
         }
     }
@@ -324,7 +342,7 @@ router.get("/config", (_req, res) => {
 router.get("/log/metrics", async (req, res) => {
     if (config.healthExposeDetails) {
         const token = extractAuthToken(req);
-        if (token !== config.relayerAuthToken) {
+        if (!safeTokenMatch(token, config.relayerAuthToken)) {
             return res.status(401).json({ error: "Unauthorized" });
         }
     }
@@ -348,7 +366,7 @@ router.get("/db/stats", async (req, res) => {
     // Require auth token for detailed diagnostics
     if (config.healthExposeDetails) {
         const token = extractAuthToken(req);
-        if (token !== config.relayerAuthToken) {
+        if (!safeTokenMatch(token, config.relayerAuthToken)) {
             // Return basic stats without diagnostics
             try {
                 const dbStatus = getDbStatus();
@@ -395,7 +413,7 @@ router.post("/csp-report", bodyLimit("100kb"), (req, res) => {
  */
 router.get("/debug/heap", async (req, res) => {
     const token = extractAuthToken(req);
-    if (!config.relayerAuthToken || token !== config.relayerAuthToken) {
+    if (!config.relayerAuthToken || !safeTokenMatch(token, config.relayerAuthToken)) {
         return res.status(401).json({ error: "Unauthorized" });
     }
     const snapshotPath = path.join(os.tmpdir(), `zkvote-heap-${Date.now()}.heapsnapshot`);
@@ -422,6 +440,12 @@ router.get("/debug/heap", async (req, res) => {
  * Issue #387
  */
 router.get("/relay-test", async (req, res) => {
+    // Auth-gate: this endpoint exposes relayer public key, sequence numbers,
+    // contract IDs, RPC pool URLs, and DB internals — all sensitive.
+    const token = extractAuthToken(req);
+    if (!safeTokenMatch(token, config.relayerAuthToken)) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
     const startTime = Date.now();
     const results = {
         timestamp: new Date().toISOString(),
@@ -589,7 +613,7 @@ router.get("/sequence/health", async (req, res) => {
         // Include detailed info if authenticated
         if (config.healthExposeDetails) {
             const token = extractAuthToken(req);
-            if (token === config.relayerAuthToken) {
+            if (safeTokenMatch(token, config.relayerAuthToken)) {
                 Object.assign(response, {
                     lastKnownSequence: health.lastKnownSequence,
                 });

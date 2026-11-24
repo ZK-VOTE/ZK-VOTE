@@ -35,6 +35,18 @@
                   "storage": [
                     {
                       "key": {
+                        "symbol": "admins"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "gov"
                       },
                       "val": {
@@ -43,7 +55,23 @@
                     },
                     {
                       "key": {
+                        "symbol": "min_tl"
+                      },
+                      "val": {
+                        "u64": "86400"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "ver"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "vk_qrm"
                       },
                       "val": {
                         "u32": 1

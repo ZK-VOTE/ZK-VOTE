@@ -159,6 +159,21 @@ rm -f data/zkvote.db-wal data/zkvote.db-shm
 # 4. Restart the relayer and confirm /health reports lastBackupStatus success.
 ```
 
+> **Relayer key revocations (#746).** The list of compromised relayer keys
+> (`relayer_key_revocations`) lives in this database. A snapshot taken before
+> a compromise declaration restores that key as **not revoked**, and if its
+> secret is still configured the relayer will sign with it again. Before
+> restarting on a restored DB:
+>
+> ```bash
+> sqlite3 data/restored-relayer.db "SELECT public_key, declared_at FROM relayer_key_revocations;"
+> ```
+>
+> Compare against the incident log (`relayer_key_events` in the *current* DB,
+> if it survives, or the incident record). Make sure no revoked secret is still
+> set in `RELAYER_SECRET_KEY` / `RELAYER_SECONDARY_SECRET_KEY`, and after the
+> restart re-declare any missing key with `npm run relayer:compromise`.
+
 The same flow is available programmatically:
 
 ```ts

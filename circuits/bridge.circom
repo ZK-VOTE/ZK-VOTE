@@ -19,16 +19,18 @@ include "merkle_tree.circom";
 // 4. Soroban relay watches for VoteForwarded, records the vote.
 //
 // Public signals: [sbtContractAddr, memberAddr, daoId, proposalId,
-//                  nullifier, voteChoice, voteRoot, sbtRoot]
+//                  nullifier, voteChoice, voteRoot, sbtRoot, chainId]
 // Private signals: secret, salt, votingPathElements, votingPathIndices,
 //                  sbtPathElements, sbtPathIndices, sbtLeaf
 //
 // Security:
-// - nullifier domain-separates by (secret, daoId, proposalId)
+// - nullifier domain-separates by (secret, daoId, proposalId, chainId)
 // - voteChoice constrained to {0,1}
+// - voting leaf = Poseidon(secret, salt, memberAddr) binds identity to SBT member
 // - SBT leaf = Poseidon(sbtContractAddr, memberAddr, daoId, 1)
 //   where 1 = isActive (unrevoked)
 // - sbtRoot is posted by relayer; circuit verifies inclusion
+// - chainId binds the proof to a single EVM network (#649)
 template BridgeVote(levels) {
     // === Public inputs ===
     signal input sbtContractAddr;   // Soroban SBT contract address (U256)
@@ -39,6 +41,7 @@ template BridgeVote(levels) {
     signal input voteChoice;        // 0 = against, 1 = for (U256)
     signal input voteRoot;          // Merkle root of voting tree (U256)
     signal input sbtRoot;           // Merkle root of SBT state tree (U256)
+    signal input chainId;           // EVM chain id for domain separation (#649)
 
     // === Private inputs ===
     signal input secret;                    // Voter's secret
@@ -50,12 +53,14 @@ template BridgeVote(levels) {
     signal input sbtLeaf;                   // SBT state leaf data
 
     // ============================================
-    // 1. Compute identity commitment: Poseidon(secret, salt)
-    //    This is the leaf in the voting Merkle tree
+    // 1. Compute identity commitment: Poseidon(secret, salt, memberAddr)
+    //    Binding memberAddr prevents using an SBT path for address A with
+    //    an unrelated voting secret (#649).
     // ============================================
-    component commitmentHasher = Poseidon(2);
+    component commitmentHasher = Poseidon(3);
     commitmentHasher.inputs[0] <== secret;
     commitmentHasher.inputs[1] <== salt;
+    commitmentHasher.inputs[2] <== memberAddr;
 
     signal commitment;
     commitment <== commitmentHasher.out;
@@ -75,13 +80,14 @@ template BridgeVote(levels) {
     voteRoot === votingProof.root;
 
     // ============================================
-    // 3. Compute nullifier: Poseidon(secret, daoId, proposalId)
-    //    Domain separation prevents cross-DAO linkability
+    // 3. Compute nullifier: Poseidon(secret, daoId, proposalId, chainId)
+    //    Domain separation prevents cross-DAO and cross-chain linkability
     // ============================================
-    component nullifierHasher = Poseidon(3);
+    component nullifierHasher = Poseidon(4);
     nullifierHasher.inputs[0] <== secret;
     nullifierHasher.inputs[1] <== daoId;
     nullifierHasher.inputs[2] <== proposalId;
+    nullifierHasher.inputs[3] <== chainId;
 
     // Constrain computed nullifier to match public nullifier
     nullifier === nullifierHasher.out;
@@ -110,12 +116,6 @@ template BridgeVote(levels) {
     // 6. Verify SBT leaf structure
     //    sbtLeaf = Poseidon(sbtContractAddr, memberAddr, daoId, isActive)
     //    where isActive = 1 (unrevoked)
-    //
-    //    This ensures:
-    //    - The leaf is for the correct SBT contract
-    //    - The leaf is for the correct member
-    //    - The leaf is for the correct DAO
-    //    - The member's SBT is active (not revoked)
     // ============================================
     component sbtLeafHasher = Poseidon(4);
     sbtLeafHasher.inputs[0] <== sbtContractAddr;
@@ -125,10 +125,15 @@ template BridgeVote(levels) {
 
     // Constrain computed leaf to match provided leaf
     sbtLeafHasher.out === sbtLeaf;
+
+    // chainId must be non-zero (reject unset / ambiguous domain)
+    component chainNonZero = IsZero();
+    chainNonZero.in <== chainId;
+    chainNonZero.out === 0;
 }
 
 // Default tree depth of 18 (supports ~262K members)
 // Public signals: [sbtContractAddr, memberAddr, daoId, proposalId,
-//                  nullifier, voteChoice, voteRoot, sbtRoot] - 8 signals
+//                  nullifier, voteChoice, voteRoot, sbtRoot, chainId] - 9 signals
 component main {public [sbtContractAddr, memberAddr, daoId, proposalId,
-                        nullifier, voteChoice, voteRoot, sbtRoot]} = BridgeVote(18);
+                        nullifier, voteChoice, voteRoot, sbtRoot, chainId]} = BridgeVote(18);

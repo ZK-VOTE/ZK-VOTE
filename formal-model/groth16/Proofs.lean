@@ -20,7 +20,7 @@ open BN254Groth16
     is guaranteed to be in the valid range [0, Fr).
     This prevents overflow attacks in field arithmetic.
 -/
-theorem assert_in_field_soundness (v : ℕ) :
+theorem assert_in_field_soundness (v : Nat) :
     assert_in_field Fr v → v < Fr := by
   intro h
   exact h
@@ -28,7 +28,7 @@ theorem assert_in_field_soundness (v : ℕ) :
 /-- The assert_in_field check is complete: every value in [0, Fr)
     passes the check.
 -/
-theorem assert_in_field_completeness (v : ℕ) :
+theorem assert_in_field_completeness (v : Nat) :
     v < Fr → assert_in_field Fr v := by
   intro h
   exact h
@@ -37,7 +37,7 @@ theorem assert_in_field_completeness (v : ℕ) :
     This means the Rust `assert_in_field` function is a precise
     characterization of the field membership property.
 -/
-theorem assert_in_field_exact (v : ℕ) :
+theorem assert_in_field_exact (v : Nat) :
     assert_in_field Fr v ↔ v < Fr := by
   constructor
   · exact assert_in_field_soundness v
@@ -49,12 +49,12 @@ theorem assert_in_field_exact (v : ℕ) :
 
 /-- validate_nullifier implies the value is in the field.
 -/
-theorem nullifier_in_field (v : ℕ) (h : validate_nullifier v) :
+theorem nullifier_in_field (v : Nat) (h : validate_nullifier v) :
     v < Fr := h.2
 
 /-- validate_nullifier implies the value is non-zero.
 -/
-theorem nullifier_nonzero_proof (v : ℕ) (h : validate_nullifier v) :
+theorem nullifier_nonzero_proof (v : Nat) (h : validate_nullifier v) :
     v ≠ 0 := h.1
 
 /-- validate_nullifier rejects zero.
@@ -66,10 +66,10 @@ theorem nullifier_rejects_zero :
 
 /-- validate_nullifier rejects values >= Fr.
 -/
-theorem nullifier_rejects_out_of_field (v : ℕ) (h : v ≥ Fr) :
+theorem nullifier_rejects_out_of_field (v : Nat) (h : v ≥ Fr) :
     ¬validate_nullifier v := by
   intro ⟨_, h_in_field⟩
-  linarith
+  exact (Nat.not_lt_of_ge h) h_in_field
 
 -- ============================================
 -- PROOF 3: Point-at-Infinity Checks
@@ -113,18 +113,13 @@ theorem valid_proof_not_identity_c (proof : Proof) :
 -/
 theorem g1_neg_involutive (P : G1Point) :
     g1_neg (g1_neg P) = P := by
-  simp [g1_neg]
-  constructor
-  · -- x coordinate: unchanged
-    simp
-  · -- y coordinate: Fq - (Fq - y) = y mod Fq
-    sorry -- Requires modular arithmetic lemma
+  sorry -- Requires modular arithmetic and proof irrelevance lemmas
 
 /-- Negation preserves the curve equation.
     If P is on the curve, then -P is also on the curve.
 -/
-theorem g1_neg_on_curve (P : G1Point) (h : P.on_curve) :
-    (g1_neg P).on_curve := by
+theorem g1_neg_on_curve (P : G1Point) (h : in_g1_subgroup P) :
+    in_g1_subgroup (g1_neg P) := by
   sorry -- Requires curve equation manipulation
 
 -- ============================================
@@ -134,7 +129,7 @@ theorem g1_neg_on_curve (P : G1Point) (h : P.on_curve) :
 /-- compute_vk_x with empty public signals returns IC₀.
 -/
 theorem compute_vk_x_empty (vk : VerificationKey) :
-    pub_signals = [] → compute_vk_x vk [] = match vk.ic with
+    compute_vk_x vk [] = match vk.ic with
       | [] => G1Inf
       | ic0 :: _ => ic0 := by
   sorry -- Requires case analysis on vk.ic
@@ -143,9 +138,9 @@ theorem compute_vk_x_empty (vk : VerificationKey) :
     The function correctly computes the weighted sum.
 -/
 theorem compute_vk_x_linear
-    (vk : VerificationKey) (signals : List ℕ) :
+    (vk : VerificationKey) (signals : List Nat) :
     compute_vk_x vk signals =
-      List.foldl (fun acc (i : ℕ) =>
+      List.foldl (fun acc (i : Nat) =>
         if h : i < signals.length then
           let signal := signals.get ⟨i, h⟩
           if h2 : i + 1 < vk.ic.length then
@@ -165,7 +160,7 @@ theorem compute_vk_x_linear
     the pairing equation and the IC length check.
 -/
 theorem groth16_verify_decomposition
-    (vk : VerificationKey) (proof : Proof) (signals : List ℕ) :
+    (vk : VerificationKey) (proof : Proof) (signals : List Nat) :
     groth16_verify vk proof signals =
       (signals.length + 1 = vk.ic.length ∧
        groth16_verify_equation vk proof signals) := by
@@ -174,7 +169,7 @@ theorem groth16_verify_decomposition
 /-- The full verification predicate implies the core verification.
 -/
 theorem full_implies_core
-    (vk : VerificationKey) (proof : Proof) (signals : List ℕ)
+    (vk : VerificationKey) (proof : Proof) (signals : List Nat)
     (h : full_groth16_verify vk proof signals) :
     groth16_verify vk proof signals := by
   exact groth16_soundness vk proof signals h
@@ -183,10 +178,14 @@ theorem full_implies_core
 -- PROOF 7: BN254 Field Properties
 -- ============================================
 
+/-- Elementary primality predicate, kept dependency-free for standalone Lean. -/
+def IsPrime (n : Nat) : Prop :=
+  n > 1 ∧ ∀ d : Nat, d ∣ n → d = 1 ∨ d = n
+
 /-- Fr is prime (necessary for the curve to have prime order).
     BN254's scalar field order is a Mersenne-like prime.
 -/
-theorem fr_is_prime : Nat.Prime Fr := by
+theorem fr_is_prime : IsPrime Fr := by
   sorry -- Verified numerically: Fr is prime
 
 /-- Fr < Fq (scalar field is smaller than base field).
@@ -214,7 +213,7 @@ theorem pairing_identity_g1 (Q : G2Point) :
 /-- Pairing identity: e(P, O) = 1 for any P (O is infinity in G2).
 -/
 theorem pairing_identity_g2 (P : G1Point) :
-    pairing P ⟨0, 0, 0, 0, sorry⟩ = 1 := by
+    pairing P ⟨0, 0, 0, 0⟩ = 1 := by
   sorry -- Requires pairing axiom
 
 /-- If e(P, Q) = 1 for all Q, then P must be the identity.
@@ -232,7 +231,7 @@ theorem pairing_nondeg_g1_lemma (P : G1Point) :
     elements that satisfy the same linear relations.
 -/
 theorem verification_equation_invariant
-    (vk : VerificationKey) (proof proof' : Proof) (signals : List ℕ)
+    (vk : VerificationKey) (proof proof' : Proof) (signals : List Nat)
     (h_eq_a : proof.a = proof'.a) (h_eq_b : proof.b = proof'.b)
     (h_eq_c : proof.c = proof'.c) :
     groth16_verify_equation vk proof signals ↔
@@ -275,6 +274,6 @@ theorem pairing_negation
   1. Subgroup membership for G2 points is axiomatized, not proved
      → The Soroban host function handles this, but it's a trust boundary
   2. The pairing itself is axiomatized → trust in the host implementation
-  3. No formal proof that the Rust U256 comparison matches the Lean ℕ comparison
+  3. No formal proof that the Rust U256 comparison matches the Lean Nat comparison
   4. The test-mode bypass is not modeled (it always returns true)
 -/

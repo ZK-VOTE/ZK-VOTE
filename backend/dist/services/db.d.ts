@@ -408,6 +408,10 @@ export declare function profileDaoQueries(daoId: number): void;
  */
 export declare function upsertDao(dao: DaoInput): void;
 /**
+ * Update a DAO's thumbnail / metadata CID
+ */
+export declare function updateDaoThumbnail(daoId: number, thumbnailCid: string): void;
+/**
  * Upsert multiple DAOs in a transaction
  */
 export declare function upsertDaos(daos: DaoInput[]): void;
@@ -528,9 +532,13 @@ export declare function getAuthTokensByClient(clientId: string): AuthToken[];
 export declare function getTokensNeedingRotation(maxAgeMs: number): AuthToken[];
 export interface ProofCommitmentRecord {
     commitmentHash: string;
+    /** Always empty for new rows — retained for legacy reads only. */
     nullifier: string;
+    /** SHA-256 hex of the nullifier; used for lookups without storing plaintext. */
+    nullifierHash: string | null;
     daoId: number;
     proposalId: number;
+    /** Always null for new rows — wallet linkage removed (#644). */
     walletAddress?: string | null;
     timestamp: number;
     status: "COMMITTED" | "REVEALED" | "EXPIRED";
@@ -538,7 +546,7 @@ export interface ProofCommitmentRecord {
     /** Malleability-safe dedup key (NULL for legacy rows). */
     canonicalProofHash: string | null;
 }
-export declare function recordProofCommitment(commitmentHash: string, nullifier: string, daoId: number, proposalId: number, timestamp: number, walletAddress?: string | null, canonicalProofHash?: string | null): void;
+export declare function recordProofCommitment(commitmentHash: string, nullifier: string, daoId: number, proposalId: number, timestamp: number, _walletAddress?: string | null, canonicalProofHash?: string | null): void;
 export declare function getProofCommitment(commitmentHash: string): ProofCommitmentRecord | null;
 /**
  * Look up a proof commitment by its canonical proof hash.

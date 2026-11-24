@@ -31,6 +31,18 @@ import { log } from "./logger.js";
 import { isDbInitialized, getDb } from "./db.js";
 import { deriveKeyId, generateBackupKey } from "./backupCrypto.js";
 
+const backupMetrics = {
+  incRotation(): void {
+    // Dynamically imported so unit tests that stub the metrics registry keep
+    // working; in production this increments zkvote_backup_key_rotations_total.
+    import("./metrics.js")
+      .then((m) => m.backupKeyRotationsTotal?.inc({ status: "ok" }))
+      .catch(() => {
+        /* metrics unavailable in unit tests */
+      });
+  },
+};
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -389,6 +401,14 @@ export function rotateBackupEncryptionKey(
     archivedPath,
     keyFile: outputFile,
   });
+  // Forward-secrecy audit metric (#600): rotation archives the old KEK for
+  // historical decrypts only; new snapshots must carry newKeyId (enforced by
+  // assertBackupUsesCurrentKey in backup.ts).
+  try {
+    backupMetrics.incRotation();
+  } catch {
+    // metrics registry may be unavailable in unit tests
+  }
 
   return {
     oldKeyId: current.keyId,

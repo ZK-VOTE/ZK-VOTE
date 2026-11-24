@@ -17,11 +17,17 @@
   "author": "ZK-VOTE Contributors",
   "license": "MIT",
   "dependencies": {
-    "snarkjs": "^0.7.0",
+    "snarkjs": "0.7.5",
     "express": "^4.18.2",
     "bitcoin-core": "^4.0.0",
     "chalk": "^5.3.0",
     "axios": "^1.6.0",
     "commander": "^11.1.0"
+  },
+  "overrides": {
+    "snarkjs": "0.7.5",
+    "circom_runtime": "0.1.28",
+    "ffjavascript": "0.2.63",
+    "wasmcurves": "0.2.2"
   }
 }

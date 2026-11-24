@@ -7,12 +7,22 @@
  */
 
 import { z } from "zod";
+import { extendZodWithOpenApi } from "@asteasolutions/zod-to-openapi";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import { detectConfusableMixedScript } from "../utils/confusables.js";
+import proposalTemplateRegistry from "./proposal-template-registry.json" with { type: "json" };
 
-async function fileTypeFromBuffer(buffer: Buffer): Promise<{ mime: string; ext: string } | null> {
+// The payment schemas below call .openapi() at module load. openapi.ts also
+// extends zod, but ESM evaluates this module first whenever something imports
+// it directly (routes, tests), so extend here too. Idempotent (#750).
+extendZodWithOpenApi(z);
+
+async function fileTypeFromBuffer(
+  buffer: Buffer,
+): Promise<{ mime: string; ext: string } | null> {
   if (!buffer || buffer.length < 12) return null;
   if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
     return { mime: "image/jpeg", ext: "jpg" };
@@ -49,6 +59,7 @@ const ALLOWED_IMAGE_MIME_SET = new Set<string>(ALLOWED_IMAGE_MIMES);
 
 export const MAX_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MiB
 export const MAX_IMAGE_DIMENSION = 4096;
+const MAX_IMAGE_PIXELS = MAX_IMAGE_DIMENSION * MAX_IMAGE_DIMENSION;
 
 export const imageUploadMulterLimits = {
   fileSize: MAX_IMAGE_UPLOAD_BYTES,
@@ -82,41 +93,83 @@ export const imageUploadSchema = z
       const claimedMime = file.mimetype.toLowerCase();
       const detected = await fileTypeFromBuffer(file.buffer);
       if (!detected) {
-        ctx.addIssue({ code: "custom", message: "Upload is not a valid JPEG, PNG, GIF, or WebP image" });
+        ctx.addIssue({
+          code: "custom",
+          message: "Upload is not a valid JPEG, PNG, GIF, or WebP image",
+        });
         return;
       }
-      if (detected.mime === "image/svg+xml" || claimedMime === "image/svg+xml") {
-        ctx.addIssue({ code: "custom", message: "SVG uploads are not allowed" });
+      if (
+        detected.mime === "image/svg+xml" ||
+        claimedMime === "image/svg+xml"
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          message: "SVG uploads are not allowed",
+        });
         return;
       }
       if (!ALLOWED_IMAGE_MIME_SET.has(detected.mime)) {
-        ctx.addIssue({ code: "custom", message: "Upload is not a valid JPEG, PNG, GIF, or WebP image" });
+        ctx.addIssue({
+          code: "custom",
+          message: "Upload is not a valid JPEG, PNG, GIF, or WebP image",
+        });
         return;
       }
       if (detected.mime !== claimedMime) {
-        ctx.addIssue({ code: "custom", message: "Declared file type does not match actual file content" });
+        ctx.addIssue({
+          code: "custom",
+          message: "Declared file type does not match actual file content",
+        });
         return;
       }
       if (await hasMalwareIndicators(file.buffer)) {
-        ctx.addIssue({ code: "custom", message: "Image contains embedded script or polyglot markers" });
+        ctx.addIssue({
+          code: "custom",
+          message: "Image contains embedded script or polyglot markers",
+        });
         return;
       }
-      const metadata = await sharp(file.buffer, { failOn: "error", animated: true }).metadata();
+      const metadata = await sharp(file.buffer, {
+        failOn: "error",
+        animated: true,
+        limitInputPixels: MAX_IMAGE_PIXELS,
+      }).metadata();
       if (!metadata.width || !metadata.height) {
-        ctx.addIssue({ code: "custom", message: "Could not read image dimensions" });
+        ctx.addIssue({
+          code: "custom",
+          message: "Could not read image dimensions",
+        });
         return;
       }
-      if (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) {
-        ctx.addIssue({ code: "custom", message: `Image dimensions must not exceed ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}px` });
+      if (
+        metadata.width > MAX_IMAGE_DIMENSION ||
+        metadata.height > MAX_IMAGE_DIMENSION
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          message: `Image dimensions must not exceed ${MAX_IMAGE_DIMENSION}x${MAX_IMAGE_DIMENSION}px`,
+        });
       }
     } catch {
-      ctx.addIssue({ code: "custom", message: "Invalid or corrupted image file" });
+      ctx.addIssue({
+        code: "custom",
+        message: "Invalid or corrupted image file",
+      });
     }
   })
   .transform(async (file) => {
     const detected = await fileTypeFromBuffer(file.buffer);
-    const metadata = await sharp(file.buffer, { failOn: "error", animated: true }).metadata();
-    const sanitizedBuffer = await sharp(file.buffer, { failOn: "error", animated: true })
+    const metadata = await sharp(file.buffer, {
+      failOn: "error",
+      animated: true,
+      limitInputPixels: MAX_IMAGE_PIXELS,
+    }).metadata();
+    const sanitizedBuffer = await sharp(file.buffer, {
+      failOn: "error",
+      animated: true,
+      limitInputPixels: MAX_IMAGE_PIXELS,
+    })
       .rotate()
       .toBuffer();
     return {
@@ -336,32 +389,85 @@ export const positiveInteger = z
   );
 
 /**
- * IPFS CID validator (CIDv0 or CIDv1)
- */
-/**
- * IPFS CID validator (CIDv0 or CIDv1)
+ * IPFS CID validator (CIDv0 or CIDv1 or plain text <= 64 chars matching contract allowance)
  */
 export const ipfsCid = z.string().refine(
   (val) => {
-    if (!val || typeof val !== "string") return false;
+    if (typeof val !== "string") return false;
     const trimmed = val.trim();
+    if (!trimmed) return true; // Contract allows empty content_cid
     if (/[/?#\s\0\r\n\t]/.test(trimmed)) return false;
+    // Contract limit is MAX_CID_LEN = 64
+    if (trimmed.length > 64) return false;
     // CIDv0: Qm + 44 base58 chars (exact length)
     if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(trimmed)) return true;
     // CIDv1: bafy/bafk + base32 content (59+ chars)
-    if ((trimmed.startsWith("bafy") || trimmed.startsWith("bafk")) && trimmed.length >= 59) {
+    if (
+      (trimmed.startsWith("bafy") || trimmed.startsWith("bafk")) &&
+      trimmed.length >= 59
+    ) {
       const content = trimmed.slice(4);
       return /^[a-z2-7]+$/.test(content);
     }
-    // CIDv0: exact-length Bitcoin base58 encoding.
-    if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(val)) return true;
-    // CIDv1: bafy... or bafk... (59+ chars).
-    if ((val.startsWith("bafy") || val.startsWith("bafk")) && val.length >= 59)
-      return true;
-    return false;
+    // Allow valid contract-compatible identifiers up to 64 chars
+    return /^[a-zA-Z0-9._-]+$/.test(trimmed);
   },
-  { message: "Invalid IPFS CID format" },
+  { message: "Invalid IPFS CID format (must be valid CID or contract-legal string <= 64 chars)" },
 );
+
+/**
+ * DAO name schema matching on-chain MAX_DAO_NAME_LEN = 24 bytes and Unicode NFC normalization.
+ * Rejects zero-width characters, control characters, and inputs exceeding 24 UTF-8 bytes.
+ */
+export const daoNameSchema = z
+  .string()
+  .transform((val) => val.normalize("NFC"))
+  .refine(
+    (val) => {
+      if (!val || val.trim().length === 0) return false;
+      // Disallow zero-width characters, control characters, invisible joiners
+      if (/[\u200B-\u200D\uFEFF\u0000-\u001F\u007F-\u009F]/.test(val)) return false;
+      // On-chain Soroban contract checks name.len() <= 24 (byte count)
+      const byteLen = Buffer.byteLength(val, "utf8");
+      return byteLen >= 1 && byteLen <= 24 && val.length <= 24;
+    },
+    { message: "DAO name must be 1-24 characters (max 24 UTF-8 bytes) without control or zero-width characters" },
+  )
+  .refine((val) => !detectConfusableMixedScript(val).confusable, {
+    message:
+      "DAO name mixes Latin letters with visually-identical characters from another script",
+  });
+
+/**
+ * Proposal title schema matching on-chain MAX_TITLE_LEN = 100 bytes and Unicode NFC normalization.
+ * Rejects zero-width characters, control characters, and inputs exceeding 100 UTF-8 bytes.
+ */
+export const proposalTitleSchema = z
+  .string()
+  .transform((val) => val.normalize("NFC"))
+  .refine(
+    (val) => {
+      if (!val || val.trim().length === 0) return false;
+      if (/[\u200B-\u200D\uFEFF\u0000-\u001F\u007F-\u009F]/.test(val)) return false;
+      // On-chain Soroban contract checks title.len() <= 100 (byte count)
+      const byteLen = Buffer.byteLength(val, "utf8");
+      return byteLen >= 1 && byteLen <= 100;
+    },
+    { message: "Proposal title must be 1-100 UTF-8 bytes without control or zero-width characters" },
+  );
+
+/**
+ * Proposal end_time schema matching on-chain voting/src/lib.rs:2320-2325:
+ * Must be a future Unix timestamp (in seconds).
+ */
+export const proposalEndTimeSchema = z.coerce
+  .number()
+  .int("end_time must be an integer timestamp")
+  .positive("end_time must be positive")
+  .refine(
+    (val) => val > Math.floor(Date.now() / 1000),
+    { message: "Proposal end_time must be in the future" },
+  );
 
 /**
  * Hex string validator for nullifiers (64 hex chars max)
@@ -611,7 +717,10 @@ export const voteBatchSchema = z
     votes: z
       .array(batchVoteSchema)
       .min(1, "votes must contain at least one vote")
-      .max(MAX_VOTE_BATCH, `votes must contain at most ${MAX_VOTE_BATCH} votes`),
+      .max(
+        MAX_VOTE_BATCH,
+        `votes must contain at most ${MAX_VOTE_BATCH} votes`,
+      ),
   })
   .refine(
     (data) =>
@@ -628,44 +737,45 @@ export type VoteBatchRequest = z.infer<typeof voteBatchSchema>;
 // ANONYMOUS COMMENT SCHEMA
 // ============================================
 
-export const anonymousCommentSchema = z
-  .object(
-    {
-      daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
-      proposalId: z
-        .number()
-        .int()
-        .nonnegative("proposalId must be a non-negative integer"),
-      contentCid: z
-        .string()
-        .refine(
-          (val) => {
-            if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(val)) return true;
-            if ((val.startsWith("bafy") || val.startsWith("bafk")) && val.length >= 59)
-              return true;
-            return false;
-            if (!val || typeof val !== "string") return false;
-            const trimmed = val.trim();
-            if (/[/?\\#\s\0\r\n\t]/.test(trimmed)) return false;
-            return CIDV0_REGEX.test(trimmed) || CIDV1_REGEX.test(trimmed);
-          },
-          { message: "Invalid submission" },
-        ),
-      parentId: z.number().int().nonnegative().nullable().optional(),
-      voteChoice: z.boolean({
-        required_error: "Invalid submission",
-        invalid_type_error: "Invalid submission",
-      }),
-      nullifier: bn254FieldAnon,
-      root: bn254FieldAnon,
-      proof: groth16ProofAnon,
-      serverId: z.string().optional(),
-      workNonce: z.string().optional(),
-    },
-    {
-      errorMap: () => ({ message: "Invalid submission" }),
-    },
-  );
+export const anonymousCommentSchema = z.object(
+  {
+    daoId: z.number().int().nonnegative("daoId must be a non-negative integer"),
+    proposalId: z
+      .number()
+      .int()
+      .nonnegative("proposalId must be a non-negative integer"),
+    contentCid: z.string().refine(
+      (val) => {
+        if (!val || typeof val !== "string") return false;
+        const trimmed = val.trim();
+        if (/[/?\\#\s\0\r\n\t]/.test(trimmed)) return false;
+        if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(trimmed)) return true;
+        if (
+          (trimmed.startsWith("bafy") || trimmed.startsWith("bafk")) &&
+          trimmed.length >= 59 &&
+          trimmed.length <= 64
+        )
+          return true;
+        // Plaintext or backwards compatibility up to contract MAX_CID_LEN
+        return trimmed.length > 0 && trimmed.length <= 64;
+      },
+      { message: "Invalid submission" },
+    ),
+    parentId: z.number().int().nonnegative().nullable().optional(),
+    voteChoice: z.boolean({
+      required_error: "Invalid submission",
+      invalid_type_error: "Invalid submission",
+    }),
+    nullifier: bn254FieldAnon,
+    root: bn254FieldAnon,
+    proof: groth16ProofAnon,
+    serverId: z.string().optional(),
+    workNonce: z.string().optional(),
+  },
+  {
+    errorMap: () => ({ message: "Invalid submission" }),
+  },
+);
 
 export type AnonymousCommentRequest = z.infer<typeof anonymousCommentSchema>;
 
@@ -754,6 +864,22 @@ export type NotifyEventRequest = z.infer<typeof notifyEventSchema>;
 
 export const proposalMetadataSchema = z
   .object({
+    // ZV-128: preserve template provenance and reject stale/unknown versions.
+    template: z.object({
+      id: z.string().min(1),
+      version: z.number().int().positive(),
+    }).superRefine((template, ctx) => {
+      const known = proposalTemplateRegistry.templates.some(
+        (record) => record.id === template.id && record.version === template.version,
+      );
+      if (!known) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Unknown or unsupported proposal template version",
+          path: ["version"],
+        });
+      }
+    }).optional(),
     version: z.literal(1, {
       errorMap: () => ({ message: "version must be 1" }),
     }),
@@ -905,6 +1031,8 @@ export const bridgeVoteSchema = z.object({
   sbtContractAddr: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
   /** Field element encoding of the member address (public signal 1) */
   memberAddr: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
+  /** EVM chain id bound into the bridge proof (#649) */
+  chainId: z.union([z.number().int().positive(), z.string().regex(/^[0-9]+$/)]),
   proof: z.object({
     a: z.string().regex(/^0x[0-9a-fA-F]{128}$/),
     b: z.string().regex(/^0x[0-9a-fA-F]{256}$/),
@@ -913,6 +1041,50 @@ export const bridgeVoteSchema = z.object({
 });
 
 export type BridgeVoteRequest = z.infer<typeof bridgeVoteSchema>;
+
+// ============================================
+// SATELLITE TREASURY ESCROW SCHEMAS (ZV-107)
+// ============================================
+
+const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address");
+const evmTxHash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "Invalid transaction hash");
+/** uint256 lock id / Soroban message nonce / wei amount, as a decimal string. */
+const uint256Decimal = z.string().regex(/^[0-9]{1,78}$/, "Must be a decimal uint256");
+
+export const escrowLockRecordSchema = z.object({
+  lockId: uint256Decimal,
+  daoId: z.number().int().positive(),
+  proposalId: z.number().int().positive(),
+  depositor: evmAddress,
+  recipient: evmAddress,
+  amount: uint256Decimal,
+  lockTxHash: evmTxHash,
+});
+
+export const escrowResolutionSchema = z.object({
+  sorobanNonce: uint256Decimal,
+  resolutionTxHash: evmTxHash,
+});
+
+export const escrowRefundSchema = z.object({
+  resolutionTxHash: evmTxHash,
+});
+
+// ============================================
+// ONBOARDING FUNNEL SCHEMA (ZV-108)
+// ============================================
+
+export const onboardingFunnelStepSchema = z.object({
+  step: z.enum([
+    "registration_started",
+    "explore_readonly_selected",
+    "secret_created",
+    "backup_viewed",
+    "backup_verification_started",
+    "backup_verification_passed",
+    "registration_completed",
+  ]),
+});
 
 // ============================================
 // CIRCUIT PARAMETER SCHEMA
@@ -1233,6 +1405,46 @@ export const adminRelayerRotateSchema = z.object({
   targetKeyId: z.string().optional(),
   targetPublicKey: z.string().optional(),
   reason: z.string().max(500).optional(),
+  actor: z.string().min(1).max(100).optional(),
+});
+
+// Abuse-detection enforcement review queue (ZV-111)
+export const adminAbuseHoldsQuerySchema = z.object({
+  tenantId: z.string().min(1).max(64).optional(),
+  status: z.enum(["held", "pending_release", "released", "escalated"]).optional(),
+});
+
+export const adminAbuseHoldReviewSchema = z.object({
+  reviewerId: z.string().min(1).max(100),
+  reason: z.string().min(1).max(500),
+});
+
+// Relayer key lifecycle (#746)
+const operatorId = z.string().min(1).max(100);
+// `${cosignerId}.${expiresAtMs}.${hmacHex}` — see issueActionApproval.
+const cosignerApproval = z.string().regex(/^[\w-]{1,64}\.\d{10,16}\.[0-9a-f]{64}$/);
+
+export const adminRelayerRotationActionSchema = z.object({
+  actor: operatorId.optional(),
+  reason: z.string().max(500).optional(),
+});
+
+export const adminRelayerCompromiseSchema = z.object({
+  key: z.string().min(1).max(100),
+  declaredBy: operatorId,
+  reason: z.string().min(1).max(500),
+  confirmation: cosignerApproval.optional(),
+});
+
+export const adminRelayerSweepSchema = z.object({
+  key: z.string().min(1).max(100),
+  requestedBy: operatorId,
+  confirmation: cosignerApproval,
+});
+
+export const adminRelayerHaltSchema = z.object({
+  reason: z.string().min(1).max(500),
+  actor: operatorId.optional(),
 });
 
 export const adminRelayerRegisterKeySchema = z.object({
@@ -1270,3 +1482,197 @@ export const remediationHistoryQuerySchema = z.object({
     .max(1000, "limit must be at most 1000")
     .default(50),
 });
+
+// ============================================
+// PAYMENTS / SWAP SCHEMAS (#594 #597)
+// Single source of truth for pay + swap routes AND openapi.ts ENDPOINTS.
+// Addresses are Stellar StrKey-encoded: G... (ed25519 public key) or M...
+// (muxed account, G... base + 64-bit ID). M... and G... are NOT
+// interchangeable — sending a muxed-bound payment to the bare G... base
+// credits the shared base balance instead of the virtual sub-account.
+// ============================================
+
+const STELLAR_G_RE = /^G[A-Z2-7]{55}$/;
+const STELLAR_M_RE = /^M[A-Z2-7]{68}$/;
+
+export const stellarGAddressSchema = z
+  .string()
+  .regex(STELLAR_G_RE, "must be a valid Stellar G... address")
+  .openapi({ example: "GABCDEF234567...", description: "Stellar ed25519 public key (G...)" });
+
+export const stellarMuxedAddressSchema = z
+  .string()
+  .regex(STELLAR_M_RE, "must be a valid Stellar M... muxed address")
+  .openapi({ example: "MAAAAAAAAA...", description: "Stellar muxed account (M...)" });
+
+export const stellarDestinationSchema = z
+  .string()
+  .refine((v) => STELLAR_G_RE.test(v) || STELLAR_M_RE.test(v), {
+    message: "destination must be a valid Stellar G... or M... address",
+  })
+  .openapi({
+    example: "GABCDEF234567...",
+    description:
+      "Payment destination. G... = base account, M... = muxed sub-account. They are not interchangeable.",
+  });
+
+export const paymentAssetSchema = z
+  .enum(["XLM", "USDC", "EURC"])
+  .openapi({ example: "XLM", description: "Payment asset code" });
+
+export const paymentAmountSchema = z
+  .string()
+  .regex(/^\d+(\.\d{1,7})?$/, "amount must be a decimal string with up to 7 decimals")
+  .refine((v) => Number(v) > 0, { message: "amount must be > 0" })
+  .openapi({ example: "10.0000000", description: "Amount as decimal string, max 7 decimals" });
+
+export const paymentOpSchema = z
+  .object({
+    destination: stellarDestinationSchema,
+    asset: paymentAssetSchema,
+    amount: paymentAmountSchema,
+    memo: z.string().max(28).optional().openapi({ example: "invoice-42" }),
+  })
+  .openapi("PaymentOp");
+
+export const payRequestSchema = paymentOpSchema.openapi("PayRequest");
+
+export const payBatchRequestSchema = z
+  .object({
+    ops: z.array(paymentOpSchema).min(1).max(100).openapi({ description: "Batch operations (max 100/tx)" }),
+  })
+  .openapi("PayBatchRequest");
+
+export const swapQuoteQuerySchema = z.object({
+  from: paymentAssetSchema,
+  to: paymentAssetSchema,
+  amount: paymentAmountSchema,
+});
+
+export const swapSubmitRequestSchema = z
+  .object({
+    from: paymentAssetSchema,
+    to: paymentAssetSchema,
+    amount: paymentAmountSchema,
+    destMin: paymentAmountSchema.optional().openapi({ example: "9.5000000" }),
+    destination: stellarDestinationSchema.optional().openapi({
+      description: "Defaults to the relayer account when omitted",
+    }),
+  })
+  .openapi("SwapSubmitRequest");
+
+// ============================================
+// SAFE DOMAIN FORMS — SPIKE-132 / #923
+//
+// Shared validators for every boundary that accepts Stellar addresses,
+// amounts, contract IDs, asset codes and memos.  These are the canonical
+// source of truth for field-level error messages; frontend validators mirror
+// them via the shared `stellarAmount` / `stellar-address` helpers.
+//
+// Rules:
+//  • Amounts: reject scientific notation, Unicode digits, leading zeros,
+//    sub-stroop precision, zero/negative values, and i64 overflow (> MAX_STROOPS).
+//  • Addresses: reject wrong-network addresses (G.../M... for mainnet;
+//    Unicode confusables handled by detectConfusableMixedScript).
+//  • Contract IDs: C... Soroban contract addresses.
+//  • Asset codes: 1-12 alphanumeric chars (Stellar alphanum4 / alphanum12).
+//  • Memos: text memos ≤ 28 bytes; hash memos as 64 hex chars.
+//  • All string fields: trimmed before validation; empty strings rejected.
+// ============================================
+
+const MAX_STELLAR_STROOPS_STR = "922337203685.4775807"; // i64::MAX / 1e7
+
+/** Rejects scientific notation, Unicode digits, overflow, zero, and sub-stroop precision. */
+export const safeAmountSchema = z
+  .string()
+  .trim()
+  .min(1, "Amount is required")
+  .refine((v) => !/[eE]/.test(v), { message: "Scientific notation is not allowed" })
+  .refine((v) => /^[0-9]+(\.[0-9]+)?$/.test(v), {
+    message: "Amount must be a plain decimal number (e.g. 10.5000000)",
+  })
+  .refine(
+    (v) => {
+      const parts = v.split(".");
+      return !parts[1] || parts[1].length <= 7;
+    },
+    { message: "Amount must have at most 7 decimal places (stroop precision)" },
+  )
+  .refine((v) => parseFloat(v) > 0, { message: "Amount must be greater than zero" })
+  .refine(
+    (v) => {
+      // Guard against i64 overflow using string comparison on the integer part.
+      const whole = v.split(".")[0];
+      const max = MAX_STELLAR_STROOPS_STR.split(".")[0];
+      if (whole.length > max.length) return false;
+      if (whole.length === max.length) return whole <= max;
+      return true;
+    },
+    { message: "Amount exceeds the Stellar i64 maximum" },
+  )
+  .openapi({ example: "10.0000000", description: "Stellar amount (max 7 decimal places)" });
+
+/** Accepts G... (base) and M... (muxed) Stellar addresses. */
+export const safeAddressSchema = z
+  .string()
+  .trim()
+  .min(1, "Address is required")
+  .refine(
+    (v) => /^G[A-Z2-7]{55}$/.test(v) || /^M[A-Z2-7]{68}$/.test(v),
+    {
+      message:
+        "Invalid Stellar address. Must be a G... account (56 chars) or M... muxed account (69 chars) using base32 characters only",
+    },
+  )
+  .refine(
+    (v) => !detectConfusableMixedScript(v),
+    { message: "Address contains confusable or mixed-script characters" },
+  )
+  .openapi({
+    example: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    description: "Stellar G... or M... address",
+  });
+
+/** Accepts Soroban C... contract IDs. */
+export const safeContractIdSchema = z
+  .string()
+  .trim()
+  .min(1, "Contract ID is required")
+  .regex(/^C[A-Z2-7]{55}$/, "Invalid Soroban contract ID (must be C... 56 chars, base32)")
+  .openapi({ example: "CCJZ5DGALEBFA4L3H5L67YXYGEJ5KLQ4AIOC7FEPH7CFAWTTF6NGA3Z", description: "Soroban contract ID" });
+
+/** Stellar asset code: 1-4 chars (alphanum4) or 5-12 chars (alphanum12). */
+export const safeAssetCodeSchema = z
+  .string()
+  .trim()
+  .min(1, "Asset code is required")
+  .max(12, "Asset code must be 12 characters or fewer")
+  .regex(/^[A-Za-z0-9]+$/, "Asset code must be alphanumeric (A-Z, 0-9)")
+  .openapi({ example: "USDC", description: "Stellar asset code (alphanum4 or alphanum12)" });
+
+/** Stellar text memo: UTF-8, max 28 bytes. */
+export const safeMemoTextSchema = z
+  .string()
+  .max(28, "Memo text must be 28 bytes or fewer")
+  .openapi({ example: "invoice-42", description: "Stellar text memo (max 28 bytes)" });
+
+/** Stellar hash memo: 64 hex characters. */
+export const safeMemoHashSchema = z
+  .string()
+  .regex(/^[0-9a-fA-F]{64}$/, "Memo hash must be 64 hex characters")
+  .openapi({ description: "Stellar hash memo (64 hex chars)" });
+
+/**
+ * Combined safe payment form schema used by SwapPanel, DepositWithdraw,
+ * DaoMultisigManagement and VoterRegistration.
+ *
+ * Validates all fields at the boundary before any transaction is constructed.
+ */
+export const safePaymentFormSchema = z.object({
+  destination: safeAddressSchema,
+  amount: safeAmountSchema,
+  asset: safeAssetCodeSchema,
+  memo: safeMemoTextSchema.optional(),
+});
+
+export type SafePaymentForm = z.infer<typeof safePaymentFormSchema>;

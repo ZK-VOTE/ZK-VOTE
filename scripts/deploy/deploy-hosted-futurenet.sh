@@ -65,6 +65,38 @@ success "Deployment version: $DEPLOY_VERSION"
 # Building everything together triggers Cargo feature unification that turns on
 # num-traits' float impls, which fail to compile on newer rustc (>=1.80) for
 # wasm32v1-none. Per-crate builds keep num-traits feature-minimal and succeed.
+#
+# TOOLCHAIN PARITY (#595): Soroban P25 hosts require the wasm32v1-none target.
+# A binary built for testnet with wasm32-unknown-unknown (or a stale
+# rust-toolchain.toml) deploys fine but fails at invoke time with a missing
+# bn254/poseidon host-function error. Fail fast here instead.
+step "Checking toolchain parity..."
+EXPECTED_TARGET="wasm32v1-none"
+if ! grep -q 'wasm32v1-none' rust-toolchain.toml 2>/dev/null; then
+  echo "ERROR: rust-toolchain.toml must pin targets = [\"wasm32v1-none\"] (Soroban P25). Refusing to deploy." >&2
+  exit 1
+fi
+if ! rustc --print target-list 2>/dev/null | grep -qx "$EXPECTED_TARGET"; then
+  echo "ERROR: target $EXPECTED_TARGET is not installed (rustup target add $EXPECTED_TARGET). Refusing to deploy." >&2
+  exit 1
+fi
+if grep -rn "wasm32-unknown-unknown" contracts/ Cargo.toml 2>/dev/null | grep -v "^Binary" | head -1; then
+  echo "ERROR: stale wasm32-unknown-unknown reference found in contracts/Cargo config. Use $EXPECTED_TARGET." >&2
+  exit 1
+fi
+# NETWORK PARITY: the RPC URL and passphrase must belong to the same network.
+# Deploying a testnet-passphrase build against the futurenet RPC (or vice
+# versa) produces signatures the network rejects at ingest.
+case "$RPC_URL" in
+  *futurenet*) EXPECTED_PASSPHRASE="Test SDF Future Network ; October 2022" ;;
+  *testnet*) EXPECTED_PASSPHRASE="Test SDF Network ; September 2015" ;;
+  *) EXPECTED_PASSPHRASE="" ;;
+esac
+if [ -n "$EXPECTED_PASSPHRASE" ] && [ "$NETWORK_PASSPHRASE" != "$EXPECTED_PASSPHRASE" ]; then
+  echo "ERROR: RPC/network mismatch: RPC_URL=$RPC_URL expects passphrase '$EXPECTED_PASSPHRASE' but NETWORK_PASSPHRASE='$NETWORK_PASSPHRASE'." >&2
+  exit 1
+fi
+success "Toolchain ($EXPECTED_TARGET) and network parity OK"
 step "Building all contracts..."
 for c in dao-registry membership-sbt membership-tree voting comments; do
   cargo build -p "$c" --target wasm32v1-none --release
@@ -331,26 +363,62 @@ done
 # Set verification key for Public DAO
 echo "Setting verification key..."
 VK_FILE="frontend/src/lib/verification_key_soroban.json"
-if [ -f "$VK_FILE" ]; then
-  VK_JSON=$(cat "$VK_FILE")
-  sleep 5  # Wait for sequence number to sync
-  if VK_OUTPUT=$(stellar contract invoke \
-    --id "$VOTING_ID" \
-    --rpc-url "$RPC_URL" \
-    --network-passphrase "$NETWORK_PASSPHRASE" \
-    --source "$KEY_NAME" \
-    -- set_vk \
-    --dao_id "$DAO_ID" \
-    --vk "$VK_JSON" \
-    --admin "$ADMIN_ADDRESS" 2>&1); then
-    success "Verification key set for Public DAO"
-  else
-    echo "$VK_OUTPUT"
-    warn "Verification key setting may have failed - check output above"
-  fi
+# NUM_PUBLIC_SIGNALS in contracts/voting/src/lib.rs; a Groth16 key has one more
+# IC point than the circuit has public signals.
+EXPECTED_VK_IC_LEN=7
+
+if [ ! -f "$VK_FILE" ]; then
+  # Previously this was a `warn` and the deploy continued, leaving a live DAO
+  # with no voting key: every `vote` call fails VkNotSet, so the DAO exists but
+  # nobody can vote. A missing key is a hard stop.
+  echo "ERROR: verification key not found at $VK_FILE"
+  echo ""
+  echo "  The key is produced by the trusted setup and must match the circuit's"
+  echo "  public-signal count. See frontend/public/circuits/README.md."
+  echo ""
+  echo "  Refusing to deploy a DAO that cannot accept votes."
+  exit 1
+fi
+
+VK_IC_LEN="$(node -e '
+    const fs = require("fs");
+    try {
+        const v = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        process.stdout.write(String((v.ic || v.IC || []).length));
+    } catch (e) { process.stdout.write(""); }
+' "$VK_FILE")"
+
+if [ "$VK_IC_LEN" != "$EXPECTED_VK_IC_LEN" ]; then
+  echo "ERROR: $VK_FILE has ${VK_IC_LEN:-0} IC points, expected $EXPECTED_VK_IC_LEN."
+  echo ""
+  echo "  set_vk rejects any key whose IC length is not NUM_PUBLIC_SIGNALS + 1, and"
+  echo "  verify_groth16 returns false when the counts disagree — so this key could"
+  echo "  not be registered, and even if it were, no proof would verify. Refusing to"
+  echo "  deploy. See frontend/public/circuits/README.md."
+  exit 1
+fi
+
+VK_JSON=$(cat "$VK_FILE")
+sleep 5  # Wait for sequence number to sync
+if VK_OUTPUT=$(stellar contract invoke \
+  --id "$VOTING_ID" \
+  --rpc-url "$RPC_URL" \
+  --network-passphrase "$NETWORK_PASSPHRASE" \
+  --source "$KEY_NAME" \
+  -- set_vk \
+  --dao_id "$DAO_ID" \
+  --vk "$VK_JSON" \
+  --admin "$ADMIN_ADDRESS" 2>&1); then
+  success "Verification key set for Public DAO"
 else
-  warn "Verification key file not found at $VK_FILE"
-  warn "You'll need to set it manually through the frontend UI"
+  echo "$VK_OUTPUT"
+  # `set_vk` also requires an MPC transcript attestation. A DAO without a
+  # registered key cannot vote, so this is fatal rather than advisory.
+  echo "ERROR: failed to register the verification key."
+  echo "  The DAO is deployed but CANNOT accept votes until set_vk succeeds."
+  echo "  Check the output above; a common cause is a missing transcript-registry"
+  echo "  attestation for this vk_hash (VkNotAttested, error #93)."
+  exit 1
 fi
 
 # Step 4: Update frontend configuration

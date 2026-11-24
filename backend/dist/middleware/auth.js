@@ -86,7 +86,7 @@ function safeCompare(a, b) {
             return false;
         }
     }
-    return timingSafeEqual(bufAY, bufB);
+    return timingSafeEqual(bufA, bufB);
 }
 /**
  * Authentication guard for write endpoints

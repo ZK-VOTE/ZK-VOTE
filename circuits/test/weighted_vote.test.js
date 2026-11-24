@@ -199,4 +199,67 @@ describe("WeightedVoteBalanceProof circuit", () => {
       }),
     ).rejects.toThrow();
   });
+  // -------------------------------------------------------------------------
+  // The anchor is NOT in this circuit, and these tests exist so nobody
+  // re-discovers that the hard way.
+  //
+  // `balanceCommitment` is a *public* input, so the prover chooses it. Every
+  // test above derives the commitment from an "honest" balance, which makes
+  // the circuit look sound in isolation. It is not: the statement it proves is
+  // "voteWeight == balance", where `balance` is itself prover-chosen. There is
+  // no in-circuit check that the protocol ever issued the commitment.
+  //
+  // The control is contract-side: `Voting::vote_weighted` refuses any
+  // `balanceCommitment` the DAO did not pin via
+  // `set_weighted_balance_commitment`. These tests document the exact inputs
+  // that must therefore never be accepted on-chain, and they fail loudly if a
+  // future change to this circuit starts rejecting them -- at which point the
+  // anchor has moved into the circuit and the contract-side pin can be
+  // revisited.
+  // -------------------------------------------------------------------------
+
+  test("KNOWN LIMITATION: a prover-chosen commitment yields a max-range weight", async () => {
+    // The forged statement from the audit: claim the entire 128-bit range.
+    const balance = 2n ** 128n - 1n;
+    const blinding = 42n;
+    const commitment = await balanceCommitment(balance, blinding);
+
+    const witness = await calculateWitness({
+      balanceCommitment: commitment,
+      maxSupply: balance.toString(),
+      voteWeight: balance.toString(),
+      balance: balance.toString(),
+      blindingFactor: blinding.toString(),
+    });
+
+    // The circuit accepts it. This is the vulnerability, asserted so it cannot
+    // silently change. If this test ever starts failing, the anchor landed in
+    // the circuit -- update contracts/voting/src/lib.rs accordingly.
+    expect(witness).toBeDefined();
+    expect(witness[3].toString()).toBe(balance.toString());
+  });
+
+  test("KNOWN LIMITATION: the same weight is reachable from many distinct commitments", async () => {
+    // A fixed weight with many valid commitments shows the commitment carries
+    // no information the protocol issued: it is just Poseidon(weight, salt).
+    const weight = 12345n;
+    const blindings = [1n, 2n, 3n, 4n, 5n];
+    const commitments = await Promise.all(
+      blindings.map((blinding) => balanceCommitment(weight, blinding)),
+    );
+    // Distinct salts give distinct commitments for the same weight, so the
+    // commitment conveys nothing about whether the protocol ever issued it.
+    expect(new Set(commitments).size).toBe(blindings.length);
+
+    for (const [i, commitment] of commitments.entries()) {
+      const witness = await calculateWitness({
+        balanceCommitment: commitment,
+        maxSupply: MAX_SUPPLY.toString(),
+        voteWeight: weight.toString(),
+        balance: weight.toString(),
+        blindingFactor: blindings[i].toString(),
+      });
+      expect(witness).toBeDefined();
+    }
+  });
 });

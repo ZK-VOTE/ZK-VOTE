@@ -46,6 +46,12 @@ interface LogMetrics {
  * Get current log metrics snapshot and optionally reset counters.
  */
 export declare function getLogMetrics(reset?: boolean): LogMetrics;
+export declare function sanitizeConfigForLogging(cfg: Record<string, unknown>): Record<string, unknown>;
+/**
+ * Deep-clone and redact sensitive fields from a body object.
+ * Returns a new object with sensitive values replaced with "[REDACTED]".
+ */
+export declare function redactBody(body: unknown, maxChars: number): unknown;
 /**
  * Capture the request body for logging.
  * Middleware must be mounted before body parsing for this to work.

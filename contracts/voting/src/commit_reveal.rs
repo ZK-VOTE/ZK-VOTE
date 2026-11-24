@@ -239,6 +239,13 @@ impl Voting {
     ///
     /// Committing is as binding as voting: a member gets one commitment per
     /// election and cannot switch to a direct vote afterwards.
+    ///
+    /// SECURITY (#audit-H2): that claim was false for the same reason it was
+    /// false in `vote_sybil_weighted`. `vote` marked nullifiers in Temporary
+    /// storage and only this path's Persistent-only lookup was consulted, so a
+    /// member could commit a ballot and then also cast a direct vote with the
+    /// same nullifier — two head-count votes, one of them hidden until reveal.
+    /// Both paths now resolve the namespace through one shared check/spend pair.
     pub fn commit_vote(
         env: Env,
         dao_id: u64,
@@ -277,14 +284,17 @@ impl Voting {
         if proposal.state != ProposalState::Active {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
-        if root != proposal.eligible_root {
-            panic_with_error!(&env, VotingError::RootMismatch);
-        }
+        // Shared eligibility helper rather than a bare `eligible_root` equality
+        // check, so a commitment made against a root a member removal has since
+        // invalidated is rejected here exactly as it is in `vote` (#audit-H3).
+        // It also supplies the `vote_mode` check this path never had: commit /
+        // reveal is not a Quadratic mechanism, and a Quadratic election ballots
+        // in its own namespace (#audit-H2).
+        Self::assert_root_eligible(&env, PathContext::Anonymous, dao_id, &proposal, &root);
 
         // The nullifier lives in the same namespace `vote` uses, so committing
         // and voting directly are mutually exclusive.
-        let null_key = crate::storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
-        if env.storage().persistent().has(&null_key) {
+        if Self::nullifier_is_used(&env, dao_id, proposal_id, nullifier.clone()) {
             panic_with_error!(&env, VotingError::NullifierUsed);
         }
 
@@ -295,8 +305,7 @@ impl Voting {
 
         // Checks-effects-interactions: burn the nullifier before verifying, so
         // a reentrant call during verification cannot double-spend it.
-        env.storage().persistent().set(&null_key, &true);
-        Self::bump_persistent(&env, &null_key);
+        Self::consume_nullifier(&env, dao_id, proposal_id, nullifier.clone());
 
         let vk: VerificationKey = env
             .storage()

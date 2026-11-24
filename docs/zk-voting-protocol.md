@@ -25,7 +25,7 @@ When a proposal (election) is created, the current ledger sequence is recorded a
 **Key components**:
 - `BalanceSnapshotInfo` struct stores `snapshot_ledger` (ledger sequence) and `timestamp`
 - `ProposalInfo.snapshot_ledger` field records when the proposal was created
-- `create_balance_snapshot()` captures the snapshot
+- `create_balance_snapshot()` captures the snapshot (DAO admin only)
 - `get_balance_snapshot()` retrieves the snapshot for verification
 
 ### 2. Voter Eligibility at Snapshot Time
@@ -69,7 +69,10 @@ TWAB provides Sybil resistance by measuring the average balance over time, not j
 
 **How it works**:
 - `BalanceCheckpoint` stores (dao_id, address, ledger_seq) -> balance
-- Token contracts call `record_balance_checkpoint()` when balances change
+- The DAO admin calls `record_balance_checkpoint()` when balances change. This is
+  deliberately admin-gated rather than permissionless: checkpoints are the sole
+  input to the TWAB, so an unauthenticated caller could forge any voter's
+  balance history and defeat the flash-loan check entirely.
 - `get_time_weighted_average_balance()` computes the average across a ledger range
 - TWAB = Σ(balance_i × duration_i) / total_duration
 
@@ -86,10 +89,17 @@ During an active election, registered voters enter a transfer cooldown that prev
 - Having their SBT revoked to avoid vote accountability
 
 **Cooldown enforcement**:
-- `set_voter_cooldown()` sets a 7-day cooldown when a voter registers/votes
+- `set_voter_cooldown(dao_id, voter, caller)` sets a 7-day cooldown when a voter
+  registers/votes. `caller` must be the voter themselves or the DAO admin
 - `is_in_transfer_cooldown()` is called by token contracts before allowing transfers
 - `leave()` in SBT contract checks cooldown before allowing departure
-- Cooldown is cleared when the election ends via `clear_voter_cooldown()`
+- Cooldown is cleared when the election ends via `clear_voter_cooldown(dao_id, voter, caller)`,
+  under the same self-or-admin rule
+- The SBT contract's `set_election_cooldown()` / `clear_election_cooldown()` /
+  `set_in_active_election()` follow the same self-or-admin rule. These gate
+  `leave()`, so leaving them permissionless would let anyone lock a member out
+  of the DAO permanently (`cooldown_end = u64::MAX`) or drop the barrier that
+  stops a vote -> leave -> rejoin cycle inside one election
 
 ## Election Randomness
 
@@ -139,13 +149,16 @@ fn transfer(..., from: Address, ...) {
     // Proceed with transfer
 }
 
-// Record balance checkpoints for TWAB
-fn after_balance_change(..., voter: Address, new_balance: i128) {
+// Record balance checkpoints for TWAB. Admin-gated: pass the DAO admin as the
+// trailing `admin` argument and have it `require_auth()`.
+fn after_balance_change(..., admin: Address, voter: Address, new_balance: i128) {
     let voting_contract: Address = ...;
+    admin.require_auth();
     env.invoke_contract(
         &voting_contract,
         &Symbol::new(&env, "record_balance_checkpoint"),
-        vec![&env, dao_id.into_val(&env), voter.into_val(&env), new_balance.into_val(&env)],
+        vec![&env, dao_id.into_val(&env), voter.into_val(&env),
+             new_balance.into_val(&env), admin.into_val(&env)],
     );
 }
 ```
@@ -158,7 +171,7 @@ fn create_token_gated_proposal(...) {
     let proposal_id = voting_contract.create_proposal(...);
     
     // Create balance snapshot
-    voting_contract.create_balance_snapshot(dao_id, proposal_id);
+    voting_contract.create_balance_snapshot(dao_id, proposal_id, admin);
     
     // Configure token-gating
     voting_contract.set_election_config(
@@ -187,7 +200,7 @@ fn vote_with_token_gate(..., voter, proposal_id) {
     }
     
     // Set cooldown to prevent transfer after voting
-    voting_contract.set_voter_cooldown(dao_id, voter);
+    voting_contract.set_voter_cooldown(dao_id, voter, voter);
     
     // Submit vote
     voting_contract.vote(...);
@@ -312,3 +325,30 @@ ZKV1 bytes (hex) = 0x0100 + ("01" * 64) + ("02" * 128) + ("03" * 64)
 ### Scope note
 
 This format currently covers the BN254 G1&times;G2&times;G1 proof shape used by the single on-chain `Proof` type (`contracts/zkvote-groth16/src/lib.rs`). The BLS12-381 curve id byte is defined and round-trip tested, but `ProofBls381` uses different point sizes (`BytesN<96>`/`BytesN<192>`); encoding those is a straightforward follow-up (a `curve_id`-dependent length) left out of this change to keep the initial format landing minimal and unambiguous for the BN254 path that is actually deployed today.
+
+---
+
+## 4. Cross-DAO Identity Derivation & Linkability Prevention
+
+### Problem Statement: Cross-DAO Secret Reuse
+If voters reuse raw `(secret, salt, blindingFactor)` credentials across multiple DAOs:
+1. **Commitment Correlation**: `Poseidon(DOMAIN_TAG, secret, salt, blinding)` produces identical leaf values across different DAO Merkle trees, publicly exposing that the same voter belongs to each of those DAOs.
+2. **Nullifier & Compromise Blast Radius**: While nullifiers `Poseidon(secret, daoId, proposalId)` incorporate `daoId`, an admin compromising or observing one DAO's secret preimage can test nullifiers across other DAOs or link timing and behavioral footprints.
+
+### The Canonical Derivation Standard
+To ensure absolute domain separation and unlinkability, credentials must be derived per DAO using a cryptographically isolated Key Derivation Function (KDF):
+
+```text
+secret_dao   = BigInt(SHA-256("zkvote:secret:"   || daoId || masterSeed))
+salt_dao     = BigInt(SHA-256("zkvote:salt:"     || daoId || masterSeed))
+blinding_dao = BigInt(SHA-256("zkvote:blinding:" || daoId || masterSeed))
+```
+
+Each derived value is reduced into the BN254 scalar field ($< r$). The resulting commitment:
+$$\text{Commitment}_{\text{DAO}} = \text{Poseidon}(\text{DOMAIN\_TAG}, \text{secret}_{\text{dao}}, \text{salt}_{\text{dao}}, \text{blinding}_{\text{dao}})$$
+is mathematically independent between distinct `daoId` values.
+
+### Migration & Rotation
+- Members rotating credentials generate new per-DAO derived identities without carrying over linkability.
+- Recovery UX utilizes deterministic wallet signatures bound to `daoId` via `generateZKCredentials(kit, daoId)` or `derivePerDaoCredentials(masterSecret, daoId)`.
+- Compromising any single DAO admin or registry node bounds the blast radius exclusively to that single DAO, preserving anonymity across the voter's broader governance activity.

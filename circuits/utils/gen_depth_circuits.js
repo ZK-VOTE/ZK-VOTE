@@ -68,12 +68,15 @@ function render(depth) {
 // by the ${depth} Poseidon hashes of the Merkle path, so a smaller depth means a
 // proportionally cheaper proof for a smaller electorate.
 //
-// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress] - 7 signals
+// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
+// MUST stay in lockstep with NUM_PUBLIC_SIGNALS in
+// contracts/voting/src/lib.rs; scripts/drift-guard.mjs fails the build
+// otherwise. See vote_template.circom for why there is no 7th relayer signal.
 // The commitment stays private; it is recomputed inside the circuit.
 
 include "vote_template.circom";
 
-component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]} = Vote(${depth});
+component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates]} = Vote(${depth});
 `;
 }
 

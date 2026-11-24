@@ -2,18 +2,27 @@
 # Built ON the box from /opt/apps/zkvote/backend. Frontend is on Pages.
 
 # ---- builder ----
+# Pinned to Node 22 to match package.json engines + local dev (#599). Mixing
+# Node 20 build layers with a Node 22 runtime breaks the better-sqlite3 /
+# sharp native ABI (better_sqlite3.node compiled for the wrong NODE_MODULE_VERSION).
 FROM node:22-bookworm-slim AS builder
-# python3 + build-essential: only used if better-sqlite3 has no prebuilt for
-# this platform. Discarded with the builder stage either way.
+# python3 + build-essential: required to rebuild better-sqlite3/sharp from
+# source for the exact Node 22 ABI. Discarded with the builder stage either way.
 RUN apt-get update && apt-get install -y --no-install-recommends python3 build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
+# Rebuild native modules for the Node 22 ABI even when the layer cache holds
+# Node 20-compiled artifacts.
+RUN npm rebuild better-sqlite3 --build-from-source && npm rebuild sharp --build-from-source || true
 COPY . .
 RUN npm run build
 # prune dev dependencies (native modules already compiled in npm ci above)
 RUN npm prune --omit=dev
+# Smoke test the native ABI before shipping the layer: fails the build instead
+# of degrading /health at runtime on Fly.
+RUN node -e "require('better-sqlite3'); console.log('better-sqlite3 ABI ok:', process.versions.modules)"
 
 # ---- runner ----
 FROM node:22-bookworm-slim AS runner

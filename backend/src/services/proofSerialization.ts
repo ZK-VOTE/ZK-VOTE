@@ -1,141 +1,90 @@
-// @ts-nocheck
 /**
- * Audit-Friendly Proof Serialization Format (ZKV1)
+ * Audit-Friendly Proof Serialization Format (ZKV1) — backend facade.
  *
- * This is the canonical, versioned wire format for a Groth16 proof shared
- * across the ZK-VOTE stack (circom/snarkjs -> backend -> Soroban contract).
- * It mirrors the Rust reference implementation in
- * `contracts/zkvote-groth16/src/serialization.rs` byte-for-byte, so a proof
- * serialized here can be decoded there (and vice versa) without any
- * additional translation layer.
+ * The wire format, constants and the legacy snarkjs adapter are generated from
+ * `shared/protocol-manifest.json` into `../generated/zkv1.ts`. This module
+ * keeps the Buffer-based API used by the relayer and its tests while delegating
+ * all format decisions to that single generated implementation.
  *
  * Wire format (big-endian throughout):
  *
  *   [ version (1B) | curve_id (1B) | A_x (32B) | A_y (32B)
- *     | B_x1 (32B) | B_x2 (32B) | B_y1 (32B) | B_y2 (32B)
+ *     | B_x1 (32B) | B_x0 (32B) | B_y1 (32B) | B_y0 (32B)
  *     | C_x (32B) | C_y (32B) ]
- *
- * - version:  format version, currently `1` (PROOF_FORMAT_VERSION). Any
- *             incompatible layout change must bump this byte.
- * - curve_id: 0x00 = BN254, 0x01 = BLS12-381.
- * - A, C:     G1 points, 64 bytes each (X || Y).
- * - B:        G2 point, 128 bytes (X_c1 || X_c0 || Y_c1 || Y_c0), matching
- *             the existing `G2Hex` convention used by `proofToScVal` in
- *             `stellar.ts`.
- *
- * Total length for the BN254/BLS12-381 G1×G2×G1 proof shape currently used
- * on-chain: 1 + 1 + 64 + 128 + 64 = 258 bytes.
  */
 
 import type { Groth16Proof } from "../types/index.js";
-import { hexToBytes, isAllZeros } from "./stellar.js";
+import {
+  ProofCurveId,
+  ProofFormatError,
+  SERIALIZED_PROOF_LEN,
+  deserializeProofBytes,
+  serializeProofBytes,
+  snarkjsToZkv1,
+  zkv1ToSnarkjs,
+  encodePublicSignalsBE,
+  assertSignalCount,
+  PUBLIC_SIGNALS,
+  PROOF_OFFSETS,
+  B_COORDINATE_ORDER,
+  PROOF_FORMAT,
+  VK_SHAPE,
+  NUM_PUBLIC_SIGNALS,
+  VK_IC_LENGTH,
+  CIRCUIT_IDS,
+  type Zkv1Proof,
+  type SnarkjsProof,
+} from "../generated/zkv1.js";
 
-/** Current wire-format version. Bump on any incompatible layout change. */
-export const PROOF_FORMAT_VERSION = 1;
+export {
+  ProofCurveId,
+  ProofFormatError,
+  SERIALIZED_PROOF_LEN,
+  snarkjsToZkv1,
+  zkv1ToSnarkjs,
+  encodePublicSignalsBE,
+  assertSignalCount,
+  PUBLIC_SIGNALS,
+  PROOF_OFFSETS,
+  B_COORDINATE_ORDER,
+  PROOF_FORMAT,
+  VK_SHAPE,
+  NUM_PUBLIC_SIGNALS,
+  VK_IC_LENGTH,
+  CIRCUIT_IDS,
+  type Zkv1Proof,
+  type SnarkjsProof,
+};
 
-export enum ProofCurveId {
-  Bn254 = 0,
-  Bls12381 = 1,
-}
+export { PROOF_FORMAT_VERSION, G1_LEN, G2_LEN } from "../generated/zkv1.js";
 
-const G1_LEN = 64;
-const G2_LEN = 128;
-
-/** Total length in bytes of a ZKV1-serialized proof. */
-export const SERIALIZED_PROOF_LEN = 1 + 1 + G1_LEN + G2_LEN + G1_LEN;
-
-export class ProofFormatError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ProofFormatError";
-  }
-}
-
-/**
- * Serialize a `Groth16Proof` (hex-encoded a/b/c) into the versioned ZKV1
- * byte format.
- */
+/** Serialize a `Groth16Proof` (hex a/b/c) into the versioned ZKV1 byte format. */
 export function serializeProof(
   proof: Groth16Proof,
   curve: ProofCurveId = ProofCurveId.Bn254,
 ): Buffer {
-  if (!proof || typeof proof !== "object") {
-    throw new ProofFormatError("Invalid proof: must be an object");
-  }
-  if (!proof.a || !proof.b || !proof.c) {
-    throw new ProofFormatError("Invalid proof: missing a, b, or c fields");
-  }
-
-  const aBytes = hexToBytes(proof.a, G1_LEN);
-  const bBytes = hexToBytes(proof.b, G2_LEN);
-  const cBytes = hexToBytes(proof.c, G1_LEN);
-
-  if (isAllZeros(aBytes) || isAllZeros(bBytes) || isAllZeros(cBytes)) {
-    throw new ProofFormatError(
-      "Invalid proof: proof components cannot be point at infinity (all zeros)",
-    );
-  }
-
-  return Buffer.concat([
-    Buffer.from([PROOF_FORMAT_VERSION]),
-    Buffer.from([curve]),
-    aBytes,
-    bBytes,
-    cBytes,
-  ]);
+  const payload: Zkv1Proof = { a: proof.a, b: proof.b, c: proof.c };
+  return Buffer.from(serializeProofBytes(payload, curve));
 }
 
-/**
- * Deserialize a ZKV1 byte buffer back into a `{ proof, curve }` pair.
- * Validates the version byte, curve id byte, and total length before
- * slicing out the fixed-size point components.
- */
-export function deserializeProof(bytes: Buffer): {
+/** Deserialize a ZKV1 buffer into hex a/b/c plus the curve tag. */
+export function deserializeProof(bytes: Buffer | Uint8Array): {
   proof: Groth16Proof;
   curve: ProofCurveId;
 } {
-  if (!Buffer.isBuffer(bytes)) {
-    throw new ProofFormatError("Invalid input: expected a Buffer");
-  }
-  if (bytes.length !== SERIALIZED_PROOF_LEN) {
-    throw new ProofFormatError(
-      `Invalid proof length: expected ${SERIALIZED_PROOF_LEN} bytes, got ${bytes.length}`,
-    );
-  }
-
-  const version = bytes[0];
-  if (version !== PROOF_FORMAT_VERSION) {
-    throw new ProofFormatError(
-      `Unsupported proof format version: ${version} (expected ${PROOF_FORMAT_VERSION})`,
-    );
-  }
-
-  const curveByte = bytes[1];
-  if (curveByte !== ProofCurveId.Bn254 && curveByte !== ProofCurveId.Bls12381) {
-    throw new ProofFormatError(`Unknown curve id: ${curveByte}`);
-  }
-  const curve = curveByte as ProofCurveId;
-
-  let offset = 2;
-  const aBytes = bytes.subarray(offset, offset + G1_LEN);
-  offset += G1_LEN;
-  const bBytes = bytes.subarray(offset, offset + G2_LEN);
-  offset += G2_LEN;
-  const cBytes = bytes.subarray(offset, offset + G1_LEN);
-
-  const proof: Groth16Proof = {
-    a: "0x" + aBytes.toString("hex"),
-    b: "0x" + bBytes.toString("hex"),
-    c: "0x" + cBytes.toString("hex"),
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const decoded = deserializeProofBytes(view);
+  return {
+    proof: {
+      a: decoded.proof.a,
+      b: decoded.proof.b,
+      c: decoded.proof.c,
+    } as Groth16Proof,
+    curve: decoded.curve,
   };
-
-  return { proof, curve };
 }
 
-/**
- * Convenience helper returning the ZKV1 bytes as a `0x`-prefixed hex string,
- * useful for logging / audit trails / example vectors.
- */
+/** ZKV1 bytes as a `0x`-prefixed hex string (logs / audit trails / fixtures). */
 export function serializeProofToHex(
   proof: Groth16Proof,
   curve: ProofCurveId = ProofCurveId.Bn254,
@@ -143,11 +92,14 @@ export function serializeProofToHex(
   return "0x" + serializeProof(proof, curve).toString("hex");
 }
 
-/** Inverse of {@link serializeProofToHex}. */
+/** Inverse of `serializeProofToHex`. */
 export function deserializeProofFromHex(hex: string): {
   proof: Groth16Proof;
   curve: ProofCurveId;
 } {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (!/^[0-9a-fA-F]*$/.test(clean) || clean.length !== SERIALIZED_PROOF_LEN * 2) {
+    throw new ProofFormatError("Invalid ZKV1 hex string");
+  }
   return deserializeProof(Buffer.from(clean, "hex"));
 }

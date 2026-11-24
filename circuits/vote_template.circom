@@ -26,6 +26,34 @@ include "merkle_tree.circom";
 // the same candidate bound that the election was configured with. Without this binding,
 // a prover could supply a proof valid under one numCandidates value while the contract
 // tallies using a different (potentially larger) count.
+//
+// #361 RELAYER BINDING — NOT IMPLEMENTED, DELIBERATELY
+//
+// A 7th public signal `relayerAddress` was added here at one point. It is
+// removed, and the reason matters:
+//
+//   * A public signal binds nothing unless the verifier checks it. The relayer
+//     cannot be checked: `Env::auths()` is `#[cfg(any(test,
+//     feature = "testutils"))]` in soroban-sdk and there is no production
+//     equivalent, because a Soroban contract cannot observe who invoked it.
+//     So the signal was decorative.
+//   * It was not merely decorative, it was destructive. With 7 public signals a
+//     Groth16 verification key has 8 IC points, but the contract's
+//     `VOTE_CIRCUIT_IC_LEN` and every call site still assumed 6/7. A key for
+//     THIS circuit could never be registered (`validate_vk` rejects any other
+//     IC length) and the checked-in 6-signal key could never verify — the
+//     entire anonymous vote path was non-functional, while every test passed
+//     because the tests build synthetic keys from the contract's own constant.
+//     scripts/drift-guard.mjs now fails the build on any such disagreement.
+//
+// The enforceable form of relayer binding needs no new public signal: take the
+// relayer as a call argument and `relayer.require_auth()`, which cryptographically
+// proves that account submitted the transaction. See RELAYER_BINDING_DESIGN.md
+// for that design and the front-running analysis that motivates it.
+//
+// The front-running risk that binding was meant to address is bounded today by
+// the nullifier being single-use per election and the tally being additive;
+// see THREAT_MODEL.md "Sybil bounds" and the anonymous-submission section.
 template Vote(levels) {
     var DOMAIN_TAG = 19666041591797403834655481403982443037438503980743793537655983658411276515161;
 
@@ -36,7 +64,6 @@ template Vote(levels) {
     signal input proposalId;        // Which proposal this vote is for
     signal input voteChoice;        // Candidate index the voter selected
     signal input numCandidates;     // Total number of candidates (set by election config)
-    signal input relayerAddress;    // Relayer address binding proof to specific relayer (anti-front-running)
 
     // Private inputs
     signal input secret;            // Voter's secret (like password)
@@ -96,22 +123,4 @@ template Vote(levels) {
     validChoice.in[0] <== voteChoice;
     validChoice.in[1] <== numCandidates;
     validChoice.out === 1;
-
-    // 5. Bind proof to relayer address (anti-front-running)
-    // NOTE: This constraint ensures relayerAddress is bound into the proof,
-    // but the contract MUST verify that msg.sender/env.invoker() matches
-    // the relayerAddress public input for this to provide front-running protection.
-    // Without contract-side validation, this binding is ineffective.
-    component relayerHasher = Poseidon(5);
-    relayerHasher.inputs[0] <== secret;
-    relayerHasher.inputs[1] <== daoId;
-    relayerHasher.inputs[2] <== proposalId;
-    relayerHasher.inputs[3] <== voteChoice;
-    relayerHasher.inputs[4] <== relayerAddress;
-    signal relayerBinding;
-    relayerBinding <== relayerHasher.out;
-    // The relayerBinding is computed and constrained (ensures relayerAddress
-    // participates in the proof) but not exposed as public output to maintain
-    // privacy. The contract should reject proofs where relayerAddress doesn't
-    // match the actual transaction sender.
 }

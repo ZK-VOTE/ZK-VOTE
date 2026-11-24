@@ -1,0 +1,104 @@
+# Combined Fault Detection Alerts for EPIC-003
+
+groups:
+  - name: combined_faults
+    interval: 30s
+    rules:
+      # Fee Surge Detection
+      - alert: FeeSurgeDetected
+        expr: stellar_fee_median > (stellar_fee_baseline * 5)
+        for: 2m
+        labels:
+          severity: warning
+          component: network
+        annotations:
+          summary: "Fee surge detected: {{ $value }}x baseline"
+          description: "Network fees have increased significantly"
+
+      # Panic Mode Active
+      - alert: PanicModeActive
+        expr: voting_panic_mode == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: voting
+        annotations:
+          summary: "Panic mode activated"
+          description: "Voting has been paused for emergency"
+
+      # Key Rotation In Progress
+      - alert: KeyRotationInProgress
+        expr: relayer_key_rotation_active == 1
+        for: 1m
+        labels:
+          severity: warning
+          component: relayer
+        annotations:
+          summary: "Key rotation in progress"
+          description: "Relayer keys are being rotated"
+
+      # Network Congestion
+      - alert: NetworkCongestionHigh
+        expr: stellar_tx_latency_p99 > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: network
+        annotations:
+          summary: "High network congestion detected"
+          description: "Transaction latency exceeds 10 seconds"
+
+      # Combined: Fee Surge + Panic
+      - alert: CombinedFaultFeeSurgePanic
+        expr: (stellar_fee_median > (stellar_fee_baseline * 5)) AND (voting_panic_mode == 1)
+        for: 1m
+        labels:
+          severity: critical
+          component: combined_fault
+        annotations:
+          summary: "Combined fault: Fee surge + Panic mode"
+          description: "Multiple critical conditions detected"
+
+      # Combined: Rotation + Congestion
+      - alert: CombinedFaultRotationCongestion
+        expr: (relayer_key_rotation_active == 1) AND (stellar_tx_latency_p99 > 10000)
+        for: 2m
+        labels:
+          severity: critical
+          component: combined_fault
+        annotations:
+          summary: "Combined fault: Rotation + Congestion"
+          description: "Key rotation under high network load"
+
+      # Degraded Election SLO: Success Rate
+      - alert: ElectionSuccessRateLow
+        expr: (voting_success_total / voting_attempts_total) < 0.90
+        for: 5m
+        labels:
+          severity: critical
+          component: election
+        annotations:
+          summary: "Vote success rate below 90%"
+          description: "Election SLO breach: {{ $value | humanizePercentage }} success rate"
+
+      # Degraded Election SLO: Latency
+      - alert: ElectionLatencyHigh
+        expr: voting_latency_p99 > 30000
+        for: 5m
+        labels:
+          severity: critical
+          component: election
+        annotations:
+          summary: "Vote latency exceeds 30s"
+          description: "Election SLO breach: {{ $value }}ms p99 latency"
+
+      # Three-Way Fault (Worst Case)
+      - alert: ThreeWayFaultDetected
+        expr: (stellar_fee_median > (stellar_fee_baseline * 10)) AND (voting_panic_mode == 1) AND (relayer_key_rotation_active == 1)
+        for: 1m
+        labels:
+          severity: critical
+          component: combined_fault
+        annotations:
+          summary: "Three-way combined fault detected"
+          description: "Multiple critical systems failing simultaneously"

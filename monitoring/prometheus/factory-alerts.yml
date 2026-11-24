@@ -1,0 +1,104 @@
+# DAO Factory Alerts for EPIC-005
+
+groups:
+  - name: dao_factory
+    interval: 30s
+    rules:
+      # Factory Stall Detection
+      - alert: FactorySagaStalled
+        expr: (time() - factory_saga_last_update_timestamp) > 600
+        for: 2m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "Factory saga stalled"
+          description: "No progress in {{ $value }}s for saga {{ $labels.ticket_id }}"
+
+      # High Failure Rate
+      - alert: FactoryFailureRateHigh
+        expr: rate(factory_saga_failed_total[10m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "High factory failure rate"
+          description: "{{ $value }} saga failures per second"
+
+      # Compensation Failures
+      - alert: CompensationFailed
+        expr: factory_compensation_failures_total > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: factory
+        annotations:
+          summary: "Factory compensation failed"
+          description: "Failed to clean up stranded DAO resources"
+
+      # First Vote Drill Failures
+      - alert: FirstVoteDrillFailureRate
+        expr: (factory_first_vote_failures_total / factory_first_vote_attempts_total) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "First vote drill failure rate high"
+          description: "{{ $value | humanizePercentage }} of drills failing"
+
+      # Creation Time SLO Breach
+      - alert: CreationTimeSLOBreach
+        expr: histogram_quantile(0.95, factory_creation_duration_seconds_bucket) > 300
+        for: 10m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "Factory creation time SLO breach"
+          description: "P95 creation time exceeds 5 minutes: {{ $value }}s"
+
+      # Factory Flood Detection
+      - alert: FactoryFloodDetected
+        expr: rate(factory_saga_created_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "Potential factory flood attack"
+          description: "{{ $value }} DAO creations per second"
+
+      # Name Reservation Exhaustion
+      - alert: NameReservationPoolLow
+        expr: factory_name_reservations_available < 100
+        for: 5m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "Name reservation pool running low"
+          description: "Only {{ $value }} names available"
+
+      # Treasury Initialization Failures
+      - alert: TreasuryInitFailureRate
+        expr: rate(factory_treasury_init_failures_total[10m]) > 0.02
+        for: 5m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "High treasury initialization failure rate"
+          description: "{{ $value }} failures per second"
+
+      # Conversion Rate Drop
+      - alert: FactoryConversionRateDrop
+        expr: (factory_saga_completed_total / factory_saga_created_total) < 0.80
+        for: 30m
+        labels:
+          severity: warning
+          component: factory
+        annotations:
+          summary: "Factory conversion rate below 80%"
+          description: "Only {{ $value | humanizePercentage }} of sagas completing"

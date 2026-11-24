@@ -1,6 +1,7 @@
 // @ts-nocheck
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { config, isValidContractId } from "../config.js";
+import { parseFeeStringToStroops, STROOPS_PER_XLM } from "../utils/stellarAmount.js";
 import type { RpcServerPort, LoggerPort } from "./interfaces.js";
 import type { TTLInfo } from "./ttl-checker.js";
 import type { TTLTrackingEntry } from "./db.js";
@@ -216,8 +217,10 @@ async function submitCall(
 
       let feeXlm: number | undefined;
       try {
-        const feeStr = prepared.fee;
-        feeXlm = Number(feeStr) / 10_000_000;
+        const feeStroops = parseFeeStringToStroops(String(prepared.fee));
+        // Display-only: safe to narrow to Number here because fee values fit
+        // comfortably within Number.MAX_SAFE_INTEGER (max tx fee ~1 XLM).
+        feeXlm = Number(feeStroops) / Number(STROOPS_PER_XLM);
       } catch {
         /* fee parsing is best-effort */
       }

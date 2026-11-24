@@ -35,6 +35,7 @@ import crypto from "crypto";
 import fs from "fs";
 import { pipeline } from "stream/promises";
 import { log } from "./logger.js";
+import { backupTamperDetected, backupRestoreSuccess, backupRestoreFailed, backupEncryptionDuration, backupDecryptionDuration, } from "./metrics.js";
 export const BACKUP_MAGIC = "ZKVE";
 export const BACKUP_FORMAT_VERSION = 1;
 const DEK_LENGTH = 32; // 256-bit data encryption key
@@ -203,7 +204,9 @@ export function probeBackupFile(filePath) {
  * @param key        Operator passphrase / KEK (see generateBackupKey()).
  */
 export async function encryptBackupFile(inputPath, outputPath, key) {
+    const startTime = Date.now();
     if (!fs.existsSync(inputPath)) {
+        backupRestoreFailed.inc({ reason: "input_not_found" });
         throw new BackupCryptoError("IO_ERROR", `Input file does not exist: ${inputPath}`);
     }
     const salt = crypto.randomBytes(SALT_LENGTH);
@@ -251,6 +254,10 @@ export async function encryptBackupFile(inputPath, outputPath, key) {
         const out = fs.createWriteStream(outputPath, { flags: "a" });
         await pipeline(fs.createReadStream(inputPath), cipher, out);
         fs.appendFileSync(outputPath, cipher.getAuthTag());
+        // Record successful encryption
+        const duration = (Date.now() - startTime) / 1000;
+        backupEncryptionDuration.observe(duration);
+        log("info", "backup_encrypted", { keyId: header.keyId, duration, size: payloadSize });
     }
     catch (err) {
         try {
@@ -260,6 +267,7 @@ export async function encryptBackupFile(inputPath, outputPath, key) {
         catch {
             /* best-effort cleanup */
         }
+        backupRestoreFailed.inc({ reason: "encryption_failed" });
         throw new BackupCryptoError("IO_ERROR", `Encryption failed: ${err.message}`);
     }
 }
@@ -273,8 +281,10 @@ export async function encryptBackupFile(inputPath, outputPath, key) {
  *                   header expects before attempting decryption (fast fail).
  */
 export async function decryptBackupFile(inputPath, outputPath, key, keyId) {
+    const startTime = Date.now();
     const header = readHeader(inputPath);
     if (keyId !== undefined && keyId !== header.keyId) {
+        backupRestoreFailed.inc({ reason: "wrong_key" });
         throw new BackupCryptoError("WRONG_KEY", `Key ${deriveKeyId(key)} does not match backup key ${header.keyId}`);
     }
     const salt = Buffer.from(header.kdf.saltB64, "base64");
@@ -295,12 +305,16 @@ export async function decryptBackupFile(inputPath, outputPath, key, keyId) {
         ]);
     }
     catch {
+        backupRestoreFailed.inc({ reason: "dek_unwrap_failed" });
+        backupTamperDetected.inc({ keyId: header.keyId });
         throw new BackupCryptoError("WRONG_KEY", "Failed to unwrap the backup data key (wrong key or corrupted header)");
     }
     // Locate the GCM auth tag at the very end of the payload.
     const payloadOffset = PREAMBLE_LENGTH + Buffer.byteLength(JSON.stringify(header), "utf-8");
     const fileSize = fs.statSync(inputPath).size;
     if (payloadOffset + header.payload.size + TAG_LENGTH !== fileSize) {
+        backupRestoreFailed.inc({ reason: "size_mismatch" });
+        backupTamperDetected.inc({ keyId: header.keyId });
         throw new BackupCryptoError("CORRUPT_PAYLOAD", `Backup size mismatch (expected ${payloadOffset + header.payload.size + TAG_LENGTH}, got ${fileSize})`);
     }
     let descriptor;
@@ -308,6 +322,7 @@ export async function decryptBackupFile(inputPath, outputPath, key, keyId) {
         descriptor = fs.openSync(inputPath, "r");
     }
     catch (err) {
+        backupRestoreFailed.inc({ reason: "io_error" });
         throw new BackupCryptoError("IO_ERROR", `Unable to open backup for decryption: ${err.message}`);
     }
     try {
@@ -322,6 +337,11 @@ export async function decryptBackupFile(inputPath, outputPath, key, keyId) {
         });
         try {
             await pipeline(source, decipher, fs.createWriteStream(outputPath));
+            // Record successful decryption
+            const duration = (Date.now() - startTime) / 1000;
+            backupDecryptionDuration.observe(duration);
+            backupRestoreSuccess.inc({ keyId: header.keyId });
+            log("info", "backup_decrypted", { keyId: header.keyId, duration });
         }
         catch {
             try {
@@ -331,6 +351,8 @@ export async function decryptBackupFile(inputPath, outputPath, key, keyId) {
             catch {
                 /* best-effort cleanup */
             }
+            backupRestoreFailed.inc({ reason: "auth_failed" });
+            backupTamperDetected.inc({ keyId: header.keyId });
             throw new BackupCryptoError("WRONG_KEY", "Authentication failed while decrypting backup (wrong key or corrupt payload)");
         }
     }

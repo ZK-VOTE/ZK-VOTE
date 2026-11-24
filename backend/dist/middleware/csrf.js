@@ -35,21 +35,6 @@ import { getAllowedOrigins } from "../cors-config.js";
  * because there is no browser session to protect against cross-site hijacking.
  */
 export function csrfGuard(req, res, next) {
-    console.error("CSRF DEBUG", req.method, req.path, req.originalUrl, req.headers.origin, req.headers.referer);
-    // Pay/swap/ramp: allow without CSRF in dev for high-volume real asset testing
-    const p = req.path || req.originalUrl || "";
-    if (p.startsWith("/pay") ||
-        p.startsWith("/api/pay") ||
-        p.startsWith("/api/v1/pay") ||
-        p.startsWith("/swap") ||
-        p.startsWith("/api/swap") ||
-        p.startsWith("/api/v1/swap") ||
-        p.startsWith("/ramp") ||
-        p.startsWith("/api/ramp") ||
-        p.startsWith("/api/v1/ramp")) {
-        console.error("CSRF BYPASS", p);
-        return next();
-    }
     // Step 1: Skip for safe methods — GET, HEAD, OPTIONS are read-only
     if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         return next();

@@ -156,7 +156,7 @@ export default function DAOList({
           </h2>
           <div className="flex items-center justify-center py-8">
             <LoadingSpinner size="md" />
-            <span className="ml-3 text-muted-foreground">Loading DAOs...</span>
+            <span className="ms-3 text-muted-foreground">Loading DAOs...</span>
           </div>
         </CardContent>
       </Card>

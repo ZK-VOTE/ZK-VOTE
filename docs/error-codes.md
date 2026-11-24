@@ -40,6 +40,13 @@ All contract errors are numeric codes. This reference provides human-readable ex
 | 13 | `RootNotFound` | Merkle root not in history | Root was evicted or invalid |
 | 14 | `AlreadyInitialized` | Tree already initialized | Constructor already called |
 | 15 | `MemberNotRevoked` | Member has not been revoked | Can only reinstate revoked members |
+| 16 | `CommitmentAlreadyUsed` | Commitment already bound to a different address | Commitment collision |
+| 17 | `RateLimited` | Call rate-limited | Too many calls in one window |
+| 18 | `MaxRootsOutOfRange` | Requested root history size is out of range | Configure fewer roots |
+| 19 | `RootPinnedByProposal` | Root is pinned by an in-flight proposal | Wait for proposals to close |
+| 20 | `Sha3TreeNotInitialized` | Post-quantum tree not initialized for DAO | Initialize the PQ tree first |
+| 21 | `PqCommitmentExists` | C_PQ commitment already stored | Commitment collision |
+| 22 | `InvalidField` | Poseidon field symbol is not `BN254` or `BLS12_381` | Typo in the field passed to `init_tree` |
 
 ## Voting Contract Errors
 

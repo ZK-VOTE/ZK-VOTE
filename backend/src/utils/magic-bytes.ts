@@ -19,6 +19,12 @@ export function detectMimeType(buffer: Buffer): string | null {
 
   // WebP
   if (hex4 === "52494646" && buffer.length >= 12) {
+    // RIFF stores its payload size as little-endian. Reject truncated and
+    // trailing-polyglot buffers before sharp sees attacker-controlled sizes.
+    const riffPayloadSize = buffer.readUInt32LE(4);
+    if (riffPayloadSize < 4 || riffPayloadSize + 8 !== buffer.length) {
+      return null;
+    }
     const webpStr = buffer.toString("utf8", 8, 12);
     if (webpStr === "WEBP") return "image/webp";
   }
@@ -34,7 +40,8 @@ export function detectMimeType(buffer: Buffer): string | null {
     const ftyp = buffer.toString("utf8", 4, 8);
     const subtype = buffer.toString("utf8", 8, 12);
     if (ftyp === "ftyp") {
-      if (["heic", "heix", "mif1", "heiv"].includes(subtype)) return "image/heic";
+      if (["heic", "heix", "mif1", "heiv"].includes(subtype))
+        return "image/heic";
       if (["avif", "avis"].includes(subtype)) return "image/avif";
     }
   }
@@ -54,7 +61,9 @@ export function detectMimeType(buffer: Buffer): string | null {
  * Extract image dimensions from the buffer for JPEG/PNG/GIF/WebP/BMP.
  * Returns null if dimensions cannot be determined or format is unsupported.
  */
-export function getImageDimensions(buffer: Buffer): { width: number; height: number } | null {
+export function getImageDimensions(
+  buffer: Buffer,
+): { width: number; height: number } | null {
   const mime = detectMimeType(buffer);
   if (!mime) return null;
 
@@ -93,12 +102,22 @@ export function getImageDimensions(buffer: Buffer): { width: number; height: num
           continue;
         }
         const marker = buffer[offset + 1];
-        if (marker >= 0x0 && marker <= 0xcf && marker !== 0x04 && marker !== 0x08 && marker !== 0xcc) {
+        if (
+          marker >= 0x0 &&
+          marker <= 0xcf &&
+          marker !== 0x04 &&
+          marker !== 0x08 &&
+          marker !== 0xcc
+        ) {
           const height = buffer.readUInt16BE(offset + 5);
           const width = buffer.readUInt16BE(offset + 7);
           return { width, height };
         }
+        if (offset + 4 > buffer.length) return null;
         const segmentLength = buffer.readUInt16BE(offset + 2);
+        if (segmentLength < 2 || offset + 2 + segmentLength > buffer.length) {
+          return null;
+        }
         offset += 2 + segmentLength;
       }
       return null;
@@ -108,7 +127,8 @@ export function getImageDimensions(buffer: Buffer): { width: number; height: num
       const chunk = buffer.toString("utf8", 12, 16);
       if (chunk === "VP8X") {
         const width = 1 + (buffer[24] | (buffer[25] << 8) | (buffer[26] << 16));
-        const height = 1 + (buffer[27] | (buffer[28] << 8) | (buffer[29] << 16));
+        const height =
+          1 + (buffer[27] | (buffer[28] << 8) | (buffer[29] << 16));
         return { width, height };
       }
       if (chunk === "VP8 ") {
@@ -133,6 +153,20 @@ export function getImageDimensions(buffer: Buffer): { width: number; height: num
   }
 }
 
+export function hasSafeImageDimensions(
+  buffer: Buffer,
+  maxDimension: number,
+  maxPixels = maxDimension * maxDimension,
+): boolean {
+  const dimensions = getImageDimensions(buffer);
+  if (!dimensions) return true;
+  return (
+    dimensions.width <= maxDimension &&
+    dimensions.height <= maxDimension &&
+    dimensions.width * dimensions.height <= maxPixels
+  );
+}
+
 /**
  * Detect whether the buffer appears to contain multiple image format signatures.
  */
@@ -145,9 +179,11 @@ export function isPolyglot(buffer: Buffer): boolean {
   if (head[0] === 0xff && head[1] === 0xd8) detected.add("jpeg");
   if (head.toString("utf8", 0, 4) === "\x89PNG") detected.add("png");
   if (sample.startsWith("GIF8")) detected.add("gif");
-  if (sample.startsWith("RIFF") && sample.slice(8, 12) === "WEBP") detected.add("webp");
+  if (sample.startsWith("RIFF") && sample.slice(8, 12) === "WEBP")
+    detected.add("webp");
   if (sample.startsWith("BM")) detected.add("bmp");
-  if (sample.includes("II*\0") || sample.includes("MM\0*")) detected.add("tiff");
+  if (sample.includes("II*\0") || sample.includes("MM\0*"))
+    detected.add("tiff");
 
   return detected.size > 1;
 }

@@ -529,3 +529,64 @@ export function logBackupCryptoEvent(
 ): void {
   log(level, event, meta);
 }
+
+// ============================================
+// FORWARD SECRECY ENFORCEMENT (#600)
+// ============================================
+
+/**
+ * Assert a freshly-written backup is bound to the CURRENT key id.
+ *
+ * Rotation archives the old KEK into the key ring so historical snapshots stay
+ * decryptable, but litestream/WAL snapshots taken AFTER rotation must carry the
+ * new keyId. If the header still carries the old keyId, the rotation never took
+ * effect on the writer and a compromised old key can still decrypt the future
+ * — fail loudly instead of shipping the backup.
+ */
+export function assertBackupUsesCurrentKey(
+  backupPath: string,
+  currentKeyId: string,
+): string {
+  const info = probeBackupFile(backupPath);
+  if (!info.encrypted || !info.keyId) {
+    throw new BackupCryptoError(
+      "NOT_ENCRYPTED",
+      "Refusing to ship an unencrypted backup when encryption is enabled",
+    );
+  }
+  if (info.keyId !== currentKeyId) {
+    throw new BackupCryptoError(
+      "WRONG_KEY",
+      `Backup key ${info.keyId} does not match current key ${currentKeyId}: ` +
+        "rotation did not take effect on the writer (forward secrecy violated)",
+    );
+  }
+  return info.keyId;
+}
+
+/**
+ * Empirical forward-secrecy check: a retired (old) key MUST NOT decrypt a
+ * backup taken under the current key. Resolves true when secrecy holds
+ * (decrypt with oldKey fails with WRONG_KEY), false otherwise. Used by the
+ * `backup:key-rotate` drill and the restore-test harness: old key before
+ * decrypts past snapshots, after rotation it must fail on new snapshots.
+ */
+export async function assertForwardSecrecy(
+  newBackupPath: string,
+  oldKey: string,
+  currentKeyId: string,
+): Promise<boolean> {
+  assertBackupUsesCurrentKey(newBackupPath, currentKeyId);
+  try {
+    await decryptBackupFile(newBackupPath, `${newBackupPath}.fs-probe`, oldKey);
+    try {
+      fs.unlinkSync(`${newBackupPath}.fs-probe`);
+    } catch {
+      /* best-effort */
+    }
+    // Old key decrypted the future: forward secrecy is broken.
+    return false;
+  } catch (err) {
+    return err instanceof BackupCryptoError && err.code === "WRONG_KEY";
+  }
+}

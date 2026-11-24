@@ -36,7 +36,7 @@ console.log(`C (G1, 64 bytes): ${sorobanProof.c}`);
 console.log('');
 
 console.log('=== Public Signals ===');
-const labels = ['Root', 'Nullifier', 'DAO ID', 'Proposal ID', 'Vote Choice', 'Commitment'];
+const labels = ['Root', 'Nullifier', 'DAO ID', 'Proposal ID', 'Vote Choice', 'Num Candidates'];
 publicSignals.forEach((sig, i) => {
     console.log(`[${i}] ${labels[i] || `Signal ${i}`}: ${sig}`);
 });
@@ -58,7 +58,7 @@ console.log(`  --proposal_id ${publicSignals[3]} \\`);
 console.log(`  --vote_choice ${publicSignals[4] === '1' ? 'true' : 'false'} \\`);
 console.log(`  --nullifier ${publicSignals[1]} \\`);
 console.log(`  --root ${publicSignals[0]} \\`);
-console.log(`  --commitment ${publicSignals[5]} \\`);
+console.log(`  --num_candidates ${publicSignals[5]} \\`);
 console.log(`  --proof '${JSON.stringify(sorobanProof)}'`);
 console.log('');
 

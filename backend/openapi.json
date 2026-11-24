@@ -213,6 +213,68 @@
             "additionalProperties": true
           }
         }
+      },
+      "PayRequest": {
+        "type": "object",
+        "required": ["asset", "destination", "amount"],
+        "properties": {
+          "asset": {
+            "type": "string",
+            "enum": ["XLM", "USDC", "EURC"]
+          },
+          "destination": {
+            "type": "string",
+            "description": "G... base account or M... muxed sub-account. Not interchangeable."
+          },
+          "amount": {
+            "type": "string",
+            "example": "10.0000000"
+          },
+          "memo": {
+            "type": "string",
+            "maxLength": 28
+          }
+        }
+      },
+      "PayBatchRequest": {
+        "type": "object",
+        "required": ["ops"],
+        "properties": {
+          "ops": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/PayRequest"
+            }
+          }
+        }
+      },
+      "SwapSubmitRequest": {
+        "type": "object",
+        "required": ["from", "to", "amount"],
+        "properties": {
+          "from": {
+            "type": "string",
+            "enum": ["XLM", "USDC", "EURC"]
+          },
+          "to": {
+            "type": "string",
+            "enum": ["XLM", "USDC", "EURC"]
+          },
+          "amount": {
+            "type": "string",
+            "example": "10.0000000"
+          },
+          "destMin": {
+            "type": "string",
+            "example": "9.5000000"
+          },
+          "destination": {
+            "type": "string",
+            "description": "Defaults to the relayer account when omitted. G... or M..."
+          }
+        }
       }
     },
     "/tx/{hash}": {
@@ -553,6 +615,141 @@
             "relayerAuth": []
           }
         ],
+        "x-audited": true
+      }
+    },
+    "/pay": {
+      "post": {
+        "summary": "Send a single XLM/USDC/EURC payment via the relayer",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PayRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payment submitted"
+          },
+          "400": {
+            "description": "Invalid asset, destination (must be G... or M...), or amount"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "x-audited": true
+      }
+    },
+    "/pay/batch": {
+      "post": {
+        "summary": "Send up to 100 payment ops in one transaction (withSequenceLock)",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PayBatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Batch submitted"
+          },
+          "400": {
+            "description": "Invalid ops array (1-100, each with valid G.../M... destination)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "x-audited": true
+      }
+    },
+    "/swap/quote": {
+      "get": {
+        "summary": "Quote XLM<->USDC/EURC via Horizon strict-send (Soroswap fallback)",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["XLM", "USDC", "EURC"]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["XLM", "USDC", "EURC"]
+            }
+          },
+          {
+            "name": "amount",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "10.0000000"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Quote"
+          },
+          "400": {
+            "description": "from, to, amount required"
+          }
+        }
+      }
+    },
+    "/swap/submit": {
+      "post": {
+        "summary": "Execute a path-payment swap via the relayer",
+        "security": [
+          {
+            "relayerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwapSubmitRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Swap submitted"
+          },
+          "400": {
+            "description": "Invalid swap request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
         "x-audited": true
       }
     },

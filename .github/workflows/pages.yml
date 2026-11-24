@@ -2,7 +2,7 @@ name: deploy-pages
 on:
   push:
     branches: [main]
-    paths: ['frontend/**', '.github/workflows/pages.yml']
+    paths: ['frontend/**', 'circuits/**', '.github/workflows/pages.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -14,6 +14,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Install circom
+        run: |
+          wget -q https://github.com/iden3/circom/releases/download/v2.1.8/circom-linux-amd64 -O /tmp/circom
+          sudo mv /tmp/circom /usr/local/bin/circom
+          sudo chmod +x /usr/local/bin/circom
+      - name: Compile vote circuit artifacts (#645)
+        working-directory: circuits
+        run: |
+          npm ci
+          mkdir -p build
+          circom vote.circom --r1cs --wasm --sym -o build -l node_modules
+          # Powers of tau + zkey (use cached pot if present)
+          if [ ! -f pot14_final.ptau ]; then
+            npx snarkjs powersoftau new bn128 14 pot14_0000.ptau -v
+            npx snarkjs powersoftau contribute pot14_0000.ptau pot14_0001.ptau --name="ci" -v -e="ci"
+            npx snarkjs powersoftau prepare phase2 pot14_0001.ptau pot14_final.ptau -v
+          fi
+          npx snarkjs groth16 setup build/vote.r1cs pot14_final.ptau build/vote_0000.zkey
+          npx snarkjs zkey contribute build/vote_0000.zkey build/vote_final.zkey --name="ci" -v -e="ci"
+          npx snarkjs zkey export verificationkey build/vote_final.zkey build/verification_key.json
       - run: npm ci
         working-directory: frontend
       - name: build (PUBLIC values only)
@@ -23,6 +43,8 @@ jobs:
           # set — it would be baked into public JS (secret leak). The relayer
           # must not require a client-held token.
           VITE_RELAYER_URL: ${{ vars.VITE_RELAYER_URL }}
+          # Fail the deploy if vote.wasm / zkey were not produced (#645)
+          STRICT_CIRCUITS: "1"
         run: npm run build
       - uses: cloudflare/wrangler-action@v3
         with:

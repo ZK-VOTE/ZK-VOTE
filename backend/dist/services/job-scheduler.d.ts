@@ -41,9 +41,25 @@ export declare class JobScheduler {
      */
     updateStoreMetrics(): number;
     /**
-     * Check for state reconciliation anomalies between local database and expected state
+     * End-to-end DAO reconciliation (#577).
+     *
+     * Verifies the full `create_dao → mint → register → proposal → vote → tally`
+     * pipeline stays consistent between the SQLite cache (DB counts), the
+     * relayer pipeline tables (`vote_submissions`, `vote_jobs`,
+     * `transaction_log`, `proof_commitments`) and the on-chain hashes recorded
+     * in per-DAO `events_<daoId>` tables (sourced from Horizon/Soroban, see
+     * FIX_REPORT.md blast-radius workflow). Any divergence increments
+     * `reconciliation_mismatch_total{component="dao_tally"}` so the Grafana /
+     * Prometheus `ZKVoteRelayerDaoTallyMismatch` alert fires.
      */
     checkStateReconciliation(): void;
+    /**
+     * Compare per-DAO `vote_cast` event counts (on-chain hashes mirrored from
+     * Horizon) against the relayer pipeline tables, plus pipeline-internal
+     * consistency (stuck pendings, dead letters, hash-less confirmations).
+     * Returns the number of mismatched groups found.
+     */
+    reconcileDaoTallies(): number;
 }
 export declare const defaultJobScheduler: JobScheduler;
 //# sourceMappingURL=job-scheduler.d.ts.map

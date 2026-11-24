@@ -226,21 +226,18 @@ export declare const commitSchema: z.ZodObject<{
     nullifier: z.ZodEffects<z.ZodString, string, string>;
     commitmentHash: z.ZodEffects<z.ZodString, string, string>;
     timestamp: z.ZodNumber;
-    walletAddress: z.ZodOptional<z.ZodString>;
 }, "strip", z.ZodTypeAny, {
     nullifier: string;
     daoId: number;
     timestamp: number;
     proposalId: number;
     commitmentHash: string;
-    walletAddress?: string | undefined;
 }, {
     nullifier: string;
     daoId: number;
     timestamp: number;
     proposalId: number;
     commitmentHash: string;
-    walletAddress?: string | undefined;
 }>;
 export type CommitRequest = z.infer<typeof commitSchema>;
 /**
@@ -295,16 +292,26 @@ export declare const voteSchema: z.ZodEffects<z.ZodObject<{
         b: string;
         c: string;
     }>>;
+    redundantProof: z.ZodOptional<z.ZodObject<{
+        a: z.ZodEffects<z.ZodEffects<z.ZodString, string, string>, string, string>;
+        b: z.ZodEffects<z.ZodEffects<z.ZodString, string, string>, string, string>;
+        c: z.ZodEffects<z.ZodEffects<z.ZodString, string, string>, string, string>;
+    }, "strip", z.ZodTypeAny, {
+        a: string;
+        b: string;
+        c: string;
+    }, {
+        a: string;
+        b: string;
+        c: string;
+    }>>;
     nonce: z.ZodOptional<z.ZodString>;
     timestamp: z.ZodOptional<z.ZodNumber>;
-    walletAddress: z.ZodOptional<z.ZodString>;
     encryptedPayload: z.ZodOptional<z.ZodUnion<[z.ZodString, z.ZodRecord<z.ZodString, z.ZodUnknown>]>>;
-    voterPublicKey: z.ZodOptional<z.ZodString>;
-    voterSignature: z.ZodOptional<z.ZodString>;
     sponsor: z.ZodOptional<z.ZodEnum<["relayer", "voter"]>>;
     feePayer: z.ZodOptional<z.ZodString>;
     feeBudgetStroops: z.ZodOptional<z.ZodNumber>;
-}, "strip", z.ZodTypeAny, {
+}, "strict", z.ZodTypeAny, {
     daoId: number;
     proposalId: number;
     choice: boolean;
@@ -317,10 +324,12 @@ export declare const voteSchema: z.ZodEffects<z.ZodObject<{
     timestamp?: number | undefined;
     root?: string | undefined;
     nonce?: string | undefined;
-    walletAddress?: string | undefined;
+    redundantProof?: {
+        a: string;
+        b: string;
+        c: string;
+    } | undefined;
     encryptedPayload?: string | Record<string, unknown> | undefined;
-    voterPublicKey?: string | undefined;
-    voterSignature?: string | undefined;
     sponsor?: "relayer" | "voter" | undefined;
     feePayer?: string | undefined;
     feeBudgetStroops?: number | undefined;
@@ -337,10 +346,12 @@ export declare const voteSchema: z.ZodEffects<z.ZodObject<{
     timestamp?: number | undefined;
     root?: string | undefined;
     nonce?: string | undefined;
-    walletAddress?: string | undefined;
+    redundantProof?: {
+        a: string;
+        b: string;
+        c: string;
+    } | undefined;
     encryptedPayload?: string | Record<string, unknown> | undefined;
-    voterPublicKey?: string | undefined;
-    voterSignature?: string | undefined;
     sponsor?: "relayer" | "voter" | undefined;
     feePayer?: string | undefined;
     feeBudgetStroops?: number | undefined;
@@ -357,10 +368,12 @@ export declare const voteSchema: z.ZodEffects<z.ZodObject<{
     timestamp?: number | undefined;
     root?: string | undefined;
     nonce?: string | undefined;
-    walletAddress?: string | undefined;
+    redundantProof?: {
+        a: string;
+        b: string;
+        c: string;
+    } | undefined;
     encryptedPayload?: string | Record<string, unknown> | undefined;
-    voterPublicKey?: string | undefined;
-    voterSignature?: string | undefined;
     sponsor?: "relayer" | "voter" | undefined;
     feePayer?: string | undefined;
     feeBudgetStroops?: number | undefined;
@@ -377,10 +390,12 @@ export declare const voteSchema: z.ZodEffects<z.ZodObject<{
     timestamp?: number | undefined;
     root?: string | undefined;
     nonce?: string | undefined;
-    walletAddress?: string | undefined;
+    redundantProof?: {
+        a: string;
+        b: string;
+        c: string;
+    } | undefined;
     encryptedPayload?: string | Record<string, unknown> | undefined;
-    voterPublicKey?: string | undefined;
-    voterSignature?: string | undefined;
     sponsor?: "relayer" | "voter" | undefined;
     feePayer?: string | undefined;
     feeBudgetStroops?: number | undefined;
@@ -898,6 +913,10 @@ export declare const bridgeVoteSchema: z.ZodObject<{
     nullifier: z.ZodString;
     voteRoot: z.ZodString;
     sbtRoot: z.ZodString;
+    /** Field element encoding of the SBT contract address (public signal 0) */
+    sbtContractAddr: z.ZodString;
+    /** Field element encoding of the member address (public signal 1) */
+    memberAddr: z.ZodString;
     proof: z.ZodObject<{
         a: z.ZodString;
         b: z.ZodString;
@@ -923,6 +942,8 @@ export declare const bridgeVoteSchema: z.ZodObject<{
     voteChoice: number;
     voteRoot: string;
     sbtRoot: string;
+    sbtContractAddr: string;
+    memberAddr: string;
 }, {
     proof: {
         a: string;
@@ -935,6 +956,8 @@ export declare const bridgeVoteSchema: z.ZodObject<{
     voteChoice: number;
     voteRoot: string;
     sbtRoot: string;
+    sbtContractAddr: string;
+    memberAddr: string;
 }>;
 export type BridgeVoteRequest = z.infer<typeof bridgeVoteSchema>;
 export declare const circuitParamsSchema: z.ZodObject<{
@@ -1148,19 +1171,19 @@ export declare const novaWitnessSchema: z.ZodObject<{
     proposal_id: z.ZodNumber;
 }, "strip", z.ZodTypeAny, {
     nullifier: string;
+    salt: string;
     secret: string;
     dao_id: number;
     proposal_id: number;
-    salt: string;
     path_elements: string[];
     path_indices: number[];
     vote_choice: number;
 }, {
     nullifier: string;
+    salt: string;
     secret: string;
     dao_id: number;
     proposal_id: number;
-    salt: string;
     path_elements: string[];
     path_indices: number[];
     vote_choice: number;
@@ -1180,19 +1203,19 @@ export declare const novaAggregateSchema: z.ZodObject<{
         proposal_id: z.ZodNumber;
     }, "strip", z.ZodTypeAny, {
         nullifier: string;
+        salt: string;
         secret: string;
         dao_id: number;
         proposal_id: number;
-        salt: string;
         path_elements: string[];
         path_indices: number[];
         vote_choice: number;
     }, {
         nullifier: string;
+        salt: string;
         secret: string;
         dao_id: number;
         proposal_id: number;
-        salt: string;
         path_elements: string[];
         path_indices: number[];
         vote_choice: number;
@@ -1202,10 +1225,10 @@ export declare const novaAggregateSchema: z.ZodObject<{
     proposalId: number;
     witnesses: {
         nullifier: string;
+        salt: string;
         secret: string;
         dao_id: number;
         proposal_id: number;
-        salt: string;
         path_elements: string[];
         path_indices: number[];
         vote_choice: number;
@@ -1216,10 +1239,10 @@ export declare const novaAggregateSchema: z.ZodObject<{
     proposalId: number;
     witnesses: {
         nullifier: string;
+        salt: string;
         secret: string;
         dao_id: number;
         proposal_id: number;
-        salt: string;
         path_elements: string[];
         path_indices: number[];
         vote_choice: number;

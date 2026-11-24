@@ -10,6 +10,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { fileTypeFromBuffer } from "file-type";
+import { assertMalwareFree } from "./malwareScanner.js";
 import sharp from "sharp";
 import { PinataSDK } from "pinata";
 import * as pinManager from "./ipfs-pin-manager.js";
@@ -34,6 +35,26 @@ const ipfsGatewayBreaker = registerCircuitBreaker("ipfs_gateway", {
   failureThreshold: config.circuitBreakerGatewayFailureThreshold,
   resetTimeoutMs: config.circuitBreakerGatewayResetMs,
 });
+
+// #593 SBT metadata SVG/script-injection guard. Enforced on upload AND on
+// gateway fetch (file-type alone is insufficient). Blocks <script,
+// event-handler attributes, foreignObject, javascript:/data:text/html URIs.
+const XSS_RE = /<\s*(script|svg|math|foreignobject|iframe|object|embed|link|style|meta)\b|on\w+\s*=|javascript\s*:|data\s*:\s*text\/html|expression\s*\(|vbscript\s*:|<\s*!\s*--/i;
+export function assertSbtMetadataSafe(input: string): void {
+  if (typeof input !== "string") return;
+  if (input.length > 200_000) throw new Error("SBT metadata too large");
+  if (XSS_RE.test(input)) {
+    import("./metrics.js").then((m) => (m as any).sbtXssBlockedTotal?.inc({ vector: "svg_script" })).catch(() => {});
+    throw new Error("SBT metadata blocked: XSS vector detected");
+  }
+}
+export function sanitizeSbtUri(uri: string): string {
+  assertSbtMetadataSafe(uri);
+  // Only allow ipfs://, https:// gateway, or ar:// URIs; force render via
+  // sandboxed <img> path downstream, never innerHTML.
+  if (!/^(ipfs:\/\/|https:\/\/|ar:\/\/)/i.test(uri.trim())) throw new Error("SBT URI scheme not allowed");
+  return uri.trim();
+}
 
 // ============================================
 // TYPES
@@ -578,6 +599,10 @@ export async function pinJSON(
     throw new Error("Pinata client not initialized");
   }
 
+  // Scan at the service boundary too: internal callers and queued retries must
+  // not bypass the upload route's scanner gate.
+  const scan = await assertMalwareFree(Buffer.from(JSON.stringify(data)));
+
   // 1. Backup to local disk before uploading (recovery safety net)
   let backupPath: string | undefined;
   try {
@@ -593,6 +618,9 @@ export async function pinJSON(
     pinata!.upload.public.json(data).name(name).keyvalues({
       app: "zkvote",
       type: "proposal-metadata",
+      scan_status: scan.status,
+      scan_engine: scan.scanner,
+      scan_at: new Date().toISOString(),
     }),
   );
 
@@ -639,7 +667,11 @@ export async function pinJSON(
 const ALLOWED_IMAGE_MIME_SET = new Set<string>(config.ALLOWED_IMAGE_MIMES);
 
 const MALWARE_SIGNATURES: Array<{ name: string; pattern: RegExp }> = [
-  { name: "eicar", pattern: /X5O!P%@AP\[4\\PZX54\(P\^\)7CC\)7\}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H\+H\*/i },
+  {
+    name: "eicar",
+    pattern:
+      /X5O!P%@AP\[4\\PZX54\(P\^\)7CC\)7\}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H\+H\*/i,
+  },
   { name: "zip", pattern: /PK\x03\x04/ },
   { name: "rar", pattern: /Rar!\x1A\x07/ },
   { name: "sevenzip", pattern: /7z\xBC\xAF\x27\x1C/ },
@@ -702,6 +734,7 @@ export async function validateAndSanitizeImage(
   }
 
   scanBufferForMalware(buffer);
+  await assertMalwareFree(buffer);
 
   const metadata = await sharp(buffer, {
     animated: detectedMime === "image/gif",
@@ -756,6 +789,7 @@ export async function pinFile(
 
   // Validate and sanitize the upload before it is backed up or pinned.
   const safeBuffer = await validateAndSanitizeImage(buffer, mimeType, uploader);
+  const scan = await assertMalwareFree(safeBuffer);
   const sha256 = crypto.createHash("sha256").update(safeBuffer).digest("hex");
   log("info", "ipfs_upload_audit", {
     filename,
@@ -788,6 +822,9 @@ export async function pinFile(
     pinata!.upload.public.file(file).name(filename).keyvalues({
       app: "zkvote",
       type: "proposal-image",
+      scan_status: scan.status,
+      scan_engine: scan.scanner,
+      scan_at: new Date().toISOString(),
     }),
   );
 
@@ -943,10 +980,7 @@ export function verifyCidContent(cid: string, content: Buffer): boolean {
 
     const digest = crypto.createHash("sha256").update(content).digest();
     // Multihash: [0x12 = sha2-256][0x20 = 32 bytes length][32-byte digest]
-    const multihash = Buffer.concat([
-      Buffer.from([0x12, 0x20]),
-      digest,
-    ]);
+    const multihash = Buffer.concat([Buffer.from([0x12, 0x20]), digest]);
 
     // Encode multihash as base58btc
     let num = BigInt("0x" + multihash.toString("hex"));

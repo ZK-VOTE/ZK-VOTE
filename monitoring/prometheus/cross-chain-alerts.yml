@@ -1,0 +1,104 @@
+# Cross-chain Mirror Alerts for EPIC-002
+
+groups:
+  - name: cross_chain_mirror
+    interval: 60s
+    rules:
+      # Mirror Lag Warning
+      - alert: MirrorLagWarning
+        expr: bridge_mirror_lag_seconds > 1800
+        for: 2m
+        labels:
+          severity: warning
+          component: bridge
+        annotations:
+          summary: "Mirror lag exceeds 30 minutes"
+          description: "Cross-chain state synchronization delayed: {{ $value }}s"
+
+      # Mirror Lag Critical
+      - alert: MirrorLagCritical
+        expr: bridge_mirror_lag_seconds > 3600
+        for: 2m
+        labels:
+          severity: critical
+          component: bridge
+        annotations:
+          summary: "Mirror lag exceeds 1 hour"
+          description: "Critical delay in cross-chain synchronization: {{ $value }}s"
+
+      # State Divergence Detected
+      - alert: StateDivergenceDetected
+        expr: bridge_state_diverged == 1
+        for: 5m
+        labels:
+          severity: critical
+          component: bridge
+        annotations:
+          summary: "Cross-chain state divergence detected"
+          description: "Soroban and EVM states have diverged"
+
+      # Merkle Root Mismatch
+      - alert: MerkleRootMismatch
+        expr: bridge_merkle_root_match == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: bridge
+        annotations:
+          summary: "Merkle root mismatch between chains"
+          description: "Membership trees out of sync"
+
+      # Mirror Operation Failure Rate
+      - alert: MirrorFailureRateHigh
+        expr: rate(bridge_mirror_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: bridge
+        annotations:
+          summary: "High mirror operation failure rate"
+          description: "{{ $value }} mirror operations failing per second"
+
+      # Proposal Count Divergence
+      - alert: ProposalCountDivergence
+        expr: abs(bridge_soroban_proposal_count - bridge_evm_proposal_count) > 2
+        for: 10m
+        labels:
+          severity: warning
+          component: bridge
+        annotations:
+          summary: "Proposal counts diverged between chains"
+          description: "Difference: {{ $value }} proposals"
+
+      # Bridge Cost Spike
+      - alert: BridgeCostSpike
+        expr: bridge_operation_cost_xlm > (bridge_operation_cost_baseline * 5)
+        for: 5m
+        labels:
+          severity: warning
+          component: bridge
+        annotations:
+          summary: "Bridge operation costs spiked"
+          description: "Current: {{ $value }}x baseline cost"
+
+      # Dual Verifier Failure
+      - alert: DualVerifierFailure
+        expr: bridge_dual_verification_failures_total > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: bridge
+        annotations:
+          summary: "Dual verifier acceptance failed"
+          description: "Tally proof rejected on one or both chains"
+
+      # Satellite Treasury Lock Timeout
+      - alert: SatelliteLockTimeout
+        expr: bridge_satellite_lock_timeout_total > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: bridge
+        annotations:
+          summary: "Satellite treasury lock timeout"
+          description: "Locks expiring without execution"

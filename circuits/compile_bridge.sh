@@ -66,6 +66,13 @@ ${SNARKJS} zkey export solidityverifier \
     ${BUILD_DIR}/${CIRCUIT_NAME}_final.zkey \
     ${BUILD_DIR}/Verifier.sol
 
+# Install into Hardhat contracts so production deploy can find it (#650)
+EVM_CONTRACTS_DIR="../contracts/bridge/evm/contracts"
+if [ -d "${EVM_CONTRACTS_DIR}" ]; then
+    cp "${BUILD_DIR}/Verifier.sol" "${EVM_CONTRACTS_DIR}/Verifier.sol"
+    echo "Installed Verifier.sol -> ${EVM_CONTRACTS_DIR}/Verifier.sol"
+fi
+
 # Generate proof instance for testing
 echo "=== Done ==="
 echo "Build artifacts in ${BUILD_DIR}/:"
@@ -73,4 +80,4 @@ echo "  ${CIRCUIT_NAME}.r1cs         - R1CS constraint system"
 echo "  ${CIRCUIT_NAME}_js/          - WASM witness generator"
 echo "  ${CIRCUIT_NAME}_final.zkey   - Proving key"
 echo "  verification_key.json        - Verification key"
-echo "  Verifier.sol                 - Solidity verifier contract"
+echo "  Verifier.sol                 - Solidity verifier contract (9 public signals)"

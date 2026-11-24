@@ -56,6 +56,8 @@ export declare const config: {
     readonly daoRegistryContractId: string | undefined;
     readonly membershipSbtContractId: string | undefined;
     readonly bridgeContractId: string | undefined;
+    readonly bridgeVkeyPath: string | undefined;
+    readonly ipHashSalt: string;
     readonly circuitRegistryContractId: string | undefined;
     readonly rewardsContractId: string | undefined;
     readonly treasuryContractId: string | undefined;

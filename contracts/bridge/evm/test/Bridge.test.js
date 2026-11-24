@@ -8,7 +8,8 @@ describe("Bridge", function () {
   const proposalId = 1n;
   const voteChoice = 1n;
   const nullifier = 999n;
-  const voteRoot = ethers.ZeroHash;
+  const memberAddr = 0xabcdefn;
+  const voteRoot = ethers.keccak256(ethers.toUtf8Bytes("test-vote-root"));
   const sbtRoot = ethers.keccak256(ethers.toUtf8Bytes("test-sbt-root"));
 
   beforeEach(async function () {
@@ -17,6 +18,8 @@ describe("Bridge", function () {
     const MockVerifier = await ethers.getContractFactory("MockVerifier");
     verifier = await MockVerifier.deploy();
     await verifier.waitForDeployment();
+    // Tests must explicitly enable the mock (#650)
+    await verifier.setShouldVerify(true);
 
     const Bridge = await ethers.getContractFactory("Bridge");
     bridge = await Bridge.deploy(
@@ -25,9 +28,25 @@ describe("Bridge", function () {
     );
     await bridge.waitForDeployment();
 
-    // Post SBT root for daoId=1
     await bridge.updateSbtRoot(daoId, sbtRoot);
+    await bridge.updateVoteRoot(daoId, proposalId, voteRoot);
   });
+
+  async function cast(
+    overrides = {}
+  ) {
+    const mockProof = ethers.hexlify(ethers.randomBytes(256));
+    return bridge.castVote(
+      overrides.daoId ?? daoId,
+      overrides.proposalId ?? proposalId,
+      overrides.voteChoice ?? voteChoice,
+      overrides.nullifier ?? nullifier,
+      overrides.voteRoot ?? voteRoot,
+      overrides.sbtRoot ?? sbtRoot,
+      overrides.memberAddr ?? memberAddr,
+      overrides.proof ?? mockProof
+    );
+  }
 
   describe("Deployment", function () {
     it("should set admin to deployer", async function () {
@@ -45,6 +64,10 @@ describe("Bridge", function () {
     it("should set chain ID", async function () {
       expect(await bridge.chainId()).to.equal(31337n);
     });
+
+    it("should set rootUpdater to deployer", async function () {
+      expect(await bridge.rootUpdater()).to.equal(owner.address);
+    });
   });
 
   describe("Admin functions", function () {
@@ -54,214 +77,173 @@ describe("Bridge", function () {
       expect(await bridge.sbtRoots(daoId)).to.equal(newRoot);
     });
 
+    it("should enforce a configurable finality depth", async function () {
+      await bridge.setFinalityDepth(25n);
+      expect(await bridge.finalityDepth()).to.equal(25n);
+    });
+
     it("should revert if non-admin updates SBT root", async function () {
       await expect(
         bridge.connect(user).updateSbtRoot(daoId, sbtRoot)
-      ).to.be.revertedWithCustomError(bridge, "OnlyAdmin");
+      ).to.be.revertedWithCustomError(bridge, "OnlyRootUpdater");
     });
 
-    it("should update verifier", async function () {
-      const newVerifier = user.address;
-      await bridge.setVerifier(newVerifier);
-      expect(await bridge.verifier()).to.equal(newVerifier);
+    it("should update vote root", async function () {
+      const newRoot = ethers.keccak256(ethers.toUtf8Bytes("new-vote-root"));
+      await bridge.updateVoteRoot(daoId, proposalId, newRoot);
+      expect(await bridge.voteRoots(daoId, proposalId)).to.equal(newRoot);
     });
 
-    it("should revert if non-admin updates verifier", async function () {
+    it("should propose and execute verifier after timelock", async function () {
+      await bridge.proposeVerifier(user.address);
+      expect(await bridge.pendingVerifier()).to.equal(user.address);
+      // Immediate execute should fail
+      await expect(bridge.executeVerifier()).to.be.revertedWithCustomError(
+        bridge,
+        "TimelockNotElapsed"
+      );
+      await ethers.provider.send("evm_increaseTime", [2 * 24 * 60 * 60 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await bridge.executeVerifier();
+      expect(await bridge.verifier()).to.equal(user.address);
+    });
+
+    it("should reject immediate setVerifier", async function () {
       await expect(
-        bridge.connect(user).setVerifier(user.address)
-      ).to.be.revertedWithCustomError(bridge, "OnlyAdmin");
+        bridge.setVerifier(user.address)
+      ).to.be.revertedWithCustomError(bridge, "TimelockNotElapsed");
     });
 
-    it("should revert if setting zero address verifier", async function () {
-      await expect(
-        bridge.setVerifier(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(bridge, "InvalidAddress");
-    });
-
-    it("should transfer admin", async function () {
-      await bridge.setAdmin(user.address);
+    it("should two-step transfer admin", async function () {
+      await bridge.transferAdmin(user.address);
+      expect(await bridge.pendingAdmin()).to.equal(user.address);
+      expect(await bridge.admin()).to.equal(owner.address);
+      await bridge.connect(user).acceptAdmin();
       expect(await bridge.admin()).to.equal(user.address);
+    });
+
+    it("should reject immediate setAdmin", async function () {
+      await expect(
+        bridge.setAdmin(user.address)
+      ).to.be.revertedWithCustomError(bridge, "OnlyPendingAdmin");
     });
   });
 
   describe("castVote", function () {
-    it("should emit VoteForwarded on valid proof", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      await expect(
-        bridge.castVote(
+    it("should emit VoteForwarded on valid proof with memberAddr", async function () {
+      await expect(cast())
+        .to.emit(bridge, "VoteForwarded")
+        .withArgs(
           daoId,
           proposalId,
-          voteChoice,
           nullifier,
+          voteChoice,
           voteRoot,
-          sbtRoot,
-          mockProof
-        )
-      )
-        .to.emit(bridge, "VoteForwarded")
-        .withArgs(daoId, proposalId, nullifier, voteChoice, voteRoot);
+          memberAddr,
+          31337n
+        );
+    });
+
+    it("should reject zero memberAddr", async function () {
+      await expect(cast({ memberAddr: 0n })).to.be.revertedWithCustomError(
+        bridge,
+        "ZeroMemberAddr"
+      );
+    });
+
+    it("should reject unanchored voteRoot", async function () {
+      const arbitrary = ethers.keccak256(ethers.toUtf8Bytes("attacker-tree"));
+      await expect(cast({ voteRoot: arbitrary })).to.be.revertedWithCustomError(
+        bridge,
+        "VoteRootMismatch"
+      );
+    });
+
+    it("should reject when vote root not set", async function () {
+      await expect(
+        cast({ proposalId: 99n })
+      ).to.be.revertedWithCustomError(bridge, "VoteRootNotSet");
     });
 
     it("should mark nullifier as used", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      await bridge.castVote(
-        daoId,
-        proposalId,
-        voteChoice,
-        nullifier,
-        voteRoot,
-        sbtRoot,
-        mockProof
-      );
+      await cast();
       expect(
         await bridge.isNullifierUsed(daoId, proposalId, nullifier)
       ).to.be.true;
     });
 
     it("should revert on double-voting (same nullifier)", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      await bridge.castVote(
-        daoId,
-        proposalId,
-        voteChoice,
-        nullifier,
-        voteRoot,
-        sbtRoot,
-        mockProof
-      );
-      await expect(
-        bridge.castVote(
-          daoId,
-          proposalId,
-          voteChoice,
-          nullifier,
-          voteRoot,
-          sbtRoot,
-          mockProof
-        )
-      ).to.be.revertedWithCustomError(bridge, "NullifierUsed");
+      await cast();
+      await expect(cast()).to.be.revertedWithCustomError(bridge, "NullifierUsed");
     });
 
     it("should revert on zero nullifier", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      await expect(
-        bridge.castVote(
-          daoId,
-          proposalId,
-          voteChoice,
-          0n,
-          voteRoot,
-          sbtRoot,
-          mockProof
-        )
-      ).to.be.revertedWithCustomError(bridge, "ZeroNullifier");
+      await expect(cast({ nullifier: 0n })).to.be.revertedWithCustomError(
+        bridge,
+        "ZeroNullifier"
+      );
     });
 
     it("should revert on invalid vote choice", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      await expect(
-        bridge.castVote(
-          daoId,
-          proposalId,
-          2n,
-          nullifier,
-          voteRoot,
-          sbtRoot,
-          mockProof
-        )
-      ).to.be.revertedWithCustomError(bridge, "InvalidVoteChoice");
+      await expect(cast({ voteChoice: 2n })).to.be.revertedWithCustomError(
+        bridge,
+        "InvalidVoteChoice"
+      );
     });
 
     it("should revert when SBT root not set", async function () {
+      await expect(cast({ daoId: 999n })).to.be.revertedWithCustomError(
+        bridge,
+        "SbtRootNotSet"
+      );
+    });
+
+    it("should revert when provided sbtRoot is not finalized", async function () {
       const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      const newDaoId = 999n;
+      const newRoot = ethers.keccak256(ethers.toUtf8Bytes("fresh-root"));
+      await bridge.setFinalityDepth(12n);
+      await bridge.updateSbtRoot(daoId, newRoot);
+
       await expect(
         bridge.castVote(
-          newDaoId,
+          daoId,
           proposalId,
           voteChoice,
-          nullifier,
+          nullifier + 10n,
           voteRoot,
-          sbtRoot,
+          newRoot,
+          memberAddr,
           mockProof
         )
-      ).to.be.revertedWithCustomError(bridge, "SbtRootNotSet");
+      ).to.be.revertedWithCustomError(bridge, "SbtRootNotFinalized");
     });
 
     it("should revert when provided sbtRoot mismatches", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
       const wrongRoot = ethers.keccak256(ethers.toUtf8Bytes("wrong"));
-      await expect(
-        bridge.castVote(
-          daoId,
-          proposalId,
-          voteChoice,
-          nullifier,
-          voteRoot,
-          wrongRoot,
-          mockProof
-        )
-      ).to.be.revertedWithCustomError(bridge, "SbtRootNotSet");
+      await expect(cast({ sbtRoot: wrongRoot })).to.be.revertedWithCustomError(
+        bridge,
+        "SbtRootNotSet"
+      );
     });
 
     it("should revert on invalid proof (mock verifier rejects)", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
       await verifier.setShouldVerify(false);
-      await expect(
-        bridge.castVote(
-          daoId,
-          proposalId,
-          voteChoice,
-          nullifier,
-          voteRoot,
-          sbtRoot,
-          mockProof
-        )
-      ).to.be.revertedWithCustomError(bridge, "InvalidProof");
+      await expect(cast()).to.be.revertedWithCustomError(bridge, "InvalidProof");
     });
 
     it("should allow different nullifiers for same DAO+proposal", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      await bridge.castVote(
-        daoId,
-        proposalId,
-        voteChoice,
-        100n,
-        voteRoot,
-        sbtRoot,
-        mockProof
-      );
-      await bridge.castVote(
-        daoId,
-        proposalId,
-        voteChoice,
-        200n,
-        voteRoot,
-        sbtRoot,
-        mockProof
-      );
-      expect(await bridge.isNullifierUsed(daoId, proposalId, 100n)).to.be
-        .true;
-      expect(await bridge.isNullifierUsed(daoId, proposalId, 200n)).to.be
-        .true;
+      await cast({ nullifier: 100n });
+      await cast({ nullifier: 200n });
+      expect(await bridge.isNullifierUsed(daoId, proposalId, 100n)).to.be.true;
+      expect(await bridge.isNullifierUsed(daoId, proposalId, 200n)).to.be.true;
     });
   });
 
   describe("Gas benchmarks", function () {
-    it("castVote should use less than 500k gas", async function () {
-      const mockProof = ethers.hexlify(ethers.randomBytes(256));
-      const tx = await bridge.castVote(
-        daoId,
-        proposalId,
-        voteChoice,
-        nullifier,
-        voteRoot,
-        sbtRoot,
-        mockProof
-      );
+    it("should cast vote under 500k gas", async function () {
+      const tx = await cast();
       const receipt = await tx.wait();
-      console.log("Gas used:", receipt.gasUsed.toString());
-      expect(receipt.gasUsed).to.be.lessThan(500000n);
+      expect(receipt.gasUsed).to.be.lt(500000n);
     });
   });
 });

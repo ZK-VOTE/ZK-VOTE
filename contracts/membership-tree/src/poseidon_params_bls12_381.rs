@@ -1,11 +1,18 @@
-// BLS12-381 Poseidon parameters (t=3, d=5, ROUNDS_F=8, ROUNDS_P=57)
+// BLS12-381 Poseidon parameters (t=3, d=5, ROUNDS_F=8, ROUNDS_P=56)
 // Generated from soroban-env-host-25.0.1 test vectors (poseidon_instance_bls12.rs)
+//
+// SECURITY: ROUNDS_P must be 56, not 57. The host validates
+// `round_constants.len() == rounds_f + rounds_p` (soroban-env-host
+// src/crypto/poseidon/poseidon_params.rs) and `get_rc3` below carries exactly
+// 64 rows, i.e. ROUNDS_F + ROUNDS_P = 8 + 56. This matches the host's own
+// t=3 instance: `PoseidonParams::new_unchecked(3, 5, 8, 56, MDS3, RC3)`.
+// (t=8 is the shape that uses 57; t=2/3/4 use 56.)
 use soroban_sdk::{bytesn, vec, Env, Vec, U256};
 
 pub const T: u32 = 3;
 pub const SBOX_D: u32 = 5;
 pub const ROUNDS_F: u32 = 8;
-pub const ROUNDS_P: u32 = 57;
+pub const ROUNDS_P: u32 = 56;
 
 #[rustfmt::skip]
 pub fn get_mds3(e: &Env) -> Vec<Vec<U256>> {

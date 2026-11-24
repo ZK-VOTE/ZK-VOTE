@@ -55,8 +55,8 @@ function buildMerkleTree(leaves) {
   const treeSize = Math.pow(2, depth);
   const paddedLeaves = [...leaves];
 
-  // Compute zero values for empty leaves
-  let zeroValue = BigInt(0);
+  // Compute zero values for empty leaves with domain separation
+  let zeroValue = poseidonHash([DOMAIN_TAG, BigInt(0), BigInt(0), BigInt(0)]);
   const zeros = [zeroValue];
   for (let i = 1; i <= depth; i++) {
     zeroValue = poseidonHash([zeroValue, zeroValue]);
@@ -103,8 +103,21 @@ function getMerkleProof(tree, leafIndex) {
   return { pathElements, pathIndices };
 }
 
-// Generate complete vote input
+// Generate complete vote input with input validation
 function generateVoteInput(memberSecrets, voterIndex, daoId, proposalId, voteChoice) {
+  if (!Array.isArray(memberSecrets) || memberSecrets.length === 0) {
+    throw new Error("memberSecrets must be a non-empty array");
+  }
+  if (voterIndex < 0 || voterIndex >= memberSecrets.length) {
+    throw new Error(`voterIndex ${voterIndex} out of bounds (0..${memberSecrets.length - 1})`);
+  }
+  if (daoId === undefined || daoId === null) {
+    throw new Error("daoId is required");
+  }
+  if (proposalId === undefined || proposalId === null) {
+    throw new Error("proposalId is required");
+  }
+
   // Get voter's identity
   const voter = memberSecrets[voterIndex];
 

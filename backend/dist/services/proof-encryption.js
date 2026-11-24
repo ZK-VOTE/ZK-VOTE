@@ -79,7 +79,10 @@ export function decryptProofPayload(encryptedPayload) {
  */
 export function createSubmissionReceipt(txHash, nullifier, daoId, proposalId, commitmentHash, serverTimestamp = new Date().toISOString()) {
     const receiptId = crypto.randomUUID();
-    const secret = config.relayerSecretKey || "fallback-secret";
+    const secret = config.relayerSecretKey;
+    if (!secret) {
+        throw new Error("RELAYER_SECRET_KEY must be configured for receipt signing");
+    }
     const payloadToSign = `${receiptId}:${txHash}:${nullifier}:${daoId}:${proposalId}:${commitmentHash}:${serverTimestamp}`;
     const signature = crypto
         .createHmac("sha256", secret)
@@ -100,12 +103,20 @@ export function createSubmissionReceipt(txHash, nullifier, daoId, proposalId, co
  * Verifies a submission receipt signature.
  */
 export function verifySubmissionReceipt(receipt) {
-    const secret = config.relayerSecretKey || "fallback-secret";
+    const secret = config.relayerSecretKey;
+    if (!secret) {
+        throw new Error("RELAYER_SECRET_KEY must be configured for receipt signing");
+    }
     const payloadToSign = `${receipt.receiptId}:${receipt.txHash}:${receipt.nullifier}:${receipt.daoId}:${receipt.proposalId}:${receipt.commitmentHash}:${receipt.serverTimestamp}`;
     const expectedSignature = crypto
         .createHmac("sha256", secret)
         .update(payloadToSign)
         .digest("hex");
-    return crypto.timingSafeEqual(Buffer.from(receipt.signature, "hex"), Buffer.from(expectedSignature, "hex"));
+    const sigBuf = Buffer.from(receipt.signature || "", "hex");
+    const expectedBuf = Buffer.from(expectedSignature, "hex");
+    if (sigBuf.length !== expectedBuf.length) {
+        return false;
+    }
+    return crypto.timingSafeEqual(sigBuf, expectedBuf);
 }
 //# sourceMappingURL=proof-encryption.js.map

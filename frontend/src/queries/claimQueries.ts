@@ -32,30 +32,44 @@ async function fetchClaimStatus(
     proposalId.toString(),
   );
 
-  // Check is_claimed via relayer (anonymous, no wallet needed)
+  // Check authoritative status via relayer (ZV-124: no longer hard-codes isVoted)
   try {
     const toHex = (v: string) => BigInt(v).toString(16).padStart(64, "0");
     const res = await relayerFetch(
-      `/api/v1/claim/status/${daoId}/${proposalId}/${toHex(claimNullifier)}`,
+      `/api/v1/claim/status/${daoId}/${proposalId}/${toHex(claimNullifier)}/${toHex(voteNullifier)}`,
       {
         maxRetries: 1,
       },
     );
     if (!res.ok) {
+      // Fallback to legacy endpoint if new endpoint not available yet
+      const legacyRes = await relayerFetch(
+        `/api/v1/claim/status/${daoId}/${proposalId}/${toHex(claimNullifier)}`,
+        {
+          maxRetries: 1,
+        },
+      );
+      if (!legacyRes.ok) {
+        return {
+          isClaimed: false,
+          isVoted: false,
+          claimNullifier,
+          voteNullifier,
+        };
+      }
+      const legacyData = await legacyRes.json();
       return {
-        isClaimed: false,
-        isVoted: false,
+        isClaimed: Boolean(legacyData.isClaimed),
+        isVoted: false, // Legacy endpoint doesn't provide this
         claimNullifier,
         voteNullifier,
       };
     }
     const data = await res.json();
-    // Also check isVoted via separate query? For now derive from voteNullifier check via voting contract?
-    // We assume isVoted = true if claim status succeeded? Better to separate.
-    // We'll set isVoted false initially; caller can fetch proposal's hasVoted
+    // Now we get authoritative isVoted from on-chain voting contract
     return {
       isClaimed: Boolean(data.isClaimed),
-      isVoted: false,
+      isVoted: Boolean(data.isVoted),
       claimNullifier,
       voteNullifier,
     };

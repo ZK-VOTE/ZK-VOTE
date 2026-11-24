@@ -97,8 +97,12 @@ export const configSchema = z
     VOTING_VK_VERSION: envInt(0)
         .describe("Static verification key version override (0 = auto-detect)"),
     // ── CORS ────────────────────────────────────────────────────
+    CORS_ORIGINS: z
+        .string()
+        .optional()
+        .describe("Comma-separated allowed origins for CORS (production: required exact URLs, no wildcards)"),
     CORS_ORIGIN: optionalString
-        .describe("Comma-separated allowed origins for CORS. Default: * (all origins)"),
+        .describe("Comma-separated allowed origins for CORS. Default: * (all origins) - DEPRECATED: Use CORS_ORIGINS"),
     // ── Logging ─────────────────────────────────────────────────
     LOG_CLIENT_IP: z
         .enum(["plain", "hash"])
@@ -294,9 +298,11 @@ export function validateConfig(env = process.env) {
         // VK Version
         staticVkVersion: raw.VOTING_VK_VERSION || undefined,
         // CORS
-        corsOrigins: raw.CORS_ORIGIN
-            ? raw.CORS_ORIGIN.split(",").map((o) => o.trim())
-            : "*",
+        corsOrigins: raw.CORS_ORIGINS
+            ? raw.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+            : raw.CORS_ORIGIN
+                ? raw.CORS_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
+                : "*",
         // Logging
         logClientIp: raw.LOG_CLIENT_IP,
         logRequestBody: raw.LOG_REQUEST_BODY,

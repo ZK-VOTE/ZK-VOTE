@@ -23,15 +23,14 @@ function b64urlDecode(input) {
     const pad = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
     return Buffer.from(normalized + pad, "base64");
 }
-export function createSignedSessionToken(clientId, privateKeyPem, options = {}) {
-    if (!clientId || !privateKeyPem) {
-        throw new Error("clientId and signing private key are required");
+export function createSignedSessionToken(clientId, _privateKeyPem, options = {}) {
+    if (!clientId) {
+        throw new Error("clientId is required");
     }
-    const publicKey = crypto.createPublicKey(privateKeyPem);
-    const publicKeyPem = crypto
-        .createPublicKey(publicKey)
-        .export({ type: "spki", format: "pem" })
-        .toString();
+    const serverSecret = config.relayerSecretKey;
+    if (!serverSecret) {
+        throw new Error("RELAYER_SECRET_KEY must be configured to issue session tokens");
+    }
     const issuedAt = Date.now();
     const expiresAt = issuedAt + (options.ttlMs ?? 5 * 60_000);
     const payload = {
@@ -42,11 +41,15 @@ export function createSignedSessionToken(clientId, privateKeyPem, options = {}) 
         issuedAt,
         expiresAt,
         capabilities: options.capabilities ?? ["relay:write"],
-        publicKeyPem,
+        publicKeyPem: "", // No longer used for verification; kept for schema compat
     };
     const payloadJson = JSON.stringify(payload);
     const payloadEncoded = b64urlEncode(payloadJson);
-    const signature = crypto.sign(null, Buffer.from(payloadJson), privateKeyPem);
+    // HMAC with server secret — only the server can create valid tokens
+    const signature = crypto
+        .createHmac("sha256", serverSecret)
+        .update(payloadJson)
+        .digest();
     const signatureEncoded = b64urlEncode(signature);
     return `${SESSION_TOKEN_PREFIX}.${payloadEncoded}.${signatureEncoded}`;
 }
@@ -102,8 +105,35 @@ export function verifySignedSessionToken(sessionToken, expectedDaoId) {
                 tokenId: payload.jti,
             };
         }
-        const publicKey = crypto.createPublicKey(payload.publicKeyPem);
-        const ok = crypto.verify(null, Buffer.from(payloadJson), publicKey, signature);
+        // SECURITY: Do NOT use the public key embedded in the token payload
+        // for verification — an attacker can generate their own keypair,
+        // self-sign a forged token, and embed the matching public key.
+        // Instead, verify an HMAC over the payload using the server-side
+        // relay secret key so only the server can issue valid session tokens.
+        const serverSecret = config.relayerSecretKey;
+        if (!serverSecret) {
+            return {
+                valid: false,
+                reason: "session_signing_key_not_configured",
+                clientId: payload.clientId,
+                daoId: payload.daoId,
+                tokenId: payload.jti,
+            };
+        }
+        const expectedMac = crypto
+            .createHmac("sha256", serverSecret)
+            .update(payloadJson)
+            .digest();
+        if (signature.length !== expectedMac.length) {
+            return {
+                valid: false,
+                reason: "invalid_session_signature",
+                clientId: payload.clientId,
+                daoId: payload.daoId,
+                tokenId: payload.jti,
+            };
+        }
+        const ok = crypto.timingSafeEqual(signature, expectedMac);
         if (!ok) {
             return {
                 valid: false,

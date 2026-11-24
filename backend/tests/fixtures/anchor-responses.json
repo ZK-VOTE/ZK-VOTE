@@ -1,0 +1,71 @@
+[
+  {
+    "name": "sep6-deposit-complete",
+    "response": {
+      "status": "completed",
+      "message": "Transfer complete"
+    },
+    "accepted": true
+  },
+  {
+    "name": "sep6-interactive-pending",
+    "response": {
+      "transaction_status": "pending_user_transfer_start",
+      "type": "interactive_customer_info_needed",
+      "url": "https://anchor.circle.com/sep24/continue"
+    },
+    "accepted": true
+  },
+  {
+    "name": "sep24-error",
+    "response": {
+      "status": "error",
+      "error": "KYC verification required"
+    },
+    "accepted": true
+  },
+  {
+    "name": "pii-name",
+    "response": {
+      "status": "completed",
+      "customer_name": "REDACTED"
+    },
+    "accepted": false
+  },
+  {
+    "name": "pii-document",
+    "response": {
+      "status": "pending_anchor",
+      "document_number": "REDACTED"
+    },
+    "accepted": false
+  },
+  {
+    "name": "pii-nested",
+    "response": {
+      "status": "completed",
+      "customer": {
+        "name": "REDACTED"
+      }
+    },
+    "accepted": false
+  },
+  {
+    "name": "anchor-tracking-id",
+    "response": {
+      "status": "pending_anchor",
+      "anchor_transaction_id": "REDACTED"
+    },
+    "accepted": false
+  },
+  {
+    "name": "provider-metadata",
+    "response": {
+      "status": "completed",
+      "provider_metadata": {
+        "caseId": "REDACTED"
+      }
+    },
+    "accepted": false
+  }
+]

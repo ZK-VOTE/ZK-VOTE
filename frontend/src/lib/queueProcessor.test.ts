@@ -48,6 +48,11 @@ vi.mock("./api", () => ({
   ),
 }));
 
+const mockRootOk = vi.fn();
+vi.mock("./client", () => ({
+  getZkVoteClient: () => ({ membershipTree: { root_ok: mockRootOk } }),
+}));
+
 // Functional localStorage mock
 const localStorageStore: Record<string, string> = {};
 Object.defineProperty(window, "localStorage", {
@@ -113,6 +118,7 @@ beforeEach(() => {
   Object.keys(localStorageStore).forEach((k) => delete localStorageStore[k]);
   submissionQueue.clearAll();
   vi.clearAllMocks();
+  mockRootOk.mockResolvedValue({ result: true });
   stopProcessor();
 });
 
@@ -353,6 +359,45 @@ describe("processEntry – concurrent processing prevention", () => {
 // ──────────────────────────────────────────────────────────────
 // processQueue batch
 // ──────────────────────────────────────────────────────────────
+
+describe("processEntry – root freshness on retry", () => {
+  async function failOnce(nullifier: string) {
+    submissionQueue.enqueue({ ...makePayload(nullifier), root: "ab" });
+    mockRelayerFetch.mockResolvedValueOnce(makeErrorResponse(500, "INTERNAL", "boom"));
+    await processEntry(submissionQueue.getState().entries[nullifier]);
+    submissionQueue.getState().entries[nullifier].retryAfter = null;
+  }
+
+  it("does not check the root on the first attempt", async () => {
+    submissionQueue.enqueue(makePayload("first_try"));
+    mockRelayerFetch.mockResolvedValueOnce(makeOkResponse());
+
+    await processEntry(submissionQueue.getState().entries["first_try"]);
+
+    expect(mockRootOk).not.toHaveBeenCalled();
+  });
+
+  it("fails a retry whose root was evicted without resubmitting", async () => {
+    await failOnce("stale_root");
+    mockRootOk.mockResolvedValueOnce({ result: false });
+
+    await processEntry(submissionQueue.getState().entries["stale_root"]);
+
+    expect(mockRootOk).toHaveBeenCalledWith({ dao_id: 1n, root: 0xabn });
+    expect(mockRelayerFetch).toHaveBeenCalledTimes(1);
+    expect(submissionQueue.getState().entries["stale_root"].status).toBe("failed");
+  });
+
+  it("resubmits a retry whose root is still valid", async () => {
+    await failOnce("fresh_root");
+    mockRelayerFetch.mockResolvedValueOnce(makeOkResponse());
+
+    await processEntry(submissionQueue.getState().entries["fresh_root"]);
+
+    expect(mockRelayerFetch).toHaveBeenCalledTimes(2);
+    expect(submissionQueue.getState().entries["fresh_root"].status).toBe("submitted");
+  });
+});
 
 describe("processQueue", () => {
   it("processes all pending entries", async () => {

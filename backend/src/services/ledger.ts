@@ -1,592 +1,628 @@
 /**
- * Double-entry settlement ledger (refactor: registry / settlement / voting composition).
- *
- * Design invariants (enforced here, not merely documented):
- *   - Every posting group balances: sum(DEBIT) === sum(CREDIT), per asset.
- *   - Every entry carries a non-empty, deterministic `balanceProofHash`:
- *       SHA-256(JSON.stringify([postingGroupId, account, asset, amount, direction, sequence]))
- *     so a tampered amount/account/direction/sequence invalidates the hash.
- *   - All money is integer *minor units* (no floating-point arithmetic).
- *
- * Storage is injected (`LedgerStore`): an in-memory implementation is provided
- * for unit tests and a SQLite implementation for production. The module-level
- * helpers are a thin convenience layer over an injected default store; they
- * never open a database or start a timer on import.
+ * Double-Entry Ledger Service (Issue #796, #961)
+ * Implements financial accounting for all money movements with:
+ * - Balance reconciliation against chain state
+ * - Historical transaction backfill
+ * - Auditor export (redacted, read-only)
+ * - Tax classification with versioned rules
+ * - Invariant monitoring and alerts
  */
 
-import crypto from "node:crypto";
-import type { LoggerPort } from "./interfaces.js";
-import { log as moduleLog } from "./logger.js";
+import type { Kysely } from "kysely";
+import type { DB } from "../generated/db-types.js";
+import { log } from "./logger.js";
+import crypto from "crypto";
 
-export type LedgerDirection = "DEBIT" | "CREDIT";
-
-/** One side of a double-entry posting. Amounts are integer minor units. */
-export interface LedgerLeg {
-  account: string;
-  asset: string;
-  amountMinor: number;
-  direction: LedgerDirection;
+export interface JournalEntry {
+  description: string;
+  referenceType: "payment" | "swap" | "anchor_deposit" | "anchor_withdraw" | "reward" | "fee";
+  referenceId: string;
+  lines: JournalLine[];
 }
 
-/** A persisted, hashed entry inside a posting group. */
-export interface LedgerPosting extends LedgerLeg {
-  postingId: string;
-  postingGroupId: string;
-  sequence: number;
-  balanceProofHash: string;
-  createdAt: string;
+export interface JournalLine {
+  accountCode: string;
+  debitStroops?: bigint;
+  creditStroops?: bigint;
+  assetCode?: string;
+  assetIssuer?: string;
+  memo?: string;
 }
 
-/** A balanced set of entries sharing one `postingGroupId`. */
-export interface PostingGroup {
-  postingGroupId: string;
-  asset: string;
-  postings: LedgerPosting[];
-  createdAt: string;
-}
+export class LedgerService {
+  constructor(private db: Kysely<DB>) {}
 
-export interface ValidationResult {
-  ok: boolean;
-  errors: string[];
-}
+  /**
+   * Post a balanced journal entry
+   * Throws if debits != credits
+   */
+  async postEntry(entry: JournalEntry): Promise<bigint> {
+    // Validate balance
+    let totalDebits = 0n;
+    let totalCredits = 0n;
 
-// ===========================================================================
-// Canonical serialization + hashing (pure)
-// ===========================================================================
-
-/** Canonical, delimiter-injection-safe serialization of a posting's identity. */
-export function canonicalPosting(
-  p: Pick<
-    LedgerPosting,
-    "postingGroupId" | "account" | "asset" | "amountMinor" | "direction" | "sequence"
-  >,
-): string {
-  return JSON.stringify([
-    p.postingGroupId,
-    p.account,
-    p.asset,
-    p.amountMinor,
-    p.direction,
-    p.sequence,
-  ]);
-}
-
-/** Deterministic SHA-256 balance proof over the canonical posting. */
-export function computeBalanceProofHash(
-  p: Parameters<typeof canonicalPosting>[0],
-): string {
-  return crypto.createHash("sha256").update(canonicalPosting(p)).digest("hex");
-}
-
-/** Deterministic id for an entry; derived from the same canonical tuple. */
-export function computePostingId(p: Parameters<typeof canonicalPosting>[0]): string {
-  return crypto
-    .createHash("sha256")
-    .update(`${canonicalPosting(p)}#posting-id`)
-    .digest("hex");
-}
-
-/** Assert an integer minor-unit amount (no floats, no NaN, no negatives). */
-export function assertMinorAmount(value: number, label: string): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`${label} must be a non-negative safe integer (minor units)`);
-  }
-}
-
-// Deterministic ordering: DEBIT before CREDIT, then account, amount, asset.
-// Sequence assignment must not depend on caller-supplied leg order.
-const DIRECTION_ORDER: Record<LedgerDirection, number> = { DEBIT: 0, CREDIT: 1 };
-
-function compareLegs(a: LedgerLeg, b: LedgerLeg): number {
-  const d = DIRECTION_ORDER[a.direction] - DIRECTION_ORDER[b.direction];
-  if (d !== 0) return d;
-  if (a.account !== b.account) return a.account < b.account ? -1 : 1;
-  if (a.amountMinor !== b.amountMinor) return a.amountMinor - b.amountMinor;
-  if (a.asset !== b.asset) return a.asset < b.asset ? -1 : 1;
-  return 0;
-}
-
-// ===========================================================================
-// Build + validate (pure)
-// ===========================================================================
-
-export interface BuildPostingGroupInput {
-  postingGroupId?: string;
-  legs: readonly LedgerLeg[];
-  /** If supplied, every leg must use this asset. */
-  asset?: string;
-  createdAt?: string;
-}
-
-/**
- * Build a balanced, hashed posting group. Throws on imbalance, zero amounts,
- * mixed assets, non-integer amounts or empty accounts.
- */
-export function buildBalancedPostingGroup(
-  input: BuildPostingGroupInput,
-): PostingGroup {
-  const legs = input.legs;
-  if (!Array.isArray(legs) || legs.length < 2) {
-    throw new Error("posting group needs at least two entries (a pair)");
-  }
-  const postingGroupId = input.postingGroupId ?? crypto.randomUUID();
-  if (typeof postingGroupId !== "string" || postingGroupId.length === 0) {
-    throw new Error("postingGroupId must be a non-empty string");
-  }
-
-  const assets = new Set<string>();
-  for (const leg of legs) {
-    if (!leg || typeof leg.account !== "string" || leg.account.length === 0) {
-      throw new Error("every posting entry needs a non-empty account");
+    for (const line of entry.lines) {
+      totalDebits += line.debitStroops || 0n;
+      totalCredits += line.creditStroops || 0n;
     }
-    if (typeof leg.asset !== "string" || leg.asset.length === 0) {
-      throw new Error("every posting entry needs a non-empty asset");
-    }
-    if (!Number.isSafeInteger(leg.amountMinor) || leg.amountMinor <= 0) {
-      throw new Error("posting amounts must be positive safe integers (minor units)");
-    }
-    if (leg.direction !== "DEBIT" && leg.direction !== "CREDIT") {
-      throw new Error(`invalid posting direction: ${String(leg.direction)}`);
-    }
-    assets.add(leg.asset);
-  }
-  if (assets.size !== 1) {
-    throw new Error("a posting group must contain exactly one asset");
-  }
-  const asset = [...assets][0] as string;
-  if (input.asset !== undefined && input.asset !== asset) {
-    throw new Error(`posting group asset mismatch: expected ${input.asset}, got ${asset}`);
-  }
 
-  // Stable ordering makes sequence numbers (and therefore hashes) deterministic.
-  const ordered = [...legs].sort(compareLegs);
-  const createdAt = input.createdAt ?? new Date().toISOString();
-  const postings: LedgerPosting[] = ordered.map((leg, sequence) => {
-    const identity = {
-      postingGroupId,
-      account: leg.account,
-      asset: leg.asset,
-      amountMinor: leg.amountMinor,
-      direction: leg.direction,
-      sequence,
-    };
-    const balanceProofHash = computeBalanceProofHash(identity);
-    if (balanceProofHash.length === 0) {
-      // Defensive: a hash function failure must never produce an unproven entry.
-      throw new Error("empty balance proof hash");
-    }
-    return {
-      ...identity,
-      postingId: computePostingId(identity),
-      balanceProofHash,
-      createdAt,
-    };
-  });
-
-  const group: PostingGroup = { postingGroupId, asset, postings, createdAt };
-  const validation = validatePostingGroup(group);
-  if (!validation.ok) {
-    throw new Error(`unbalanced posting group ${postingGroupId}: ${validation.errors.join("; ")}`);
-  }
-  return group;
-}
-
-/** Verify one posting group: hashes, sequences and per-asset balance. */
-export function validatePostingGroup(group: PostingGroup): ValidationResult {
-  const errors: string[] = [];
-  if (!group || typeof group.postingGroupId !== "string" || group.postingGroupId.length === 0) {
-    return { ok: false, errors: ["missing postingGroupId"] };
-  }
-  if (!Array.isArray(group.postings) || group.postings.length < 2) {
-    return { ok: false, errors: ["posting group has fewer than two entries"] };
-  }
-
-  const sequences = new Set<number>();
-  const balances = new Map<string, { debit: number; credit: number }>();
-  for (const posting of group.postings) {
-    if (!Number.isSafeInteger(posting.amountMinor) || posting.amountMinor <= 0) {
-      errors.push(`entry ${posting.postingId || "?"} has invalid amount`);
-    }
-    if (!posting.balanceProofHash || posting.balanceProofHash.length === 0) {
-      errors.push(`entry ${posting.postingId || "?"} has an empty proof hash`);
-    } else {
-      const expected = computeBalanceProofHash(posting);
-      if (posting.balanceProofHash !== expected) {
-        errors.push(`entry ${posting.postingId || "?"} proof hash mismatch`);
-      }
-    }
-    if (posting.postingGroupId !== group.postingGroupId) {
-      errors.push(`entry ${posting.postingId || "?"} belongs to another group`);
-    }
-    if (posting.postingId && posting.postingId !== computePostingId(posting)) {
-      errors.push(`entry ${posting.postingId} id mismatch`);
-    }
-    if (!Number.isSafeInteger(posting.sequence) || posting.sequence < 0 || sequences.has(posting.sequence)) {
-      errors.push(`invalid/duplicate sequence ${String(posting.sequence)}`);
-    }
-    sequences.add(posting.sequence);
-    const balance = balances.get(posting.asset) ?? { debit: 0, credit: 0 };
-    if (posting.direction === "DEBIT") balance.debit += posting.amountMinor;
-    else if (posting.direction === "CREDIT") balance.credit += posting.amountMinor;
-    else errors.push(`invalid direction ${String(posting.direction)}`);
-    balances.set(posting.asset, balance);
-  }
-  for (const [asset, balance] of balances) {
-    if (balance.debit !== balance.credit) {
-      errors.push(
-        `${asset} imbalance: debits ${balance.debit} != credits ${balance.credit}`,
+    if (totalDebits !== totalCredits) {
+      throw new Error(
+        `Unbalanced entry: debits=${totalDebits} credits=${totalCredits}`,
       );
     }
-  }
-  return { ok: errors.length === 0, errors };
-}
 
-/** Validate every posting group in a collection. */
-export function validatePostings(groups: Iterable<PostingGroup>): ValidationResult {
-  const errors: string[] = [];
-  for (const group of groups) {
-    const result = validatePostingGroup(group);
-    for (const error of result.errors) errors.push(`${group?.postingGroupId ?? "?"}: ${error}`);
-  }
-  return { ok: errors.length === 0, errors };
-}
+    // Begin transaction
+    return await this.db.transaction().execute(async (trx) => {
+      // Insert entry header
+      const entryResult = await trx
+        .insertInto("ledger_entries")
+        .values({
+          description: entry.description,
+          reference_type: entry.referenceType,
+          reference_id: entry.referenceId,
+        })
+        .returning("id")
+        .executeTakeFirstOrThrow();
 
-// ===========================================================================
-// Transfer helper (gross -> net + fees, always balanced)
-// ===========================================================================
+      const entryId = entryResult.id as bigint;
 
-export interface LedgerFeeLeg {
-  account: string;
-  amountMinor: number;
-}
+      // Resolve account IDs and insert lines
+      for (const line of entry.lines) {
+        const account = await trx
+          .selectFrom("ledger_accounts")
+          .select("id")
+          .where("code", "=", line.accountCode)
+          .executeTakeFirst();
 
-export interface PostTransferInput {
-  postingGroupId?: string;
-  sourceAccount: string;
-  destinationAccount: string;
-  asset: string;
-  /** Gross debited from the source account. */
-  amountMinor: number;
-  /** Fee credits carved out of the gross; the remainder is credited to destination. */
-  feeLegs?: readonly LedgerFeeLeg[];
-  createdAt?: string;
-}
+        if (!account) {
+          throw new Error(`Account not found: ${line.accountCode}`);
+        }
 
-/**
- * Build a balanced transfer group: DEBIT source(gross), CREDIT destination(net)
- * and CREDIT each fee account. Net + fees === gross by construction.
- */
-export function buildTransferGroup(input: PostTransferInput): PostingGroup {
-  assertMinorAmount(input.amountMinor, "amountMinor");
-  const fees = input.feeLegs ?? [];
-  let feeTotal = 0;
-  for (const fee of fees) {
-    assertMinorAmount(fee.amountMinor, "feeLegs[].amountMinor");
-    if (!fee.account || fee.account.length === 0) {
-      throw new Error("feeLegs[].account must be non-empty");
-    }
-    feeTotal += fee.amountMinor;
-    if (!Number.isSafeInteger(feeTotal)) throw new Error("fee total overflow");
-  }
-  const net = input.amountMinor - feeTotal;
-  if (net < 0) throw new Error("fee legs exceed gross amount");
+        await trx
+          .insertInto("ledger_lines")
+          .values({
+            entry_id: entryId,
+            account_id: account.id,
+            debit_stroops: line.debitStroops || 0n,
+            credit_stroops: line.creditStroops || 0n,
+            asset_code: line.assetCode || "XLM",
+            asset_issuer: line.assetIssuer,
+            memo: line.memo,
+          })
+          .execute();
+      }
 
-  const legs: LedgerLeg[] = [
-    {
-      account: input.sourceAccount,
-      asset: input.asset,
-      amountMinor: input.amountMinor,
-      direction: "DEBIT",
-    },
-  ];
-  if (net > 0) {
-    legs.push({
-      account: input.destinationAccount,
-      asset: input.asset,
-      amountMinor: net,
-      direction: "CREDIT",
+      return entryId;
     });
   }
-  for (const fee of fees) {
-    if (fee.amountMinor === 0) continue;
-    legs.push({
-      account: fee.account,
-      asset: input.asset,
-      amountMinor: fee.amountMinor,
-      direction: "CREDIT",
+
+  /**
+   * Post a payment transaction
+   * Debit: Relayer Float
+   * Credit: Fee Revenue (fee portion) + DAO Treasury (amount portion)
+   */
+  async postPayment(params: {
+    amountStroops: bigint;
+    feeStroops: bigint;
+    paymentHash: string;
+    daoId?: number;
+  }): Promise<bigint> {
+    return this.postEntry({
+      description: `Payment ${params.paymentHash}`,
+      referenceType: "payment",
+      referenceId: params.paymentHash,
+      lines: [
+        {
+          accountCode: "1000", // Relayer Float (debit - asset decreases)
+          creditStroops: params.amountStroops + params.feeStroops,
+        },
+        {
+          accountCode: "1100", // DAO Treasury (credit - asset increases for recipient)
+          debitStroops: params.amountStroops,
+        },
+        {
+          accountCode: "4000", // Fee Revenue
+          debitStroops: params.feeStroops,
+        },
+      ],
     });
   }
-  return buildBalancedPostingGroup({
-    postingGroupId: input.postingGroupId,
-    asset: input.asset,
-    legs,
-    createdAt: input.createdAt,
-  });
-}
 
-// ===========================================================================
-// Stellar amount conversion — string based, no floating point
-// ===========================================================================
-
-const STROOPS_PER_UNIT = 10_000_000; // 7 decimals
-
-/** Convert a Stellar amount string ("10.0000000") to integer stroops. */
-export function stellarAmountToMinor(amount: string): number {
-  if (typeof amount !== "string" || !/^-?\d+(?:\.\d+)?$/.test(amount.trim())) {
-    throw new Error(`invalid Stellar amount: ${String(amount)}`);
+  /**
+   * Post a swap transaction with slippage/dust accounting
+   */
+  async postSwap(params: {
+    sourceAmountStroops: bigint;
+    destAmountStroops: bigint;
+    feeStroops: bigint;
+    dustStroops: bigint;
+    swapId: string;
+  }): Promise<bigint> {
+    return this.postEntry({
+      description: `Swap ${params.swapId}`,
+      referenceType: "swap",
+      referenceId: params.swapId,
+      lines: [
+        {
+          accountCode: "1000", // Relayer Float source (credit)
+          creditStroops: params.sourceAmountStroops,
+        },
+        {
+          accountCode: "1000", // Relayer Float dest (debit)
+          debitStroops: params.destAmountStroops,
+        },
+        {
+          accountCode: "5000", // Transaction Fees (expense)
+          debitStroops: params.feeStroops,
+        },
+        {
+          accountCode: "5100", // Dust Account (expense)
+          debitStroops: params.dustStroops,
+        },
+      ],
+    });
   }
-  const trimmed = amount.trim();
-  const negative = trimmed.startsWith("-");
-  const unsigned = negative ? trimmed.slice(1) : trimmed;
-  const [whole, fraction = ""] = unsigned.split(".");
-  if (fraction.length > 7) throw new Error(`too many decimals in amount: ${amount}`);
-  const padded = (fraction + "0000000").slice(0, 7);
-  const minor = Number(whole) * STROOPS_PER_UNIT + Number(padded);
-  if (!Number.isSafeInteger(minor)) throw new Error(`amount out of range: ${amount}`);
-  return negative ? -minor : minor;
-}
 
-/** Convert integer stroops back to a 7-decimal Stellar amount string. */
-export function minorToStellarAmount(minor: number): string {
-  if (!Number.isSafeInteger(minor)) throw new Error("minor amount must be a safe integer");
-  const sign = minor < 0 ? "-" : "";
-  const absolute = Math.abs(minor);
-  const whole = Math.floor(absolute / STROOPS_PER_UNIT);
-  const fraction = String(absolute % STROOPS_PER_UNIT).padStart(7, "0");
-  return `${sign}${whole}.${fraction}`;
-}
+  /**
+   * Perform daily close - verify all entries balance
+   */
+  async performDailyClose(date: Date): Promise<boolean> {
+    const result = await this.db
+      .selectFrom("ledger_entries as e")
+      .innerJoin("ledger_lines as l", "e.id", "l.entry_id")
+      .select((eb) => [
+        eb.fn.sum("l.debit_stroops").as("total_debits"),
+        eb.fn.sum("l.credit_stroops").as("total_credits"),
+      ])
+      .where("e.entry_date", "=", date.toISOString().split("T")[0])
+      .executeTakeFirst();
 
-// ===========================================================================
-// Storage ports + implementations
-// ===========================================================================
+    const totalDebits = BigInt(result?.total_debits || 0);
+    const totalCredits = BigInt(result?.total_credits || 0);
+    const isBalanced = totalDebits === totalCredits;
+    const discrepancy = totalDebits - totalCredits;
 
-export interface LedgerStore {
-  saveGroup(group: PostingGroup): void | Promise<void>;
-  getGroup(postingGroupId: string): PostingGroup | undefined | Promise<PostingGroup | undefined>;
-  listGroups(): PostingGroup[] | Promise<PostingGroup[]>;
-}
+    await this.db
+      .insertInto("ledger_daily_close")
+      .values({
+        close_date: date.toISOString().split("T")[0],
+        total_debits: totalDebits,
+        total_credits: totalCredits,
+        balance_proof_hash: "", // TODO: Implement cryptographic proof
+        is_balanced: isBalanced,
+        discrepancy_stroops: discrepancy < 0n ? -discrepancy : discrepancy,
+      })
+      .execute();
 
-function cloneGroup(group: PostingGroup): PostingGroup {
-  return JSON.parse(JSON.stringify(group)) as PostingGroup;
-}
-
-/** In-memory ledger store for unit tests / default safety net. */
-export interface InMemoryLedgerStore extends LedgerStore {
-  readonly groups: Map<string, PostingGroup>;
-  clear(): void;
-}
-
-export function createInMemoryLedgerStore(): InMemoryLedgerStore {
-  const groups = new Map<string, PostingGroup>();
-  return {
-    groups,
-    saveGroup(group) {
-      groups.set(group.postingGroupId, cloneGroup(group));
-    },
-    getGroup(postingGroupId) {
-      const group = groups.get(postingGroupId);
-      return group ? cloneGroup(group) : undefined;
-    },
-    listGroups() {
-      return [...groups.values()].map(cloneGroup);
-    },
-    clear() {
-      groups.clear();
-    },
-  };
-}
-
-/** Minimal structural database port (satisfied by better-sqlite3). */
-export interface SqliteStatementPort {
-  get(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-  run(...params: unknown[]): unknown;
-}
-export interface SqliteDbPort {
-  prepare(sql: string): SqliteStatementPort;
-}
-
-interface PostingRow {
-  posting_id: string;
-  posting_group_id: string;
-  account: string;
-  asset: string;
-  amount_minor: number;
-  direction: LedgerDirection;
-  sequence: number;
-  balance_proof_hash: string;
-  created_at: string;
-}
-
-const LEDGER_TABLE_SQL = `
-  CREATE TABLE IF NOT EXISTS ledger_postings (
-    posting_id TEXT PRIMARY KEY,
-    posting_group_id TEXT NOT NULL,
-    account TEXT NOT NULL,
-    asset TEXT NOT NULL,
-    amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
-    direction TEXT NOT NULL CHECK(direction IN ('DEBIT','CREDIT')),
-    sequence INTEGER NOT NULL,
-    balance_proof_hash TEXT NOT NULL CHECK(length(balance_proof_hash) = 64),
-    created_at TEXT NOT NULL,
-    UNIQUE(posting_group_id, sequence)
-  );
-  CREATE INDEX IF NOT EXISTS idx_ledger_postings_group ON ledger_postings(posting_group_id);
-`;
-
-function rowToPosting(row: PostingRow): LedgerPosting {
-  return {
-    postingId: row.posting_id,
-    postingGroupId: row.posting_group_id,
-    account: row.account,
-    asset: row.asset,
-    amountMinor: row.amount_minor,
-    direction: row.direction,
-    sequence: row.sequence,
-    balanceProofHash: row.balance_proof_hash,
-    createdAt: row.created_at,
-  };
-}
-
-/** SQLite-backed ledger store. Creates its table defensively (idempotent DDL). */
-export function createSqliteLedgerStore(db: SqliteDbPort): LedgerStore {
-  for (const statement of LEDGER_TABLE_SQL.split(";").map((s) => s.trim()).filter(Boolean)) {
-    db.prepare(statement).run();
+    return isBalanced;
   }
-  return {
-    saveGroup(group) {
-      const validation = validatePostingGroup(group);
-      if (!validation.ok) {
-        throw new Error(`refusing to persist unbalanced group: ${validation.errors.join("; ")}`);
+
+  /**
+   * Get account balance
+   */
+  async getAccountBalance(accountCode: string): Promise<bigint> {
+    const result = await this.db
+      .selectFrom("ledger_account_balances")
+      .select("balance_stroops")
+      .where("code", "=", accountCode)
+      .executeTakeFirst();
+
+    return result ? BigInt(result.balance_stroops) : 0n;
+  }
+
+  /**
+   * Backfill historical transactions from chain (#961)
+   * Deterministic replay with checkpoints
+   */
+  async backfillFromChain(params: {
+    horizonUrl: string;
+    relayerAccountId: string;
+    startCursor?: string;
+    limit?: number;
+    checkpoint?: () => Promise<void>;
+  }): Promise<{
+    processed: number;
+    lastCursor: string | null;
+    errors: number;
+  }> {
+    let processed = 0;
+    let errors = 0;
+    let lastCursor: string | null = null;
+
+    try {
+      const url = new URL(`${params.horizonUrl}/accounts/${params.relayerAccountId}/transactions`);
+      url.searchParams.set("order", "asc");
+      url.searchParams.set("limit", String(params.limit || 200));
+      if (params.startCursor) {
+        url.searchParams.set("cursor", params.startCursor);
       }
-      const insert = db.prepare(
-        `INSERT OR REPLACE INTO ledger_postings
-          (posting_id, posting_group_id, account, asset, amount_minor, direction, sequence, balance_proof_hash, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      for (const p of group.postings) {
-        insert.run(
-          p.postingId,
-          p.postingGroupId,
-          p.account,
-          p.asset,
-          p.amountMinor,
-          p.direction,
-          p.sequence,
-          p.balanceProofHash,
-          p.createdAt,
-        );
+
+      const response = await fetch(url.toString());
+      if (!response.ok) {
+        throw new Error(`Horizon API returned ${response.status}`);
       }
-    },
-    getGroup(postingGroupId) {
-      const rows = db
-        .prepare("SELECT * FROM ledger_postings WHERE posting_group_id = ? ORDER BY sequence ASC")
-        .all(postingGroupId) as PostingRow[];
-      if (rows.length === 0) return undefined;
-      const postings = rows.map(rowToPosting);
-      return {
-        postingGroupId,
-        asset: postings[0]?.asset ?? "",
-        postings,
-        createdAt: postings[0]?.createdAt ?? "",
-      };
-    },
-    listGroups() {
-      const rows = db.prepare("SELECT * FROM ledger_postings ORDER BY posting_group_id, sequence").all() as PostingRow[];
-      const groups = new Map<string, PostingGroup>();
-      for (const row of rows) {
-        const posting = rowToPosting(row);
-        const group = groups.get(row.posting_group_id) ?? {
-          postingGroupId: row.posting_group_id,
-          asset: posting.asset,
-          postings: [],
-          createdAt: posting.createdAt,
-        };
-        group.postings.push(posting);
-        groups.set(row.posting_group_id, group);
+
+      const data = await response.json();
+      const transactions = data._embedded?.records || [];
+
+      for (const tx of transactions) {
+        try {
+          await this.backfillTransaction(tx);
+          processed++;
+          lastCursor = tx.paging_token;
+
+          // Checkpoint every 50 transactions
+          if (processed % 50 === 0 && params.checkpoint) {
+            await params.checkpoint();
+            log("info", "ledger_backfill_checkpoint", {
+              processed,
+              lastCursor,
+            });
+          }
+        } catch (err) {
+          errors++;
+          log("error", "ledger_backfill_transaction_failed", {
+            txHash: tx.hash,
+            error: (err as Error).message,
+          });
+        }
       }
-      return [...groups.values()];
-    },
-  };
-}
 
-// ===========================================================================
-// Module-level convenience layer (no DB/timer opened on import)
-// ===========================================================================
-
-let wiredStore: LedgerStore | undefined;
-let wiredLogger: LoggerPort | undefined;
-
-const fallbackLogger: LoggerPort = {
-  debug: (event, meta) => moduleLog("debug", event, meta),
-  info: (event, meta) => moduleLog("info", event, meta),
-  warn: (event, meta) => moduleLog("warn", event, meta),
-  error: (event, meta) => moduleLog("error", event, meta),
-  log: (level, event, meta) => moduleLog(level, event, meta),
-};
-
-/** Wire the ledger's store/logger (composition root / tests). */
-export function initLedger(deps: { store: LedgerStore; logger?: LoggerPort }): void {
-  wiredStore = deps.store;
-  wiredLogger = deps.logger;
-}
-
-/** Default store shared by the module-level ledger and reconciliation helpers. */
-export function getDefaultLedgerStore(): LedgerStore {
-  if (!wiredStore) wiredStore = createInMemoryLedgerStore();
-  return wiredStore;
-}
-
-function currentLedger(): { store: LedgerStore; logger: LoggerPort } {
-  return { store: getDefaultLedgerStore(), logger: wiredLogger ?? fallbackLogger };
-}
-
-function settleAsync(result: void | Promise<void>, logger: LoggerPort, groupId: string): void {
-  if (result && typeof (result as Promise<void>).then === "function") {
-    (result as Promise<void>).catch((error: unknown) => {
-      logger.error("ledger_group_save_failed", {
-        postingGroupId: groupId,
-        error: (error as Error).message,
+      log("info", "ledger_backfill_completed", {
+        processed,
+        errors,
+        lastCursor,
       });
-    });
+
+      return { processed, lastCursor, errors };
+    } catch (err) {
+      log("error", "ledger_backfill_failed", {
+        error: (err as Error).message,
+        processed,
+      });
+      return { processed, lastCursor, errors };
+    }
   }
-}
 
-/** Build + persist a balanced posting group through the injected store. */
-export function postBalancedGroup(input: BuildPostingGroupInput): PostingGroup {
-  const { store, logger } = currentLedger();
-  const group = buildBalancedPostingGroup(input);
-  settleAsync(store.saveGroup(group), logger, group.postingGroupId);
-  logger.info("ledger_group_posted", {
-    postingGroupId: group.postingGroupId,
-    asset: group.asset,
-    entries: group.postings.length,
-  });
-  return group;
-}
+  /**
+   * Backfill a single transaction
+   */
+  private async backfillTransaction(tx: any): Promise<void> {
+    // Extract operations and categorize
+    const operations = tx.operations || [];
+    
+    // Skip if already processed
+    const existing = await this.db
+      .selectFrom("ledger_entries")
+      .select("id")
+      .where("reference_id", "=", tx.hash)
+      .executeTakeFirst();
+    
+    if (existing) {
+      return;
+    }
 
-/** Build + persist a balanced transfer through the injected store. */
-export function postTransfer(input: PostTransferInput): PostingGroup {
-  const group = buildTransferGroup(input);
-  const { store, logger } = currentLedger();
-  settleAsync(store.saveGroup(group), logger, group.postingGroupId);
-  logger.info("ledger_transfer_posted", {
-    postingGroupId: group.postingGroupId,
-    asset: group.asset,
-    entries: group.postings.length,
-  });
-  return group;
-}
+    // Parse operations and create journal entry
+    for (const op of operations) {
+      if (op.type === "payment") {
+        await this.postPayment({
+          amountStroops: BigInt(Math.floor(parseFloat(op.amount) * 10_000_000)),
+          feeStroops: BigInt(tx.fee_charged || 100),
+          paymentHash: tx.hash,
+        });
+      }
+      // Add more operation types as needed
+    }
+  }
 
-/** Read one posting group from the injected store. */
-export async function getPostingGroup(
-  postingGroupId: string,
-): Promise<PostingGroup | undefined> {
-  return currentLedger().store.getGroup(postingGroupId);
-}
+  /**
+   * Reconcile ledger balances with chain state (#961)
+   */
+  async reconcileWithChain(params: {
+    horizonUrl: string;
+    relayerAccountId: string;
+  }): Promise<{
+    ledgerBalance: bigint;
+    chainBalance: bigint;
+    discrepancy: bigint;
+    isBalanced: boolean;
+  }> {
+    try {
+      // Get chain balance
+      const response = await fetch(`${params.horizonUrl}/accounts/${params.relayerAccountId}`);
+      if (!response.ok) {
+        throw new Error(`Horizon API returned ${response.status}`);
+      }
 
-/** Validate every posting group currently held by the injected store. */
-export async function validateLedger(): Promise<ValidationResult> {
-  const groups = await currentLedger().store.listGroups();
-  return validatePostings(groups);
+      const account = await response.json();
+      const xlmBalance = account.balances.find(
+        (b: any) => b.asset_type === "native",
+      );
+      const chainBalance = xlmBalance
+        ? BigInt(Math.floor(parseFloat(xlmBalance.balance) * 10_000_000))
+        : 0n;
+
+      // Get ledger balance
+      const ledgerBalance = await this.getAccountBalance("1000"); // Relayer Float
+
+      const discrepancy = ledgerBalance - chainBalance;
+      const isBalanced = discrepancy === 0n;
+
+      // Record reconciliation
+      await this.db
+        .insertInto("ledger_reconciliations")
+        .values({
+          reconciliation_date: new Date().toISOString().split("T")[0],
+          account_code: "1000",
+          ledger_balance: ledgerBalance,
+          chain_balance: chainBalance,
+          discrepancy,
+          is_balanced: isBalanced,
+        })
+        .execute();
+
+      if (!isBalanced) {
+        log("error", "ledger_reconciliation_mismatch", {
+          ledgerBalance: ledgerBalance.toString(),
+          chainBalance: chainBalance.toString(),
+          discrepancy: discrepancy.toString(),
+        });
+      } else {
+        log("info", "ledger_reconciliation_success", {
+          balance: ledgerBalance.toString(),
+        });
+      }
+
+      return {
+        ledgerBalance,
+        chainBalance,
+        discrepancy,
+        isBalanced,
+      };
+    } catch (err) {
+      log("error", "ledger_reconciliation_failed", {
+        error: (err as Error).message,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Export auditor-friendly report (redacted, read-only) (#961)
+   */
+  async exportAuditorReport(params: {
+    startDate: string;
+    endDate: string;
+    includePII?: boolean;
+  }): Promise<{
+    entries: Array<{
+      date: string;
+      description: string;
+      account: string;
+      debit: string;
+      credit: string;
+      balance: string;
+    }>;
+    summary: {
+      totalDebits: string;
+      totalCredits: string;
+      startBalance: string;
+      endBalance: string;
+    };
+    hash: string;
+  }> {
+    const entries = await this.db
+      .selectFrom("ledger_entries as e")
+      .innerJoin("ledger_lines as l", "e.id", "l.entry_id")
+      .innerJoin("ledger_accounts as a", "l.account_id", "a.id")
+      .select([
+        "e.entry_date",
+        "e.description",
+        "a.code",
+        "a.name",
+        "l.debit_stroops",
+        "l.credit_stroops",
+      ])
+      .where("e.entry_date", ">=", params.startDate)
+      .where("e.entry_date", "<=", params.endDate)
+      .orderBy("e.entry_date", "asc")
+      .orderBy("e.id", "asc")
+      .execute();
+
+    // Redact PII if requested
+    const exportEntries = entries.map((entry) => {
+      let description = entry.description;
+      if (!params.includePII) {
+        // Redact transaction hashes and addresses
+        description = description.replace(/[A-Z0-9]{56}/g, "<REDACTED>");
+        description = description.replace(/G[A-Z0-9]{55}/g, "<REDACTED_ADDRESS>");
+      }
+
+      return {
+        date: entry.entry_date,
+        description,
+        account: `${entry.code} - ${entry.name}`,
+        debit: (entry.debit_stroops / 10_000_000n).toString(),
+        credit: (entry.credit_stroops / 10_000_000n).toString(),
+        balance: "0", // Calculated below
+      };
+    });
+
+    // Calculate totals
+    const totalDebits = entries.reduce((sum, e) => sum + e.debit_stroops, 0n);
+    const totalCredits = entries.reduce((sum, e) => sum + e.credit_stroops, 0n);
+
+    // Generate reproducible hash
+    const hashInput = JSON.stringify({
+      startDate: params.startDate,
+      endDate: params.endDate,
+      entries: exportEntries,
+    });
+    const hash = crypto.createHash("sha256").update(hashInput).digest("hex");
+
+    log("info", "auditor_report_exported", {
+      startDate: params.startDate,
+      endDate: params.endDate,
+      entryCount: exportEntries.length,
+      hash,
+    });
+
+    return {
+      entries: exportEntries,
+      summary: {
+        totalDebits: (totalDebits / 10_000_000n).toString(),
+        totalCredits: (totalCredits / 10_000_000n).toString(),
+        startBalance: "0",
+        endBalance: ((totalDebits - totalCredits) / 10_000_000n).toString(),
+      },
+      hash,
+    };
+  }
+
+  /**
+   * Check balance invariants and raise alerts (#961)
+   */
+  async checkBalanceInvariants(): Promise<{
+    passed: boolean;
+    violations: Array<{ rule: string; message: string }>;
+  }> {
+    const violations: Array<{ rule: string; message: string }> = [];
+
+    // Invariant 1: All entries must be balanced
+    const unbalancedEntries = await this.db
+      .selectFrom("ledger_entries as e")
+      .innerJoin("ledger_lines as l", "e.id", "l.entry_id")
+      .select((eb) => [
+        "e.id",
+        eb.fn.sum("l.debit_stroops").as("total_debits"),
+        eb.fn.sum("l.credit_stroops").as("total_credits"),
+      ])
+      .groupBy("e.id")
+      .having((eb) =>
+        eb.fn("SUM", ["l.debit_stroops"], eb.fn.sum("l.credit_stroops")),
+      )
+      .execute();
+
+    if (unbalancedEntries.length > 0) {
+      violations.push({
+        rule: "balanced_entries",
+        message: `Found ${unbalancedEntries.length} unbalanced journal entries`,
+      });
+    }
+
+    // Invariant 2: Asset-liability-equity equation
+    const trialBalance = await this.db
+      .selectFrom("ledger_account_balances")
+      .select((eb) => [
+        eb
+          .fn
+          .sum(
+            eb.case()
+              .when("type", "in", ["asset", "expense"])
+              .then("balance_stroops")
+              .else(0),
+          )
+          .as("assets_expenses"),
+        eb
+          .fn
+          .sum(
+            eb.case()
+              .when("type", "in", ["liability", "equity", "revenue"])
+              .then("balance_stroops")
+              .else(0),
+          )
+          .as("liabilities_equity_revenue"),
+      ])
+      .executeTakeFirst();
+
+    const assetsExpenses = BigInt(trialBalance?.assets_expenses || 0);
+    const liabilitiesEquityRevenue = BigInt(
+      trialBalance?.liabilities_equity_revenue || 0,
+    );
+
+    if (assetsExpenses !== liabilitiesEquityRevenue) {
+      violations.push({
+        rule: "accounting_equation",
+        message: `Trial balance mismatch: Assets+Expenses=${assetsExpenses}, Liabilities+Equity+Revenue=${liabilitiesEquityRevenue}`,
+      });
+    }
+
+    // Invariant 3: No negative balances in asset accounts
+    const negativeAssets = await this.db
+      .selectFrom("ledger_account_balances")
+      .select(["code", "name", "balance_stroops"])
+      .where("type", "=", "asset")
+      .where("balance_stroops", "<", 0)
+      .execute();
+
+    if (negativeAssets.length > 0) {
+      violations.push({
+        rule: "no_negative_assets",
+        message: `Found ${negativeAssets.length} asset accounts with negative balances`,
+      });
+    }
+
+    const passed = violations.length === 0;
+
+    if (!passed) {
+      log("error", "ledger_invariant_violation", {
+        violations,
+      });
+    }
+
+    return { passed, violations };
+  }
+
+  /**
+   * Classify transaction for tax reporting (#961)
+   */
+  classifyForTax(entry: JournalEntry): {
+    taxCategory: string;
+    taxable: boolean;
+    effectiveDate: string;
+    ruleVersion: number;
+  } {
+    // Version 1 tax rules (US tax treatment)
+    const ruleVersion = 1;
+    const effectiveDate = new Date().toISOString();
+
+    let taxCategory = "unknown";
+    let taxable = false;
+
+    // Classify based on reference type
+    switch (entry.referenceType) {
+      case "fee":
+        taxCategory = "fee_revenue";
+        taxable = true; // Fee revenue is taxable income
+        break;
+      case "payment":
+        taxCategory = "service_revenue";
+        taxable = true; // Payment processing revenue
+        break;
+      case "swap":
+        taxCategory = "transaction_fee_expense";
+        taxable = false; // Deductible expense
+        break;
+      case "anchor_deposit":
+      case "anchor_withdraw":
+        taxCategory = "capital_movement";
+        taxable = false; // Not taxable (movement of capital)
+        break;
+      case "reward":
+        taxCategory = "reward_income";
+        taxable = true; // Rewards are taxable income
+        break;
+      default:
+        taxCategory = "other";
+        taxable = false;
+    }
+
+    return {
+      taxCategory,
+      taxable,
+      effectiveDate,
+      ruleVersion,
+    };
+  }
 }

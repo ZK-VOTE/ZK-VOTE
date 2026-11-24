@@ -11,8 +11,9 @@ export const queryClient = new QueryClient({
       retry: 2,
       // Refetch on window focus for fresh data
       refetchOnWindowFocus: true,
-      // Don't refetch on reconnect by default (can be expensive for contract calls)
-      refetchOnReconnect: false,
+      // Refetch on reconnect so optimistic state (e.g. a queued vote shown as
+      // voted) is reconciled against server truth after going offline (#755).
+      refetchOnReconnect: true,
     },
     mutations: {
       // Retry mutations once

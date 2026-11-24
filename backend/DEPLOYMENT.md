@@ -52,6 +52,30 @@ usually caught automatically before it replaces the healthy instance — the
 above is for rolling back a release that *did* go live but is misbehaving
 in a way health checks don't catch (e.g. a business-logic regression).
 
+## Relayer key rotation (Issue #746)
+
+A relayer key rotation is **not** a deploy and needs no restart: it is a
+runtime operation against the running relayer
+(full runbook: `docs/ops/RELAYER_KEY_ROTATION.md`).
+
+- **Planned:** keep a funded standby in `RELAYER_SECONDARY_SECRET_KEY`, then
+  `npm run relayer:rotate -- --actor <you> --reason <why>`. The old identity
+  drains for `RELAYER_ROTATION_DRAIN_WINDOW_MS`; finalize or roll back with
+  `npm run relayer:key -- finalize|rollback`. Afterwards update the secrets so
+  the next deploy boots on the new identity:
+  `fly secrets set RELAYER_SECRET_KEY=<new> RELAYER_SECONDARY_SECRET_KEY=<new standby>`
+  (`fly secrets set` triggers a rolling deploy).
+- **Compromise:** `npm run relayer:compromise -- --key <G...> --declared-by <you> --reason <evidence>`
+  first, and **deploy nothing** until the declaration returns. Then sweep
+  (two-person), remove the leaked secret with `fly secrets set`, and
+  reconstitute a funded standby. The revocation is persisted, so a restart
+  with the leaked secret still configured keeps refusing it.
+- **Cluster mode:** key state is per process. With `CLUSTER_ENABLED=true`,
+  rotate through `fly secrets set` (a rolling restart) instead of the runtime
+  API, or run a single process for the rotation.
+- Migration `015_relayer_key_lifecycle` (key event audit + revocation list)
+  runs on boot like any other migration.
+
 ## Encrypted SQLite backups (Issue #359)
 
 When `BACKUP_ENCRYPTION_ENABLED=true`, the relayer's scheduled snapshots are

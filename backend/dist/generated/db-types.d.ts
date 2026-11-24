@@ -79,7 +79,7 @@ export interface PartitionRegistry {
     dao_id: Generated<number | null>;
 }
 export interface PaymentJobs {
-    amount: Generated<number | bigint | string>;
+    amount: Generated<bigint | string>;
     created_at: Generated<string | null>;
     id: string;
     ops: string;

@@ -1,7 +1,8 @@
 services:
   frontend:
     build:
-      context: ./frontend
+      context: .
+      dockerfile: frontend/Dockerfile
       args:
         VITE_RELAYER_URL: https://server.zkvote.net
     ports:
@@ -30,6 +31,7 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/prometheus/zkvote-alerts.yml:/etc/prometheus/zkvote-alerts.yml:ro
+      - ./monitoring/prometheus/priority-queue-alerts.yml:/etc/prometheus/priority-queue-alerts.yml:ro
     depends_on: [backend]
     networks: [observability]
 

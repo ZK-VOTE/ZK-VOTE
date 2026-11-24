@@ -36,15 +36,73 @@ jobs:
           bash scripts/deploy/verify-wasm-signature.sh target/wasm32v1-none/release/dao_registry.wasm
       - name: Run unit tests (workspace, excluding integration)
         run: cargo test --workspace --exclude zkvote-integration-tests --locked
+      - name: Property-based tests — nova-aggregator (ZV-047 / #896)
+        # Runs proptest suites with a fixed seed (PROPTEST_SEED) for
+        # reproducibility. Failures are shrunk and saved to
+        # crates/nova-aggregator/proptest-regressions/ for rerun.
+        # 1,000 cases per property; bounded to stay within CI time budget.
+        run: cargo test -p nova-aggregator proptest -- --nocapture
+        env:
+          PROPTEST_CASES: "1000"
       - name: Run integration tests (explicit, #575)
         # zkvote-integration-tests is a workspace member but excluded from
         # default-members, so it must be invoked explicitly — otherwise
         # reentrancy/stress coverage stays hidden from CI.
         run: cargo test -p zkvote-integration-tests --locked -- --test-threads=1
-      - name: Groth16 production edge corpus
-        run: cargo test -p zkvote-groth16 --test bn254_edge_case_corpus --locked -- --nocapture
+      - name: Groth16 production edge corpus (REQUIRED, ZV-117)
+        # Full BN254 edge-case corpus must pass on every PR touching the verifier.
+        # Catches identity points, subgroup attacks, field-boundary cases, and
+        # ensures validator guards are actually invoked by all entry points.
+        run: |
+          set -euo pipefail
+          echo "=== Running BN254 Edge-Case Corpus (ZV-117) ==="
+          cargo test -p zkvote-groth16 --test bn254_edge_case_corpus --locked -- --nocapture --test-threads=1 | tee corpus-output.txt
+
+          # Verify minimum corpus size (control + 50 edge cases)
+          if ! grep -q "corpus must include the control plus at least 50 edge cases" corpus-output.txt; then
+            echo "::error::BN254 corpus did not run or was truncated"
+            exit 1
+          fi
+
+          echo "✓ BN254 edge-case corpus passed"
+      - name: Upload corpus results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bn254-corpus-results
+          path: corpus-output.txt
+          retention-days: 30
+      - name: Groth16 verifier stub gate
+        # Fails if `verify_groth16` ever stops really verifying in a default
+        # build. The stub is reachable only via the `testutils` feature, so a
+        # regression that widens the gate turns this red.
+        run: cargo test -p zkvote-groth16 --test verifier_stub_gate --locked -- --nocapture
       - name: Groth16 testutils stub behavior
         run: cargo test -p zkvote-groth16 --features testutils --test bn254_edge_case_corpus testutils_feature_uses_stubbed_verifier --locked -- --nocapture
+      - name: Verifier stub cannot reach a wasm build
+        # The `testutils` feature makes verification return `true`. It must be
+        # impossible to compile a contract with it on, so `--all-features`
+        # (or any future feature that forwards it) fails the build instead of
+        # quietly shipping a contract that accepts every proof. The inverted
+        # exit check is the point: success here means the build FAILED.
+        run: |
+          set -euo pipefail
+          if cargo build --target wasm32v1-none --release --all-features --locked; then
+            echo "::error::an --all-features wasm build succeeded, so the testutils verifier stub is reachable from a deployable build"
+            exit 1
+          fi
+          echo "ok: --all-features wasm build is rejected"
+      - name: All-features build is verifier-clean
+        # The build must also succeed without any feature, and the resulting
+        # wasm must not contain the marker string emitted by the stub.
+        run: |
+          set -euo pipefail
+          cargo build --target wasm32v1-none --release --locked
+          if grep -rl "ZKVOTE_GROTH16_STUB_ACTIVE" target/wasm32v1-none/release/ 2>/dev/null; then
+            echo "::error::a release wasm contains the verifier stub marker"
+            exit 1
+          fi
+          echo "ok: release wasm is free of the verifier stub marker"
       - name: Doc check
         run: cargo doc --workspace --no-deps --locked
       - name: Security audit
@@ -62,15 +120,47 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version-file: ".nvmrc"
+          cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
+      - name: Verify depth/memory device matrix from fixtures (ZV-129)
+        working-directory: .
+        run: node scripts/generate-proof-device-matrix.mjs --check
+      - name: Check localized proposal-template registry parity (ZV-128)
+        working-directory: .
+        run: node scripts/check-proposal-template-registry.mjs
       - name: Type check
         run: npm run type-check
+      - name: CSP origin-policy parity
+        run: npm run csp:check
+      - name: Protocol bindings are reproducible
+        # Generated bindings are checked in. Regenerating them from the single
+        # manifest must produce no diff; otherwise CI fails with a hint to run
+        # `npm run protocol:generate` (or `npm run drift:fix`).
+        working-directory: .
+        run: |
+          npm run protocol:generate
+          if ! git diff --exit-code -- frontend/src/generated/zkv1.ts backend/src/generated/zkv1.ts packages/sdk/src/generated/zkv1.ts contracts/zkvote-groth16/src/generated.rs; then
+            echo "::error::Generated protocol bindings are stale. Run 'npm run protocol:generate' and commit the result."
+            exit 1
+          fi
       - name: Drift guard
+        # The vote proving/verification key is produced by the MPC trusted setup,
+        # not by CI, and is deliberately not committed. The guard warns about its
+        # absence but still enforces signal order/count across circuit, contract,
+        # frontend and generated bindings. Pipelines that produce the key set
+        # ZK_VOTE_REQUIRE_VKEY=1 to make its absence fatal.
+        env:
+          ZK_VOTE_ALLOW_MISSING_VKEY: "1"
         run: npm run drift:check
+      - name: Drift guard self-tests
+        working-directory: .
+        run: npm run test:drift
+      - name: Upgrade/migration chaos drill
+        working-directory: .
+        run: npm run test:upgrade-drill
       - name: Lint (includes JSDoc validation)
         run: npm run lint
       - name: Format check
@@ -92,30 +182,46 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version-file: ".nvmrc"
+          cache: "npm"
           cache-dependency-path: backend/package-lock.json
+      - name: Preflight — verify toolchain versions
+        run: bash ../scripts/preflight-check.sh
       - name: Install dependencies
         run: npm ci
+      - name: Shared message-origin policy parity
+        run: npm run origins:check
       - name: Enforce lockfile integrity
         run: npm ci --ignore-scripts --audit=false
-      - name: Lint (includes JSDoc validation + type check)
-        run: npm run lint
-      - name: Format check
-        run: npx prettier --check "src/**/*.ts"
-      - name: Validate environment profiles
-        run: npm run validate-profiles
       - name: Run tests (including .test.ts files)
+        # Runs before lint so repo-wide lint errors on main cannot skip the tests.
         run: npm test 2>&1 | tee test-output.log
         env:
-          RELAYER_TEST_MODE: 'true'
-          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org'
-          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
-          RELAYER_SECRET_KEY: 'SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS'
-          RELAYER_AUTH_TOKEN: 'ci-test-token-placeholder-32-chars-min'
-          VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+          RELAYER_TEST_MODE: "true"
+          SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+          NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          RELAYER_SECRET_KEY: "SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS"
+          RELAYER_AUTH_TOKEN: "ci-test-token-placeholder-32-chars-min"
+          VOTING_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          TREE_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          COMMENTS_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+      - name: SDK circuit-compatibility matrix check (ZV-113 / #953)
+        run: npx tsx ../scripts/ci/verify-sdk-compatibility-matrix.mjs
+      - name: Property-based tests — ZKV1 proof serialization (ZV-047 / #896)
+        # Runs fast-check suites with a fixed seed for reproducibility.
+        # Each suite exercises ≥1,000 generated cases; failures print the
+        # minimal counterexample. The seed can be overridden with FAST_CHECK_SEED.
+        run: npm run test:property 2>&1 | tee property-test-output.log
+        env:
+          RELAYER_TEST_MODE: "true"
+          FAST_CHECK_SEED: "5a4b3c2d"
+      - name: Upload property-test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: property-test-results
+          path: backend/property-test-output.log
+          retention-days: 30
       - name: Report test counts
         if: always()
         run: |
@@ -127,19 +233,32 @@ jobs:
           echo ""
           echo "Test execution log:"
           tail -20 test-output.log || echo "No test output"
+      - name: Lint (includes JSDoc validation + type check)
+        run: npm run lint
+      - name: Format check
+        run: npx prettier --check "src/**/*.ts"
+      - name: Validate environment profiles
+        run: npm run validate-profiles
       - name: Check OpenAPI spec and API.md are up to date
         run: npm run docs:check
         env:
-          RELAYER_TEST_MODE: 'true'
-          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org'
-          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
-          RELAYER_SECRET_KEY: 'SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS'
-          RELAYER_AUTH_TOKEN: 'ci-test-token-placeholder-32-chars-min'
-          VOTING_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          TREE_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
-          COMMENTS_CONTRACT_ID: 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
+          RELAYER_TEST_MODE: "true"
+          SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+          NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          RELAYER_SECRET_KEY: "SCZANGBA5AKIA7VTJQXBDKPQOBFZD3NWKNR3CQULPSFMJUADSHWFUCS"
+          RELAYER_AUTH_TOKEN: "ci-test-token-placeholder-32-chars-min"
+          VOTING_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          TREE_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+          COMMENTS_CONTRACT_ID: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+      - name: Enforce OpenAPI and generated TypeScript parity
+        run: |
+          npm run docs:types
+          git diff --exit-code -- openapi.json src/generated/api-types.ts || (echo '::error::OpenAPI or generated API types are stale. Run npm run docs:generate and commit both artifacts.' && exit 1)
+      - name: Enforce bounded metric label catalogue
+        run: npm run metrics:cardinality
       - name: Check config schema and .env.example are in sync
-        run: npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
+        run: |
+          npm run config:generate && git diff --exit-code .env.example || (echo '::error::.env.example is out of sync! Run: npm run config:generate' && exit 1)
       - name: Check configuration security
         run: npm run config:security
       - name: Check migration parity with db-types
@@ -163,8 +282,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version-file: ".nvmrc"
+          cache: "npm"
           cache-dependency-path: circuits/package-lock.json
 
       # Cache compiled circuits to speed up CI
@@ -187,6 +306,13 @@ jobs:
           sudo chmod +x /usr/local/bin/circom
       - name: Install dependencies
         run: npm ci
+      - name: Verify exact dependency pinning
+        run: |
+          node -e "
+            const p = require('./package.json');
+            if (p.dependencies.snarkjs !== '0.7.5') throw new Error('snarkjs not pinned to 0.7.5');
+            console.log('✓ snarkjs exact version verified');
+          "
       - name: Run tests
         run: npm test
       - name: Run Soroban BE conversion parity tests (#369)
@@ -221,7 +347,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version-file: ".nvmrc"
       - name: Install Stellar CLI
         run: |
           curl -Lo stellar.tar.gz https://github.com/stellar/stellar-cli/releases/download/v21.0.0/stellar-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz
@@ -253,8 +379,8 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version-file: ".nvmrc"
+          cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
         run: |

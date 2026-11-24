@@ -586,6 +586,16 @@ async function cli() {
     }
     const database = new Database(DB_FILE);
     database.pragma("journal_mode = WAL");
+    database.pragma("foreign_keys = ON");
+    database.pragma("busy_timeout = 5000");
+    // Verify WAL mode is enabled
+    const journalMode = database.pragma("journal_mode", { simple: true });
+    if (journalMode !== "wal") {
+        console.warn(`Warning: journal_mode is '${journalMode}', expected 'wal'. WAL may not be enabled.`);
+    }
+    else {
+        console.info("WAL mode verified: journal_mode = wal");
+    }
     try {
         switch (command) {
             case "up": {

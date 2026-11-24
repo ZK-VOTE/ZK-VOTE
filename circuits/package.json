@@ -3,12 +3,15 @@
   "version": "1.0.0",
   "circomVersion": "2.1.8",
   "description": "Circom circuits for ZKVote anonymous voting",
+  "engines": {
+    "node": "24.x",
+    "npm": "10.x"
+  },
   "main": "index.js",
   "scripts": {
     "compile": "../scripts/compile-circuits.sh",
     "compile:docker": "../scripts/compile-circuits.sh --docker",
     "compile:direct": "circom vote.circom --r1cs --wasm --sym -o build",
-    "compile": "circom vote.circom --r1cs --wasm --sym -o build",
     "compile:qv": "circom quadratic_vote_main.circom --r1cs --wasm --sym -o build/quadratic_vote",
     "compile:weighted-vote": "circom weighted_vote.circom --r1cs --wasm --sym -o build/weighted_vote",
     "compile:pedersen-commitment": "circom test/pedersen_commitment_test.circom --r1cs --wasm --sym -o build/pedersen_test",
@@ -27,17 +30,7 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "poseidon:audit": "node utils/poseidon_param_audit.js",
-    "poseidon:audit:all": "node utils/poseidon_param_audit.js --all",
-    "poseidon:golden": "node utils/gen_poseidon_golden.js",
-    "depths:gen": "node utils/gen_depth_circuits.js",
-    "depths:check": "node utils/gen_depth_circuits.js --check",
-    "depths:benchmark": "node utils/benchmark_depths.js",
-    "batch:fixture": "node utils/gen_batch_fixture.js",
-    "test:parity": "jest soroban_be_parity soroban_be_cli --verbose",
-    "ceremony:test": "node ceremony/test-ceremony.js",
-    "ceremony:verify": "node ceremony/verify-ceremony.js",
-    "ceremony:contribute": "node ceremony/contribute.js"
+    "test:depth": "jest depth-alignment.test.js --runInBand"
   },
   "dependencies": {
     "circomlib": "^2.0.5",
@@ -47,5 +40,11 @@
   "devDependencies": {
     "circom_tester": "^0.0.19",
     "jest": "^29.7.0"
+  },
+  "overrides": {
+    "snarkjs": "0.7.5",
+    "circom_runtime": "0.1.28",
+    "ffjavascript": "0.2.63",
+    "wasmcurves": "0.2.2"
   }
 }

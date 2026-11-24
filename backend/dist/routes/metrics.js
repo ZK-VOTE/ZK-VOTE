@@ -4,6 +4,9 @@
  * Exposes /metrics in Prometheus text exposition format.
  */
 import { Router } from "express";
+import { extractAuthToken } from "../middleware/auth.js";
+import { config } from "../config.js";
+import { timingSafeEqual } from "node:crypto";
 import { register } from "../services/metrics.js";
 import { dbConnectionsActive, dbWalSizeBytes, dbReadLagMs, dbWriteHealthy, dbWriteFailoverTotal, } from "../services/metrics.js";
 import { rpcPoolManager } from "../services/stellar.js";
@@ -20,7 +23,19 @@ const router = Router();
  * GET /metrics
  * Prometheus-compatible metrics endpoint
  */
-router.get("/metrics", async (_req, res) => {
+router.get("/metrics", async (req, res) => {
+    // Auth-gate: metrics can reveal operational details (queue depths,
+    // error rates, sequence numbers). Require the relayer auth token.
+    const token = extractAuthToken(req);
+    const expected = config.relayerAuthToken;
+    if (!token || !expected) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+    const bufA = Buffer.from(token);
+    const bufB = Buffer.from(expected);
+    if (bufA.length !== bufB.length || !timingSafeEqual(new Uint8Array(bufA), new Uint8Array(bufB))) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
     try {
         // Update RPC pool gauges before collecting
         const poolMetrics = rpcPoolManager.getMetrics();

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./IGroth16Verifier.sol";
+
 /**
  * @title ZKVote Bridge Contract
  * @notice Verifies Groth16 proofs for cross-chain voting from Ethereum
@@ -9,7 +11,7 @@ pragma solidity ^0.8.20;
  * Flow:
  * 1. Relayer watches Soroban, builds SBT state tree, posts sbtRoot here
  * 2. User generates Groth16 proof (bridge.circom) proving SBT membership
- * 3. User calls castVote() with proof + public signals
+ * 3. User calls castVote() with proof + public signals (incl. memberAddr)
  * 4. Contract verifies proof via BN254 precompiles (EIP-196/197)
  * 5. Emits VoteForwarded event for Soroban relay
  * 6. Nullifier stored to prevent double-voting
@@ -26,7 +28,9 @@ contract Bridge {
         uint256 indexed proposalId,
         uint256 nullifier,
         uint256 voteChoice,
-        uint256 voteRoot
+        uint256 voteRoot,
+        uint256 memberAddr,
+        uint256 chainId
     );
 
     event SbtRootUpdated(
@@ -35,7 +39,18 @@ contract Bridge {
         uint256 blockNumber
     );
 
+    event VoteRootUpdated(
+        uint256 indexed daoId,
+        uint256 indexed proposalId,
+        uint256 voteRoot,
+        uint256 blockNumber
+    );
+
+    event VerifierProposed(address indexed newVerifier, uint256 eta);
     event VerifierUpdated(address indexed newVerifier);
+    event AdminTransferStarted(address indexed pendingAdmin);
+    event AdminUpdated(address indexed newAdmin);
+    event RootUpdaterUpdated(address indexed newRootUpdater);
 
     // ============================================
     // STATE
@@ -47,31 +62,62 @@ contract Bridge {
     /// @notice SBT contract address on Soroban (binds proofs to specific SBT)
     uint256 public sbtContractAddr;
 
-    /// @notice SBT state roots per DAO (posted by relayer)
+    /// @notice SBT state roots per DAO (posted by rootUpdater)
     mapping(uint256 => uint256) public sbtRoots; // daoId => sbtRoot
+
+    /// @notice Block number when the SBT root was last posted for a DAO.
+    /// @dev Used to enforce finality before the root can be used to prove votes.
+    mapping(uint256 => uint256) public sbtRootBlock; // daoId => blockNumber
 
     /// @notice Nullifiers used per DAO+proposal (prevents double-voting)
     mapping(uint256 => mapping(uint256 => mapping(uint256 => bool)))
         public nullifiers; // daoId => proposalId => nullifier => used
 
-    /// @notice Admin who can update verifier and SBT roots
+    /// @notice Admin who can propose verifier changes and transfer admin
     address public admin;
+
+    /// @notice Address pending acceptance of the admin role (#650 two-step transfer)
+    address public pendingAdmin;
+
+    /// @notice Address authorized to post SBT/vote roots (in addition to admin)
+    address public rootUpdater;
+
+    /// @notice Vote tally roots per DAO+proposal (posted by rootUpdater)
+    mapping(uint256 => mapping(uint256 => uint256)) public voteRoots; // daoId => proposalId => voteRoot
+
+    /// @notice Minimum confirmation depth before a posted SBT root is accepted.
+    uint256 public finalityDepth;
 
     /// @notice Chain ID for domain separation in EVMVerifier circuit
     uint256 public chainId;
+
+    /// @notice Timelock delay for verifier rotation (#650)
+    uint256 public constant VERIFIER_TIMELOCK = 2 days;
+
+    address public pendingVerifier;
+    uint256 public pendingVerifierEta;
 
     // ============================================
     // ERRORS
     // ============================================
 
     error OnlyAdmin();
+    error OnlyRootUpdater();
+    error OnlyPendingAdmin();
     error InvalidProof();
     error NullifierUsed();
     error InvalidVoteChoice();
     error ZeroNullifier();
     error SbtRootNotSet();
+    error SbtRootNotFinalized();
     error InvalidVerifier();
     error InvalidAddress();
+    error ZeroMemberAddr();
+    error TimelockNotElapsed();
+    error NoPendingVerifier();
+    error ChainIdMismatch();
+    error VoteRootNotSet();
+    error VoteRootMismatch();
 
     // ============================================
     // CONSTRUCTOR
@@ -86,44 +132,119 @@ contract Bridge {
         verifier = _verifier;
         sbtContractAddr = _sbtContractAddr;
         admin = msg.sender;
+        rootUpdater = msg.sender;
+        finalityDepth = 0;
         chainId = block.chainid;
     }
 
     // ============================================
-    // ADMIN FUNCTIONS
+    // ADMIN / GOVERNANCE
     // ============================================
 
     /**
-     * @notice Update the Groth16 verifier contract
-     * @param _newVerifier Address of the new verifier contract
+     * @notice Propose a new Groth16 verifier (timelocked, #650)
      */
-    function setVerifier(address _newVerifier) external {
+    function proposeVerifier(address _newVerifier) external {
         if (msg.sender != admin) revert OnlyAdmin();
         if (_newVerifier == address(0)) revert InvalidAddress();
-        verifier = _newVerifier;
-        emit VerifierUpdated(_newVerifier);
+        pendingVerifier = _newVerifier;
+        pendingVerifierEta = block.timestamp + VERIFIER_TIMELOCK;
+        emit VerifierProposed(_newVerifier, pendingVerifierEta);
+    }
+
+    /**
+     * @notice Execute a previously proposed verifier after the timelock
+     */
+    function executeVerifier() external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (pendingVerifier == address(0)) revert NoPendingVerifier();
+        if (block.timestamp < pendingVerifierEta) revert TimelockNotElapsed();
+        address newVerifier = pendingVerifier;
+        pendingVerifier = address(0);
+        pendingVerifierEta = 0;
+        verifier = newVerifier;
+        emit VerifierUpdated(newVerifier);
+    }
+
+    /**
+     * @notice Legacy immediate setVerifier — REMOVED. Use propose/execute.
+     * @dev Kept name as revert to catch stale callers.
+     */
+    function setVerifier(address) external pure {
+        revert TimelockNotElapsed();
     }
 
     /**
      * @notice Post a new SBT state root for a DAO
-     * @dev Called by relayer after watching Soroban chain
-     * @param daoId DAO identifier
-     * @param sbtRoot Merkle root of the SBT state tree
      */
     function updateSbtRoot(uint256 daoId, uint256 sbtRoot) external {
-        if (msg.sender != admin) revert OnlyAdmin();
+        if (msg.sender != rootUpdater && msg.sender != admin) revert OnlyRootUpdater();
+        if (sbtRoot == 0) revert SbtRootNotSet();
         sbtRoots[daoId] = sbtRoot;
+        sbtRootBlock[daoId] = block.number;
         emit SbtRootUpdated(daoId, sbtRoot, block.number);
     }
 
     /**
-     * @notice Transfer admin role
+     * @notice Set the confirmation depth required before a posted SBT root can
+     * be used to validate bridge proofs.
+     * @param _finalityDepth Minimum number of blocks that must confirm the root.
+     */
+    function setFinalityDepth(uint256 _finalityDepth) external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        finalityDepth = _finalityDepth;
+    }
+
+    /**
+     * @notice Post a new vote tally root for a DAO proposal
+     */
+    function updateVoteRoot(
+        uint256 daoId,
+        uint256 proposalId,
+        uint256 voteRoot
+    ) external {
+        if (msg.sender != rootUpdater && msg.sender != admin) revert OnlyRootUpdater();
+        if (voteRoot == 0) revert VoteRootNotSet();
+        voteRoots[daoId][proposalId] = voteRoot;
+        emit VoteRootUpdated(daoId, proposalId, voteRoot, block.number);
+    }
+
+    /**
+     * @notice Set the address authorized to post SBT/vote roots
+     */
+    function setRootUpdater(address newRootUpdater) external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (newRootUpdater == address(0)) revert InvalidAddress();
+        rootUpdater = newRootUpdater;
+        emit RootUpdaterUpdated(newRootUpdater);
+    }
+
+    /**
+     * @notice Start two-step admin transfer (#650)
      * @param newAdmin Address of the new admin
      */
-    function setAdmin(address newAdmin) external {
+    function transferAdmin(address newAdmin) external {
         if (msg.sender != admin) revert OnlyAdmin();
         if (newAdmin == address(0)) revert InvalidAddress();
-        admin = newAdmin;
+        pendingAdmin = newAdmin;
+        emit AdminTransferStarted(newAdmin);
+    }
+
+    /**
+     * @notice Accept admin role (must be pendingAdmin)
+     */
+    function acceptAdmin() external {
+        if (msg.sender != pendingAdmin) revert OnlyPendingAdmin();
+        admin = pendingAdmin;
+        pendingAdmin = address(0);
+        emit AdminUpdated(admin);
+    }
+
+    /**
+     * @notice Legacy immediate setAdmin — REMOVED. Use transferAdmin/acceptAdmin.
+     */
+    function setAdmin(address) external pure {
+        revert OnlyPendingAdmin();
     }
 
     // ============================================
@@ -132,15 +253,7 @@ contract Bridge {
 
     /**
      * @notice Cast a cross-chain vote with Groth16 proof
-     * @dev Verifies the proof and emits VoteForwarded for Soroban relay
-     *
-     * @param daoId DAO identifier
-     * @param proposalId Proposal identifier
-     * @param voteChoice 0 = against, 1 = for
-     * @param nullifier Domain-separated nullifier (prevents double-voting)
-     * @param voteRoot Merkle root of the voting tree
-     * @param sbtRoot Merkle root of the SBT state tree
-     * @param proof Groth16 proof components [a, b, c]
+     * @param memberAddr Field-encoded Stellar member address (MUST match circuit)
      */
     function castVote(
         uint256 daoId,
@@ -149,73 +262,66 @@ contract Bridge {
         uint256 nullifier,
         uint256 voteRoot,
         uint256 sbtRoot,
+        uint256 memberAddr,
         bytes calldata proof
     ) external {
-        // === Validation ===
-
-        // Reject zero nullifier
         if (nullifier == 0) revert ZeroNullifier();
-
-        // Reject if nullifier already used (double-voting prevention)
+        if (memberAddr == 0) revert ZeroMemberAddr();
         if (nullifiers[daoId][proposalId][nullifier]) revert NullifierUsed();
-
-        // Validate vote choice is binary
         if (voteChoice > 1) revert InvalidVoteChoice();
 
-        // Check SBT root is set for this DAO
         if (sbtRoots[daoId] == 0) revert SbtRootNotSet();
-
-        // Verify the provided sbtRoot matches the posted one
         if (sbtRoot != sbtRoots[daoId]) revert SbtRootNotSet();
+
+        // Vote root must be anchored to a value previously posted by the root
+        // updater; otherwise an attacker could submit a proof against an
+        // arbitrary, unanchored vote tree.
+        uint256 anchoredVoteRoot = voteRoots[daoId][proposalId];
+        if (anchoredVoteRoot == 0) revert VoteRootNotSet();
+        if (voteRoot != anchoredVoteRoot) revert VoteRootMismatch();
+
+        // Enforce confirmation depth to prevent replaying against unfinalized roots.
+        if (block.number < sbtRootBlock[daoId] + finalityDepth) {
+            revert SbtRootNotFinalized();
+        }
 
         // === Proof Verification ===
 
-        // Build public signals array for the verifier
-        // Order matches bridge.circom: [sbtContractAddr, memberAddr, daoId,
-        //   proposalId, nullifier, voteChoice, voteRoot, sbtRoot]
-        // Note: memberAddr is not passed here; it's derived from the proof
-        // The verifier contract validates the proof against all public signals
-        uint256[8] memory publicSignals;
+        // Public signals must match bridge.circom order including chainId (#649)
+        uint256[9] memory publicSignals;
         publicSignals[0] = sbtContractAddr;
-        // memberAddr is embedded in the proof; the circuit constrains it
-        // We use a dummy value here; the actual memberAddr is verified by
-        // the SBT leaf hash in the circuit
-        publicSignals[1] = 0; // placeholder; circuit verifies SBT leaf
+        publicSignals[1] = memberAddr;
         publicSignals[2] = daoId;
         publicSignals[3] = proposalId;
         publicSignals[4] = nullifier;
         publicSignals[5] = voteChoice;
         publicSignals[6] = voteRoot;
         publicSignals[7] = sbtRoot;
+        publicSignals[8] = chainId;
 
-        // Decode proof: a (32 bytes), b (64 bytes), c (32 bytes)
         (uint256[2] memory a, uint256[2][2] memory b, uint256[2] memory c) =
             decodeProof(proof);
 
-        // Verify Groth16 proof via precompile
         bool valid = _verifyProof(a, b, c, publicSignals);
         if (!valid) revert InvalidProof();
 
-        // === Record Vote ===
-
-        // Mark nullifier as used
         nullifiers[daoId][proposalId][nullifier] = true;
 
-        // Emit event for Soroban relay
-        emit VoteForwarded(daoId, proposalId, nullifier, voteChoice, voteRoot);
+        emit VoteForwarded(
+            daoId,
+            proposalId,
+            nullifier,
+            voteChoice,
+            voteRoot,
+            memberAddr,
+            chainId
+        );
     }
 
     // ============================================
     // VIEW FUNCTIONS
     // ============================================
 
-    /**
-     * @notice Check if a nullifier has been used
-     * @param daoId DAO identifier
-     * @param proposalId Proposal identifier
-     * @param nullifier The nullifier to check
-     * @return True if the nullifier has been used
-     */
     function isNullifierUsed(
         uint256 daoId,
         uint256 proposalId,
@@ -224,57 +330,40 @@ contract Bridge {
         return nullifiers[daoId][proposalId][nullifier];
     }
 
-    /**
-     * @notice Get the current SBT root for a DAO
-     * @param daoId DAO identifier
-     * @return The SBT state root
-     */
     function getSbtRoot(uint256 daoId) external view returns (uint256) {
         return sbtRoots[daoId];
+    }
+
+    function getVoteRoot(
+        uint256 daoId,
+        uint256 proposalId
+    ) external view returns (uint256) {
+        return voteRoots[daoId][proposalId];
     }
 
     // ============================================
     // INTERNAL: PROOF VERIFICATION
     // ============================================
 
-    /**
-     * @dev Verify Groth16 proof using BN254 precompiles
-     * @param a Proof point A (G1)
-     * @param b Proof point B (G2)
-     * @param c Proof point C (G1)
-     * @param publicSignals Public signals array
-     * @return True if proof is valid
-     */
     function _verifyProof(
         uint256[2] memory a,
         uint256[2][2] memory b,
         uint256[2] memory c,
-        uint256[8] memory publicSignals
+        uint256[9] memory publicSignals
     ) internal view returns (bool) {
-        // Call the verifier contract
-        // The verifier contract implements the Groth16 verification
-        // using BN254 precompiles (bn256Add, bn256ScalarMul, bn256Pairing)
+        // abi.encodeCall type-checks this call against IGroth16Verifier at
+        // compile time, so the verifier interface (and its 9 public signals,
+        // matching bridge.circom) cannot drift from what Bridge sends (#887).
+        // A low-level staticcall keeps the check fail-closed: a reverting or
+        // malformed verifier yields "invalid", never a revert path.
         (bool success, bytes memory result) = verifier.staticcall(
-            abi.encodeWithSignature(
-                "verifyProof(uint256[2],uint256[2][2],uint256[2],uint256[8])",
-                a,
-                b,
-                c,
-                publicSignals
-            )
+            abi.encodeCall(IGroth16Verifier.verifyProof, (a, b, c, publicSignals))
         );
 
         if (!success || result.length < 32) return false;
         return abi.decode(result, (bool));
     }
 
-    /**
-     * @dev Decode raw proof bytes into Groth16 components
-     * @param proof Raw proof bytes (128 bytes: a=64, b=128, c=64)
-     * @return a Proof point A
-     * @return b Proof point B
-     * @return c Proof point C
-     */
     function decodeProof(
         bytes calldata proof
     )
@@ -288,17 +377,14 @@ contract Bridge {
     {
         require(proof.length == 256, "Invalid proof length");
 
-        // Decode A point (64 bytes)
         a[0] = uint256(bytes32(proof[0:32]));
         a[1] = uint256(bytes32(proof[32:64]));
 
-        // Decode B point (128 bytes, G2 - complex point)
         b[0][0] = uint256(bytes32(proof[64:96]));
         b[0][1] = uint256(bytes32(proof[96:128]));
         b[1][0] = uint256(bytes32(proof[128:160]));
         b[1][1] = uint256(bytes32(proof[160:192]));
 
-        // Decode C point (64 bytes)
         c[0] = uint256(bytes32(proof[192:224]));
         c[1] = uint256(bytes32(proof[224:256]));
     }

@@ -76,11 +76,24 @@ export interface FeePlan {
   baseFeeStroops: number;
   /** Soroban resource fee, in stroops (padded). */
   resourceFeeStroops: number;
-  /** baseFeeStroops + resourceFeeStroops -- what we set as tx.fee. */
+  /** Priority / surge inclusion fee bump, in stroops. */
+  priorityFeeStroops: number;
+  /** baseFeeStroops + resourceFeeStroops + priorityFeeStroops -- what we set as tx.fee. */
   totalFeeStroops: number;
   congestionMultiplier: number;
   safetyMarginPct: number;
+  /** True when feeStats indicate a surge (high ledger fill or p99 spread). */
+  surgeDetected: boolean;
   createdAt: string; // ISO timestamp
+}
+
+/** Fee-bump replacement plan targeting inclusion within ~1 ledger during surge. */
+export interface FeeBumpPlan {
+  originalFeeStroops: number;
+  bumpedFeeStroops: number;
+  bumpMultiplier: number;
+  reason: string;
+  surgeDetected: boolean;
 }
 
 export interface FeeStats {
@@ -248,19 +261,51 @@ export class FeeEstimator {
   // 2 & 3. Padding + congestion-adjusted fee plan
   // ----------------------------------------------------------------------
 
+  /**
+   * Surge-aware congestion model (#601).
+   *
+   * The previous linear model (1.0 / 1.15 / 1.4) underestimated inclusion fees
+   * during surges: votes submitted with the p50 fee would sit un-included for
+   * many ledgers and miss `end_time`. This model:
+   *   - reads Horizon/Soroban `feeStats` percentiles (p50/p90/p99) so the base
+   *     fee tracks what the network actually charges instead of a flat 100,
+   *   - scales the multiplier with ledger fill AND p99/p50 spread (surge),
+   *   - exposes `surgeDetected` so callers can prioritize / fee-bump.
+   */
+  static detectSurge(stats: FeeStats): boolean {
+    const spread = stats.p50 > 0 ? stats.p99 / stats.p50 : 0;
+    return stats.ledgerCapacityUsagePct > 80 || spread > 8 || stats.p99 > 5000;
+  }
+
+  /** Priority inclusion fee: p50 normally, p90 on fill, p99 on surge. */
+  static priorityFeeForStats(stats: FeeStats): number {
+    if (FeeEstimator.detectSurge(stats)) return Math.max(100, Math.ceil(stats.p99));
+    if (stats.ledgerCapacityUsagePct > 50) return Math.max(100, Math.ceil(stats.p90));
+    return Math.max(100, Math.ceil(stats.p50));
+  }
+
+  /** Order plans so surge votes with the highest fee go first (priority queue). */
+  static sortByPriority(plans: FeePlan[]): FeePlan[] {
+    return [...plans].sort((a, b) => b.totalFeeStroops - a.totalFeeStroops);
+  }
+
   /** Pulls recent network fee stats to gauge congestion. Falls back gracefully. */
   async getCongestionMultiplier(): Promise<{
     multiplier: number;
     stats: FeeStats | null;
+    surgeDetected: boolean;
+    priorityFeeStroops: number;
   }> {
     if (!this.server.getFeeStats) {
-      return { multiplier: 1, stats: null };
+      return { multiplier: 1, stats: null, surgeDetected: false, priorityFeeStroops: 100 };
     }
 
     try {
       const raw = await this.server.getFeeStats();
-      // Soroban RPC returns { sorobanInclusionFee: {p10,p50,p90,p99,...}, ... }
-      const soroban = raw?.sorobanInclusionFee ?? raw?.inclusionFee ?? {};
+      // Soroban RPC returns { sorobanInclusionFee: {p10,p50,p90,p99,...}, ... };
+      // Horizon feeStats returns { fee_charged: {p50,p90,p99,...}, ... }.
+      const soroban =
+        raw?.sorobanInclusionFee ?? raw?.inclusionFee ?? raw?.fee_charged ?? {};
       const stats: FeeStats = {
         p10: Number(soroban.p10 ?? 100),
         p50: Number(soroban.p50 ?? 100),
@@ -269,29 +314,72 @@ export class FeeEstimator {
         ledgerCapacityUsagePct: Number(
           raw?.ledgerCapacityUsage != null
             ? raw.ledgerCapacityUsage * 100
-            : 0
+            : raw?.ledger_capacity_usage != null
+              ? raw.ledger_capacity_usage * 100
+              : 0
         ),
       };
 
-      // Simple congestion heuristic:
-      //   - <50% full ledgers  -> use p10 baseline, multiplier 1.0
-      //   - 50-80% full        -> use p50, multiplier 1.15
-      //   - >80% full          -> use p90/p99, multiplier 1.4
-      let multiplier = 1.0;
-      if (stats.ledgerCapacityUsagePct > 80) {
-        multiplier = 1.4;
-      } else if (stats.ledgerCapacityUsagePct > 50) {
-        multiplier = 1.15;
-      }
+      const spread = stats.p50 > 0 ? stats.p99 / stats.p50 : 0;
+      const surgeDetected = FeeEstimator.detectSurge(stats);
 
-      return { multiplier, stats };
+      // Surge-aware tiers (previously capped at 1.4, which delayed surge votes ~30m):
+      //   - >95% full or extreme spread -> 2.5x (p99 priority fee)
+      //   - >80% full or surge          -> 1.8x (p99 priority fee)
+      //   - >50% full                   -> 1.3x (p90 priority fee)
+      //   - otherwise                   -> 1.0x (p50 priority fee)
+      let multiplier = 1.0;
+      if (stats.ledgerCapacityUsagePct > 95 || spread > 15) {
+        multiplier = 2.5;
+      } else if (surgeDetected) {
+        multiplier = 1.8;
+      } else if (stats.ledgerCapacityUsagePct > 50) {
+        multiplier = 1.3;
+      }
+      // Wide p99/p50 spread means fees are spiking within the window: add up
+      // to +0.5 (capped at 3.0) so we don't trail the surge.
+      if (spread > 10) multiplier = Math.min(3.0, multiplier + 0.5);
+
+      const priorityFeeStroops = FeeEstimator.priorityFeeForStats(stats);
+      return { multiplier, stats, surgeDetected, priorityFeeStroops };
     } catch (err) {
       // Network hiccup fetching fee stats shouldn't block submission;
       // fall back to a conservative default multiplier.
       // eslint-disable-next-line no-console
       console.warn("[FeeEstimator] getFeeStats failed, using default multiplier:", err);
-      return { multiplier: 1.1, stats: null };
+      return { multiplier: 1.1, stats: null, surgeDetected: false, priorityFeeStroops: 100 };
     }
+  }
+
+  /**
+   * Whether a submitted fee needs a fee-bump replacement to land within ~1
+   * ledger. True when the network moved into surge after submission or the
+   * submitted fee trails the current priority (p99) fee.
+   */
+  needsFeeBump(submittedFeeStroops: number, stats: FeeStats | null): boolean {
+    if (!stats) return false;
+    if (!FeeEstimator.detectSurge(stats)) return false;
+    return submittedFeeStroops < FeeEstimator.priorityFeeForStats(stats);
+  }
+
+  /** Build a fee-bump replacement targeting inclusion in the next ledger. */
+  buildFeeBumpPlan(submittedFeeStroops: number, stats: FeeStats | null): FeeBumpPlan {
+    const surgeDetected = stats ? FeeEstimator.detectSurge(stats) : false;
+    const priorityFee = stats ? FeeEstimator.priorityFeeForStats(stats) : 100;
+    // Bump at least 25% over the original AND cover the priority fee.
+    const bumpedFeeStroops = Math.max(
+      Math.ceil(submittedFeeStroops * 1.25),
+      Math.ceil(priorityFee * 1.1)
+    );
+    return {
+      originalFeeStroops: submittedFeeStroops,
+      bumpedFeeStroops,
+      bumpMultiplier: submittedFeeStroops > 0 ? bumpedFeeStroops / submittedFeeStroops : 1,
+      reason: surgeDetected
+        ? "surge detected: bumping to p99 priority fee for <1 ledger inclusion"
+        : "refreshing fee to current priority level",
+      surgeDetected,
+    };
   }
 
   /**
@@ -312,11 +400,14 @@ export class FeeEstimator {
       writeBytes: Math.ceil(simulated.writeBytes * (1 + marginPct)),
     };
 
-    const { multiplier } = await this.getCongestionMultiplier();
+    const { multiplier, stats, surgeDetected, priorityFeeStroops } =
+      await this.getCongestionMultiplier();
 
-    // Base (inclusion) fee: classic Stellar per-operation fee, congestion
-    // adjusted. 100 stroops is the network floor for a single op.
-    const baseFeeStroops = Math.ceil((opts.baseFeeStroops ?? 100) * multiplier);
+    // Base (inclusion) fee: track the network's current priority fee (p50/p90/
+    // p99 from feeStats) instead of a flat 100 stroops, so surge votes are not
+    // underpriced. An explicit caller override still wins.
+    const networkBase = stats ? FeeEstimator.priorityFeeForStats(stats) : 100;
+    const baseFeeStroops = Math.ceil((opts.baseFeeStroops ?? networkBase) * multiplier);
 
     // Resource fee: pad Soroban's own minResourceFee estimate rather than
     // recomputing pricing math ourselves (pricing tables change with
@@ -325,7 +416,13 @@ export class FeeEstimator {
       simulated.minResourceFeeStroops * (1 + marginPct) * multiplier
     );
 
-    const totalFeeStroops = baseFeeStroops + resourceFeeStroops;
+    // Priority surcharge during surge: lifting the total to the p99 priority
+    // fee keeps the vote competitive for next-ledger inclusion.
+    const prioritySurcharge = surgeDetected
+      ? Math.max(0, priorityFeeStroops - baseFeeStroops)
+      : 0;
+
+    const totalFeeStroops = baseFeeStroops + resourceFeeStroops + prioritySurcharge;
 
     const plan: FeePlan = {
       operationType: opts.operationType,
@@ -333,9 +430,11 @@ export class FeeEstimator {
       padded,
       baseFeeStroops,
       resourceFeeStroops,
+      priorityFeeStroops: prioritySurcharge,
       totalFeeStroops,
       congestionMultiplier: multiplier,
       safetyMarginPct: marginPct,
+      surgeDetected,
       createdAt: new Date().toISOString(),
     };
 
@@ -488,9 +587,11 @@ export class FeeEstimator {
       estimatedFeeStroops: plan.totalFeeStroops,
       estimatedFeeXLM: (plan.totalFeeStroops / 10_000_000).toFixed(7),
       congestionMultiplier: plan.congestionMultiplier,
+      surgeDetected: plan.surgeDetected,
       breakdown: {
         baseFeeStroops: plan.baseFeeStroops,
         resourceFeeStroops: plan.resourceFeeStroops,
+        priorityFeeStroops: plan.priorityFeeStroops,
       },
       safetyMarginPct: plan.safetyMarginPct,
     };

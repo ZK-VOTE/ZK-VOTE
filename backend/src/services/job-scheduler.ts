@@ -11,6 +11,9 @@
 import { createLogger } from "./logger.js";
 import { runMaintenanceTasks } from "./authTokens.js";
 import { getDb } from "./db.js";
+import { factoryOrchestrator } from "./factory-orchestrator.js";
+import { reloadQuotaOverridesFromConfig } from "../middleware/rateLimiter.js";
+import { reclaimExpiredLeases, getQueueHealth } from "./durable-jobs.js";
 import {
   session_store_size,
   rate_limit_store_size,
@@ -18,6 +21,7 @@ import {
   daoReconciliationRunsTotal,
   daoReconciliationLastOk,
   serviceLastRunTime,
+  backupAgeSeconds,
 } from "./metrics.js";
 
 const logger = createLogger("job-scheduler");
@@ -80,10 +84,16 @@ export class JobScheduler {
     cleanedSessions: number;
     tokenMaintenance: any;
     rateLimitKeys: number;
+    recoveredSagas: number;
   }> {
     if (this.running) {
       logger.debug("job_scheduler_skip_concurrent_tick");
-      return { cleanedSessions: 0, tokenMaintenance: null, rateLimitKeys: 0 };
+      return {
+        cleanedSessions: 0,
+        tokenMaintenance: null,
+        rateLimitKeys: 0,
+        recoveredSagas: 0,
+      };
     }
 
     this.running = true;
@@ -94,16 +104,39 @@ export class JobScheduler {
       // 2. Auth token maintenance
       const tokenMaintenance = runMaintenanceTasks();
 
-      // 3. Update gauge metrics
+      // 3. Reconcile live quota overrides and update gauge metrics
+      try {
+        reloadQuotaOverridesFromConfig();
+      } catch (err) {
+        logger.warn("quota_override_reload_failed", {
+          error: (err as Error).message,
+        });
+      }
       const rateLimitKeys = this.updateStoreMetrics();
+      this.updateBackupAge();
 
       // 4. State reconciliation check
       this.checkStateReconciliation();
+
+      // 5. Durable job queue — reclaim expired leases so stuck jobs re-enter
+      //    the ready pool, and log queue depth for observability.
+      try {
+        reclaimExpiredLeases();
+        const qh = getQueueHealth();
+        logger.debug("durable_job_queue_health", qh);
+      } catch (err) {
+        // Jobs table may not exist in environments running old migrations.
+        logger.debug("durable_job_queue_unavailable", { error: (err as Error).message });
+      }
+
+      // 6. Resume factory sagas stranded by a process restart.
+      const recoveredSagas = await this.recoverStalledSagas();
 
       return {
         cleanedSessions,
         tokenMaintenance,
         rateLimitKeys,
+        recoveredSagas,
       };
     } finally {
       this.running = false;
@@ -142,13 +175,68 @@ export class JobScheduler {
   }
 
   /**
-   * Inspect and update rate limit metrics
+   * Inspect and update rate limit metrics (#598).
+   *
+   * Previously hardcoded to 0, so `zkvote_rate_limit_store_size` never moved
+   * and the exhaustion alert could not fire. Now sums the bounded in-process
+   * limiter stores (best-effort: middleware may not be loaded in all contexts).
    */
   updateStoreMetrics(): number {
-    // Basic approximate count of active rate limit buckets
-    const count = 0;
-    rate_limit_store_size.set(count);
+    let count = 0;
+    try {
+      // Dynamic import path avoided to keep scheduler free of middleware
+      // cycles; resolve via the global registry when available.
+      const g = globalThis as { __rateLimitStoreSize?: () => number };
+      if (typeof g.__rateLimitStoreSize === "function") {
+        count = g.__rateLimitStoreSize();
+      }
+    } catch {
+      count = 0;
+    }
+    try {
+      rate_limit_store_size.set(count);
+    } catch {
+      // metrics registry may be unavailable in unit tests
+    }
     return count;
+  }
+
+  /**
+   * Resume DAO-creation sagas that are still `in_progress`/`failed` after a
+   * restart. Each saga resumes from its last committed step; stepping is
+   * idempotent so a recovered worker never redeploys an existing component.
+   */
+  async recoverStalledSagas(): Promise<number> {
+    try {
+      const count = await factoryOrchestrator.recoverStalled();
+      if (count > 0) {
+        logger.info("factory_sagas_recovered", { count });
+      }
+      return count;
+    } catch (err) {
+      logger.error("factory_saga_recovery_failed", {
+        error: (err as Error).message,
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * Track backup staleness for the DR alert (#600). Age is derived from the
+   * backup module's last-success timestamp when available; unknown stays put
+   * so the alert only fires on measured staleness.
+   */
+  updateBackupAge(): void {
+    try {
+      const g = globalThis as { __lastBackupAt?: () => string | null };
+      const at = typeof g.__lastBackupAt === "function" ? g.__lastBackupAt() : null;
+      if (at) {
+        const ageSec = Math.max(0, (Date.now() - Date.parse(at)) / 1000);
+        backupAgeSeconds.set(ageSec);
+      }
+    } catch {
+      // metrics registry may be unavailable in unit tests
+    }
   }
 
   /**

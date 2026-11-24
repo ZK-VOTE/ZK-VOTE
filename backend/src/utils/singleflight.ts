@@ -2,6 +2,7 @@ import {
   coalescingHitsTotal,
   coalescingMissesTotal,
   coalescingWaitTime,
+  normalizeCoalesceKey,
 } from "../services/metrics.js";
 
 interface Call {
@@ -27,10 +28,11 @@ export class SingleFlight {
     timeoutMs: number = 30000,
   ): Promise<T> {
     const existing = this.calls.get(key);
+    const operation = normalizeCoalesceKey(key);
 
     if (existing) {
-      coalescingHitsTotal.inc({ key });
-      const timer = coalescingWaitTime.startTimer({ key });
+      coalescingHitsTotal.inc({ operation });
+      const timer = coalescingWaitTime.startTimer({ operation });
       try {
         return await existing.promise;
       } finally {
@@ -38,7 +40,7 @@ export class SingleFlight {
       }
     }
 
-    coalescingMissesTotal.inc({ key });
+    coalescingMissesTotal.inc({ operation });
 
     const promise = new Promise<T>((resolve, reject) => {
       // Execute the function

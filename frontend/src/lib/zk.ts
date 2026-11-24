@@ -2,6 +2,7 @@
 import { buildPoseidon } from "circomlibjs";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
 import { CONTRACTS, NETWORK_CONFIG } from "../config/contracts";
+import { relayerFetch } from "./api";
 
 // Domain separation tag for commitment scheme
 // SHA-256("ZK-VOTE-COMMITMENT") reduced mod BN254 scalar field
@@ -143,7 +144,59 @@ By signing, you accept the voting terms for DAO ${daoId}.`;
   };
 }
 
-// Legacy: Generate random ZK credentials (kept for backwards compatibility)
+/**
+ * Derives cryptographically domain-separated ZK credentials for a specific DAO
+ * from a master secret. This prevents cross-DAO secret reuse and correlation of
+ * identity commitments and nullifiers across different DAOs.
+ *
+ * @param masterSecret Base secret string or seed
+ * @param daoId DAO identifier used for domain separation
+ */
+export async function derivePerDaoCredentials(
+  masterSecret: string,
+  daoId: number,
+): Promise<ZKCredentials> {
+  const poseidon = await buildPoseidon();
+  const baseBytes = new TextEncoder().encode(masterSecret);
+
+  // Secret: bound to DAO domain
+  const secretDomain = new TextEncoder().encode(`zkvote:secret:${daoId}`);
+  const secretInput = new Uint8Array([...secretDomain, ...baseBytes]);
+  const secretHash = new Uint8Array(await crypto.subtle.digest("SHA-256", secretInput));
+  const secret = BigInt("0x" + Array.from(secretHash).map((b) => b.toString(16).padStart(2, "0")).join(""));
+
+  // Salt: bound to DAO domain
+  const saltDomain = new TextEncoder().encode(`zkvote:salt:${daoId}`);
+  const saltInput = new Uint8Array([...saltDomain, ...baseBytes]);
+  const saltHash = new Uint8Array(await crypto.subtle.digest("SHA-256", saltInput));
+  const salt = BigInt("0x" + Array.from(saltHash).map((b) => b.toString(16).padStart(2, "0")).join(""));
+
+  // Blinding: bound to DAO domain
+  const blindingDomain = new TextEncoder().encode(`zkvote:blinding:${daoId}`);
+  const blindingInput = new Uint8Array([...blindingDomain, ...baseBytes]);
+  const blindingHash = new Uint8Array(await crypto.subtle.digest("SHA-256", blindingInput));
+  const blindingFactor = BigInt("0x" + Array.from(blindingHash).map((b) => b.toString(16).padStart(2, "0")).join(""));
+
+  const commitment = poseidon.F.toString(
+    poseidon([DOMAIN_TAG, secret, salt, blindingFactor]),
+  );
+
+  return {
+    secret: secret.toString(),
+    salt: salt.toString(),
+    blindingFactor: blindingFactor.toString(),
+    commitment,
+  };
+}
+
+/**
+ * Legacy: Generate random ZK credentials (kept for backwards compatibility)
+ *
+ * @deprecated Generating standalone random credentials without DAO binding can lead to
+ * cross-DAO secret reuse where the same (secret, salt) produces identical commitments and
+ * linkable nullifiers across DAOs. Prefer `generateZKCredentials(kit, daoId)` or
+ * `derivePerDaoCredentials(masterSecret, daoId)`.
+ */
 export async function generateRandomZKCredentials(): Promise<ZKCredentials> {
   const poseidon = await buildPoseidon();
 
@@ -271,28 +324,64 @@ export async function getOrRegenerateZKCredentials(
     return null;
   }
 
-  // Regenerate from wallet signature
+  // Regenerate from wallet signature and discover leaf index via relayer (ZV-060 / #906).
   if (import.meta.env.DEV)
     console.log(
       `[ZK] Regenerating credentials from wallet signature for DAO ${daoId}...`,
     );
   try {
-    // Credentials generated but not used - leaf index lookup not yet implemented
-    await generateDeterministicZKCredentials(kit, daoId);
+    const credentials = await generateDeterministicZKCredentials(kit, daoId);
 
-    // Get leaf index from contract (this requires on-chain lookup)
-    // For now, return null and require explicit registration
-    // In the future, we could query the tree contract to find the leaf index
+    // Look up the commitment's leaf index from the relayer, which reads it
+    // from the on-chain membership tree. This avoids re-registration for
+    // members who lost local state (fresh install, cleared storage, new device).
     if (import.meta.env.DEV)
-      console.log(
-        `[ZK] Credentials regenerated, but leaf index unknown. User must re-register.`,
-      );
-    return null;
+      console.log(`[ZK] Looking up leaf index for commitment ${credentials.commitment.slice(0, 12)}…`);
 
-    // Future enhancement: Query contract for leaf index
-    // const leafIndex = await queryLeafIndexFromContract(commitment, daoId);
-    // storeZKCredentials(daoId, publicKey, credentials, leafIndex);
-    // return { ...credentials, leafIndex };
+    const resp = await relayerFetch(
+      `/api/v1/membership/leaf-index/${daoId}/${credentials.commitment}`,
+    );
+
+    if (resp.status === 404) {
+      // Commitment not in the tree — member must register first.
+      if (import.meta.env.DEV)
+        console.log(`[ZK] Commitment not found on-chain; re-registration required.`);
+      return null;
+    }
+
+    if (resp.status === 410) {
+      // Commitment was revoked — credentials cannot be used.
+      if (import.meta.env.DEV)
+        console.log(`[ZK] Commitment is revoked; credentials cannot be recovered.`);
+      return null;
+    }
+
+    if (!resp.ok) {
+      if (import.meta.env.DEV)
+        console.warn(`[ZK] Leaf index lookup failed (${resp.status}); cannot recover without re-registration.`);
+      return null;
+    }
+
+    const data = (await resp.json()) as {
+      leafIndex: number;
+      daoId: number;
+      commitment: string;
+      root: string;
+    };
+
+    if (typeof data.leafIndex !== "number" || data.leafIndex < 0) {
+      if (import.meta.env.DEV)
+        console.warn(`[ZK] Unexpected leaf index value from relayer:`, data.leafIndex);
+      return null;
+    }
+
+    // Cache the recovered credentials so subsequent calls hit the fast path.
+    storeZKCredentials(daoId, publicKey, credentials, data.leafIndex);
+
+    if (import.meta.env.DEV)
+      console.log(`[ZK] Credentials recovered; leaf index = ${data.leafIndex}`);
+
+    return { ...credentials, leafIndex: data.leafIndex };
   } catch (err) {
     console.error(`[ZK] Failed to regenerate credentials:`, err);
     return null;

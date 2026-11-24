@@ -67,7 +67,7 @@ router.post("/membership/register-commitment", authGuard, commitmentRegistration
         : req.body;
     try {
         log("info", "membership_register_commitment_request", { daoId, caller });
-        membershipRegistrationTotal.inc({ dao_id: String(daoId) });
+        membershipRegistrationTotal.inc({ status: "requested" });
         if (!config.treeContractId) {
             return res
                 .status(503)

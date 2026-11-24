@@ -73,12 +73,35 @@ router.get("/daos", queryLimiter, validateQuery(daosQuerySchema), (async (
 
     let filteredDaos = dbService.getAllCachedDaos();
 
-    // Apply free-text search on DAO name (case-insensitive substring)
+    // Apply free-text search on DAO name with squat-resistant ranking & Unicode NFC normalization
     if (search) {
-      const lowerSearch = (search as string).toLowerCase();
-      filteredDaos = filteredDaos.filter((dao) =>
-        dao.name.toLowerCase().includes(lowerSearch),
-      );
+      const normSearch = (search as string).normalize("NFC").toLowerCase().trim();
+      type ScoredDao = { dao: (typeof filteredDaos)[0]; score: number };
+      const scored: ScoredDao[] = [];
+
+      for (const dao of filteredDaos) {
+        const normName = (dao.name || "").normalize("NFC").toLowerCase();
+        let score = 0;
+        if (normName === normSearch) {
+          score = 3; // exact match
+        } else if (normName.startsWith(normSearch)) {
+          score = 2; // prefix match
+        } else if (normName.includes(normSearch)) {
+          score = 1; // substring match
+        }
+
+        if (score > 0) {
+          scored.push({ dao, score });
+        }
+      }
+
+      // Sort by score DESC, then by dao.id DESC for stable, squat-resistant pagination
+      scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return b.dao.id - a.dao.id;
+      });
+
+      filteredDaos = scored.map((s) => s.dao);
     }
 
     // Apply membership type filter
@@ -133,6 +156,11 @@ router.get("/daos", queryLimiter, validateQuery(daosQuerySchema), (async (
       },
       lastSync: dbService.getDaosSyncTime(),
       cached: true,
+      degraded: syncHealth.state !== "healthy",
+      syncStatus: syncHealth.state,
+      dataStatus: syncHealth.state === "healthy" ? "fresh" : "stale",
+      // A stale empty response is never evidence that no DAOs exist.
+      sourceAvailable: syncHealth.state === "healthy",
     });
   } catch (err) {
     log("error", "get_daos_failed", { error: (err as Error).message });
@@ -350,11 +378,11 @@ router.get(
         proposals = proposals.filter((p) => p.closed);
       }
 
-      // Apply free-text search on title
+      // Apply free-text search on title with Unicode NFC normalization
       if (search) {
-        const lowerSearch = search.toLowerCase();
+        const normSearch = search.normalize("NFC").toLowerCase().trim();
         proposals = proposals.filter((p) =>
-          p.title.toLowerCase().includes(lowerSearch),
+          (p.title || "").normalize("NFC").toLowerCase().includes(normSearch),
         );
       }
 
@@ -376,6 +404,8 @@ router.get(
         pagination: {
           cursor: hasMore ? String(offset + limit) : undefined,
           hasMore,
+          limit,
+          offset,
           total,
         },
         filters: { status, search: search ?? null },

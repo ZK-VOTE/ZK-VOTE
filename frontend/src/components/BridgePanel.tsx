@@ -1,4 +1,6 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
+import { TreasuryEscrowPanel } from "./TreasuryEscrowPanel";
+import { fetchBridgeRoots, type BridgeRoots } from "../hooks/useBridge";
 
 interface BridgePanelProps {
   daoId: number;
@@ -41,6 +43,20 @@ export function BridgePanel({
   });
   const [evmConnected, setEvmConnected] = useState(false);
   const [evmAddress, setEvmAddress] = useState<string | null>(null);
+  // The roots Bridge.sol has anchored (#887): shown, and used in the vote, so
+  // the proof is built against the values castVote checks.
+  const [roots, setRoots] = useState<BridgeRoots | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    let cancelled = false;
+    fetchBridgeRoots(daoId, proposalId).then((r) => {
+      if (!cancelled) setRoots(r);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [daoId, proposalId, isConnected]);
 
   const connectEVMWallet = useCallback(async () => {
     try {
@@ -73,6 +89,13 @@ export function BridgePanel({
 
   const submitBridgeVote = useCallback(async () => {
     if (voteChoice === null) return;
+    if (!roots?.anchored) {
+      setVoteState({
+        status: "error",
+        error: "The bridge roots for this proposal are not anchored yet. Try again shortly.",
+      });
+      return;
+    }
 
     setVoteState({ status: "generating" });
 
@@ -99,8 +122,8 @@ export function BridgePanel({
           proposalId,
           voteChoice: voteChoice ? 1 : 0,
           nullifier: "0x" + "0".repeat(64), // Placeholder
-          voteRoot: "0x" + "0".repeat(64), // Placeholder
-          sbtRoot: "0x" + "0".repeat(64), // Placeholder
+          voteRoot: roots.voteRoot,
+          sbtRoot: roots.sbtRoot,
           proof: {
             a: "0x" + "0".repeat(128),
             b: "0x" + "0".repeat(256),
@@ -129,7 +152,7 @@ export function BridgePanel({
         error: "Bridge vote failed: " + (err as Error).message,
       });
     }
-  }, [daoId, proposalId, voteChoice, onVoteSubmitted]);
+  }, [daoId, proposalId, voteChoice, onVoteSubmitted, roots]);
 
   if (!isConnected) {
     return (
@@ -154,6 +177,27 @@ export function BridgePanel({
         Use your Stellar SBT membership to vote from Ethereum. Your identity
         remains anonymous via zero-knowledge proofs.
       </p>
+
+      {/* Roots anchored on Bridge.sol (#887) */}
+      <div className="text-xs space-y-1" data-testid="bridge-roots">
+        {roots === undefined && <p className="text-muted-foreground">Loading bridge roots…</p>}
+        {roots === null && (
+          <p className="text-muted-foreground">Bridge roots are unavailable right now.</p>
+        )}
+        {roots && !roots.anchored && (
+          <p className="text-amber-700 dark:text-amber-300">
+            Bridge roots for this proposal are not anchored yet.
+          </p>
+        )}
+        {roots?.anchored && (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-2 font-mono">
+            <dt className="text-muted-foreground">SBT root</dt>
+            <dd className="truncate" title={roots.sbtRoot}>{roots.sbtRoot}</dd>
+            <dt className="text-muted-foreground">Vote root</dt>
+            <dd className="truncate" title={roots.voteRoot}>{roots.voteRoot}</dd>
+          </dl>
+        )}
+      </div>
 
       {/* EVM Wallet Connection */}
       {!evmConnected ? (
@@ -244,6 +288,14 @@ export function BridgePanel({
         </p>
         <p>Gas cost target: &lt;500k gas for proof verification on EVM.</p>
       </div>
+
+      {evmConnected && (
+        <TreasuryEscrowPanel
+          daoId={daoId}
+          proposalId={proposalId}
+          evmAddress={evmAddress}
+        />
+      )}
     </div>
   );
 }

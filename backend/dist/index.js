@@ -54,6 +54,28 @@ const services = buildAppServices();
 // EXPRESS APP SETUP
 // ============================================
 const app = express();
+const isProduction = process.env.NODE_ENV === "production";
+// Security: CORS configuration
+function parseCorsOrigins(value) {
+    if (Array.isArray(value))
+        return value;
+    return value
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean);
+}
+const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins);
+if (allowedCorsOrigins.length === 0) {
+    throw new Error("CORS_ORIGIN must specify at least one origin");
+}
+if (isProduction && allowedCorsOrigins.includes("*")) {
+    throw new Error("CORS_ORIGIN must not be '*' in production; configure exact origins");
+}
+for (const origin of allowedCorsOrigins) {
+    if (origin !== "*" && /[*?]/.test(origin)) {
+        throw new Error("CORS_ORIGIN origins must be exact URLs, not wildcard patterns");
+    }
+}
 // Security: HTTP headers with CSP
 // This is a pure JSON API (no HTML is served outside /api-docs), so the CSP
 // defaults everything to 'none' and only opens the handful of directives
@@ -71,7 +93,7 @@ app.use(helmet({
             objectSrc: ["'none'"],
             baseUri: ["'none'"],
             formAction: ["'none'"],
-            frameAncestors: ["'none'"],
+            frameAncestors: allowedCorsOrigins.includes("*") ? ["'none'"] : allowedCorsOrigins,
             blockAllMixedContent: [],
             upgradeInsecureRequests: [],
         },
@@ -96,6 +118,15 @@ app.use((_req, res, next) => {
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
     next();
 });
+// CRITICAL (#661): Cross-origin isolation headers for timing-masking to be effective.
+// Timing masking in proof generation only works when the page is crossOriginIsolated,
+// which requires COOP + COEP headers from the server (dev/preview server has these
+// in vite.config.ts, but production must send them too).
+app.use((_req, res, next) => {
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    next();
+});
 // Prevent caching of sensitive, non-static API responses. Kept scoped to the
 // routes that return per-user or per-vote data rather than applied globally,
 // since some routes (e.g. /api-docs, /ipfs/image/:cid) are fine to cache.
@@ -109,28 +140,6 @@ const noStore = (_req, res, next) => {
 app.use(metricsMiddleware);
 // Request-scoped degradation tracking (#204)
 app.use(degradationContext);
-// Security: CORS configuration
-function parseCorsOrigins(value) {
-    if (Array.isArray(value))
-        return value;
-    return value
-        .split(",")
-        .map((origin) => origin.trim())
-        .filter(Boolean);
-}
-const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins);
-const isProduction = process.env.NODE_ENV === "production";
-if (allowedCorsOrigins.length === 0) {
-    throw new Error("CORS_ORIGIN must specify at least one origin");
-}
-if (isProduction && allowedCorsOrigins.includes("*")) {
-    throw new Error("CORS_ORIGIN must not be '*' in production; configure exact origins");
-}
-for (const origin of allowedCorsOrigins) {
-    if (origin !== "*" && /[*?]/.test(origin)) {
-        throw new Error("CORS_ORIGIN origins must be exact URLs, not wildcard patterns");
-    }
-}
 const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
 const corsOptions = {
     origin: (origin, callback) => {

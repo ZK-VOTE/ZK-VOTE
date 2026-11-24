@@ -7,6 +7,10 @@ import type { CorsOptions } from "cors";
  */
 export declare function getAllowedOrigins(input?: string | string[]): string[];
 /**
+ * Validate that CORS origins are exact URLs (no wildcards) in production.
+ */
+export declare function validateCorsOrigins(origins: string[]): void;
+/**
  * Create CORS options with origin validator function.
  */
 export declare function createCorsOptions(allowed?: string[] | string): CorsOptions;

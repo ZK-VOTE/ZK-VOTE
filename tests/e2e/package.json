@@ -10,8 +10,15 @@
     "test:comments": "node run-all.js --filter=comment"
   },
   "dependencies": {
-    "circomlibjs": "^0.1.7",
-    "snarkjs": "^0.7.5",
-    "@stellar/stellar-sdk": "^14.0.0"
+    "circomlibjs": "0.1.7",
+    "snarkjs": "0.7.5",
+    "@stellar/stellar-sdk": "15.1.0"
+  },
+  "overrides": {
+    "snarkjs": "0.7.5",
+    "circom_runtime": "0.1.28",
+    "ffjavascript": "0.2.63",
+    "wasmcurves": "0.2.2",
+    "@stellar/stellar-sdk": "15.1.0"
   }
 }

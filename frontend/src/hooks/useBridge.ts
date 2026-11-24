@@ -29,6 +29,40 @@ interface BridgeVoteResult {
 
 const EXPECTED_CHAIN_ID = 31337; // Anvil/Hardhat local
 
+/** The roots Bridge.sol has anchored for a proposal, as the relayer reads them on-chain. */
+export interface BridgeRoots {
+  sbtRoot: string;
+  voteRoot: string;
+  sbtRootBlock: number;
+  /** False until the root updater has posted both roots; castVote rejects proofs until then. */
+  anchored: boolean;
+}
+
+/**
+ * Reads the anchored roots from GET /bridge/roots (#887). Returns null when
+ * they cannot be read (bridge not configured, RPC down, bad response).
+ */
+export async function fetchBridgeRoots(
+  daoId: number,
+  proposalId: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BridgeRoots | null> {
+  try {
+    const response = await fetchImpl(`/bridge/roots/${daoId}/${proposalId}`);
+    if (!response.ok) return null;
+    const body = await response.json();
+    if (typeof body?.sbtRoot !== "string" || typeof body?.voteRoot !== "string") return null;
+    return {
+      sbtRoot: body.sbtRoot,
+      voteRoot: body.voteRoot,
+      sbtRootBlock: Number(body.sbtRootBlock ?? 0),
+      anchored: body.anchored === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * useBridge - Hook for EVM wallet connection and cross-chain voting
  */
@@ -200,6 +234,11 @@ export function useBridge() {
     };
   }, [state.evmConnected, disconnect]);
 
+  const fetchRoots = useCallback(
+    (daoId: number, proposalId: number) => fetchBridgeRoots(daoId, proposalId),
+    [],
+  );
+
   return {
     ...state,
     isMetaMaskAvailable: !!isMetaMaskAvailable,
@@ -208,6 +247,7 @@ export function useBridge() {
     switchChain,
     submitVote,
     checkNullifier,
+    fetchRoots,
   };
 }
 

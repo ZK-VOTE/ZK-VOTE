@@ -113,7 +113,7 @@ export default function Profile({ publicKey, isConnected }: ProfileProps) {
             variant="outline"
             onClick={() => fileInputRef.current?.click()}
           >
-            <Upload className="mr-2 h-4 w-4" />
+            <Upload className="me-2 h-4 w-4" />
             Import
           </Button>
           <Button
@@ -121,7 +121,7 @@ export default function Profile({ publicKey, isConnected }: ProfileProps) {
             onClick={handleExport}
             disabled={receipts.length === 0}
           >
-            <Download className="mr-2 h-4 w-4" />
+            <Download className="me-2 h-4 w-4" />
             Export
           </Button>
         </div>
@@ -151,14 +151,14 @@ export default function Profile({ publicKey, isConnected }: ProfileProps) {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
+              <table className="w-full text-sm text-start">
                 <thead className="text-xs uppercase bg-muted/50">
                   <tr>
                     <th className="px-4 py-3">Date</th>
                     <th className="px-4 py-3">DAO ID</th>
                     <th className="px-4 py-3">Proposal ID</th>
                     <th className="px-4 py-3">Tx Hash</th>
-                    <th className="px-4 py-3 text-right">Verification</th>
+                    <th className="px-4 py-3 text-end">Verification</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -179,14 +179,14 @@ export default function Profile({ publicKey, isConnected }: ProfileProps) {
                           {truncateAddress(receipt.txHash, 6, 6)}
                         </a>
                       </td>
-                      <td className="px-4 py-3 text-right">
+                      <td className="px-4 py-3 text-end">
                         {verificationResult[receipt.id] === true ? (
                           <span className="inline-flex items-center text-green-600 dark:text-green-400">
-                            <CheckCircle className="mr-1 h-4 w-4" /> Verified
+                            <CheckCircle className="me-1 h-4 w-4" /> Verified
                           </span>
                         ) : verificationResult[receipt.id] === false ? (
                           <span className="inline-flex items-center text-destructive">
-                            <XCircle className="mr-1 h-4 w-4" /> Failed
+                            <XCircle className="me-1 h-4 w-4" /> Failed
                           </span>
                         ) : (
                           <Button

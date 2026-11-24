@@ -12,22 +12,44 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config.js";
 import { log } from "../services/logger.js";
 import { server, relayerKeypair, callWithTimeout, simulateWithBackoff, waitForTransaction, withSequenceLock, u256ToScVal, } from "../services/stellar.js";
-import { authGuard, queryLimiter, validateBody } from "../middleware/index.js";
+import { verifyBridgeProof } from "../services/bridgeProof.js";
+import { authGuard, bodyLimit, queryLimiter, validateBody, voteLimiter, } from "../middleware/index.js";
 import { bridgeVoteSchema } from "../validation/schemas.js";
 const router = Router();
+/** Privacy-preserving rejection — never disclose which check failed. */
+function voteRejected(res, status = 400) {
+    return res.status(status).json({
+        error: "VOTE_REJECTED",
+        code: "VOTE_REJECTED",
+    });
+}
 // ============================================
 // ROUTES
 // ============================================
 /**
  * POST /bridge/vote - Submit cross-chain vote
  *
- * Receives a Groth16 proof generated on EVM and relays it to Soroban.
- * The proof proves SBT membership and voting eligibility.
+ * Receives a Groth16 proof, verifies it off-chain against the bridge VK, then
+ * relays only the public vote fields to Soroban `relay_vote` (which does not
+ * accept a proof). Authenticity comes from the verified proof + authGuard.
  */
-router.post("/bridge/vote", validateBody(bridgeVoteSchema), (async (req, res) => {
-    const { daoId, proposalId, voteChoice, nullifier, voteRoot } = config.stripRequestBodies ? {} : req.body;
+router.post("/bridge/vote", bodyLimit("5kb"), authGuard, voteLimiter, validateBody(bridgeVoteSchema), (async (req, res) => {
+    const { daoId, proposalId, voteChoice, nullifier, voteRoot, sbtRoot, sbtContractAddr, memberAddr, proof, } = config.stripRequestBodies ? {} : req.body;
     try {
         log("info", "bridge_vote_request", { daoId, proposalId });
+        const proofValid = await verifyBridgeProof(proof, {
+            sbtContractAddr,
+            memberAddr,
+            daoId,
+            proposalId,
+            nullifier,
+            voteChoice,
+            voteRoot,
+            sbtRoot,
+        });
+        if (!proofValid) {
+            return voteRejected(res);
+        }
         // Convert inputs to Soroban types
         let scNullifier;
         let scRoot;
@@ -35,20 +57,26 @@ router.post("/bridge/vote", validateBody(bridgeVoteSchema), (async (req, res) =>
             scNullifier = u256ToScVal(nullifier);
             scRoot = u256ToScVal(voteRoot);
         }
-        catch (err) {
-            return res.status(400).json({ error: err.message });
+        catch {
+            return voteRejected(res);
         }
         if (config.testMode) {
-            return res.status(400).json({ error: "Simulation failed (test mode)" });
+            return voteRejected(res);
+        }
+        if (!config.bridgeContractId) {
+            log("error", "bridge_contract_not_configured");
+            return res.status(503).json({ error: "Bridge unavailable" });
         }
         // Build contract call to Soroban bridge
         const contract = new StellarSdk.Contract(config.bridgeContractId);
+        const relayerAddress = StellarSdk.Address.fromString(relayerKeypair.publicKey());
         const args = [
             StellarSdk.nativeToScVal(daoId, { type: "u64" }),
             StellarSdk.nativeToScVal(proposalId, { type: "u64" }),
             StellarSdk.nativeToScVal(voteChoice === 1, { type: "bool" }),
             scNullifier,
             scRoot,
+            relayerAddress.toScVal(),
         ];
         const operation = contract.call("relay_vote", ...args);
         // Submit under sequence lock
@@ -65,22 +93,9 @@ router.post("/bridge/vote", validateBody(bridgeVoteSchema), (async (req, res) =>
             log("info", "simulate_bridge_vote", { daoId, proposalId });
             const simResult = await callWithTimeout(() => simulateWithBackoff(() => server.simulateTransaction(tx)), "simulate_bridge_vote");
             if (!StellarSdk.rpc.Api.isSimulationSuccess(simResult)) {
-                log("warn", "bridge_simulation_failed", {
-                    daoId,
-                    proposalId,
-                    error: simResult.error,
-                });
-                let errorMessage = "Transaction simulation failed";
-                if (simResult.error) {
-                    const errorStr = JSON.stringify(simResult.error);
-                    if (errorStr.includes("already voted")) {
-                        errorMessage = "You have already voted on this proposal";
-                    }
-                    else if (errorStr.includes("nullifier")) {
-                        errorMessage = "Invalid or already-used nullifier";
-                    }
-                }
-                throw new Error(`SIMULATION_FAILED:${errorMessage}`);
+                // Do not surface contract diagnostics (nullifier / already-voted).
+                log("warn", "bridge_simulation_failed", { daoId, proposalId });
+                throw new Error("SIMULATION_FAILED:VOTE_REJECTED");
             }
             // Prepare and sign
             const preparedTx = StellarSdk.rpc
@@ -94,7 +109,6 @@ router.post("/bridge/vote", validateBody(bridgeVoteSchema), (async (req, res) =>
                 log("error", "bridge_submit_failed", {
                     daoId,
                     proposalId,
-                    error: sr.errorResult,
                 });
                 throw new Error("SUBMIT_FAILED");
             }
@@ -130,28 +144,20 @@ router.post("/bridge/vote", validateBody(bridgeVoteSchema), (async (req, res) =>
     catch (err) {
         log("error", "bridge_vote_exception", {
             message: err.message,
-            stack: err.stack,
         });
         const errMsg = err.message || "";
-        let statusCode = 500;
-        let userMessage = "Internal server error";
         if (errMsg.startsWith("SIMULATION_FAILED:")) {
-            statusCode = 400;
-            userMessage = errMsg.slice("SIMULATION_FAILED:".length);
+            return voteRejected(res);
         }
-        else if (errMsg === "SUBMIT_FAILED") {
-            statusCode = 500;
-            userMessage = "Transaction submission failed";
+        if (errMsg === "SUBMIT_FAILED") {
+            return res.status(500).json({ error: "Transaction submission failed" });
         }
-        else if (errMsg.includes("Timeout:")) {
-            statusCode = 504;
-            userMessage = "Request timeout - please try again";
+        if (errMsg.includes("Timeout:")) {
+            return res
+                .status(504)
+                .json({ error: "Request timeout - please try again" });
         }
-        res
-            .status(statusCode)
-            .json(config.genericErrors
-            ? { error: userMessage }
-            : { error: userMessage, details: errMsg });
+        return res.status(500).json({ error: "Internal server error" });
     }
 }));
 /**

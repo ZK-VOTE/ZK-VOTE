@@ -139,34 +139,43 @@ describe("Cross-Chain Bridge Integration", () => {
     const signer = await evmProvider.getSigner(0);
 
     const bridgeABI = [
-      "function castVote(uint256,uint256,uint256,uint256,uint256,uint256,bytes) external",
+      "function castVote(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bytes) external",
       "function isNullifierUsed(uint256,uint256,uint256) view returns (bool)",
       "function updateSbtRoot(uint256,uint256) external",
+      "function updateVoteRoot(uint256,uint256,uint256) external",
       "error SbtRootNotSet()",
+      "error VoteRootNotSet()",
+      "error VoteRootMismatch()",
       "error NullifierUsed()",
       "error InvalidVoteChoice()",
       "error ZeroNullifier()",
+      "error ZeroMemberAddr()",
       "error InvalidProof()",
     ];
 
     const bridge = new ethers.Contract(BRIDGE_ADDRESS, bridgeABI, signer);
 
-    // Update SBT root first (must be non-zero, contract treats 0 as "not set")
+    // Update SBT + vote roots first (must be non-zero)
     const daoId = 1;
+    const proposalId = 1;
     const sbtRoot = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("test-sbt-root"));
+    const voteRoot = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("test-vote-root"));
     await bridge.updateSbtRoot(daoId, sbtRoot);
+    await bridge.updateVoteRoot(daoId, proposalId, voteRoot);
 
-    // Create mock proof (128 bytes)
+    // Create mock proof (256 bytes)
     const mockProof = ethers.utils.hexlify(ethers.utils.randomBytes(256));
+    const memberAddr = 0xabcdefn;
 
     // Submit vote
     const tx = await bridge.castVote(
       daoId,
-      1, // proposalId
+      proposalId,
       1, // voteChoice
       12345, // nullifier
-      ethers.constants.HashZero, // voteRoot
+      voteRoot,
       sbtRoot,
+      memberAddr,
       mockProof,
     );
 
@@ -175,7 +184,7 @@ describe("Cross-Chain Bridge Integration", () => {
 
     // Verify VoteForwarded event
     const iface = new ethers.utils.Interface([
-      "event VoteForwarded(uint256 indexed,uint256 indexed,uint256,uint256,uint256)",
+      "event VoteForwarded(uint256 indexed,uint256 indexed,uint256,uint256,uint256,uint256,uint256)",
     ]);
 
     let voteEvent = null;
@@ -218,6 +227,7 @@ describe("Cross-Chain Bridge Integration", () => {
           StellarSdk.nativeToScVal(true, { type: "bool" }),
           StellarSdk.nativeToScVal(999, { type: "u256" }),
           StellarSdk.nativeToScVal(0, { type: "u256" }),
+          StellarSdk.Address.fromString(relayer.publicKey()).toScVal(),
         ),
       )
       .setTimeout(30)

@@ -73,15 +73,25 @@ function getPedersen() {
  * Generate a cryptographically random blinding factor in the BN254 scalar
  * field, suitable for use as the `blindingFactor` input to
  * {@link computePedersenCommitment}.
+ *
+ * Requires the Web Crypto API (`globalThis.crypto.getRandomValues`), available
+ * in all modern browsers and Node.js ≥ 18. Throws rather than silently falling
+ * back to a non-CSPRNG source: a weak blinding factor breaks the hiding
+ * property of the commitment and must never be permitted.
  */
 export function generateBlindingFactor(): bigint {
   const bytes = new Uint8Array(32);
-  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
-    crypto.getRandomValues(bytes);
+  if (
+    typeof globalThis.crypto !== "undefined" &&
+    typeof globalThis.crypto.getRandomValues === "function"
+  ) {
+    globalThis.crypto.getRandomValues(bytes);
   } else {
-    for (let i = 0; i < 32; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
+    throw new Error(
+      "generateBlindingFactor: no cryptographically secure random source is available. " +
+        "Use Node.js ≥ 18 or a browser with the Web Crypto API. " +
+        "Never substitute Math.random() — a weak blinding factor breaks commitment hiding.",
+    );
   }
   let value = 0n;
   for (const b of bytes) {

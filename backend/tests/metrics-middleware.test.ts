@@ -58,7 +58,7 @@ describe("metricsMiddleware (#573 route reference)", () => {
     httpRequestsInFlight.reset();
   });
 
-  it("labels the in-flight gauge with the normalized route, not the raw daoId", async () => {
+  it("labels the in-flight gauge with the route family, not the raw daoId", async () => {
     httpRequestsInFlight.reset();
     const { req, res } = makeReqRes({ path: "/dao/9999999999999999" });
     metricsMiddleware(req, res, (() => {}) as NextFunction);
@@ -66,9 +66,11 @@ describe("metricsMiddleware (#573 route reference)", () => {
     // prom-client v15's Gauge/Counter #get() is async.
     const snapshot = await httpRequestsInFlight.get();
     const labelsUsed = snapshot.values.map((v) => v.labels.route);
+    // Before routing only the raw path is known, so the in-flight gauge
+    // labels the top-level route family (#749).
     assert.ok(
-      labelsUsed.every((route) => route === "/dao/:param"),
-      `expected only the bounded /dao/:param label, got: ${JSON.stringify(labelsUsed)}`,
+      labelsUsed.every((route) => route === "/dao"),
+      `expected only the bounded /dao route family, got: ${JSON.stringify(labelsUsed)}`,
     );
     httpRequestsInFlight.reset();
   });

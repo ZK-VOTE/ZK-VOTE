@@ -25,6 +25,14 @@ export default defineConfig([
       globals: globals.browser,
     },
     rules: {
+      // ZV-130: no user-controlled HTML bypasses SafeMarkdown/Trusted Types.
+      // Apply these rules to both production sources and future components.
+      'no-restricted-syntax': [
+        'error',
+        { selector: 'JSXAttribute[name.name="dangerouslySetInnerHTML"]', message: 'Use SafeMarkdown; raw HTML rendering is forbidden.' },
+        { selector: 'AssignmentExpression[left.property.name="innerHTML"]', message: 'Raw innerHTML sinks are forbidden.' },
+        { selector: 'CallExpression[callee.property.name="insertAdjacentHTML"]', message: 'Raw HTML insertion is forbidden.' },
+      ],
       // Type safety: warn on explicit any to encourage proper typing
       '@typescript-eslint/no-explicit-any': 'warn',
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],

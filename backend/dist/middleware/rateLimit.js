@@ -379,4 +379,96 @@ export const verifyTallyProofLimiter = isTestMode
         keyGenerator,
         handler: makeHandler("verifyTallyProof", "Too many tally proof verification requests, please try again later"),
     }));
+// ============================================
+// COST-BASED RATE LIMITING (#525)
+// ============================================
+/**
+ * Cost-based rate limiter for batch operations that amplify a single HTTP
+ * request into multiple operations. Prevents bypass of per-IP limits via
+ * batch endpoints (e.g., POST /pay/batch with 100 ops counts as 100 cost).
+ *
+ * Usage:
+ *   router.post('/pay/batch', costBasedLimiter({ maxCost: 100 }), handler)
+ *
+ * The handler must call req.rateLimit.cost(n) to set the cost for the request.
+ */
+export function costBasedLimiter(opts) {
+    getStore(opts.name);
+    const costTracking = new Map();
+    return (req, res, next) => {
+        const key = keyGenerator(req);
+        const now = Date.now();
+        const windowEnd = now + opts.windowMs;
+        // Clean up expired entries
+        for (const [k, v] of costTracking.entries()) {
+            if (v.resetTime < now) {
+                costTracking.delete(k);
+            }
+        }
+        // Get or create tracking entry
+        let entry = costTracking.get(key);
+        if (!entry || entry.resetTime < now) {
+            entry = { cost: 0, resetTime: windowEnd };
+            costTracking.set(key, entry);
+        }
+        // Attach cost function to request
+        req.rateLimit = {
+            ...req.rateLimit,
+            cost: (n) => {
+                if (!entry)
+                    return;
+                entry.cost += n;
+                recordRequest(opts.name);
+                // Check if over limit
+                if (entry.cost > opts.maxCost) {
+                    recordBlocked(opts.name);
+                    const retryAfter = Math.ceil((entry.resetTime - Date.now()) / 1000);
+                    log("warn", "cost_rate_limit_exceeded", {
+                        limiter: opts.name,
+                        path: req.path,
+                        cost: entry.cost,
+                        maxCost: opts.maxCost,
+                    });
+                    res.status(429).json({
+                        error: opts.message,
+                        limiter: opts.name,
+                        cost: entry.cost,
+                        maxCost: opts.maxCost,
+                        retryAfter,
+                        resetTime: new Date(entry.resetTime).toISOString(),
+                    });
+                    return true; // Blocked
+                }
+                return false; // Not blocked
+            },
+        };
+        next();
+    };
+}
+/**
+ * Cost-based limiter for payment batch operations.
+ * Max 100 operations per minute per IP (each op counts as 1 cost).
+ */
+export const paymentBatchCostLimiter = isTestMode
+    ? noopMiddleware
+    : costBasedLimiter({
+        name: "paymentBatch",
+        maxCost: 100,
+        windowMs: 60 * 1000,
+        message: "Too many payment operations, please try again later. Batch operations count toward your rate limit.",
+    });
+/**
+ * WebSocket rate limiter for WS connections.
+ * Limits connections per IP to prevent WebSocket flooding.
+ */
+export const wsConnectionLimiter = isTestMode
+    ? noopMiddleware
+    : rateLimit({
+        windowMs: 60 * 1000, // 1 minute
+        max: 10, // 10 new connections per minute per IP
+        ...headerOptions,
+        store: getStore("wsConnection"),
+        keyGenerator,
+        handler: makeHandler("wsConnection", "Too many WebSocket connection attempts, please try again later"),
+    });
 //# sourceMappingURL=rateLimit.js.map

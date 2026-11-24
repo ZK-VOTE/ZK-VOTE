@@ -10,6 +10,10 @@ import type { CircuitSignals, Groth16Proof } from "snarkjs";
 import { assertValidFieldElement, assertValidNullifier } from "../types/index";
 import { workerAvailable, proveInWorker } from "./proveInWorker";
 import { withMaskedTiming } from "./proofTiming";
+import { selectProvingPlan } from "./devicePreflight";
+// ZKV1 is generated from shared/protocol-manifest.json. The snarkjs -> ZKV1
+// conversion lives there so frontend, SDK and backend use identical bytes.
+import { snarkjsToZkv1, type SnarkjsProof } from "../generated/zkv1";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -62,11 +66,87 @@ function loadRustProver(): Promise<RustProver> {
   return rustProverPromise;
 }
 
+export class WitnessValidationError extends Error {
+  constructor(message: string, public details?: unknown) {
+    super(message);
+    this.name = "WitnessValidationError";
+  }
+}
+
+/**
+ * Validates witness inputs before passing them to the witness calculator / prover WASM.
+ * Catches malformed siblings, non-field elements, depth discrepancies, and empty roots,
+ * preventing worker/prover crashes and DoS.
+ */
+export function validateWitnessInput(input: Record<string, unknown>): void {
+  for (const [key, val] of Object.entries(input)) {
+    if (val === undefined || val === null) {
+      throw new WitnessValidationError(`Witness signal "${key}" cannot be null or undefined`);
+    }
+
+    if (key === "pathElements" || key === "siblings") {
+      if (!Array.isArray(val) || val.length === 0) {
+        throw new WitnessValidationError(`Witness "${key}" must be a non-empty array of field elements`);
+      }
+      for (let i = 0; i < val.length; i++) {
+        try {
+          assertValidFieldElement(val[i], `${key}[${i}]`);
+        } catch (err: any) {
+          throw new WitnessValidationError(`Witness ${key}[${i}] validation failed: ${err.message}`);
+        }
+      }
+    } else if (key === "pathIndices") {
+      if (!Array.isArray(val) || val.length === 0) {
+        throw new WitnessValidationError(`Witness "${key}" must be a non-empty array`);
+      }
+      for (let i = 0; i < val.length; i++) {
+        const num = Number(val[i]);
+        if (num !== 0 && num !== 1) {
+          throw new WitnessValidationError(`Witness ${key}[${i}] must be 0 or 1, got ${val[i]}`);
+        }
+      }
+    } else if (key === "nullifier") {
+      try {
+        assertValidNullifier(val as string | bigint);
+      } catch (err: any) {
+        throw new WitnessValidationError(`Witness nullifier validation failed: ${err.message}`);
+      }
+    } else if (key === "root") {
+      try {
+        assertValidFieldElement(val as string | bigint, "root");
+        const b = typeof val === "string" ? BigInt(val.startsWith("0x") ? val : `0x${val}`) : (val as bigint);
+        if (b === 0n) {
+          throw new WitnessValidationError("Witness root cannot be zero (uninitialized tree root)");
+        }
+      } catch (err: any) {
+        throw new WitnessValidationError(`Witness root validation failed: ${err.message}`);
+      }
+    } else if (typeof val === "string" || typeof val === "number" || typeof val === "bigint") {
+      try {
+        assertValidFieldElement(val, key);
+      } catch (err: any) {
+        throw new WitnessValidationError(`Witness signal "${key}" validation failed: ${err.message}`);
+      }
+    }
+  }
+}
+
 async function proveWithRust(
   input: Record<string, unknown>,
   wasmPath: string | Uint8Array,
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
+  validateWitnessInput(input);
+  // Never start the Rust/main-thread path on a constrained device.
+  if (Array.isArray(input.pathElements)) {
+    const plan = selectProvingPlan(input.pathElements.length, {
+      workerAvailable: workerAvailable(),
+      rustAvailable: USE_RUST_PROVER,
+    });
+    if (plan.route !== "main") {
+      throw new Error(plan.reason ?? "Main-thread proving is not suitable for this device.");
+    }
+  }
   // Compute the witness with the circom WASM (snarkjs' engine).
   const { WitnessCalculatorBuilder } = await import("circom_runtime");
   const wasmBytes =
@@ -108,12 +188,27 @@ async function proveWithSnarkjs(
   wasmPath: string | Uint8Array,
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
+  validateWitnessInput(input);
+  const depth = Array.isArray(input.pathElements)
+    ? input.pathElements.length
+    : Array.isArray(input.votingPathElements)
+      ? input.votingPathElements.length
+      : undefined;
+  if (depth !== undefined) {
+    const plan = selectProvingPlan(depth, {
+      workerAvailable: workerAvailable(),
+      rustAvailable: false,
+    });
+    if (plan.route === "unavailable") {
+      throw new Error(plan.reason ?? "This device cannot generate the required election proof.");
+    }
+  }
   // Off the main thread where the platform allows it (#92): a multi-second
   // BigInt proof on the main thread blocks rendering, which hands any script
   // on the page a timing trace via frame pacing alone. Timing masking is
   // applied by the caller, so this path does not pad.
   if (workerAvailable()) {
-    const r = await proveInWorker(input, wasmPath, zkeyPath);
+    const r = await proveInWorker(input, wasmPath, zkeyPath, undefined, depth);
     return { proof: r.proof, publicSignals: r.publicSignals } as GeneratedProof;
   }
   const { groth16 } = await import("snarkjs");
@@ -138,12 +233,16 @@ export interface VoteProofInput {
   daoId: string;
   proposalId: string;
   voteChoice: string; // "0" for no, "1" for yes
-  relayerAddress: string; // Relayer Stellar address - public signal for relayer binding
+  /** Public signal: must match on-chain ElectionConfig.num_candidates (#645) */
+  numCandidates: string; // bounds voteChoice in-circuit
   commitment: string; // Identity commitment - private input, computed internally in circuit
   pathElements: string[];
   pathIndices: number[];
   circuitVersion?: string; // "v1" or "v2" (defaults to "v1")
   chainId?: string; // Required for v2 circuits
+  familyNullifier?: string; // v2 only: breaks cross-proposal linkability
+  nonce?: string; // v2 only: re-vote counter
+  relayerAddress?: string; // v2 only
 }
 
 export interface CommentProofInput {
@@ -181,6 +280,8 @@ export interface BridgeProofInput {
   sbtLeaf: string;
   sbtContractAddr: string;
   memberAddr: string;
+  /** EVM chain id — public signal for cross-chain domain separation (#649) */
+  chainId?: string;
   votingPathElements: string[];
   votingPathIndices: number[];
   sbtPathElements: string[];
@@ -329,6 +430,7 @@ export async function fetchVersionedVK(
   circuitId: string,
   version: number,
   fetchFn: typeof fetch = fetch,
+  circuitType: "Vote" | "Comment" = "Vote",
 ): Promise<VersionedVK> {
   const key = vkCacheKey(circuitId, version);
   const cached =
@@ -341,7 +443,7 @@ export async function fetchVersionedVK(
   const relayerUrl =
     (import.meta as unknown as { env: Record<string, string> })?.env
       ?.VITE_RELAYER_URL ?? "http://localhost:3001";
-  const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}`;
+  const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}?type=${circuitType.toLowerCase()}`;
 
   const res = await fetchFn(url);
   if (res.status === 410 || res.status === 409) {
@@ -357,9 +459,29 @@ export async function fetchVersionedVK(
   }
 
   const data = await res.json();
-  // Backend returns { vk, version, hash, numPublicSignals, vkVersion } or { verificationKey }
+  // Backend returns { vk, version, hash, hashScheme, numPublicSignals } or { verificationKey }
   const vk = data.vk ?? data.verificationKey ?? data;
   const hash: string = data.hash ?? data.vkHash ?? (await computeVKHash(vk));
+
+  // When the relayer marks the hash as a registry canonical hash, verify it
+  // client-side against the same canonical record before trusting or caching.
+  // A mismatched hash means the response is forged, stale, or from a different
+  // registry — fail closed.
+  if (data.hashScheme === "registry-v1") {
+    const canonical = await computeVKHash({
+      circuitId,
+      circuitType,
+      version: data.version ?? version,
+      vk,
+      numPublicSignals: data.numPublicSignals,
+    });
+    if (canonical !== hash) {
+      invalidateVKCache(circuitId, version);
+      throw new Error(
+        `VK hash mismatch for ${circuitId} v${version}: registry response is not authoritative`,
+      );
+    }
+  }
 
   // CRITICAL (#660): Bind VK to the backend version for integrity verification
   const entry: VersionedVK = {
@@ -589,6 +711,53 @@ export const WEIGHTED_VOTE_KAT = {
  * @param zkeyPath Path to proving key, or an already-downloaded buffer
  * @returns Generated proof and public signals
  */
+/** Inputs for the encrypted-tally circuit (`vote_encrypted.circom`). */
+export interface EncryptedVoteProofInput {
+  root: string;
+  nullifier: string;
+  daoId: string;
+  proposalId: string;
+  numCandidates: string;
+  epoch: string;
+  publicKey: [string, string];
+  c1: [string, string];
+  cYes: [string, string];
+  cNo: [string, string];
+  relayerAddress: string;
+  // Private
+  voteChoice: string;
+  secret: string;
+  salt: string;
+  blindingFactor: string;
+  randomness: string;
+  pathElements: string[];
+  pathIndices: number[];
+}
+
+/**
+ * Generate a Groth16 proof for the encrypted ballot.
+ *
+ * The plaintext choice is a private witness; the public signals contain only
+ * the ElGamal ciphertext. This intentionally bypasses the Rust prover, whose
+ * artifacts target the legacy plaintext circuit, until the encrypted circuit is
+ * added to the prover's key registry.
+ */
+export async function generateEncryptedVoteProof(
+  input: EncryptedVoteProofInput,
+  wasmPath: string,
+  zkeyPath: string,
+): Promise<{ proof: Groth16Proof; publicSignals: string[] }> {
+  // Encrypted ballots have the same mandatory election Merkle depth.
+  // Reuse the worker route and RAM gate; never generate a secret witness on
+  // an under-provisioned main thread.
+  const result = await proveWithSnarkjs(
+    input as unknown as Record<string, unknown>,
+    wasmPath,
+    zkeyPath,
+  );
+  return { proof: result.proof, publicSignals: result.publicSignals };
+}
+
 export async function generateVoteProof(
   input: VoteProofInput,
   wasmPath: string | Uint8Array,
@@ -599,36 +768,64 @@ export async function generateVoteProof(
       "A proof generation process is already in progress. Please wait for it to finish.",
     );
   }
+  // The witness path is built for the election's circuit depth (ZV-052).
+  // Never substitute a shallower circuit to make proving cheaper.
+  const plan = selectProvingPlan(input.pathElements.length, {
+    workerAvailable: workerAvailable(),
+    rustAvailable: USE_RUST_PROVER,
+  });
+  if (plan.route === "unavailable") {
+    throw new Error(plan.reason ?? "This device cannot generate the required election proof.");
+  }
   activeProofGenerationCount++;
   try {
     const circuitVersion = input.circuitVersion ?? "v1";
     let circuitInput: Record<string, unknown>;
     if (circuitVersion === "v2") {
-      // vote_v2.circom: 10 public signals
+      // vote_v2.circom: 10 public signals + private blindingFactor
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
+        familyNullifier: input.familyNullifier ?? "0",
         daoId: input.daoId,
         proposalId: input.proposalId,
         voteChoice: input.voteChoice,
+        numCandidates: input.numCandidates,
         chainId: input.chainId || "0",
-        relayerAddress: input.relayerAddress,
+        nonce: input.nonce ?? "0",
+        relayerAddress: input.relayerAddress ?? "0",
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
     } else {
-      // vote_v1.circom: 7 public signals (vote.circom with relayerAddress)
+      // vote.circom: 6 public signals
+      //   [root, nullifier, daoId, proposalId, voteChoice, numCandidates]
+      //
+      // `numCandidates` is not optional. The circuit range-checks
+      // `voteChoice < numCandidates` against this PUBLIC input so the contract
+      // can be sure the proof enforced the candidate bound the election was
+      // configured with. Leaving it out leaves the signal at 0, which makes
+      // `voteChoice < 0` unsatisfiable — so the witness cannot be generated at
+      // all. It was missing here, which is one reason the anonymous vote path
+      // produced no usable proofs.
+      //
+      // There is deliberately no `relayerAddress` on this path: see the header
+      // of circuits/vote_template.circom. A public signal that the verifier
+      // cannot check binds nothing, and adding it made the IC length disagree
+      // with the contract.
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
         daoId: input.daoId,
         proposalId: input.proposalId,
         voteChoice: input.voteChoice,
-        relayerAddress: input.relayerAddress,
+        numCandidates: input.numCandidates,
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
@@ -641,7 +838,7 @@ export async function generateVoteProof(
     // the clock. One masking boundary here covers every path; the individual
     // provers deliberately do not pad, so the padding cannot compound.
     return withMaskedTiming(async () => {
-      if (USE_RUST_PROVER) {
+      if (USE_RUST_PROVER && plan.route === "main") {
         try {
           const primary = await proveWithRust(circuitInput, wasmPath, zkeyPath);
           try {
@@ -768,6 +965,7 @@ export async function generateBridgeProof(
       voteChoice: input.voteChoice,
       voteRoot: input.voteRoot,
       sbtRoot: input.sbtRoot,
+      chainId: input.chainId ?? "0",
       secret: input.secret,
       salt: input.salt,
       votingPathElements: input.votingPathElements,
@@ -922,29 +1120,14 @@ export function formatProofForSoroban(proof: Groth16Proof): {
   proof_b: string;
   proof_c: string;
 } {
-  // Convert field element to BIG-ENDIAN hex (no reversal needed)
-  const toHexBE = (value: string): string => {
-    const bigInt = BigInt(value);
-    return bigInt.toString(16).padStart(64, "0");
+  // Deprecated compatibility wrapper: the canonical conversion now lives in
+  // the generated ZKV1 adapter (one boundary for SDK, frontend and backend).
+  const zkv1 = snarkjsToZkv1(proof as unknown as SnarkjsProof);
+  return {
+    proof_a: zkv1.a.slice(2),
+    proof_b: zkv1.b.slice(2),
+    proof_c: zkv1.c.slice(2),
   };
-
-  // Format pi_a (G1 point): be_bytes(X) || be_bytes(Y)
-  const proof_a = toHexBE(proof.pi_a[0]) + toHexBE(proof.pi_a[1]);
-
-  // Format pi_b (G2 point): [[x.c0, x.c1], [y.c0, y.c1]]
-  // Ethereum/Soroban format: be_bytes(X_c1) || be_bytes(X_c0) || be_bytes(Y_c1) || be_bytes(Y_c0)
-  // snarkjs outputs: [[c0, c1], [c0, c1]] where c0=real, c1=imaginary
-  // We swap within each coordinate pair: [c1, c0, c1, c0]
-  const proof_b =
-    toHexBE(proof.pi_b[0][1]) + // X.c1 (imaginary)
-    toHexBE(proof.pi_b[0][0]) + // X.c0 (real)
-    toHexBE(proof.pi_b[1][1]) + // Y.c1 (imaginary)
-    toHexBE(proof.pi_b[1][0]); // Y.c0 (real)
-
-  // Format pi_c (G1 point): be_bytes(X) || be_bytes(Y)
-  const proof_c = toHexBE(proof.pi_c[0]) + toHexBE(proof.pi_c[1]);
-
-  return { proof_a, proof_b, proof_c };
 }
 
 /**
@@ -1120,6 +1303,18 @@ export async function verifyProofWithVersionedVK(
   version: number,
 ): Promise<boolean> {
   const vkEntry = await fetchVersionedVK(circuitId, version);
+  // Bind verification to the registry's circuit ID and public-signal count.
+  if (vkEntry.circuitId !== circuitId) {
+    throw new Error(
+      `VK registry returned ${vkEntry.circuitId}; expected ${circuitId}`,
+    );
+  }
+  if (
+    typeof vkEntry.numPublicSignals === "number" &&
+    publicSignals.length !== vkEntry.numPublicSignals
+  ) {
+    return false;
+  }
   try {
     const { groth16 } = await import("snarkjs");
     const result = await groth16.verify(

@@ -1,6 +1,6 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  darkMode: 'class',
+  darkMode: "class",
   content: [
     "./index.html",
     "./src/**/*.{ts,tsx}",
@@ -87,5 +87,19 @@ export default {
       },
     },
   },
-  plugins: [require("tailwindcss-animate"), require("@tailwindcss/typography")],
-}
+  plugins: [
+    require("tailwindcss-animate"),
+    require("@tailwindcss/typography"),
+    // Tailwind 3.3+ ships the full logical-property scale natively
+    // (ms-*/me-*/ps-*/pe-*/start-*/end-*/text-start/text-end/border-s/
+    // border-e/float-start/float-end, across the whole spacing scale —
+    // not just "auto" or "0"), so this plugin only needs to add what
+    // Tailwind doesn't already provide: safe-area-aware logical padding.
+    function ({ addUtilities }) {
+      addUtilities({
+        ".ps-safe": { "padding-inline-start": "env(safe-area-inset-left)" },
+        ".pe-safe": { "padding-inline-end": "env(safe-area-inset-right)" },
+      });
+    },
+  ],
+};

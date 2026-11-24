@@ -411,7 +411,8 @@ export const commitSchema = z.object({
     nullifier: bn254Field,
     commitmentHash: commitmentHash,
     timestamp: z.number().int().positive("timestamp must be a positive integer"),
-    walletAddress: z.string().optional(),
+    // walletAddress intentionally omitted — client-supplied wallets were never
+    // verified against the proof and created nullifier→wallet linkage (#644).
 });
 // ============================================
 // MEMBERSHIP REGISTRATION SCHEMA (#371)
@@ -460,12 +461,12 @@ export const voteSchema = z
     nullifier: bn254FieldAnon.optional(),
     root: bn254FieldAnon.optional(),
     proof: groth16ProofAnon.optional(),
+    redundantProof: groth16ProofAnon.optional(),
     nonce: z.string().optional(),
     timestamp: z.number().int().optional(),
-    walletAddress: z.string().optional(),
     encryptedPayload: z.union([z.string(), z.record(z.unknown())]).optional(),
-    voterPublicKey: stellarAddress.optional(),
-    voterSignature: z.string().min(1).optional(), // signed XDR from Freighter
+    // Identity fields are forbidden via .strict() — voterPublicKey /
+    // voterSignature / walletAddress must not appear beside the ZK proof (#644).
     sponsor: z.enum(["relayer", "voter"]).optional(),
     feePayer: stellarAddress.optional(),
     feeBudgetStroops: z.coerce
@@ -475,6 +476,7 @@ export const voteSchema = z
         .max(1_000_000, "feeBudgetStroops exceeds the allowed relay cap")
         .optional(),
 })
+    .strict()
     .refine((data) => data.encryptedPayload || (data.nullifier && data.root && data.proof), {
     message: "Invalid submission",
 });
@@ -741,6 +743,10 @@ export const bridgeVoteSchema = z.object({
     nullifier: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
     voteRoot: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
     sbtRoot: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
+    /** Field element encoding of the SBT contract address (public signal 0) */
+    sbtContractAddr: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
+    /** Field element encoding of the member address (public signal 1) */
+    memberAddr: z.string().regex(/^0x[0-9a-fA-F]{1,64}$/),
     proof: z.object({
         a: z.string().regex(/^0x[0-9a-fA-F]{128}$/),
         b: z.string().regex(/^0x[0-9a-fA-F]{256}$/),

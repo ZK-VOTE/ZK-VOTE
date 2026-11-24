@@ -86,6 +86,86 @@ spread of the true costs. It uses simulated costs so it runs in CI in
 milliseconds; the assertion is about the masking, which is the part that can
 regress.
 
+## Measurement plan (SPIKE-029 / #714)
+
+The current implementation provides timing masking infrastructure but has NOT
+been validated against real-world distributions. SPIKE-029 requires:
+
+### Required measurements (acceptance criteria)
+
+1. **Duration distributions per (circuit, depth, device)**
+   - Collect 500+ samples per configuration
+   - Segment by: vote/claim circuit, depth (10/15/20), device class
+   - Record both raw and masked durations
+   - Publish distributions in `RUST_WASM_WITNESS_BENCHMARK.md`
+
+2. **Choice indistinguishability**
+   - Train classifiers to predict vote choice from timing
+   - Target: AUC ~0.5 (random chance) with masking enabled
+   - Validate that `TIMING_QUANTUM_MS` / `MAX_JITTER_MS` are sufficient
+   - Test across multiple candidate positions
+
+3. **Depth distinguishability**
+   - Measure whether depth (10/15/20) leaks through masked timing
+   - Document if depth limits are needed for indistinguishability
+
+4. **Claim vs vote proof timing**
+   - Test whether claim proofs are distinguishable from vote proofs
+   - `generateClaimProof` timing compared to `proveVote`
+
+5. **Worker fallback analysis**
+   - Measure worker-unavailable rate across browsers/devices
+   - Profile main-thread fallback timing characteristics
+   - Document policy: disable fallback or harden it equally
+
+6. **Mobile OOM/jank limits**
+   - Test low-end mobile (≤4GB RAM) at each depth
+   - Record OOM rates, ANR/jank frequency
+   - Set maximum supported depth per device class
+
+### Measurement infrastructure
+
+Available in `proofTiming.ts`:
+
+```typescript
+// Enable measurement mode (dev/test only)
+enableTimingMeasurement();
+
+// Generate proofs (timing samples auto-recorded)
+await withMaskedTimingAndMeasurement(
+  () => proveVote(...),
+  { circuitType: 'vote', depth: 20 }
+);
+
+// Analyze collected samples
+const samples = getTimingSamples();
+const stats = computeTimingStatistics(samples, 
+  s => s.circuitType === 'vote' && s.depth === 20
+);
+
+disableTimingMeasurement();
+```
+
+### Device class timing budgets
+
+Placeholder values in `TIMING_BUDGETS_MS` need validation:
+
+| Device | Depth 10 | Depth 15 | Depth 20 | Claim |
+|--------|----------|----------|----------|-------|
+| Desktop | 1500ms | 2500ms | 4000ms | 800ms |
+| Mobile | 3000ms | 5000ms | 8000ms | 1500ms |
+| Low-end | 5000ms | 9000ms | 15000ms | 2500ms |
+
+**Action required:** Run measurement campaign, update budgets to P95 values,
+validate masking effectiveness (AUC test).
+
+### Open questions
+
+- Is `TIMING_QUANTUM_MS = 250ms` sufficient across all depths?
+- Should quantum be adaptive per circuit/depth/device?
+- What is the mobile OOM rate at depth 20? Is depth 15 the safe max?
+- Worker availability: 95%? 50%? Varies by browser?
+
 ## What is *not* addressed
 
 - **`snarkjs` is still not constant time.** The mitigations bound what an

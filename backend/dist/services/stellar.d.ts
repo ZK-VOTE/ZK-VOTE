@@ -99,6 +99,8 @@ export declare class SequenceManager {
 }
 export declare const sequenceManager: SequenceManager;
 export declare function withSequenceLock<T>(fn: () => Promise<T>): Promise<T>;
+export declare function acquireSequenceLockForSubmit(): Promise<void>;
+export declare function releaseLockForConfirmation(): void;
 export interface RpcEndpointStatus {
     url: string;
     healthy: boolean;

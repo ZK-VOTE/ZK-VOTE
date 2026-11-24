@@ -1,36 +1,40 @@
 /**
- * Trusted Types Policy Initialization.
- * Enforces Trusted Types DOM sinks protection and script execution integrity.
+ * Trusted Types bootstrap (ZV-130).
+ * Raw HTML/script/script-URL passthrough default policies are unsafe: an
+ * attacker who reaches an injection sink would bypass CSP enforcement.
+ *
+ * Render user Markdown with SafeMarkdown (React elements + rehype-sanitize).
+ * The only exported policy here is a text-escaping policy for integrations
+ * requiring a TrustedHTML object; it cannot turn untrusted HTML into markup.
  */
-
 declare global {
   interface Window {
     trustedTypes?: {
-      createPolicy: (
-        name: string,
-        rules: {
-          createHTML?: (html: string) => string;
-          createScript?: (script: string) => string;
-          createScriptURL?: (url: string) => string;
-        },
-      ) => any;
-      defaultPolicy?: any;
+      createPolicy: (name: string, rules: { createHTML: (text: string) => string }) => unknown;
     };
   }
+}
+
+export function escapeUntrustedHTML(text: string): string {
+  return text.replace(/[&<>"']/g, (char) => {
+    const replacements: Record<string, string> = {
+      "&": "&amp;", "<": "&lt;", ">": "&gt;",
+      '"': "&quot;", "'": "&#39;",
+    };
+    return replacements[char];
+  });
 }
 
 export function initTrustedTypes(): void {
   if (typeof window !== "undefined" && window.trustedTypes) {
     try {
-      if (!window.trustedTypes.defaultPolicy) {
-        window.trustedTypes.createPolicy("default", {
-          createHTML: (html: string) => html,
-          createScript: (script: string) => script,
-          createScriptURL: (url: string) => url,
-        });
-      }
+      // Explicit policy only; no permissive "default" policy. A raw DOM
+      // injection remains blocked under require-trusted-types-for 'script'.
+      window.trustedTypes.createPolicy("zkvote-escaped-text", {
+        createHTML: escapeUntrustedHTML,
+      });
     } catch {
-      // Policy already defined or not permitted to redefine
+      // Already registered, or CSP did not allow the named policy.
     }
   }
 }

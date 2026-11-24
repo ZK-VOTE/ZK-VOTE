@@ -15,8 +15,9 @@
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, WebSocket, type Server as WsServer } from "ws";
 import { config } from "../config.js";
-import { log } from "./logger.js";
+import { log, hashIp } from "./logger.js";
 import { wsConnections, wsMessagesSent, wsAuthDuration, wsMessageDuration, wsRateLimitTotal } from "./metrics.js";
+import { incWithDrilldown } from "./metric-drilldown.js";
 
 let wss: WsServer | null = null;
 let attachFailed = false;
@@ -49,8 +50,9 @@ export function attachConfirmationHub(httpServer: HttpServer): void {
       const lastAttempt = connectionAttempts.get(ip);
       if (lastAttempt && now - lastAttempt < 2000) {
         // More than 1 connection per 2 seconds
-        log("warn", "ws_rate_limit_exceeded", { ip });
-        wsRateLimitTotal.inc({ ip });
+        // Aggregate counter only; the client is on the drill-down record,
+        // hashed (#749) — an IP label would let a botnet mint series.
+        incWithDrilldown(wsRateLimitTotal, {}, { client: hashIp(ip) }, { level: "warn" });
         socket.close(1008, "Rate limit exceeded");
         return;
       }

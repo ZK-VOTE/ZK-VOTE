@@ -9,6 +9,9 @@ use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{Proof, VerificationKey, VoteMode, VotingClient};
 
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 fn create_test_vk(env: &Env) -> VerificationKey {
     let g1_gen = {
         let mut bytes = [0u8; 64];
@@ -128,6 +131,9 @@ fn test_migrate_dao_and_vote_in_overlap() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
     let circuit_reg_id = env.register(circuit_registry::CircuitRegistry, (governance,));
 
     let registry_client = DaoRegistryClient::new(&env, &registry_id);
@@ -231,6 +237,9 @@ fn test_wrong_circuit_id_rejected() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
     let circuit_reg_id = env.register(circuit_registry::CircuitRegistry, (governance,));
 
     let registry_client = DaoRegistryClient::new(&env, &registry_id);
@@ -359,6 +368,9 @@ fn test_vote_with_circuit_id() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
     let circuit_reg_id = env.register(circuit_registry::CircuitRegistry, (governance,));
 
     let registry_client = DaoRegistryClient::new(&env, &registry_id);

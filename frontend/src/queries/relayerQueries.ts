@@ -5,15 +5,15 @@ import { checkRelayerReady, fetchRelayerConfig } from "../lib/stellar";
 import type { RelayerConfig } from "../lib/stellar";
 import { queryKeys } from "../lib/queryClient";
 import { nextRelayerPollDelay } from "../lib/relayerBackoff";
+import { RELAYER_URL } from "../config/env";
 
 export type RelayerStatus =
   | { state: "missing-url"; message: string }
   | { state: "error"; message: string }
   | { state: "ready"; message: string }
-  | { state: "mismatch"; message: string; mismatches: string[] };
+  | { state: "mismatch"; message: string; mismatches: string[]; wrongNetwork?: boolean };
 
-// Use environment variable with fallback to localhost for development
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+// Relayer URL comes from the single config source.
 
 interface RelayerStatusData {
   status: RelayerStatus;
@@ -100,6 +100,9 @@ async function fetchRelayerStatus(): Promise<RelayerStatusData> {
         state: "mismatch",
         message: "relayer config mismatch",
         mismatches,
+        wrongNetwork:
+          !!config.networkPassphrase &&
+          config.networkPassphrase !== NETWORK_CONFIG.networkPassphrase,
       },
       relayerConfig: config,
     };
@@ -109,6 +112,15 @@ async function fetchRelayerStatus(): Promise<RelayerStatusData> {
     status: { state: "ready", message: "relayer ready" },
     relayerConfig: config,
   };
+}
+
+/**
+ * True when the relayer submits to a different Stellar network than this
+ * build. A proof made here cannot be counted there, so voting is blocked
+ * before proving instead of only warning (#751).
+ */
+export function isWrongNetwork(status: RelayerStatus | null | undefined): boolean {
+  return status?.state === "mismatch" && status.wrongNetwork === true;
 }
 
 /**

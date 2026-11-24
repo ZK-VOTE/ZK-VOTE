@@ -7,6 +7,10 @@
  */
 
 import * as StellarSdk from "@stellar/stellar-sdk";
+import {
+  notificationFromIndexedEvent,
+  publishNotificationEventSafely,
+} from "./notifications/index.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db.js";
@@ -64,7 +68,33 @@ const EVENT_TYPES: Record<string, string> = {
   ProposalClosedEvent: "proposal_closed",
   ProposalArchivedEvent: "proposal_archived",
   VoteEvent: "vote_cast",
+  // SEP-41 token events (ZV-065)
+  MintEvent: "token_mint",
+  BurnEvent: "token_burn",
+  TransferEvent: "token_transfer",
+  DelegateChanged: "token_delegate",
+  Checkpoint: "token_checkpoint",
+  // Protocol upgrade / migration (prepare -> verify -> commit / rollback).
+  // Indexers use these to pause vote ingestion during a migration window and
+  // to surface the manifest hash that pins the release train.
+  ContractUpgraded: "contract_upgraded",
+  StorageMigratedEvent: "storage_migrated",
+  ContractRollbackEvent: "contract_rollback",
+  UpgradePreparedEvent: "upgrade_prepared",
+  UpgradeVerifiedEvent: "upgrade_verified",
+  MigrationWindowEvent: "migration_window",
+  DaoMigrationEvent: "circuit_migration_started",
+  CircuitUpgradedEvent: "circuit_upgraded",
 };
+
+/**
+ * Election start/end notifications (#886). Runs only for newly stored events,
+ * so a re-indexed ledger does not notify twice, and never throws into the indexer.
+ */
+function notifySubscribers(event: EventInput): void {
+  const notification = notificationFromIndexedEvent(event);
+  if (notification) publishNotificationEventSafely(notification);
+}
 
 /** Parsed event from the chain */
 interface ParsedEvent {
@@ -364,6 +394,7 @@ async function pollEvents(
                   };
                   if (db.addEvent(eventInput)) {
                     count++;
+                    notifySubscribers(eventInput);
                     recordInteraction("db", "db.addEvent", {
                       daoId: eventInput.daoId,
                       type: eventInput.type,
@@ -793,6 +824,7 @@ export async function drainEventQueue(): Promise<number> {
       for (const item of batch) {
         if (db.addEvent(item)) {
           processed++;
+          notifySubscribers(item);
           indexerEventsProcessed.inc({ event_type: "stream_indexed" }, 1);
         }
       }

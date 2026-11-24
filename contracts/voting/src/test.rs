@@ -1,6 +1,12 @@
 use super::*;
 use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env, String};
 
+// The crate is `#![no_std]`; `std::panic::catch_unwind` is needed so a single
+// test can assert that a call is rejected *and* then inspect the state it left
+// behind (e.g. "the weighted tally is still zero"). `#[should_panic]` can only
+// assert the panic, not the aftermath.
+extern crate std;
+
 // Mock tree contract
 mod mock_tree {
     use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, U256};
@@ -9,6 +15,9 @@ mod mock_tree {
     pub enum DataKey {
         SbtContract,
         CurrentRoot(u64),
+        RootIndex(u64, U256),
+        NextRootIdx(u64),
+        MinValidRootIdx(u64),
     }
 
     #[contract]
@@ -27,9 +36,28 @@ mod mock_tree {
                 .unwrap()
         }
 
+        /// Publish a root as the DAO's current one.
+        ///
+        /// Also records an index for it, because the real tree indexes every
+        /// root it publishes and `root_idx` is a hard error for a root it does
+        /// not know. Without that, the mock advertised a current root it could
+        /// not index, and every `root_idx` lookup — which the revocation check
+        /// now performs on *both* vote modes — failed.
         pub fn set_root(env: Env, dao_id: u64, root: U256) {
             let key = DataKey::CurrentRoot(dao_id);
             env.storage().persistent().set(&key, &root);
+            let idx_key = DataKey::RootIndex(dao_id, root.clone());
+            if !env.storage().persistent().has(&idx_key) {
+                let next: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::NextRootIdx(dao_id))
+                    .unwrap_or(0);
+                env.storage().persistent().set(&idx_key, &next);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::NextRootIdx(dao_id), &(next + 1));
+            }
         }
 
         pub fn get_root(env: Env, dao_id: u64) -> U256 {
@@ -40,10 +68,75 @@ mod mock_tree {
                 .unwrap_or(U256::from_u32(&env, 0))
         }
 
-        pub fn curr_idx(_env: Env, _dao_id: u64) -> u32 {
-            // Mock implementation: return index 0 for current root
-            // Real contract tracks root history, mock doesn't need to
+        pub fn curr_idx(env: Env, dao_id: u64) -> u32 {
+            let root = Self::get_root(env.clone(), dao_id);
+            Self::root_idx(env, dao_id, root)
+        }
+
+        /// Index of a root in the mock's history.
+        ///
+        /// This and `min_root` did not exist on the mock before, which is why
+        /// revocation could not be tested at all: the voting contract's root
+        /// check reached for them only on the Trailing arm, so Fixed-mode
+        /// behaviour — the mode revocation actually applies to — had no mock
+        /// surface to express, and the Fixed arm's missing `min_root` check was
+        /// untestable by construction rather than by oversight (#audit-H3).
+        pub fn root_idx(env: Env, dao_id: u64, root: U256) -> u32 {
+            if let Some(idx) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::RootIndex(dao_id, root.clone()))
+            {
+                return idx;
+            }
+            // The real tree indexes its empty root at 0 when it is initialised,
+            // so a tree that has never had `set_root` called on it still has a
+            // coherent current root. Mirror that: the current root is index 0
+            // until something publishes a later one. Any *other* unknown root
+            // is a genuine RootNotFound, as on the real contract.
+            if root == Self::get_root(env.clone(), dao_id) {
+                return 0;
+            }
+            panic!("RootNotFound")
+        }
+
+        pub fn set_root_index(env: Env, dao_id: u64, root: U256, index: u32) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RootIndex(dao_id, root), &index);
+        }
+
+        /// The revocation floor, mirroring `MinValidRootIdx` in the real tree:
+        /// `remove_member` raises it, and every root below it predates the
+        /// removal. The real contract has no setter for it either, so the mock
+        /// only offers the same one-way operation.
+        pub fn min_root(env: Env, dao_id: u64) -> u32 {
+            let key = DataKey::MinValidRootIdx(dao_id);
+            env.storage().persistent().get(&key).unwrap_or(0)
+        }
+
+        /// Single-hop form of the three root facts, matching the real tree.
+        /// 0 = eligible, 1 = not in history, 2 = predates the election,
+        /// 3 = predates a member removal.
+        pub fn root_eligibility(env: Env, dao_id: u64, root: U256, earliest: u32) -> u32 {
+            if !Self::root_ok(env.clone(), dao_id, root.clone()) {
+                return 1;
+            }
+            let idx = Self::root_idx(env.clone(), dao_id, root);
+            if idx < earliest {
+                return 2;
+            }
+            if idx < Self::min_root(env, dao_id) {
+                return 3;
+            }
             0
+        }
+
+        /// Simulate `remove_member` advancing the revocation floor.
+        pub fn remove_member_at(env: Env, dao_id: u64, root_index: u32) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MinValidRootIdx(dao_id), &root_index);
         }
 
         pub fn revok_at(_env: Env, _dao_id: u64, _commitment: U256) -> Option<u64> {
@@ -171,6 +264,11 @@ mod mock_transcript_registry {
     pub enum DataKey {
         AttestedVk(BytesN<32>),
         Attestation(BytesN<32>, BytesN<32>),
+        /// When true, every hash is attested unless explicitly revoked.
+        /// Set by the shared test harness so a test about voting mechanics is
+        /// not also a test about MPC ceremony bookkeeping; the tests that *are*
+        /// about attestation turn it off first.
+        AttestAll,
     }
 
     #[contract]
@@ -178,6 +276,10 @@ mod mock_transcript_registry {
 
     #[contractimpl]
     impl MockTranscriptRegistry {
+        pub fn set_attest_all(env: Env, on: bool) {
+            env.storage().persistent().set(&DataKey::AttestAll, &on);
+        }
+
         pub fn set_attested(env: Env, vk_hash: BytesN<32>, attested: bool) {
             env.storage()
                 .persistent()
@@ -196,9 +298,16 @@ mod mock_transcript_registry {
         }
 
         pub fn is_vk_attested(env: Env, vk_hash: BytesN<32>) -> bool {
+            if let Some(explicit) = env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::AttestedVk(vk_hash))
+            {
+                return explicit;
+            }
             env.storage()
                 .persistent()
-                .get(&DataKey::AttestedVk(vk_hash))
+                .get(&DataKey::AttestAll)
                 .unwrap_or(false)
         }
 
@@ -207,9 +316,16 @@ mod mock_transcript_registry {
             transcript_hash: BytesN<32>,
             vk_hash: BytesN<32>,
         ) -> bool {
+            if let Some(explicit) = env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Attestation(transcript_hash, vk_hash))
+            {
+                return explicit;
+            }
             env.storage()
                 .persistent()
-                .get(&DataKey::Attestation(transcript_hash, vk_hash))
+                .get(&DataKey::AttestAll)
                 .unwrap_or(false)
         }
     }
@@ -222,9 +338,19 @@ fn setup_env_with_registry() -> (Env, Address, Address, Address, Address, Addres
     let registry_id = env.register(mock_registry::MockRegistry, ());
     let sbt_id = env.register(mock_sbt::MockSbt, ());
     let tree_id = env.register(mock_tree::MockTree, ());
+    // Transcript registry: `set_vk` refuses a key with no MPC ceremony
+    // attestation (#662), so every test that registers a VK needs one wired up.
+    // Without this, `set_vk` panics with "Transcript registry not configured"
+    // and 55 of the 120 voting tests die before asserting anything. Attest-all
+    // keeps those tests about voting mechanics; the three attestation tests
+    // below turn it off and drive the mock explicitly.
+    let transcript_reg_id = env.register(mock_transcript_registry::MockTranscriptRegistry, ());
+    mock_transcript_registry::MockTranscriptRegistryClient::new(&env, &transcript_reg_id)
+        .set_attest_all(&true);
     // Pass both tree_id and registry_id to constructor (registry cached to reduce cross-contract calls)
     let guardian = Address::generate(&env);
     let voting_id = env.register(Voting, (tree_id.clone(), registry_id.clone(), guardian));
+    VotingClient::new(&env, &voting_id).set_transcript_registry(&transcript_reg_id);
 
     // Link tree to sbt
     let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
@@ -235,6 +361,14 @@ fn setup_env_with_registry() -> (Env, Address, Address, Address, Address, Addres
     sbt_client.set_registry(&registry_id);
 
     let member = Address::generate(&env);
+
+    // `set_vk` is fail-closed without a transcript registry (#662), so give
+    // every test a permissive one. Tests that mean to exercise the attestation
+    // gate overwrite it with a strict registry of their own.
+    let transcript_id = env.register(mock_transcript_registry::MockTranscriptRegistry, ());
+    mock_transcript_registry::MockTranscriptRegistryClient::new(&env, &transcript_id)
+        .set_attest_all(&true);
+    VotingClient::new(&env, &voting_id).set_transcript_registry(&transcript_id);
 
     (env, voting_id, tree_id, sbt_id, registry_id, member)
 }
@@ -300,7 +434,7 @@ fn create_dummy_proof(env: &Env) -> Proof {
 
 fn create_wrong_length_proof(env: &Env) -> Proof {
     // Deliberately malformed proof points (not valid curve coordinates).
-    // In tests we force verification to fail via VerifyOverride.
+    // In tests we force verification to fail via `set_verify_override_for_tests`.
     let mut bad_a = [0u8; 64];
     bad_a[0] = 1;
     let mut bad_b = [0u8; 128];
@@ -1283,11 +1417,7 @@ fn test_vote_with_malformed_proof_fails() {
     let bad_proof = create_wrong_length_proof(&env);
 
     // Force verify_groth16 to return false in test mode
-    env.as_contract(&voting_id, || {
-        env.storage()
-            .instance()
-            .set(&DataKey::VerifyOverride, &false);
-    });
+    Voting::set_verify_override_for_tests(&env, &voting_id, false);
 
     voting_client.vote(
         &1u64,
@@ -1326,11 +1456,7 @@ fn test_vote_with_swapped_pub_signals_fails() {
     );
 
     // Force verify_groth16 to return false to simulate swapped public inputs
-    env.as_contract(&voting_id, || {
-        env.storage()
-            .instance()
-            .set(&DataKey::VerifyOverride, &false);
-    });
+    Voting::set_verify_override_for_tests(&env, &voting_id, false);
 
     let _proposal = voting_client.get_proposal(&1u64, &proposal_id);
     let nullifier = U256::from_u32(&env, 99988);
@@ -1373,11 +1499,7 @@ fn test_vote_with_swapped_dao_proposal_ids_fails() {
         &VoteMode::Fixed,
     );
 
-    env.as_contract(&voting_id, || {
-        env.storage()
-            .instance()
-            .set(&DataKey::VerifyOverride, &false);
-    });
+    Voting::set_verify_override_for_tests(&env, &voting_id, false);
 
     let nullifier = U256::from_u32(&env, 1010);
     let proof = create_dummy_proof(&env);
@@ -1420,11 +1542,7 @@ fn test_vote_with_all_zero_proof_fails() {
     );
 
     // Force verification to run and fail
-    env.as_contract(&voting_id, || {
-        env.storage()
-            .instance()
-            .set(&DataKey::VerifyOverride, &false);
-    });
+    Voting::set_verify_override_for_tests(&env, &voting_id, false);
 
     let nullifier = U256::from_u32(&env, 2020);
     let proof = create_all_zero_proof(&env);
@@ -1459,11 +1577,7 @@ fn test_vote_with_off_curve_proof_fails() {
     );
 
     // Force verification to run and fail
-    env.as_contract(&voting_id, || {
-        env.storage()
-            .instance()
-            .set(&DataKey::VerifyOverride, &false);
-    });
+    Voting::set_verify_override_for_tests(&env, &voting_id, false);
 
     let nullifier = U256::from_u32(&env, 3030);
     let proof = create_off_curve_proof(&env);
@@ -1602,9 +1716,9 @@ fn test_vote_with_mismatched_vk_hash_in_proposal_fails() {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(1, proposal_id), &p);
-        env.storage()
-            .instance()
-            .set(&DataKey::VerifyOverride, &false);
+        // Fail the vk-hash comparison that comes after proof verification, so
+        // the test isolates the VK-pin check rather than the pairing check.
+        Voting::set_verify_override_for_tests(&env, &voting_id, false);
     });
 
     let proposal = voting_client.get_proposal(&1u64, &proposal_id);
@@ -2835,7 +2949,7 @@ fn test_commit_reveal_finalizes_candidate_seed() {
     let first_value = BytesN::from_array(&env, &[1; 32]);
     let second_value = BytesN::from_array(&env, &[2; 32]);
 
-    voting.set_election_config(&1, &proposal_id, &0, &0, &2);
+    voting.set_election_config(&1, &proposal_id, &0, &0, &2, &first);
     voting.commit_randomness(
         &1,
         &proposal_id,
@@ -2974,6 +3088,310 @@ fn test_non_guardian_cannot_pause() {
     VotingClient::new(&env, &voting_id).pause(&Address::generate(&env));
 }
 
+// ── Tiered emergency halt tests (ZV-114 / #954) ─────────────────────────────
+
+/// Set up a DAO with one member, a VK, and a proposal ready to vote on.
+/// Returns (env, client, guardian, member, proposal_id, nullifier, proof).
+fn setup_halt_vote_env() -> (
+    Env,
+    VotingClient<'static>,
+    Address,
+    Address,
+    u64,
+    U256,
+    Proof,
+) {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+
+    sbt_client.set_member(&1u64, &member, &true);
+    let root = U256::from_u32(&env, 12345);
+    tree_client.set_root(&1u64, &root);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let now = env.ledger().timestamp();
+    // Long enough to outlive a FAST_HALT_MAX_DURATION time jump in the
+    // expiry/ratification tests below, so those are actually exercising
+    // the halt gate rather than incidentally hitting VotingClosed.
+    let proposal_id = client.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Halt Test"),
+        &String::from_str(&env, ""),
+        &(now + FAST_HALT_MAX_DURATION * 3),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    let guardian = client.guardian();
+    let nullifier = U256::from_u32(&env, 424242);
+    let proof = create_dummy_proof(&env);
+    (env, client, guardian, member, proposal_id, nullifier, proof)
+}
+
+#[test]
+fn test_activate_halt_blocks_vote_submission_tier_only() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "suspected exploit"),
+        &guardian,
+    );
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+    // A different, unhalted tier must remain unaffected.
+    assert!(!client.is_tier_halted(&HALT_TIER_TALLY_FINALIZATION));
+
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    let res = client.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_fast_halt_expires_automatically_if_not_ratified() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "temporary"),
+        &guardian,
+    );
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + FAST_HALT_MAX_DURATION);
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    // And voting actually works again - the gate, not just the getter, sees the expiry.
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+}
+
+#[test]
+fn test_fast_halt_resumed_early_by_its_activator() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "false alarm"),
+        &guardian,
+    );
+    let resumed = client.resume_halt(&guardian);
+    assert!(resumed);
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+}
+
+#[test]
+fn test_fast_halt_cannot_be_resumed_by_a_non_activator() {
+    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) = setup_halt_vote_env();
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "x"),
+        &guardian,
+    );
+
+    let someone_else = Address::generate(&env);
+    let res = client.try_resume_halt(&someone_else);
+    assert!(res.is_err());
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+}
+
+#[test]
+fn test_ratified_halt_survives_fast_expiry_and_requires_quorum_to_resume() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    let signer_a = Address::generate(&env);
+    let signer_b = Address::generate(&env);
+    let signer_c = Address::generate(&env);
+    client.set_halt_quorum(
+        &soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+        &2u32,
+        &guardian,
+    );
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "under investigation"),
+        &guardian,
+    );
+
+    // One approval is not enough to ratify.
+    assert!(!client.ratify_halt(&signer_a));
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    // A second, distinct signer's approval ratifies it.
+    assert!(client.ratify_halt(&signer_b));
+
+    // Ratified: survives past what would have been the fast-halt expiry.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + FAST_HALT_MAX_DURATION + 1);
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    let res = client.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+    assert!(res.is_err());
+
+    // The original activator alone cannot resume a ratified halt.
+    let res = client.try_resume_halt(&guardian);
+    assert!(res.is_err());
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    // Quorum resume: one approval isn't enough either.
+    assert!(!client.resume_halt(&signer_a));
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+    assert!(client.resume_halt(&signer_c));
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+}
+
+#[test]
+fn test_halt_ratification_rejects_duplicate_and_unknown_signer() {
+    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) = setup_halt_vote_env();
+    let signer_a = Address::generate(&env);
+    let signer_b = Address::generate(&env);
+    client.set_halt_quorum(
+        &soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone()],
+        &2u32,
+        &guardian,
+    );
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "x"),
+        &guardian,
+    );
+
+    assert!(!client.ratify_halt(&signer_a));
+    let dup = client.try_ratify_halt(&signer_a);
+    assert!(dup.is_err());
+
+    let unknown = Address::generate(&env);
+    let res = client.try_ratify_halt(&unknown);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_invalid_halt_tier_and_quorum_rejected() {
+    let (env, client, guardian, ..) = setup_halt_vote_env();
+
+    // Zero tiers / a bit outside the known mask.
+    assert!(client
+        .try_activate_halt(&0u32, &String::from_str(&env, "x"), &guardian)
+        .is_err());
+    assert!(client
+        .try_activate_halt(&0x8u32, &String::from_str(&env, "x"), &guardian)
+        .is_err());
+
+    // Threshold above signer count.
+    let signer_a = Address::generate(&env);
+    assert!(client
+        .try_set_halt_quorum(&soroban_sdk::vec![&env, signer_a], &2u32, &guardian)
+        .is_err());
+}
+
+#[test]
+fn test_treasury_execution_tier_has_no_gated_entrypoint_but_is_queryable() {
+    let (env, client, guardian, ..) = setup_halt_vote_env();
+    assert!(!client.is_tier_halted(&HALT_TIER_TREASURY_EXECUTION));
+    client.activate_halt(
+        &HALT_TIER_TREASURY_EXECUTION,
+        &String::from_str(&env, "pending review"),
+        &guardian,
+    );
+    assert!(client.is_tier_halted(&HALT_TIER_TREASURY_EXECUTION));
+    // Other tiers remain independently unaffected.
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+}
+
+#[test]
+fn test_tally_finalization_tier_blocks_submit_recursive_tally() {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    tree_client.set_root(&1u64, &U256::from_u32(&env, 12345));
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    client.set_recursive_vk(&dao_id, &Bytes::from_slice(&env, &[1, 2, 3, 4]), &admin);
+    client.set_tally_vk(&dao_id, &create_dummy_vk(&env), &admin);
+
+    let end_time = env.ledger().timestamp() + 3600;
+    let prop_id = client.create_proposal(
+        &dao_id,
+        &String::from_str(&env, "Tally Halt Test"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &end_time,
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    let guardian = client.guardian();
+    client.activate_halt(
+        &HALT_TIER_TALLY_FINALIZATION,
+        &String::from_str(&env, "tally dispute"),
+        &guardian,
+    );
+
+    let proof = create_dummy_proof(&env);
+    let res = client.try_submit_recursive_tally(
+        &dao_id,
+        &prop_id,
+        &1000u64,
+        &650u64,
+        &350u64,
+        &U256::from_u32(&env, 0),
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
 // ── Candidate index bounds tests ────────────────────────────────────────────
 
 #[test]
@@ -3001,7 +3419,7 @@ fn test_election_config_stores_num_candidates() {
         &VoteMode::Fixed,
     );
 
-    voting_client.set_election_config(&1u64, &proposal_id, &0, &0, &3u32);
+    voting_client.set_election_config(&1u64, &proposal_id, &0, &0, &3u32, &admin);
 
     let config = voting_client.get_election_config(&1u64, &proposal_id);
     assert!(config.is_some());
@@ -3085,7 +3503,7 @@ fn test_vote_with_num_candidates_1_rejects_vote_choice_1() {
         &VoteMode::Fixed,
     );
 
-    voting_client.set_election_config(&1u64, &proposal_id, &0, &0, &1u32);
+    voting_client.set_election_config(&1u64, &proposal_id, &0, &0, &1u32, &admin);
 
     let proposal = voting_client.get_proposal(&1u64, &proposal_id);
     let nullifier = U256::from_u32(&env, 99999);
@@ -3127,7 +3545,7 @@ fn test_vote_with_num_candidates_2_accepts_both_choices() {
         &VoteMode::Fixed,
     );
 
-    voting_client.set_election_config(&1u64, &proposal_id, &0, &0, &2u32);
+    voting_client.set_election_config(&1u64, &proposal_id, &0, &0, &2u32, &admin);
 
     let proposal = voting_client.get_proposal(&1u64, &proposal_id);
     let proof = create_dummy_proof(&env);
@@ -3363,10 +3781,276 @@ fn test_recursive_tally_submission() {
 }
 
 // ============================================================================
+// Universal tally-semantics verification (ZV-112 / Issue #952, #699)
+// ============================================================================
+
+/// Create a `Registration`-state proposal, pin `semantics_id`/`semantics_version`
+/// on it, register a matching dummy VK, then activate it. Returns
+/// (env, client, admin, dao_id, proposal_id).
+fn setup_universal_tally_proposal(
+    semantics_id: u32,
+    semantics_version: u32,
+    num_public_signals: u32,
+) -> (Env, VotingClient<'static>, Address, u64, u64) {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    let now = env.ledger().timestamp();
+    let proposal_id = client.create_proposal_in_registration(
+        &dao_id,
+        &String::from_str(&env, "Universal Tally Test Proposal"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    client.set_proposal_semantics(
+        &dao_id,
+        &proposal_id,
+        &semantics_id,
+        &semantics_version,
+        &admin,
+    );
+    client.set_semantics_vk(
+        &dao_id,
+        &semantics_id,
+        &semantics_version,
+        &create_dummy_tally_vk(&env, num_public_signals),
+        &admin,
+    );
+    client.activate_proposal(&dao_id, &proposal_id, &admin);
+
+    (env, client, admin, dao_id, proposal_id)
+}
+
+#[test]
+fn test_universal_tally_yes_no_submission() {
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    client.submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &10u64,
+        &6u64,
+        &4u64,
+        &0u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+
+    let tally = client.get_universal_tally(&dao_id, &proposal_id).unwrap();
+    assert_eq!(tally.semantics_id, SEMANTICS_YES_NO);
+    assert_eq!(tally.yes_votes, 6);
+    assert_eq!(tally.no_votes, 4);
+
+    let prop_info = client.get_proposal(&dao_id, &proposal_id);
+    assert_eq!(prop_info.yes_votes, 6);
+    assert_eq!(prop_info.no_votes, 4);
+    assert_eq!(prop_info.state, ProposalState::Closed);
+}
+
+#[test]
+fn test_universal_tally_quadratic_submission() {
+    let (env, client, _admin, dao_id, proposal_id) = setup_universal_tally_proposal(
+        SEMANTICS_QUADRATIC,
+        1,
+        UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS,
+    );
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    client.submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_QUADRATIC,
+        &1u32,
+        &3u64,
+        &0u64,
+        &0u64,
+        &14u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+
+    let tally = client.get_universal_tally(&dao_id, &proposal_id).unwrap();
+    assert_eq!(tally.semantics_id, SEMANTICS_QUADRATIC);
+    assert_eq!(tally.total_credits_spent, 14);
+
+    // QV results do not feed the legacy yes/no fields.
+    let prop_info = client.get_proposal(&dao_id, &proposal_id);
+    assert_eq!(prop_info.yes_votes, 0);
+    assert_eq!(prop_info.no_votes, 0);
+}
+
+#[test]
+fn test_universal_tally_rejects_mismatched_semantics() {
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+
+    // Proof declares QV even though the proposal is pinned to yes/no.
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_QUADRATIC,
+        &1u32,
+        &3u64,
+        &0u64,
+        &0u64,
+        &14u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_universal_tally_rejects_cross_semantics_output_leakage() {
+    // Pinned + declared tuple both say yes/no, but the caller also smuggles
+    // in a non-zero QV output - must be rejected even though the tuple matches.
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &10u64,
+        &6u64,
+        &4u64,
+        &999u64, // non-zero totalCreditsSpent under a yes/no tuple
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_set_proposal_semantics_is_one_shot() {
+    let (_env, client, admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    // Proposal was already activated by the fixture, so even a repeat call
+    // with the same tuple is now also rejected for being past Registration;
+    // this just confirms pinning is not silently idempotent either way.
+    let res =
+        client.try_set_proposal_semantics(&dao_id, &proposal_id, &SEMANTICS_YES_NO, &1u32, &admin);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_submit_universal_tally_without_pinned_semantics_fails() {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    let now = env.ledger().timestamp();
+    let proposal_id = client.create_proposal_in_registration(
+        &dao_id,
+        &String::from_str(&env, "No Semantics Pinned"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+    client.activate_proposal(&dao_id, &proposal_id, &admin);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &1u64,
+        &1u64,
+        &0u64,
+        &0u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+// ============================================================================
 // Quadratic voting with range proofs (issue #50)
 // ============================================================================
 
 // QV circuit has 6 public signals -> IC length must be 7.
+/// A verification key shaped for the Sybil-weighted circuit.
+///
+/// `set_sybil_vk` checks `ic.len() == SYBIL_NUM_PUBLIC_SIGNALS + 1` (= 10), which
+/// is a different arity from the plain vote circuit's 7, so the shared
+/// `create_dummy_vk` is rejected by it.
+fn create_dummy_sybil_vk(env: &Env) -> VerificationKey {
+    let g1 = bn254_g1_generator(env);
+    let g2 = bn254_g2_generator(env);
+    let mut ic = soroban_sdk::Vec::new(env);
+    for _ in 0..10u32 {
+        ic.push_back(g1.clone());
+    }
+    VerificationKey {
+        alpha: g1.clone(),
+        beta: g2.clone(),
+        gamma: g2.clone(),
+        delta: g2.clone(),
+        ic,
+    }
+}
+
+/// The Sybil-weighted circuit takes the same `Proof` type as the vote circuit;
+/// the stubbed verifier means its contents do not matter here.
+/// A verification key shaped for the commit-reveal circuit
+/// (`COMMIT_NUM_PUBLIC_SIGNALS + 1` = 5 IC entries).
+fn create_dummy_commit_vk(env: &Env) -> VerificationKey {
+    let g1 = bn254_g1_generator(env);
+    let g2 = bn254_g2_generator(env);
+    let mut ic = soroban_sdk::Vec::new(env);
+    for _ in 0..5u32 {
+        ic.push_back(g1.clone());
+    }
+    VerificationKey {
+        alpha: g1.clone(),
+        beta: g2.clone(),
+        gamma: g2.clone(),
+        delta: g2.clone(),
+        ic,
+    }
+}
+
+fn create_dummy_sybil_proof(env: &Env) -> Proof {
+    create_dummy_proof(env)
+}
+
 fn create_dummy_qv_vk(env: &Env) -> VerificationKey {
     let g1 = bn254_g1_generator(env);
     let g2 = bn254_g2_generator(env);
@@ -4338,9 +5022,9 @@ fn test_cast_votes_leaves_no_nullifier_burned_when_the_batch_fails() {
 #[test]
 #[should_panic(expected = "Error(Contract, #68)")]
 fn test_cast_votes_enforces_the_candidate_bound() {
-    let (env, voting, _admin, proposal_id, root) = setup_batch_election();
+    let (env, voting, admin, proposal_id, root) = setup_batch_election();
     // One candidate means only index 0 is valid, so a "yes" (index 1) is out of range.
-    voting.set_election_config(&1u64, &proposal_id, &0i128, &0u64, &1u32);
+    voting.set_election_config(&1u64, &proposal_id, &0i128, &0u64, &1u32, &admin);
 
     let votes = soroban_sdk::vec![&env, batch_vote(&env, true, 701, &root)];
     voting.cast_votes(&1u64, &proposal_id, &votes);
@@ -4397,7 +5081,15 @@ fn test_set_vk_for_depth_rejects_depth_above_the_maximum() {
 fn test_election_can_declare_a_merkle_depth() {
     let (env, voting, admin, proposal_id, root) = setup_batch_election();
     voting.set_vk_for_depth(&1u64, &10u32, &create_dummy_vk(&env), &admin);
-    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &10u32);
+    voting.set_election_config_with_depth(
+        &1u64,
+        &proposal_id,
+        &0i128,
+        &0u64,
+        &2u32,
+        &10u32,
+        &admin,
+    );
 
     assert_eq!(voting.get_merkle_depth(&1u64, &proposal_id), 10);
     let config = voting.get_election_config(&1u64, &proposal_id).unwrap();
@@ -4420,14 +5112,22 @@ fn test_election_can_declare_a_merkle_depth() {
 #[test]
 #[should_panic(expected = "Error(Contract, #71)")]
 fn test_election_cannot_declare_a_depth_without_a_registered_key() {
-    let (_env, voting, _admin, proposal_id, _root) = setup_batch_election();
-    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &15u32);
+    let (_env, voting, admin, proposal_id, _root) = setup_batch_election();
+    voting.set_election_config_with_depth(
+        &1u64,
+        &proposal_id,
+        &0i128,
+        &0u64,
+        &2u32,
+        &15u32,
+        &admin,
+    );
 }
 
 #[test]
 #[should_panic(expected = "Error(Contract, #71)")]
 fn test_election_rejects_a_depth_above_the_maximum() {
-    let (_env, voting, _admin, proposal_id, _root) = setup_batch_election();
+    let (_env, voting, admin, proposal_id, _root) = setup_batch_election();
     voting.set_election_config_with_depth(
         &1u64,
         &proposal_id,
@@ -4435,6 +5135,7 @@ fn test_election_rejects_a_depth_above_the_maximum() {
         &0u64,
         &2u32,
         &(MAX_MERKLE_DEPTH + 1),
+        &admin,
     );
 }
 
@@ -4445,7 +5146,15 @@ fn test_replacing_a_depth_key_mid_election_is_rejected() {
     // must not silently start verifying against a different key.
     let (env, voting, admin, proposal_id, root) = setup_batch_election();
     voting.set_vk_for_depth(&1u64, &10u32, &create_dummy_vk(&env), &admin);
-    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &10u32);
+    voting.set_election_config_with_depth(
+        &1u64,
+        &proposal_id,
+        &0i128,
+        &0u64,
+        &2u32,
+        &10u32,
+        &admin,
+    );
 
     let mut replacement = create_dummy_vk(&env);
     replacement.alpha = BytesN::from_array(&env, &[0u8; 64]);
@@ -4466,9 +5175,17 @@ fn test_set_election_config_preserves_a_declared_depth() {
     // The plain setter must not silently reset the depth an election declared.
     let (env, voting, admin, proposal_id, _root) = setup_batch_election();
     voting.set_vk_for_depth(&1u64, &20u32, &create_dummy_vk(&env), &admin);
-    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &20u32);
+    voting.set_election_config_with_depth(
+        &1u64,
+        &proposal_id,
+        &0i128,
+        &0u64,
+        &2u32,
+        &20u32,
+        &admin,
+    );
 
-    voting.set_election_config(&1u64, &proposal_id, &5i128, &10u64, &3u32);
+    voting.set_election_config(&1u64, &proposal_id, &5i128, &10u64, &3u32, &admin);
 
     let config = voting.get_election_config(&1u64, &proposal_id).unwrap();
     assert_eq!(config.merkle_depth, 20);
@@ -4480,7 +5197,15 @@ fn test_set_election_config_preserves_a_declared_depth() {
 fn test_cast_votes_uses_the_depth_key_when_one_is_declared() {
     let (env, voting, admin, proposal_id, root) = setup_batch_election();
     voting.set_vk_for_depth(&1u64, &15u32, &create_dummy_vk(&env), &admin);
-    voting.set_election_config_with_depth(&1u64, &proposal_id, &0i128, &0u64, &2u32, &15u32);
+    voting.set_election_config_with_depth(
+        &1u64,
+        &proposal_id,
+        &0i128,
+        &0u64,
+        &2u32,
+        &15u32,
+        &admin,
+    );
 
     let votes = soroban_sdk::vec![
         &env,
@@ -4501,6 +5226,10 @@ fn test_transcript_registry_gating_blocks_unattested_vk() {
     registry.set_admin(&1u64, &admin);
 
     let transcript_reg_id = env.register(mock_transcript_registry::MockTranscriptRegistry, ());
+    // Opt out of the harness's attest-all default: these three tests are
+    // specifically about the attestation gate.
+    mock_transcript_registry::MockTranscriptRegistryClient::new(&env, &transcript_reg_id)
+        .set_attest_all(&false);
     voting.set_transcript_registry(&transcript_reg_id);
 
     // VK is not attested in transcript registry -> must panic with VkNotAttested (#93)
@@ -4517,6 +5246,10 @@ fn test_transcript_registry_gating_allows_attested_vk() {
     registry.set_admin(&1u64, &admin);
 
     let transcript_reg_id = env.register(mock_transcript_registry::MockTranscriptRegistry, ());
+    // Opt out of the harness's attest-all default: these three tests are
+    // specifically about the attestation gate.
+    mock_transcript_registry::MockTranscriptRegistryClient::new(&env, &transcript_reg_id)
+        .set_attest_all(&false);
     voting.set_transcript_registry(&transcript_reg_id);
 
     let dummy_vk = create_dummy_vk(&env);
@@ -4542,6 +5275,10 @@ fn test_set_vk_with_transcript_attestation() {
     registry.set_admin(&1u64, &admin);
 
     let transcript_reg_id = env.register(mock_transcript_registry::MockTranscriptRegistry, ());
+    // Opt out of the harness's attest-all default: these three tests are
+    // specifically about the attestation gate.
+    mock_transcript_registry::MockTranscriptRegistryClient::new(&env, &transcript_reg_id)
+        .set_attest_all(&false);
     voting.set_transcript_registry(&transcript_reg_id);
 
     let dummy_vk = create_dummy_vk(&env);
@@ -4555,4 +5292,355 @@ fn test_set_vk_with_transcript_attestation() {
     voting.set_vk_with_transcript(&1u64, &dummy_vk, &admin, &transcript_hash);
     let stored_vk = voting.vk_for_version(&1u64, &1u32);
     assert_eq!(Voting::hash_vk(&env, &stored_vk), vk_hash);
+}
+
+// ---------------------------------------------------------------------------
+// Weighted voting (ZK-013) — the weight must be *earned*, not asserted.
+//
+// Before this was fixed, `vote_weighted` range-checked `weight`, called the
+// plain `vote()`, and threw `weight` away: a "weighted" vote recorded as a
+// plain one-member-one-vote ballot. It also verified `proof` against the PLAIN
+// vote circuit's VK, so nothing constrained `weight` at all, and it never
+// looked at `balanceCommitment` — which, being a *public* input of
+// `weighted_vote.circom`, is chosen by the prover. A prover could commit to
+// 2^128-1 tokens and vote with that weight; the contract would have accepted
+// it and then discarded the number.
+// ---------------------------------------------------------------------------
+
+/// A VK shaped for `weighted_vote.circom`: 3 public signals
+/// ([balanceCommitment, maxSupply, voteWeight]) => IC length 4.
+fn create_dummy_weighted_vk(env: &Env) -> VerificationKey {
+    let g1 = bn254_g1_generator(env);
+    let g2 = bn254_g2_generator(env);
+    VerificationKey {
+        alpha: g1.clone(),
+        beta: g2.clone(),
+        gamma: g2.clone(),
+        delta: g2.clone(),
+        ic: soroban_sdk::vec![env, g1.clone(), g1.clone(), g1.clone(), g1],
+    }
+}
+
+fn setup_weighted_election() -> (Env, VotingClient<'static>, Address, u64, U256, U256) {
+    let (env, voting_id, tree_id, sbt_id, registry_id, admin) = setup_env_with_registry();
+    let voting = VotingClient::new(&env, &voting_id);
+    let sbt = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry = mock_registry::MockRegistryClient::new(&env, &registry_id);
+
+    registry.set_admin(&1, &admin);
+    sbt.set_member(&1, &admin, &true);
+    let root = U256::from_u32(&env, 12345);
+    tree.set_root(&1, &root);
+
+    // Both keys registered: the plain one proves that `vote_weighted` no longer
+    // borrows it, the weighted one is what the weighted circuit must use.
+    voting.set_vk(&1, &create_dummy_vk(&env), &admin);
+    voting.set_weighted_vk(&1, &create_dummy_weighted_vk(&env), &admin);
+
+    let proposal_id = voting.create_proposal(
+        &1,
+        &String::from_str(&env, "Weighted"),
+        &String::from_str(&env, ""),
+        &(env.ledger().timestamp() + 10_000),
+        &admin,
+        &VoteMode::Fixed,
+    );
+
+    // A balance commitment the DAO actually issued, and the max supply it
+    // snapshots against.
+    let commitment = U256::from_u32(&env, 0xBEEF);
+    let max_supply = U256::from_u32(&env, 1_000_000);
+    voting.set_weighted_balance_commitment(&1, &commitment);
+
+    (env, voting, admin, proposal_id, root, commitment)
+}
+
+#[test]
+fn test_weighted_vote_accumulates_weight_into_tally() {
+    let (env, voting, _admin, proposal_id, root, commitment) = setup_weighted_election();
+    let max_supply = U256::from_u32(&env, 1_000_000);
+    let proof = create_dummy_proof(&env);
+
+    voting.vote_weighted(
+        &1,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 111),
+        &root,
+        &proof,
+        &commitment,
+        &max_supply,
+        &500,
+        &DOMAIN_TAG_WEIGHTED,
+    );
+
+    let tally: WeightedTally = voting.weighted_tally(&1, &proposal_id);
+    assert_eq!(tally.yes_weight, 500, "the weight must reach the tally");
+    assert_eq!(tally.yes_ballots, 1);
+    assert_eq!(tally.no_weight, 0);
+
+    // Second voter on the other side.
+    voting.vote_weighted(
+        &1,
+        &proposal_id,
+        &false,
+        &U256::from_u32(&env, 222),
+        &root,
+        &proof,
+        &commitment,
+        &max_supply,
+        &250,
+        &DOMAIN_TAG_WEIGHTED,
+    );
+
+    let tally: WeightedTally = voting.weighted_tally(&1, &proposal_id);
+    assert_eq!(tally.yes_weight, 500);
+    assert_eq!(tally.no_weight, 250);
+    assert_eq!(tally.yes_ballots, 1);
+    assert_eq!(tally.no_ballots, 1);
+}
+
+#[test]
+fn test_weighted_vote_rejects_prover_minted_balance_commitment() {
+    // The audit's forgery: a commitment the DAO never pinned. The circuit is
+    // perfectly happy with it (see circuits/test/weighted_vote.test.js), so
+    // this on-chain pin is the only thing standing between a 1-token voter and
+    // a weight of 2^128-1.
+    let (env, voting, _admin, proposal_id, root, _pinned) = setup_weighted_election();
+    let max_supply = U256::from_u32(&env, 1_000_000);
+    let minted = U256::from_u32(&env, 0xDEAD_BEEF);
+    let proof = create_dummy_proof(&env);
+
+    assert!(!voting.is_weighted_balance_commitment(&1, &minted));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.vote_weighted(
+            &1,
+            &proposal_id,
+            &true,
+            &U256::from_u32(&env, 999),
+            &root,
+            &proof,
+            &minted,
+            &max_supply,
+            &1_000_000,
+            &DOMAIN_TAG_WEIGHTED,
+        );
+    }));
+    assert!(
+        result.is_err(),
+        "a balance commitment the DAO never pinned must be rejected"
+    );
+
+    // And nothing was recorded.
+    let tally: WeightedTally = voting.weighted_tally(&1, &proposal_id);
+    assert_eq!(tally.yes_weight, 0);
+    assert_eq!(tally.yes_ballots, 0);
+}
+
+#[test]
+fn test_weighted_vote_rejects_zero_balance_commitment() {
+    let (env, voting, _admin, proposal_id, root, _pinned) = setup_weighted_election();
+    let max_supply = U256::from_u32(&env, 1_000_000);
+    let proof = create_dummy_proof(&env);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.vote_weighted(
+            &1,
+            &proposal_id,
+            &true,
+            &U256::from_u32(&env, 998),
+            &root,
+            &proof,
+            &U256::from_u32(&env, 0),
+            &max_supply,
+            &500,
+            &DOMAIN_TAG_WEIGHTED,
+        );
+    }));
+    assert!(
+        result.is_err(),
+        "a zero balance commitment must be rejected"
+    );
+}
+
+#[test]
+fn test_weighted_vk_registers_only_with_matching_ic_length() {
+    let (env, voting, _admin, _proposal_id, _root, _commitment) = setup_weighted_election();
+    let _ = env;
+
+    // A plain-vote VK (IC length 7) must not be accepted as a weighted VK:
+    // otherwise the weighted entry point would verify a weighted statement
+    // against the plain circuit's key.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.set_weighted_vk(&1, &create_dummy_vk(&env), &Address::generate(&env));
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_weighted_vote_still_enforces_weight_bounds_and_domain_tag() {
+    let (env, voting, _admin, proposal_id, root, commitment) = setup_weighted_election();
+    let max_supply = U256::from_u32(&env, 1_000_000);
+    let proof = create_dummy_proof(&env);
+
+    // Above MAX_WEIGHT.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.vote_weighted(
+            &1,
+            &proposal_id,
+            &true,
+            &U256::from_u32(&env, 700),
+            &root,
+            &proof,
+            &commitment,
+            &max_supply,
+            &(MAX_WEIGHT + 1),
+            &DOMAIN_TAG_WEIGHTED,
+        );
+    }));
+    assert!(result.is_err(), "weight above MAX_WEIGHT must be rejected");
+
+    // Below MIN_WEIGHT.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.vote_weighted(
+            &1,
+            &proposal_id,
+            &true,
+            &U256::from_u32(&env, 701),
+            &root,
+            &proof,
+            &commitment,
+            &max_supply,
+            &0,
+            &DOMAIN_TAG_WEIGHTED,
+        );
+    }));
+    assert!(result.is_err(), "weight below MIN_WEIGHT must be rejected");
+
+    // Wrong domain tag -> cross-circuit replay.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.vote_weighted(
+            &1,
+            &proposal_id,
+            &true,
+            &U256::from_u32(&env, 702),
+            &root,
+            &proof,
+            &commitment,
+            &max_supply,
+            &500,
+            &(DOMAIN_TAG_WEIGHTED + 1),
+        );
+    }));
+    assert!(result.is_err(), "a wrong domain tag must be rejected");
+}
+
+#[test]
+fn test_weighted_and_plain_vote_share_a_nullifier_namespace() {
+    // A member must not be able to cast both a weighted and an unweighted
+    // ballot in the same election to have their weight counted twice.
+    let (env, voting, _admin, proposal_id, root, commitment) = setup_weighted_election();
+    let max_supply = U256::from_u32(&env, 1_000_000);
+    let proof = create_dummy_proof(&env);
+    let nullifier = U256::from_u32(&env, 4242);
+
+    voting.vote_weighted(
+        &1,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &root,
+        &proof,
+        &commitment,
+        &max_supply,
+        &500,
+        &DOMAIN_TAG_WEIGHTED,
+    );
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        voting.vote(
+            &1,
+            &proposal_id,
+            &false,
+            &nullifier,
+            &root,
+            &create_dummy_proof(&env),
+        );
+    }));
+    assert!(
+        result.is_err(),
+        "the same nullifier must not be spendable on the plain path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Public-signal accounting.
+//
+// Every other voting test builds a synthetic VK from `VOTE_CIRCUIT_IC_LEN`, so
+// the tests and the contract always agree — which is exactly why a real
+// mismatch between the circuit, the contract, and the committed verification key
+// went unnoticed for so long. These tests pin the relationship instead, by
+// counting the signals the contract actually builds.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vote_public_signal_count_matches_ic_length() {
+    // A Groth16 IC vector has one more element than the circuit has public
+    // signals. If these ever diverge, no key can be registered.
+    assert_eq!(
+        VOTE_CIRCUIT_IC_LEN,
+        NUM_PUBLIC_SIGNALS + 1,
+        "IC length must be public signals + 1"
+    );
+    assert_eq!(
+        NUM_PUBLIC_SIGNALS, 6,
+        "vote.circom declares 6 public signals"
+    );
+}
+
+#[test]
+fn test_effective_num_candidates_is_always_satisfiable() {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, admin) = setup_env_with_registry();
+    let voting = VotingClient::new(&env, &voting_id);
+    let registry = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let sbt = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+
+    registry.set_admin(&1, &admin);
+    sbt.set_member(&1, &admin, &true);
+    voting.set_vk(&1, &create_dummy_vk(&env), &admin);
+    let proposal_id = voting.create_proposal(
+        &1,
+        &String::from_str(&env, "Candidates"),
+        &String::from_str(&env, ""),
+        &(env.ledger().timestamp() + 10_000),
+        &admin,
+        &VoteMode::Fixed,
+    );
+
+    // No election config: `get_num_candidates` reports 0 ("unbounded"), but the
+    // circuit constrains `voteChoice < numCandidates`, so 0 would admit no
+    // witness at all. The effective value must be floored.
+    assert_eq!(voting.get_num_candidates(&1, &proposal_id), 0);
+    assert_eq!(voting.get_effective_num_candidates(&1, &proposal_id), 2);
+
+    // A configured value is passed through unchanged.
+    voting.set_election_config(&1, &proposal_id, &0, &0, &7, &admin);
+    assert_eq!(voting.get_num_candidates(&1, &proposal_id), 7);
+    assert_eq!(voting.get_effective_num_candidates(&1, &proposal_id), 7);
+}
+
+/// A vote is binary, so the circuit can never be satisfied with a bound below 2.
+/// This is the invariant that made the whole anonymous vote path unsatisfiable
+/// for any election that had not set an explicit candidate count.
+#[test]
+fn test_min_satisfiable_num_candidates_admits_a_binary_vote() {
+    assert!(MIN_SATISFIABLE_NUM_CANDIDATES >= 2);
+    for choice in 0..2u32 {
+        assert!(
+            choice < MIN_SATISFIABLE_NUM_CANDIDATES,
+            "voteChoice={choice} must be below the circuit's numCandidates bound"
+        );
+    }
 }

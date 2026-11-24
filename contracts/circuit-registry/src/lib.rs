@@ -11,6 +11,13 @@ const VERSION_KEY: Symbol = symbol_short!("ver");
 const GOVERNANCE: Symbol = symbol_short!("gov");
 const ADMINS: Symbol = symbol_short!("admins");
 const VK_PROPOSAL_COUNTER: Symbol = symbol_short!("vk_pr_cnt");
+/// Minimum timelock (seconds) for VK upgrades — not caller-chosen (#650)
+const MIN_VK_TIMELOCK: Symbol = symbol_short!("min_tl");
+/// Required distinct admin approvals for VK upgrades (#650)
+const VK_QUORUM: Symbol = symbol_short!("vk_qrm");
+
+const DEFAULT_MIN_VK_TIMELOCK: u64 = 86_400; // 24h
+const DEFAULT_VK_QUORUM: u32 = 1;
 
 const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
 const INSTANCE_TTL_EXTEND: u32 = 535_680;
@@ -37,7 +44,11 @@ pub enum RegistryError {
     VkProposalInvalidQuorum = 15,
     VkProposalAlreadyCancelled = 16,
     NotAdmin = 17,
-    InvalidCeremonyHash = 18,
+    /// #726: Circuit registration rejected because no ceremony transcript hash
+    /// was provided. Every new circuit artifact must be backed by an auditable
+    /// trusted-setup transcript whose SHA-256 hash is recorded on-chain so
+    /// downstream verifiers can trace the VK to the ceremony.
+    MissingCeremonyProvenance = 18,
 }
 
 #[contracttype]
@@ -58,6 +69,17 @@ pub struct CircuitInfo {
     pub registered_at: u64,
     pub expiration: u64,
     pub num_public_signals: u32,
+    /// #726 — SHA-256 hash of the MPC trusted-setup ceremony transcript that
+    /// produced the parameters embedded in `vk`. Computed by
+    /// `circuits/ceremony/verify-ceremony.js` and stored here so any party can
+    /// independently verify that the on-chain VK matches the published
+    /// transcript without re-running the full ceremony.
+    ///
+    /// `None` is rejected by `register_circuit` for new registrations; it is
+    /// kept optional in the storage type only to preserve backward
+    /// compatibility with circuit records written by earlier versions of this
+    /// contract that pre-date this field.
+    pub ceremony_transcript_hash: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -113,7 +135,8 @@ pub struct VkProposal {
     pub proposed_at: u64,
     pub execute_after: u64,
     pub required_approvals: u32,
-    pub approvals: u32,
+    /// Distinct approver addresses (duplicate approvals rejected) (#650)
+    pub approvers: Vec<Address>,
     pub status: VkProposalStatus,
     pub dao_id: Option<u64>,
 }
@@ -126,9 +149,8 @@ pub enum DataKey {
     VkProposal(u32),
     VkProposalCounter,
     DaoVkProposal(u64),
-    // Additive keys: never collide with the existing ones above.
+    /// Per-circuit version, incremented when a VkProposal is executed.
     CircuitVersion(String, CircuitType),
-    CeremonyHash(String, CircuitType),
 }
 
 #[soroban_sdk::contractevent]
@@ -230,11 +252,67 @@ impl CircuitRegistry {
         }
         env.storage().instance().set(&VERSION_KEY, &VERSION);
         env.storage().instance().set(&GOVERNANCE, &governance);
+        // Seed admins with governance so VK upgrades are not permissionless (#650)
+        let mut admins: Vec<Address> = Vec::new(&env);
+        admins.push_back(governance.clone());
+        env.storage().instance().set(&ADMINS, &admins);
+        env.storage()
+            .instance()
+            .set(&MIN_VK_TIMELOCK, &DEFAULT_MIN_VK_TIMELOCK);
+        env.storage().instance().set(&VK_QUORUM, &DEFAULT_VK_QUORUM);
     }
 
     fn assert_governance(env: &Env) {
         let governance: Address = env.storage().instance().get(&GOVERNANCE).unwrap();
         governance.require_auth();
+    }
+
+    fn is_admin(env: &Env, addr: &Address) -> bool {
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ADMINS)
+            .unwrap_or_else(|| Vec::new(env));
+        for a in admins.iter() {
+            if &a == addr {
+                return true;
+            }
+        }
+        // Governance address is always an admin
+        let governance: Address = env.storage().instance().get(&GOVERNANCE).unwrap();
+        addr == &governance
+    }
+
+    fn assert_admin(env: &Env, addr: &Address) {
+        addr.require_auth();
+        if !Self::is_admin(env, addr) {
+            panic_with_error!(env, RegistryError::NotAdmin);
+        }
+    }
+
+    /// Governance-only: replace the admin set used for VK upgrade approvals.
+    pub fn set_admins(env: Env, admins: Vec<Address>) {
+        Self::bump_instance(&env);
+        Self::assert_governance(&env);
+        if admins.is_empty() {
+            panic_with_error!(&env, RegistryError::VkProposalInvalidQuorum);
+        }
+        env.storage().instance().set(&ADMINS, &admins);
+    }
+
+    /// Governance-only: configure minimum timelock and required approvals.
+    pub fn set_vk_upgrade_params(env: Env, min_timelock: u64, required_approvals: u32) {
+        Self::bump_instance(&env);
+        Self::assert_governance(&env);
+        if required_approvals == 0 {
+            panic_with_error!(&env, RegistryError::VkProposalInvalidQuorum);
+        }
+        env.storage()
+            .instance()
+            .set(&MIN_VK_TIMELOCK, &min_timelock);
+        env.storage()
+            .instance()
+            .set(&VK_QUORUM, &required_approvals);
     }
 
     pub fn register_circuit(
@@ -245,9 +323,20 @@ impl CircuitRegistry {
         wasm_hash: BytesN<32>,
         expiration: u64,
         num_public_signals: u32,
+        // #726: SHA-256 hash of the MPC ceremony transcript (output of
+        // `circuits/ceremony/verify-ceremony.js`). Required for all new
+        // circuit registrations; absent provenance is rejected so that
+        // downstream verifiers can always trace any on-chain VK back to
+        // its trusted-setup ceremony.
+        ceremony_transcript_hash: Option<BytesN<32>>,
     ) {
         Self::bump_instance(&env);
         Self::assert_governance(&env);
+
+        // #726: reject registration without ceremony provenance.
+        if ceremony_transcript_hash.is_none() {
+            panic_with_error!(&env, RegistryError::MissingCeremonyProvenance);
+        }
 
         let key = DataKey::Circuit(circuit_id.clone(), circuit_type);
         if env.storage().persistent().has(&key) {
@@ -262,10 +351,17 @@ impl CircuitRegistry {
             registered_at: env.ledger().timestamp(),
             expiration,
             num_public_signals,
+            ceremony_transcript_hash,
         };
 
         env.storage().persistent().set(&key, &circuit);
         Self::bump_persistent(&env, &key);
+
+        // Single source of truth for VK versioning. Starts at 1 and is bumped
+        // by execute_vk_upgrade, so clients can detect stale cached VKs.
+        let version_key = DataKey::CircuitVersion(circuit_id.clone(), circuit_type);
+        env.storage().persistent().set(&version_key, &1u32);
+        Self::bump_persistent(&env, &version_key);
 
         CircuitRegisteredEvent {
             circuit_id,
@@ -285,6 +381,23 @@ impl CircuitRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
         Self::bump_persistent(&env, &key);
         circuit
+    }
+
+    /// Current on-chain version of a circuit's verification key.
+    pub fn get_circuit_version(
+        env: Env,
+        circuit_id: String,
+        circuit_type: CircuitType,
+    ) -> u32 {
+        Self::bump_instance(&env);
+        let key = DataKey::CircuitVersion(circuit_id.clone(), circuit_type);
+        let version: u32 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+        Self::bump_persistent(&env, &key);
+        version
     }
 
     pub fn get_vk(env: Env, circuit_id: String, circuit_type: CircuitType) -> CircuitVKMap {
@@ -538,31 +651,70 @@ impl CircuitRegistry {
         Self::bump_persistent(&env, &current_key);
     }
 
+    /// Compensating step for a release-train rollback: restore the circuit ID
+    /// that was active before a migration. Governance-gated like the forward
+    /// setter, and additive-only — it never deletes a registered circuit.
+    pub fn restore_current_circuit(
+        env: Env,
+        dao_id: u64,
+        circuit_type: CircuitType,
+        circuit_id: String,
+    ) {
+        Self::bump_instance(&env);
+        Self::assert_governance(&env);
+
+        let circuit_key = DataKey::Circuit(circuit_id.clone(), circuit_type.clone());
+        if !env.storage().persistent().has(&circuit_key) {
+            panic_with_error!(&env, RegistryError::CircuitNotFound);
+        }
+        let current_key = DataKey::DaoCurrentCircuit(dao_id, circuit_type.clone());
+        env.storage().persistent().set(&current_key, &circuit_id);
+        Self::bump_persistent(&env, &current_key);
+        CircuitUpgradedEvent {
+            dao_id,
+            circuit_type,
+            to_circuit_id: circuit_id,
+        }
+        .publish(&env);
+    }
+
     pub fn propose_vk_upgrade(
         env: Env,
         circuit_id: String,
         circuit_type: CircuitType,
         new_vk: VerificationKey,
         new_wasm_hash: BytesN<32>,
-        timelock_duration: u64,
-        required_approvals: u32,
+        // Caller-supplied values are IGNORED for security — contract config wins (#650)
+        _timelock_duration: u64,
+        _required_approvals: u32,
         dao_id: Option<u64>,
         proposer: Address,
     ) -> u32 {
         Self::bump_instance(&env);
-        proposer.require_auth();
+        Self::assert_admin(&env, &proposer);
 
         let circuit_key = DataKey::Circuit(circuit_id.clone(), circuit_type);
         if !env.storage().persistent().has(&circuit_key) {
             panic_with_error!(&env, RegistryError::CircuitNotFound);
         }
 
+        let required_approvals: u32 = env
+            .storage()
+            .instance()
+            .get(&VK_QUORUM)
+            .unwrap_or(DEFAULT_VK_QUORUM);
         if required_approvals == 0 {
             panic_with_error!(&env, RegistryError::VkProposalInvalidQuorum);
         }
 
+        let min_timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&MIN_VK_TIMELOCK)
+            .unwrap_or(DEFAULT_MIN_VK_TIMELOCK);
+
         let now = env.ledger().timestamp();
-        let execute_after = now.saturating_add(timelock_duration);
+        let execute_after = now.saturating_add(min_timelock);
 
         let counter_key = DataKey::VkProposalCounter;
         let proposal_id: u32 = env
@@ -583,7 +735,7 @@ impl CircuitRegistry {
             proposed_at: now,
             execute_after,
             required_approvals,
-            approvals: 0,
+            approvers: Vec::new(&env),
             status: VkProposalStatus::Pending,
             dao_id,
         };
@@ -615,7 +767,7 @@ impl CircuitRegistry {
 
     pub fn approve_vk_upgrade(env: Env, proposal_id: u32, approver: Address) {
         Self::bump_instance(&env);
-        approver.require_auth();
+        Self::assert_admin(&env, &approver);
 
         let proposal_key = DataKey::VkProposal(proposal_id);
         let mut proposal: VkProposal = env
@@ -628,14 +780,20 @@ impl CircuitRegistry {
             panic_with_error!(&env, RegistryError::VkProposalNotActive);
         }
 
-        proposal.approvals = proposal.approvals.saturating_add(1);
+        for a in proposal.approvers.iter() {
+            if a == approver {
+                panic_with_error!(&env, RegistryError::VkProposalAlreadyApproved);
+            }
+        }
+
+        proposal.approvers.push_back(approver.clone());
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_persistent(&env, &proposal_key);
 
         VkProposalApprovedEvent {
             proposal_id,
             approver,
-            current_approvals: proposal.approvals,
+            current_approvals: proposal.approvers.len(),
             required_approvals: proposal.required_approvals,
         }
         .publish(&env);
@@ -643,6 +801,8 @@ impl CircuitRegistry {
 
     pub fn execute_vk_upgrade(env: Env, proposal_id: u32, executor: Address) {
         Self::bump_instance(&env);
+        // Only governance may execute (mirrors token clawback pattern) (#650)
+        Self::assert_governance(&env);
         executor.require_auth();
 
         let proposal_key = DataKey::VkProposal(proposal_id);
@@ -661,7 +821,7 @@ impl CircuitRegistry {
             panic_with_error!(&env, RegistryError::VkProposalTimelockNotElapsed);
         }
 
-        if proposal.approvals < proposal.required_approvals {
+        if proposal.approvers.len() < proposal.required_approvals {
             panic_with_error!(&env, RegistryError::VkProposalQuorumNotMet);
         }
 
@@ -682,18 +842,12 @@ impl CircuitRegistry {
         env.storage().persistent().set(&circuit_key, &circuit);
         Self::bump_persistent(&env, &circuit_key);
 
-        // Bump the circuit's monotonic version. Clients detect the rotation and
-        // invalidate cached VKs whenever this value changes.
         let version_key =
             DataKey::CircuitVersion(proposal.circuit_id.clone(), proposal.circuit_type);
-        let previous_version: u32 = env
-            .storage()
-            .persistent()
-            .get(&version_key)
-            .unwrap_or(1);
+        let previous_version: u32 = env.storage().persistent().get(&version_key).unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&version_key, &previous_version.saturating_add(1));
+            .set(&version_key, &(previous_version + 1));
         Self::bump_persistent(&env, &version_key);
 
         VkProposalExecutedEvent {

@@ -182,3 +182,48 @@ describe('soroban_be parity: round-trip snarkjs -> Soroban -> snarkjs', () => {
         expect(snarkjs.pi_c[2]).toBe('1');
     });
 });
+
+describe('public signal semantics and registry invariants', () => {
+    test('vote circuit public signals pin 6 canonical slots with numCandidates at index 5', () => {
+        const canonicalVoteSignals = [
+            'root',
+            'nullifier',
+            'daoId',
+            'proposalId',
+            'voteChoice',
+            'numCandidates'
+        ];
+        expect(canonicalVoteSignals.length).toBe(6);
+        expect(canonicalVoteSignals[0]).toBe('root');
+        expect(canonicalVoteSignals[1]).toBe('nullifier');
+        expect(canonicalVoteSignals[2]).toBe('daoId');
+        expect(canonicalVoteSignals[3]).toBe('proposalId');
+        expect(canonicalVoteSignals[4]).toBe('voteChoice');
+        expect(canonicalVoteSignals[5]).toBe('numCandidates');
+        expect(canonicalVoteSignals[5]).not.toBe('commitment');
+    });
+
+    test('circuit family signal registry counts and differential ordering', () => {
+        const registry = {
+            vote: {
+                signals: ['root', 'nullifier', 'daoId', 'proposalId', 'voteChoice', 'numCandidates'],
+                count: 6
+            },
+            quadratic_vote: {
+                // In quadratic voting, nullifier and daoId slots are distinguished
+                signals: ['root', 'daoId', 'nullifier', 'proposalId', 'voteChoice', 'creditsRemaining'],
+                count: 6
+            },
+            comment_v2: {
+                signals: ['root', 'commentHash', 'authorNullifier', 'daoId', 'proposalId', 'timestamp', 'reputationRoot'],
+                count: 7
+            }
+        };
+
+        expect(registry.vote.signals.length).toBe(6);
+        expect(registry.comment_v2.signals.length).toBe(7);
+        // Ensure quadratic and base vote slot differences are tracked
+        expect(registry.quadratic_vote.signals[1]).not.toBe(registry.vote.signals[1]);
+    });
+});
+

@@ -11,271 +11,187 @@
  * before delegating to settlement reconciliation, which in turn deduplicates
  * on (anchor, externalTxId) and applies the state machine's conflict rule.
  */
-
-import crypto from "node:crypto";
-import type { LoggerPort } from "./interfaces.js";
-import { log as moduleLog } from "./logger.js";
+import { log } from "./logger.js";
+import { config } from "../config.js";
+import { canonicalizeStellarAmount } from "../utils/stellarAmount.js";
 import {
-  handleAnchorCallback as reconcileCallback,
-  type AnchorCallbackEvent,
-  type AnchorCallbackKind,
-  type CallbackResult,
-} from "./settlementReconciliation.js";
+  minimizeKYCResponse,
+  enforceMinimizationBoundary
+} from "./kycBoundary.js";
+import {
+  createEndpointPool,
+  HttpStatusError,
+  parseRetryAfterMs,
+  poolOptionsFromConfig,
+  type EndpointPool,
+  type OperationClass,
+} from "./endpoint-pool.js";
 
-export type AnchorId = "USDC" | "EURC";
+type AnchorAsset = "USDC" | "EURC";
 
-export interface AnchorTransaction {
-  id: string;
-  status: string;
-  asset?: string;
-  amount?: string;
-  [key: string]: unknown;
-}
+// ── Anchor endpoint pools (#745) ─────────────────────────────────────────
+//
+// ANCHOR_<ASSET>_URLS lists mirrors of the SAME anchor operator (one SEP-1
+// organisation). Failing over to a different operator would hand the user's
+// funds to another counterparty, so that is deliberately not a fallback.
+// SEP-6 GETs are retried across mirrors; SEP-31 POSTs create a transfer and
+// are never retried once the anchor may have received them.
 
-/** Normalized client surface shared by every anchor. */
-export interface AnchorClient {
-  readonly id: AnchorId;
-  readonly baseUrl: string;
-  getTransaction(externalTxId: string): Promise<AnchorTransaction>;
-  deposit(account: string, amount: string): Promise<AnchorTransaction>;
-  withdraw(account: string, amount: string, dest: string): Promise<AnchorTransaction>;
-  send(payload: Record<string, unknown>): Promise<AnchorTransaction>;
-}
-
-export interface AnchorAdapterDeps {
-  urls?: Partial<Record<AnchorId, string>>;
-  /** HTTP implementation (defaults to global fetch). */
-  fetchImpl?: typeof fetch;
-  logger?: LoggerPort;
-  /** Callback sink (defaults to settlement reconciliation). */
-  onCallback?: (event: AnchorCallbackEvent) => Promise<CallbackResult> | CallbackResult;
-}
-
-export interface AnchorAdapter {
-  client(anchor: AnchorId): AnchorClient;
-  getTransaction(anchor: AnchorId, externalTxId: string): Promise<AnchorTransaction>;
-  deposit(anchor: AnchorId, account: string, amount: string): Promise<AnchorTransaction>;
-  withdraw(anchor: AnchorId, account: string, amount: string, dest: string): Promise<AnchorTransaction>;
-  send(anchor: AnchorId, payload: Record<string, unknown>): Promise<AnchorTransaction>;
-  /** Normalize a raw webhook body into a canonical callback event. */
-  normalize(raw: Record<string, unknown>, anchor: AnchorId): AnchorCallbackEvent;
-  /**
-   * Deliver a callback once. Returns null when this adapter already saw the
-   * event id (adapter-level idempotency), otherwise the reconciliation result.
-   */
-  processCallback(event: AnchorCallbackEvent): Promise<CallbackResult | null>;
-  processedEventIds(): readonly string[];
-}
-
-const DEFAULT_URLS: Record<AnchorId, string> = {
-  USDC: "https://anchor.circle.com",
-  EURC: "https://anchor.eurc.circle.com",
-};
-
-const fallbackLogger: LoggerPort = {
-  debug: (event, meta) => moduleLog("debug", event, meta),
-  info: (event, meta) => moduleLog("info", event, meta),
-  warn: (event, meta) => moduleLog("warn", event, meta),
-  error: (event, meta) => moduleLog("error", event, meta),
-  log: (level, event, meta) => moduleLog(level, event, meta),
-};
-
-function urlFor(anchor: AnchorId, urls?: Partial<Record<AnchorId, string>>): string {
-  const envKey = anchor === "USDC" ? "ANCHOR_USDC_URL" : "ANCHOR_EURC_URL";
-  return urls?.[anchor] ?? process.env[envKey] ?? DEFAULT_URLS[anchor];
-}
-
-/** Build one normalized anchor client over an injected fetch implementation. */
-export function createAnchorClient(
-  anchor: AnchorId,
-  baseUrl: string,
-  fetchImpl: typeof fetch,
-  logger: LoggerPort,
-): AnchorClient {
-  const request = async (path: string, init?: RequestInit): Promise<AnchorTransaction> => {
-    const response = await fetchImpl(`${baseUrl}${path}`, init);
-    const body = (await response.json()) as AnchorTransaction;
-    if (!response.ok) {
-      const message = `anchor ${anchor} request failed (${response.status}): ${JSON.stringify(body).slice(0, 500)}`;
-      logger.error("anchor_request_failed", { anchor, path, status: response.status });
-      throw new Error(message);
-    }
-    return body;
-  };
-
-  return {
-    id: anchor,
-    baseUrl,
-    getTransaction: (externalTxId) =>
-      request(`/sep6/transaction?id=${encodeURIComponent(externalTxId)}`),
-    deposit: (account, amount) =>
-      request(
-        `/sep6/deposit?asset=${anchor}&account=${encodeURIComponent(account)}&amount=${encodeURIComponent(amount)}`,
-      ),
-    withdraw: (account, amount, dest) =>
-      request(
-        `/sep6/withdraw?asset=${anchor}&account=${encodeURIComponent(account)}&amount=${encodeURIComponent(amount)}&dest=${encodeURIComponent(dest)}`,
-      ),
-    send: (payload) =>
-      request("/sep31/transactions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }),
-  };
-}
-
-const CALLBACK_KINDS: Record<string, AnchorCallbackKind> = {
-  anchor_confirmed: "anchor_confirmed",
-  confirmed: "anchor_confirmed",
-  sep6_confirmed: "anchor_confirmed",
-  settled: "settled",
-  settlement_confirmed: "settled",
-  completed: "settled",
-  complete: "settled",
-  failed: "failed",
-  error: "failed",
-  rejected: "failed",
-  disputed: "disputed",
-  dispute: "disputed",
-  chargeback: "disputed",
-};
-
-function pick(raw: Record<string, unknown>, ...keys: string[]): unknown {
-  for (const key of keys) {
-    if (raw[key] !== undefined && raw[key] !== null) return raw[key];
+async function probeAnchor(url: string): Promise<{}> {
+  const res = await fetch(new URL("/.well-known/stellar.toml", url));
+  if (!res.ok) {
+    throw new HttpStatusError(res.status, `Anchor SEP-1 returned HTTP ${res.status}`);
   }
-  return undefined;
+  return {};
 }
 
-function finiteNumber(value: unknown, fallback: number): number {
-  const parsed = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+function createAnchorPool(asset: AnchorAsset, urls: string[]): EndpointPool<null> {
+  return createEndpointPool<null>({
+    dependency: `anchor_${asset.toLowerCase()}`,
+    serviceName: asset === "USDC" ? "anchor_usdc" : "anchor_eurc",
+    urls,
+    clientFactory: () => null,
+    probe: (_client, url) => probeAnchor(url),
+    ledgerAware: false,
+    ...poolOptionsFromConfig(config),
+  });
 }
 
-/**
- * Convert an anchor webhook body (snake_case or camelCase) to the canonical
- * callback event. If no event id is supplied, a deterministic hash of the
- * body is used so byte-identical redeliveries are still deduplicated.
- */
-export function normalizeAnchorCallback(
-  raw: Record<string, unknown>,
-  anchor: AnchorId,
-): AnchorCallbackEvent {
-  const rawKind = String(pick(raw, "kind", "type", "status", "event_type") ?? "confirmed").toLowerCase();
-  const kind = CALLBACK_KINDS[rawKind] ?? "anchor_confirmed";
-  const externalTxId = String(
-    pick(raw, "external_tx_id", "externalTxId", "tx_id", "txid", "transaction_id", "id") ?? "",
+export const anchorPools: Record<AnchorAsset, EndpointPool<null>> = {
+  USDC: createAnchorPool("USDC", config.anchorUsdcUrls),
+  EURC: createAnchorPool("EURC", config.anchorEurcUrls),
+};
+
+/** Primary anchor URL for an asset (first configured mirror). */
+export function anchorFor(asset: AnchorAsset): string {
+  return anchorPools[asset].urls[0];
+}
+
+export function validateInteractiveUrl(
+  value: unknown,
+  asset: AnchorAsset,
+): string {
+  if (typeof value !== "string")
+    throw new Error("Anchor interactive URL is missing");
+  const candidate = new URL(value);
+  // Any configured mirror of the asset's anchor may host the interactive flow.
+  const trustedOrigins = new Set(
+    anchorPools[asset].urls.map((url) => new URL(url).origin),
   );
-  const rawEventId = pick(raw, "event_id", "eventId", "id");
-  const eventId =
-    rawEventId !== undefined
-      ? String(rawEventId)
-      : crypto
-          .createHash("sha256")
-          .update(`${anchor}|${externalTxId}|${JSON.stringify(raw)}`)
-          .digest("hex")
-          .slice(0, 32);
-  const rawObservedAt = pick(raw, "observed_at", "observedAt", "timestamp", "created_at");
-  const observedAt =
-    typeof rawObservedAt === "number"
-      ? rawObservedAt
-      : typeof rawObservedAt === "string"
-        ? Date.parse(rawObservedAt)
-        : Date.now();
-
-  return {
-    eventId,
-    anchor,
-    externalTxId,
-    kind,
-    asset: (pick(raw, "asset") as string | undefined) ?? anchor,
-    grossMinor: raw.gross_minor === undefined ? undefined : finiteNumber(raw.gross_minor, 0),
-    netMinor: raw.net_minor === undefined ? undefined : finiteNumber(raw.net_minor, 0),
-    feeBreakdown: (pick(raw, "fee_breakdown", "feeBreakdown") as AnchorCallbackEvent["feeBreakdown"]) ?? undefined,
-    ledgerVersion: finiteNumber(pick(raw, "ledger_version", "ledgerVersion", "ledger"), 0),
-    observedAt: finiteNumber(observedAt, Date.now()),
-    payload: raw,
-  };
+  if (
+    candidate.protocol !== "https:" ||
+    !trustedOrigins.has(candidate.origin) ||
+    candidate.username ||
+    candidate.password
+  ) {
+    throw new Error("Anchor returned an untrusted interactive URL");
+  }
+  return candidate.toString();
 }
 
-/** Create an isolated adapter (tests / composition root). */
-export function createAnchorAdapter(deps: AnchorAdapterDeps = {}): AnchorAdapter {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const logger = deps.logger ?? fallbackLogger;
-  const onCallback = deps.onCallback ?? reconcileCallback;
-  const clients = new Map<AnchorId, AnchorClient>();
-  const seenEventIds = new Set<string>();
+export function sanitizeAnchorResponse(
+  payload: unknown,
+  asset: AnchorAsset,
+): Record<string, unknown> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("Anchor returned an invalid response");
+  }
+  const response = { ...(payload as Record<string, unknown>) };
 
-  const client = (anchor: AnchorId): AnchorClient => {
-    let existing = clients.get(anchor);
-    if (!existing) {
-      existing = createAnchorClient(anchor, urlFor(anchor, deps.urls), fetchImpl, logger);
-      clients.set(anchor, existing);
+  // Enforce KYC boundary: detect excess fields before processing
+  enforceMinimizationBoundary(response);
+
+  const rawInteractiveUrl =
+    response.interactive_url ??
+    (response.type === "interactive_customer_info_needed"
+      ? response.url
+      : undefined);
+  if (rawInteractiveUrl !== undefined) {
+    const interactiveUrl = validateInteractiveUrl(rawInteractiveUrl, asset);
+    response.interactiveUrl = interactiveUrl;
+    response.interactiveOrigin = new URL(interactiveUrl).origin;
+    delete response.interactive_url;
+    if (response.type === "interactive_customer_info_needed")
+      delete response.url;
+  }
+
+  // Apply data minimization to KYC fields
+  const minimized = minimizeKYCResponse(response);
+
+  return minimized as unknown as Record<string, unknown>;
+}
+
+async function fetchAnchorJson(
+  asset: AnchorAsset,
+  opClass: OperationClass,
+  path: string,
+  init: { search?: URLSearchParams; method?: string; body?: unknown } = {},
+): Promise<unknown> {
+  return anchorPools[asset].execute(opClass, async (_client, { url: base }) => {
+    const url = new URL(path, base);
+    if (init.search) url.search = init.search.toString();
+    const res = await fetch(url, {
+      method: init.method ?? "GET",
+      headers:
+        init.body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: init.body === undefined ? undefined : JSON.stringify(init.body),
+    });
+    if (!res.ok) {
+      throw new HttpStatusError(
+        res.status,
+        `Anchor returned HTTP ${res.status}`,
+        parseRetryAfterMs(res.headers.get("retry-after")),
+      );
     }
-    return existing;
-  };
-
-  return {
-    client,
-    getTransaction: (anchor, externalTxId) => client(anchor).getTransaction(externalTxId),
-    deposit: (anchor, account, amount) => client(anchor).deposit(account, amount),
-    withdraw: (anchor, account, amount, dest) => client(anchor).withdraw(account, amount, dest),
-    send: (anchor, payload) => client(anchor).send(payload),
-    normalize: normalizeAnchorCallback,
-    processCallback(event) {
-      if (seenEventIds.has(event.eventId)) {
-        logger.info("anchor_callback_duplicate", { eventId: event.eventId, anchor: event.anchor });
-        return Promise.resolve(null);
-      }
-      seenEventIds.add(event.eventId);
-      return Promise.resolve(onCallback(event));
-    },
-    processedEventIds: () => [...seenEventIds],
-  };
+    return res.json();
+  });
 }
 
-// ===========================================================================
-// Module-level default adapter + legacy aliases
-// ===========================================================================
-
-let defaultAdapter: AnchorAdapter | undefined;
-
-/** Wire the default adapter's dependencies (composition root / tests). */
-export function initAnchor(deps: AnchorAdapterDeps): void {
-  defaultAdapter = createAnchorAdapter(deps);
+export async function sep6Deposit(
+  asset: AnchorAsset,
+  account: string,
+  amount: string,
+) {
+  const canonicalAmount = canonicalizeStellarAmount(amount);
+  const payload = await fetchAnchorJson(asset, "read", "/sep6/deposit", {
+    search: new URLSearchParams({ asset, account, amount: canonicalAmount }),
+  });
+  const response = sanitizeAnchorResponse(payload, asset);
+  log("info", "anchor_deposit", {
+    asset,
+    account: account.slice(0, 8) + "...",
+    amount: canonicalAmount,
+  });
+  return response;
 }
 
-function adapter(): AnchorAdapter {
-  if (!defaultAdapter) defaultAdapter = createAnchorAdapter();
-  return defaultAdapter;
+export async function sep6Withdraw(
+  asset: AnchorAsset,
+  account: string,
+  amount: string,
+  dest: string,
+) {
+  const canonicalAmount = canonicalizeStellarAmount(amount);
+  const payload = await fetchAnchorJson(asset, "read", "/sep6/withdraw", {
+    search: new URLSearchParams({
+      asset,
+      account,
+      amount: canonicalAmount,
+      dest,
+    }),
+  });
+  const response = sanitizeAnchorResponse(payload, asset);
+  log("info", "anchor_withdraw", {
+    asset,
+    account: account.slice(0, 8) + "...",
+    amount: canonicalAmount,
+  });
+  return response;
 }
 
-/** Backwards-compatible alias: USDC/EURC SEP-6 deposit. */
-export async function sep6Deposit(asset: AnchorId, account: string, amount: string) {
-  return adapter().deposit(asset, account, amount);
-}
-
-/** Backwards-compatible alias: USDC/EURC SEP-6 withdrawal. */
-export async function sep6Withdraw(asset: AnchorId, account: string, amount: string, dest: string) {
-  return adapter().withdraw(asset, account, amount, dest);
-}
-
-/** Backwards-compatible alias: USDC/EURC SEP-31 send. */
-export async function sep31Send(asset: AnchorId, payload: Record<string, unknown>) {
-  return adapter().send(asset, payload);
-}
-
-/** Backwards-compatible alias for the anchor base URL. */
-export function anchorFor(asset: AnchorId): string {
-  return adapter().client(asset).baseUrl;
-}
-
-/** Deliver a raw anchor webhook through the default adapter (idempotent). */
-export function processAnchorCallback(
-  raw: Record<string, unknown>,
-  anchor: AnchorId,
-): Promise<CallbackResult | null> {
-  const instance = adapter();
-  return instance.processCallback(instance.normalize(raw, anchor));
+export async function sep31Send(asset: AnchorAsset, payload: any) {
+  return fetchAnchorJson(asset, "submit_non_idempotent", "/sep31/transactions", {
+    method: "POST",
+    body: payload,
+  });
 }

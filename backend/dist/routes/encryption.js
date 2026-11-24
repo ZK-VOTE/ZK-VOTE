@@ -185,7 +185,7 @@ router.get(`${BASE}/daos/:daoId/recovery-shares`, queryLimiter, authGuard, valid
 // CIPHERTEXT STORE
 // ============================================
 /** Store an encrypted proposal or comment body. */
-router.put(`${BASE}/daos/:daoId/content/:contentType/:contentId`, commentLimiter, validateParams(contentParams), validateBody(envelopeSchema), (async (req, res) => {
+router.put(`${BASE}/daos/:daoId/content/:contentType/:contentId`, authGuard, commentLimiter, validateParams(contentParams), validateBody(envelopeSchema), (async (req, res) => {
     const { daoId, contentType, contentId } = params(req);
     const body = req.body;
     const active = getActiveEpoch(daoId);

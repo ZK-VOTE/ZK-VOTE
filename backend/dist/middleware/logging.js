@@ -58,42 +58,143 @@ export function getLogMetrics(reset = false) {
 // ============================================
 // SENSITIVE FIELD REDACTION
 // ============================================
-/** Fields to redact from request/response bodies */
+/**
+ * Fields to redact from request/response bodies (#574).
+ *
+ * Stored NORMALIZED (lowercase, separators stripped) because lookups use
+ * `normalizeFieldKey()`. The previous set mixed camelCase entries
+ * (`relayerSecretKey`) with a lowercase lookup, so those keys NEVER matched
+ * and `RELAYER_SECRET_KEY` / `blindingFactor` could reach access logs.
+ * Never log the full `config` object — use `sanitizeConfigForLogging()`.
+ */
 const SENSITIVE_FIELDS = new Set([
     "proof",
     "nullifier",
+    "commitment",
+    "commitmenthash",
     "secret",
+    "secretkey",
+    "secret_key",
+    "relayersecretkey",
+    "relayer_secret_key",
+    "relayerauth",
+    "relayer_auth_token",
+    "relayerAuthToken",
+    "x-relayer-auth",
+    "xrelayerauth",
     "token",
+    "authtoken",
+    "auth_token",
+    "masterkey",
+    "master_key",
+    "x-master-key",
     "password",
     "jwt",
+    "pinatajwt",
+    "pinata_jwt",
+    "web3storagetoken",
+    "web3_storage_token",
+    "privatekey",
+    "private_key",
+    "seed",
+    "mnemonic",
+    "blindingfactor",
+    "blinding_factor",
+    "blinding",
+    "salt",
     "authorization",
-    "authorizationHeader",
-    "relayerSecretKey",
-    "relayerAuthToken",
-    "pinataJwt",
-    "web3StorageToken",
-    "privateKey",
-    "secretKey",
+    "authorizationheader",
+    "cookie",
+    "session",
+    "apikey",
+    "api_key",
+    // Vote anonymity fields (#644)
+    "choice",
+    "votechoice",
+    "walletaddress",
+    "wallet_address",
+    "voterpublickey",
+    "voter_public_key",
+    "votersignature",
+    "voter_signature",
+    "publickey",
+    "signature",
+    "idempotencykey",
+].map(normalizeFieldKey));
+/** Substring fragments that always force redaction even when the full key is unknown. */
+const SENSITIVE_KEY_FRAGMENTS = [
+    "secret",
+    "private",
+    "password",
+    "token",
+    "jwt",
+    "blinding",
+    "relayer",
+    "mnemonic",
+    "seed",
+    "passwd",
+];
+function normalizeFieldKey(key) {
+    return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+function isSensitiveKey(key) {
+    const normalized = normalizeFieldKey(key);
+    if (SENSITIVE_FIELDS.has(normalized))
+        return true;
+    return SENSITIVE_KEY_FRAGMENTS.some((frag) => normalized.includes(frag));
+}
+/**
+ * allowlist of config keys that are safe to log. Everything else —
+ * especially RELAYER_SECRET_KEY / RELAYER_AUTH_TOKEN / PINATA_JWT — is
+ * replaced with "[REDACTED]". Use this instead of logging `config` directly.
+ */
+const SAFE_CONFIG_KEYS = new Set([
+    "port",
+    "networkPassphrase",
+    "rpcUrl",
+    "corsOrigins",
+    "indexerEnabled",
+    "logSamplingRate",
+    "logSlowThresholdMs",
+    "logBodyMaxChars",
 ]);
+export function sanitizeConfigForLogging(cfg) {
+    const safe = {};
+    for (const [key, value] of Object.entries(cfg)) {
+        if (SAFE_CONFIG_KEYS.has(key)) {
+            safe[key] = value;
+        }
+        else {
+            safe[key] = "[REDACTED]";
+        }
+    }
+    return safe;
+}
 /** Regex patterns for sensitive values */
 const SENSITIVE_PATTERNS = [
     /^(sk_|pk_|C[A-Z2-7]{55})/, // Stellar keys and contract IDs
+    /^S[A-Z2-7]{55}$/, // Stellar SECRET seeds (e.g. RELAYER_SECRET_KEY) — #574
     /^Bearer\s+/i, // Bearer tokens
 ];
 /**
  * Deep-clone and redact sensitive fields from a body object.
  * Returns a new object with sensitive values replaced with "[REDACTED]".
  */
-function redactBody(body, maxChars) {
+export function redactBody(body, maxChars) {
+    if (Array.isArray(body)) {
+        return body.map((item) => redactBody(item, maxChars));
+    }
     if (!body || typeof body !== "object") {
         if (typeof body === "string") {
+            if (SENSITIVE_PATTERNS.some((p) => p.test(body)))
+                return "[REDACTED]";
             return body.length > maxChars ? body.slice(0, maxChars) + "...(truncated)" : body;
         }
         return body;
     }
     const redacted = {};
     for (const [key, value] of Object.entries(body)) {
-        if (SENSITIVE_FIELDS.has(key.toLowerCase())) {
+        if (isSensitiveKey(key)) {
             redacted[key] = "[REDACTED]";
         }
         else if (typeof value === "string" && SENSITIVE_PATTERNS.some((p) => p.test(value))) {
@@ -121,8 +222,8 @@ function redactBody(body, maxChars) {
  * Map route patterns to sampling rates.
  */
 const ROUTE_SAMPLING_OVERRIDES = [
-    // /vote endpoints always log at full rate with body
-    { pattern: /^\/vote/, rate: 1.0, alwaysLogBody: true },
+    // /vote must never log bodies — choice + identity fields destroy anonymity (#644)
+    { pattern: /^\/vote/, rate: 1.0, alwaysLogBody: false },
     // /comment endpoints log at higher rate
     { pattern: /^\/comment/, rate: 0.5, alwaysLogBody: false },
     // /health at low rate (noisy)
@@ -137,6 +238,8 @@ const ROUTE_SAMPLING_OVERRIDES = [
     { pattern: /^\/ipfs/, rate: 0.2, alwaysLogBody: false },
     // /daos at moderate rate
     { pattern: /^\/daos/, rate: 0.1, alwaysLogBody: false },
+    // /bridge votes — never log bodies
+    { pattern: /^\/bridge\/vote/, rate: 1.0, alwaysLogBody: false },
 ];
 /**
  * Determine whether this request should be sampled in.
@@ -162,11 +265,12 @@ function shouldSample(path, statusCode, durationMs) {
 }
 /**
  * Check if a route has body logging enabled.
+ * Route overrides win: alwaysLogBody:false forces no body for that path (#644).
  */
 function shouldLogBody(path) {
     for (const override of ROUTE_SAMPLING_OVERRIDES) {
-        if (override.pattern.test(path) && override.alwaysLogBody) {
-            return true;
+        if (override.pattern.test(path)) {
+            return override.alwaysLogBody;
         }
     }
     return config.logRequestBody;
@@ -309,6 +413,9 @@ export function requestLogger(req, res, next) {
             ...bodyMeta,
         });
     });
+    // #574: the ambient span context carries ONLY trace/span identifiers —
+    // never request bodies, config, or secrets — so exporters cannot leak
+    // RELAYER_SECRET_KEY / blindingFactor through trace attributes.
     const spanContext = { traceId, spanId, traceFlags: "01" };
     runWithSpanContext(spanContext, next);
 }

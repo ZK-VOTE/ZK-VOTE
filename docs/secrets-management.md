@@ -130,6 +130,29 @@ initSecretManager({
 4. **Rotation monitoring** — Secrets are tracked for expiration and overdue rotation.
 5. **Coalesced fetches** — In-flight duplicate secret fetches are coalesced to avoid redundant Vault requests.
 
+## Relayer Signing Keys (Issue #746)
+
+Relayer secrets differ from the other secrets here: each one **is a Stellar
+account**, so rotating it changes the relayer's on-chain identity (new
+sequence chain, new balance). Rotation is therefore a runtime operation run by
+the rotation orchestrator, not a secret-store update. The runbook is
+`docs/ops/RELAYER_KEY_ROTATION.md`; this section only states the storage rules.
+
+| Secret | Holder | Rule |
+| :--- | :--- | :--- |
+| `RELAYER_SECRET_KEY` | relayer | Active identity. Max age `RELAYER_KEY_MAX_AGE_DAYS` (alerted) |
+| `RELAYER_SECONDARY_SECRET_KEY` | relayer | Standby; must be **funded** before it is needed |
+| `RELAYER_COSIGNER_KEYS` | relayer (verifier) | One HMAC secret per co-signer, `id:secret` |
+| `RELAYER_COSIGNER_SECRET` | each co-signer, on their own machine | Never stored with the relayer's admin token |
+| `RELAYER_BREAK_GLASS_SECRET` | sealed, ≥ 32 chars | Warm tier only; every use is audited |
+| `RELAYER_SWEEP_SAFE_ACCOUNT` | config (public key) | Cold account; its secret is never on the relayer |
+
+Rotation spec:
+1. **Order:** register + fund the new identity → rotate at runtime → update the secret store → retire the old secret after the drain window. Updating the secret store first would boot the next instance on an identity that was never cut over.
+2. **Compromise:** declare first (runtime revocation is persisted in `relayer_key_revocations`), then remove the secret from the store. Removing the secret alone does not stop the running process signing with it.
+3. **Co-signer secrets** rotate independently. Approvals expire, so rotating a co-signer secret invalidates only outstanding approvals from that co-signer.
+4. A leaked relayer secret's **funds** are recovered by the two-person sweep, never by importing the secret elsewhere.
+
 ## Future Enhancements
 
 - Automatic secret rotation (scheduled rotation via Vault's built-in rotation engine)

@@ -11,6 +11,11 @@ include "vote_template.circom";
 // depth-N election is a proof for `Vote(N)`, verified against the verification
 // key registered for depth N.
 //
-// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress] - 7 signals
+// Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
 // Commitment is computed internally from secret+salt (private)
-component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]} = Vote(18);
+//
+// MUST stay in lockstep with `NUM_PUBLIC_SIGNALS` in
+// contracts/voting/src/lib.rs. scripts/drift-guard.mjs fails the build if the
+// two disagree, or if the checked-in verification key's IC vector is not
+// exactly one element longer than this list.
+component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates]} = Vote(18);

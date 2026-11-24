@@ -5,6 +5,8 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 process.env.RELAYER_TEST_MODE = "true";
 process.env.RELAYER_AUTH_TOKEN =
   "test_admin_token_01234567890123456789012345678901";
+// /admin/relayer/* sits behind masterKeyGuard, which checks AUTH_MASTER_KEY.
+process.env.AUTH_MASTER_KEY = process.env.RELAYER_AUTH_TOKEN;
 
 const { relayerKeyManager, LocalKeypairSigner, MockTestSigner } = await import(
   "../src/services/relayerKeyManager.ts"

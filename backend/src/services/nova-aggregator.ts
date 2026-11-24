@@ -10,6 +10,12 @@ import { exec } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { promisify } from "util";
+import {
+  aggregateCiphertexts,
+  pointFromHex,
+  pointToHex,
+  type Ciphertext,
+} from "./elgamal.js";
 
 const execAsync = promisify(exec);
 
@@ -152,6 +158,63 @@ export class NovaAggregatorService {
       if (fs.existsSync(batchPath)) fs.unlinkSync(batchPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     }
+  }
+
+  /**
+   * Homomorphically aggregate encrypted ballots (vote-choice privacy path).
+   *
+   * The Nova IVC fold proves *validity* of the batch; this method produces the
+   * ciphertext aggregate that the 2-of-3 ceremony later decrypts. Each input
+   * is a hex Baby Jubjub point (64 bytes) for c1/cYes/cNo.
+   */
+  async aggregateEncryptedBallots(params: {
+    daoId: number;
+    proposalId: number;
+    epoch: number;
+    ballots: Array<{ c1: string; cYes: string; cNo: string }>;
+  }): Promise<{
+    daoId: number;
+    proposalId: number;
+    epoch: number;
+    ballotCount: number;
+    aggregate: { c1: string; cYes: string; cNo: string };
+  }> {
+    if (params.ballots.length === 0) {
+      throw new Error("aggregateEncryptedBallots: no ballots");
+    }
+    const c1s: Ciphertext[] = [];
+    const yes: Ciphertext[] = [];
+    const no: Ciphertext[] = [];
+    for (const ballot of params.ballots) {
+      const c1 = pointFromHex(ballot.c1);
+      c1s.push({ c1, c2: c1 });
+      yes.push({ c1: pointFromHex(ballot.cYes), c2: pointFromHex(ballot.cYes) });
+      no.push({ c1: pointFromHex(ballot.cNo), c2: pointFromHex(ballot.cNo) });
+    }
+    // `aggregateCiphertexts` exposes point addition through `.c1`; c2 is not
+    // meaningful for these accumulator instances.
+    const aggC1 = await aggregateCiphertexts(c1s);
+    const aggYes = await aggregateCiphertexts(yes);
+    const aggNo = await aggregateCiphertexts(no);
+
+    const aggregate = {
+      c1: pointToHex(aggC1.c1),
+      cYes: pointToHex(aggYes.c1),
+      cNo: pointToHex(aggNo.c1),
+    };
+
+    await this.backupProofToS3(
+      `encrypted_aggregate_${params.daoId}_${params.proposalId}_${Date.now()}`,
+      { ...params, aggregate },
+    );
+
+    return {
+      daoId: params.daoId,
+      proposalId: params.proposalId,
+      epoch: params.epoch,
+      ballotCount: params.ballots.length,
+      aggregate,
+    };
   }
 
   async backupProofToS3(proofKey: string, payload: any): Promise<void> {

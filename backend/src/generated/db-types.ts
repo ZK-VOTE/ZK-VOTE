@@ -93,6 +93,19 @@ export interface PartitionRegistry {
   dao_id: Generated<number | null>;
 }
 
+/**
+ * Added by hand for migration 017 (onboarding_funnel_counts) — this file
+ * predates that migration and `db:generate-types` requires a live sqlite
+ * db with every earlier migration applied, which migrations 014-016
+ * currently block in this checkout; keep this entry's shape in sync with
+ * that migration's SQL until the file can be regenerated.
+ */
+export interface OnboardingFunnelCounts {
+  count: Generated<number>;
+  step: string;
+  updated_at: Generated<string>;
+}
+
 export interface PaymentJobs {
   // `number` removed: payment amounts are stored as SQLite INTEGER and can
   // exceed Number.MAX_SAFE_INTEGER (2^53-1) in stroops, causing silent
@@ -144,6 +157,7 @@ export interface DB {
   events: Events;
   hidden_comments: HiddenComments;
   metadata: Metadata;
+  onboarding_funnel_counts: OnboardingFunnelCounts;
   partition_registry: PartitionRegistry;
   payment_jobs: PaymentJobs;
   transaction_log: TransactionLog;

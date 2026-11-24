@@ -2,111 +2,112 @@ groups:
   - name: zkvote-relayer
     rules:
       - alert: ZKVoteRelayerHighErrorRate
-        expr: sum(rate(zkvote_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(zkvote_http_requests_total[5m])), 1) > 0.05
-        for: 10m
+        expr: |
+          rate(http_requests_total{job="zkvote-relayer",status=~"5.."}[5m])
+            / rate(http_requests_total{job="zkvote-relayer"}[5m]) > 0.05
+        for: 2m
         labels:
           severity: warning
           service: zkvote-relayer
         annotations:
-          summary: ZKVote relayer error rate is elevated
-          description: More than 5% of relayer requests have returned 5xx for 10 minutes.
+          summary: "High error rate on ZK-VOTE relayer ({{ $value | humanizePercentage }})"
+          description: "More than 5% of relayer requests are returning 5xx errors over the last 5 minutes."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
       - alert: ZKVoteRelayerHighLatency
-        expr: histogram_quantile(0.95, sum by (le) (rate(zkvote_http_request_duration_seconds_bucket[5m]))) > 2
-        for: 10m
+        expr: |
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{job="zkvote-relayer"}[5m])
+          ) > 2
+        for: 5m
         labels:
           severity: warning
           service: zkvote-relayer
         annotations:
-          summary: ZKVote relayer latency is high
-          description: HTTP request p95 latency has exceeded 2 seconds for 10 minutes.
+          summary: "High p95 latency on ZK-VOTE relayer ({{ $value | humanizeDuration }})"
+          description: "95th percentile request latency exceeds 2 s over the last 5 minutes."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/rotation-under-congestion.md"
+
       - alert: ZKVoteRelayerIndexerStalled
-        expr: zkvote_service_running{service="indexer"} == 1 and time() - zkvote_service_last_run_timestamp_seconds{service="indexer"} > 600
-        for: 5m
+        expr: |
+          time() - zkvote_relayer_last_indexed_block_timestamp > 120
+        for: 3m
         labels:
           severity: critical
           service: zkvote-relayer
         annotations:
-          summary: ZKVote indexer appears stalled
-          description: The indexer has not completed a successful run for more than 10 minutes.
+          summary: "ZK-VOTE relayer indexer has stalled"
+          description: "No new block has been indexed for more than 2 minutes. Chain sync may have dropped."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
       - alert: ZKVoteRelayerDatabaseUnavailable
-        expr: zkvote_db_write_healthy == 0
-        for: 5m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: ZKVote database write connection is unhealthy
-          description: The relayer write database connection has been unhealthy for 5 minutes.
-      - alert: ZKVoteRelayerHighUnauthenticatedRejections
-        expr: sum(rate(zkvote_unauthenticated_rejection_total[5m])) > 10
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: High rate of unauthenticated requests rejected
-          description: More than 10 unauthenticated requests per second have been rejected for 5 minutes.
-      - alert: ZKVoteRelayerCrossTenantViolation
-        expr: sum(rate(zkvote_cross_tenant_denial_total[5m])) > 0
+        expr: |
+          zkvote_relayer_db_up == 0
         for: 1m
         labels:
           severity: critical
           service: zkvote-relayer
         annotations:
-          summary: Cross-tenant access denial detected
-          description: Cross-tenant isolation violation attempted on relayer resources.
-      - alert: ZKVoteRelayerReconciliationMismatch
-        expr: sum(rate(zkvote_reconciliation_mismatch_total[5m])) > 0
-        for: 2m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: State reconciliation mismatch detected
-          description: State divergence detected between SQLite cache and Soroban on-chain state.
-      - alert: ZKVoteRelayerDaoTallyMismatch
-        expr: sum(rate(zkvote_reconciliation_mismatch_total{component="dao_tally"}[5m])) > 0
-        for: 2m
-        labels:
-          severity: critical
-          service: zkvote-relayer
-        annotations:
-          summary: DAO hash-vs-DB tally mismatch detected
-          description: Per-DAO vote_cast hash count (Horizon/stellar.expert) diverges from relayer DB pipeline counts. See FIX_REPORT.md blast-radius workflow.
-      - alert: ZKVoteRelayerDaoReconciliationStale
-        expr: time() - zkvote_dao_reconciliation_last_ok_timestamp_seconds > 900
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: DAO reconciliation has not completed cleanly
-          description: No fully-consistent DAO reconciliation run in the last 15 minutes.
-      - alert: ZKVoteRelayerRateLimitStoreExhaustion
-        expr: zkvote_rate_limit_store_size > 50000
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: Rate limit store capacity elevated
-          description: In-memory rate limit store tracking over 50,000 active keys.
-      - alert: ZKVoteRelayerBatchPartialFailureSpike
-        expr: sum(rate(zkvote_batch_partial_failure_total[5m])) > 1
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: Batch partial failure rate elevated
-          description: Elevated partial failures observed in multi-item batch execution.
-      - alert: ZKVoteRelayerHighCardinalityMetricWarning
-        expr: count(zkvote_http_requests_total) > 500
-        for: 5m
-        labels:
-          severity: warning
-          service: zkvote-relayer
-        annotations:
-          summary: Metric label cardinality elevated
-          description: More than 500 distinct http_requests_total metric series detected, indicating potential route label cardinality leak.
+          summary: "ZK-VOTE relayer cannot reach its database"
+          description: "Database health check has been failing for more than 1 minute."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
 
+      - alert: ZKVoteRelayerHighUnauthenticatedRejections
+        expr: |
+          rate(zkvote_relayer_auth_rejections_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Elevated unauthenticated request rejections on ZK-VOTE relayer"
+          description: "More than 0.5 auth rejections per second over 5 minutes. May indicate a brute-force attempt."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
+      - alert: ZKVoteRelayerCrossTenantViolation
+        expr: |
+          increase(zkvote_relayer_cross_tenant_violations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: "Cross-tenant data access violation detected on ZK-VOTE relayer"
+          description: "A request accessed data belonging to another tenant. Immediate investigation required."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
+      - alert: ZKVoteRelayerReconciliationMismatch
+        expr: |
+          zkvote_relayer_reconciliation_mismatch_count > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: "ZK-VOTE relayer tally reconciliation mismatch"
+          description: "On-chain vote tally does not match the relayer's local count. Data integrity issue."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
+      - alert: ZKVoteRelayerDaoTallyMismatch
+        expr: |
+          abs(zkvote_relayer_dao_tally_local - zkvote_relayer_dao_tally_onchain) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: "ZK-VOTE DAO tally mismatch between local and on-chain state"
+          description: "Local DAO tally diverges from on-chain tally. Governance integrity at risk."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/panic-plus-surge.md"
+
+      - alert: ZKVoteRelayerDaoReconciliationStale
+        expr: |
+          time() - zkvote_relayer_dao_last_reconciliation_timestamp > 3600
+        for: 10m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "ZK-VOTE DAO reconciliation has not run in over 1 hour"
+          description: "The last successful DAO reconciliation is more than 1 hour old. Stale governance state possible."
+          runbook_url: "https://github.com/ZK-VOTE/ZK-VOTE/blob/main/docs/ops/runbooks/rotation-under-congestion.md"

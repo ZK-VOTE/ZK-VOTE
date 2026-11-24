@@ -80,7 +80,7 @@ export const coalescingWaitTime = new Histogram({
 export const membershipRegistrationTotal = new Counter({
     name: "zkvote_membership_registration_requests_total",
     help: "Total commitment registration requests served by the membership route",
-    labelNames: ["dao_id"],
+    labelNames: ["status"],
     registers: [register],
 });
 export const membershipRegistrationLimited = new Counter({
@@ -295,6 +295,11 @@ export const indexerOverrunSkips = new Counter({
     help: "Polling cycles skipped because the prior indexer cycle was still active",
     registers: [register],
 });
+export const indexerPollMissesTotal = new Counter({
+    name: "zkvote_indexer_poll_misses_total",
+    help: "Polling cycles that held the watermark because a contract's getEvents failed (window retried next cycle, #562)",
+    registers: [register],
+});
 export const indexerQueueDepth = new Gauge({
     name: "zkvote_indexer_queue_depth",
     help: "Current number of buffered events in the indexer backpressure queue",
@@ -415,13 +420,31 @@ export const wsMessagesSent = new Counter({
     help: "Total WebSocket messages sent to connected clients",
     registers: [register],
 });
+export const wsAuthDuration = new Histogram({
+    name: "zkvote_ws_auth_duration_seconds",
+    help: "WebSocket authentication/handshake duration in seconds",
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [register],
+});
+export const wsMessageDuration = new Histogram({
+    name: "zkvote_ws_message_duration_seconds",
+    help: "WebSocket message processing duration in seconds",
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+    registers: [register],
+});
+export const wsRateLimitTotal = new Counter({
+    name: "zkvote_ws_rate_limit_total",
+    help: "Total WebSocket connections blocked by rate limiting",
+    labelNames: ["ip"],
+    registers: [register],
+});
 // ============================================
 // RELAYER KEY ROTATION METRICS (#177)
 // ============================================
 export const relayerKeyBalance = new Gauge({
     name: "zkvote_relayer_key_balance_xlm",
     help: "Current balance of relayer keys in XLM",
-    labelNames: ["key_id", "public_key", "role"],
+    labelNames: ["key_id", "role"],
     registers: [register],
 });
 export const relayerKeyRotationsTotal = new Counter({
@@ -433,13 +456,13 @@ export const relayerKeyRotationsTotal = new Counter({
 export const relayerKeyAgeSeconds = new Gauge({
     name: "zkvote_relayer_key_age_seconds",
     help: "Age of relayer key in seconds since activation",
-    labelNames: ["key_id", "public_key"],
+    labelNames: ["key_id"],
     registers: [register],
 });
 export const relayerKeyTransactionsTotal = new Counter({
     name: "zkvote_relayer_key_transactions_total",
     help: "Total transactions signed by relayer key",
-    labelNames: ["key_id", "public_key"],
+    labelNames: ["key_id"],
     registers: [register],
 });
 // ============================================
@@ -447,14 +470,18 @@ export const relayerKeyTransactionsTotal = new Counter({
 // ============================================
 /**
  * Normalise Express route path to a low-cardinality label.
- * Strips parameter values (e.g. /dao/123 -> /dao/:daoId)
+ * Strips parameter values, hashes, addresses, and query strings.
  */
 export function normalizeRoute(path) {
     if (!path)
         return "unknown";
-    return path
-        .replace(/\/[0-9a-f]{20,}/g, "/:hash")
-        .replace(/\/(dao|proposal|comment|events|bridge|circuits|ipfs)\/[^/]+/g, "/$1/:param")
+    const cleanPath = path.split("?")[0];
+    return cleanPath
+        .replace(/\/[0-9a-f]{20,}/gi, "/:hash")
+        .replace(/\/[CG][A-Z2-7]{55}/g, "/:address")
+        .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "/:uuid")
+        .replace(/\/(dao|proposal|comment|comments|events|bridge|circuits|ipfs|membership|claim|pay|swap|ramp|nullifier|root|root-history|vote|threshold|randomness)\/[^/]+/gi, "/$1/:param")
+        .replace(/\/(proposal|nullifier|root-history|comments|comment|threshold)\/[^/]+\/[^/]+/gi, "/$1/:param/:id2")
         .replace(/\/(root|daos|ready|health|config|metrics|db)(\/|$)/g, "/$1$2");
 }
 // ============================================
@@ -507,6 +534,88 @@ export const batch_partial_failure_total = new Counter({
     name: "zkvote_batch_partial_failure_total",
     help: "Total partial failures encountered during batch operations (e.g. pay batch, vote batch)",
     labelNames: ["batch_type", "reason"],
+    registers: [register],
+});
+// ============================================
+// COST-BASED RATE LIMITING METRICS (#525)
+// ============================================
+export const paymentOpsPerMinute = new Histogram({
+    name: "zkvote_payment_ops_per_minute",
+    help: "Histogram of payment operations per minute per IP",
+    buckets: [1, 5, 10, 25, 50, 100],
+    registers: [register],
+});
+export const costRateLimitExceeded = new Counter({
+    name: "zkvote_cost_rate_limit_exceeded_total",
+    help: "Total cost-based rate limit violations",
+    labelNames: ["limiter", "cost"],
+    registers: [register],
+});
+// ============================================
+// BACKUP ENCRYPTION METRICS (#524)
+// ============================================
+export const backupAge = new Gauge({
+    name: "zkvote_backup_age_seconds",
+    help: "Age of the most recent backup in seconds",
+    registers: [register],
+});
+export const backupTamperDetected = new Counter({
+    name: "zkvote_backup_tamper_detected_total",
+    help: "Total number of tampered backup restore attempts detected",
+    labelNames: ["keyId"],
+    registers: [register],
+});
+export const backupRestoreSuccess = new Counter({
+    name: "zkvote_backup_restore_success_total",
+    help: "Total successful backup restore operations",
+    labelNames: ["keyId"],
+    registers: [register],
+});
+export const backupRestoreFailed = new Counter({
+    name: "zkvote_backup_restore_failed_total",
+    help: "Total failed backup restore attempts",
+    labelNames: ["reason"],
+    registers: [register],
+});
+export const backupEncryptionDuration = new Histogram({
+    name: "zkvote_backup_encryption_duration_seconds",
+    help: "Backup encryption operation duration in seconds",
+    buckets: [0.1, 0.5, 1, 2.5, 5, 10, 30, 60],
+    registers: [register],
+});
+export const backupDecryptionDuration = new Histogram({
+    name: "zkvote_backup_decryption_duration_seconds",
+    help: "Backup decryption operation duration in seconds",
+    buckets: [0.1, 0.5, 1, 2.5, 5, 10, 30, 60],
+    registers: [register],
+});
+// ============================================
+// DAO END-TO-END RECONCILIATION METRICS (#577)
+// ============================================
+export const daoReconciliationRunsTotal = new Counter({
+    name: "zkvote_dao_reconciliation_runs_total",
+    help: "Total DAO end-to-end reconciliation runs (create_dao→mint→register→proposal→vote→tally hash vs DB count)",
+    labelNames: ["status"],
+    registers: [register],
+});
+export const daoReconciliationLastOk = new Gauge({
+    name: "zkvote_dao_reconciliation_last_ok_timestamp_seconds",
+    help: "Unix timestamp of the last fully-consistent DAO reconciliation run (0 when never clean)",
+    registers: [register],
+});
+// ============================================
+// OFFLINE RETRY & CDC OUTBOX LAG METRICS (#542, #544)
+// ============================================
+export const offlineRetryTotal = new Counter({
+    name: "zkvote_offline_retry_total",
+    help: "Total offline retry attempts processed from client queue",
+    labelNames: ["type", "status"],
+    registers: [register],
+});
+export const outboxLagGauge = new Gauge({
+    name: "zkvote_outbox_lag_seconds",
+    help: "Outbox pattern CDC WAL replication lag in seconds",
+    labelNames: ["channel"],
     registers: [register],
 });
 //# sourceMappingURL=metrics.js.map

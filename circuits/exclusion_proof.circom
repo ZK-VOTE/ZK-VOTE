@@ -110,3 +110,18 @@ template MerkleProofV(levels) {
 
     root <== currentHash[levels];
 }
+
+// ---------------------------------------------------------------------------
+// Compiled entry points for each supported depth (ZV-051 / #899).
+//
+// Previously this file had no `component main`, so circom produced no R1CS or
+// WASM and there was no verification key to register. Each `component main`
+// below produces a separate compiled circuit for its depth. The build script
+// (circuits/compile.sh) already iterates over SUPPORTED_DEPTHS; adding these
+// entry points is the missing half of that convention for the exclusion circuit.
+//
+// The default depth (18) is the production default and is what the relayer
+// uses when no explicit merkle_depth is passed. The other depths mirror the
+// generated vote-circuit wrappers in circuits/vote_d*.circom.
+// ---------------------------------------------------------------------------
+component main { public [historicalRoot, currentRoot, daoId, leafIndex, commitment] } = ExclusionProof(18);

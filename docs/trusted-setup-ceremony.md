@@ -148,10 +148,18 @@ After ceremony:
 
 For production deployment:
 
-1. Complete MPC ceremony
+1. Complete MPC ceremony across all circuit families (vote, quadratic, comment, tally, bridge)
 2. Test with ceremony-generated keys
 3. Deploy with upgrade mechanism (#67)
-4. Consider PLONK migration (#51) to eliminate trusted setup
+4. Prioritize high-blast-radius circuits (bridge, tally) for early PLONK / Halo2 migration (#51) to eliminate trusted setup
+5. Maintain per-circuit ceremony provenance in `docs/TRUSTED_SETUP_BLAST_RADIUS.md`
+
+## Multi-Family Ceremony Governance & Blast-Radius Accounting
+
+While Phase 1 (Powers of Tau) provides universal polynomials, Groth16 requires an independent Phase 2 ceremony for every unique circuit R1CS constraint system.
+Reusing Phase 2 toxic waste across distinct circuit families or depth variants (`d10..d25`) creates **correlated compromise sets**—where the subversion of one developer or contributor machine enables proof forgery across multiple independent protocol functions.
+
+For detailed risk quantification, exploit economics, ceremony-to-circuit mapping tables, and depth forensic analysis (absorbed SPIKE-120), see [TRUSTED_SETUP_BLAST_RADIUS.md](file:///home/modev/opensource/ZK-VOTE/docs/TRUSTED_SETUP_BLAST_RADIUS.md).
 
 ## Resources
 

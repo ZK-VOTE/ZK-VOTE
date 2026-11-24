@@ -166,9 +166,11 @@ router.post("/remediation/action", bodyLimit("100kb"), authGuard, (async (req, r
         target,
         actor: actor.slice(0, 12) + "...",
     });
-    // In production this would interact with contracts (e.g., pause, freeze). Here we simulate success.
-    res.status(201).json({
-        success: true,
+    // Return 501 Not Implemented - simulated remediation does not produce real on-chain effects
+    res.status(501).json({
+        error: "not_implemented",
+        message: "Remediation actions are not implemented. This endpoint simulates success for testing purposes but does not execute on-chain operations.",
+        simulated: true,
         remediationId: id,
         record: {
             id: record.id,
@@ -177,9 +179,8 @@ router.post("/remediation/action", bodyLimit("100kb"), authGuard, (async (req, r
             target: record.target,
             reason: record.reason,
             actor: record.actor,
-            idempotencyKey: "[REDACTED]", // never echo raw key
             metadata: record.metadata,
-            immutable: true,
+            immutable: false, // Not immutable as action was not executed
         },
     });
 }));

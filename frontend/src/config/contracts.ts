@@ -1,5 +1,11 @@
 // Deployed contract addresses and network configuration
 // Auto-generated on Fri  3 Apr 2026 00:43:03 BST
+//
+// Issue #556 — single config source: rpcUrl is now sourced from env.ts so
+// that VITE_SOROBAN_RPC_URL can override it at build time without touching
+// this file.  Import SOROBAN_RPC_URL from "./env" if you need the raw string.
+
+import { SOROBAN_RPC_URL } from "./env";
 
 export const CONTRACTS = {
   REGISTRY_ID: "CBGK5YFR5544QNHUNR4WKB5ECL75DAY3R4M5UNALA42ZBPKOFNL5RM43",
@@ -20,7 +26,8 @@ export const ASSET_ISSUERS = {
 } as const;
 
 export const NETWORK_CONFIG = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
+  // Sourced from VITE_SOROBAN_RPC_URL env var (issue #556 — no more hardcode).
+  rpcUrl: SOROBAN_RPC_URL,
   networkPassphrase: "Test SDF Network ; September 2015",
   networkName: "testnet",
 } as const;

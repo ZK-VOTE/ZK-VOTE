@@ -3,13 +3,14 @@
  *
  * Re-exports all middleware for convenient importing.
  */
-export { authGuard, extractAuthToken, masterKeyGuard } from "./auth.js";
+export { authGuard, anonymousGuard, extractAuthToken, masterKeyGuard } from "./auth.js";
 export { tlsClientCertGuard } from "./tlsAuth.js";
 export { csrfGuard, csrfTokenMiddleware } from "./csrf.js";
+export { csrfOriginGuard } from "./csrfOrigin.js";
 export { requestLogger, logMetricsEndpoint } from "./logging.js";
 export { errorHandler } from "./errorHandler.js";
 export { auditMiddleware, auditLog, redactPii, redactBody, appendAudit, queryAuditLogs, getAllAuditLogs, exportAuditLogs, clearAuditLog, isIdempotencyKeyUsed, markIdempotencyKey, deriveActor, auditAction, REDACTED, SENSITIVE_FIELDS, } from "./audit.js";
-export { voteLimiter, walletRateLimiter, queryLimiter, ipfsUploadLimiter, ipfsReadLimiter, commentLimiter, graduatedSlowDown, getRateLimitMetrics, claimLimiter, createPerMemberLimiter, commitmentRegistrationLimiter, } from "./rateLimit.js";
+export { voteLimiter, walletRateLimiter, queryLimiter, ipfsUploadLimiter, ipfsReadLimiter, commentLimiter, graduatedSlowDown, getRateLimitMetrics, claimLimiter, createPerMemberLimiter, commitmentRegistrationLimiter, costBasedLimiter, paymentBatchCostLimiter, wsConnectionLimiter, } from "./rateLimit.js";
 export { validateBody, validateQuery, validateParams } from "./validate.js";
 export { degradationContext, noteDegraded, sendPartial, } from "./degradation.js";
 export { metricsMiddleware } from "./metrics.js";

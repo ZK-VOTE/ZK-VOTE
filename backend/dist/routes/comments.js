@@ -9,7 +9,7 @@ import { config, isValidContractId } from "../config.js";
 import { log } from "../services/logger.js";
 import { server, relayerKeypair, callWithTimeout, simulateWithBackoff, waitForTransaction, withSequenceLock, u256ToScVal, proofToScVal, } from "../services/stellar.js";
 import { verifyMembership } from "../services/sync.js";
-import { authGuard, auditLog, commentLimiter, queryLimiter, validateBody, validateParams, noteDegraded, sendPartial, validateQuery, bodyLimit, } from "../middleware/index.js";
+import { authGuard, anonymousGuard, auditLog, commentLimiter, queryLimiter, validateBody, validateParams, noteDegraded, sendPartial, validateQuery, bodyLimit, } from "../middleware/index.js";
 import { anonymousCommentSchema, flagCommentSchema, commentParamsSchema, proposalParamsSchema, commitmentParamsSchema, commentCountQuerySchema, } from "../validation/schemas.js";
 import { generateChallenge, verifyChallenge } from "../services/pow.js";
 import { checkCommitmentRateLimit, recordCommentSubmission, flagComment, getHiddenCommentIds, } from "../services/anti-spam.js";
@@ -74,7 +74,7 @@ router.get("/comment/challenge/:commitment", queryLimiter, validateParams(commit
 /**
  * POST /comment/anonymous - Submit anonymous comment with ZK proof
  */
-router.post("/comment/anonymous", bodyLimit("10kb"), authGuard, auditLog("comment_anonymous_relay"), commentLimiter, validateBody(anonymousCommentSchema), (async (req, res) => {
+router.post("/comment/anonymous", bodyLimit("10kb"), anonymousGuard, auditLog("comment_anonymous_relay"), commentLimiter, validateBody(anonymousCommentSchema), (async (req, res) => {
     // Validated by anonymousCommentSchema middleware
     const { daoId, proposalId, contentCid, parentId, voteChoice, nullifier, root, proof, serverId, workNonce, } = config.stripRequestBodies ? {} : req.body;
     if (config.powEnabled && !config.testMode) {

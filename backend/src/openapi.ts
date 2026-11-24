@@ -30,6 +30,12 @@ import {
   manualEventSchema,
   notifyEventSchema,
   bridgeVoteSchema,
+  payRequestSchema,
+  payBatchRequestSchema,
+  swapQuoteQuerySchema,
+  swapSubmitRequestSchema,
+  paymentAssetSchema,
+  paymentAmountSchema,
 } from "./validation/schemas.js";
 
 extendZodWithOpenApi(z);
@@ -635,6 +641,57 @@ export const ENDPOINTS: EndpointDef[] = [
     rateLimit: null,
     responseExample: { success: true },
     errorStatuses: [401, 500],
+  },
+  // ---- Payments (#597: POST /pay/batch existed in routes/pay.ts but had no
+  // spec entry, so generated clients 404'd on the stale document) ----
+  {
+    method: "post",
+    path: "/pay",
+    tag: "Payments",
+    summary: "Send a single XLM/USDC/EURC payment via the relayer",
+    auth: true,
+    rateLimit: "queryLimiter",
+    body: payRequestSchema,
+    responseExample: { hash: "a1b2c3...64hex" },
+    errorStatuses: [400, 401, 429, 500],
+  },
+  {
+    method: "post",
+    path: "/pay/batch",
+    tag: "Payments",
+    summary: "Send up to 100 payment ops in one transaction (withSequenceLock)",
+    auth: true,
+    rateLimit: "queryLimiter",
+    body: payBatchRequestSchema,
+    responseExample: { hash: "a1b2c3...64hex", ops: 3 },
+    errorStatuses: [400, 401, 429, 500],
+  },
+  // ---- Swap (#597) ----
+  {
+    method: "get",
+    path: "/swap/quote",
+    tag: "Swap",
+    summary: "Quote XLM<->USDC/EURC via Horizon strict-send (Soroswap fallback)",
+    auth: false,
+    rateLimit: "queryLimiter",
+    query: {
+      from: paymentAssetSchema,
+      to: paymentAssetSchema,
+      amount: paymentAmountSchema,
+    },
+    responseExample: { destAmount: "9.8000000", path: [] },
+    errorStatuses: [400],
+  },
+  {
+    method: "post",
+    path: "/swap/submit",
+    tag: "Swap",
+    summary: "Execute a path-payment swap via the relayer",
+    auth: true,
+    rateLimit: "queryLimiter",
+    body: swapSubmitRequestSchema,
+    responseExample: { hash: "a1b2c3...64hex" },
+    errorStatuses: [400, 401, 429, 500],
   },
   // ---- Circuits ----
   {

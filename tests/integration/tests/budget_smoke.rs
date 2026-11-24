@@ -7,6 +7,10 @@ use dao_registry::DaoRegistryClient;
 use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{VerificationKey, VoteMode, VotingClient};
+
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 // Real verification key (big-endian) from circuits/build/verification_key_soroban_be.json
 fn get_real_vk(env: &Env) -> VerificationKey {
     // Helper to parse BE hex into BytesN of length 64 or 128
@@ -61,6 +65,11 @@ fn setup(
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(env, &voting_id);
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
 
     let registry = DaoRegistryClient::new(env, &registry_id);
     let sbt = MembershipSbtClient::new(env, &sbt_id);
@@ -138,6 +147,11 @@ fn budget_set_vk_within_limit() {
         voting::Voting,
         (tree_id.clone(), registry_id.clone(), guardian),
     );
+    // `set_vk` is fail-closed without a transcript registry (#662).
+    zkvote_integration_tests::testkit::install_permissive_transcript_registry(&env, &voting_id);
+
+    // Attestation source for `set_vk` (see test_support module docs).
+    attach_transcript_registry(env.clone(), &voting_id);
 
     let registry = DaoRegistryClient::new(&env, &registry_id);
     let tree = MembershipTreeClient::new(&env, &tree_id);

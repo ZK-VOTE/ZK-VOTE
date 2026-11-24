@@ -26,6 +26,9 @@ use membership_sbt::MembershipSbtClient;
 use membership_tree::MembershipTreeClient;
 use voting::{Proof, VerificationKey, VotingClient};
 
+// `set_vk` needs an MPC attestation source; without one it panics before
+// the test asserts anything. See zkvote_integration_tests::test_support.
+use zkvote_integration_tests::test_support::attach_transcript_registry;
 struct Sys {
     env: Env,
     registry: Address,
@@ -46,6 +49,9 @@ impl Sys {
         );
         let guardian = Address::generate(&env);
         let voting = env.register(voting::Voting, (tree.clone(), registry.clone(), guardian));
+
+        // Attestation source for `set_vk` (see test_support module docs).
+        attach_transcript_registry(env.clone(), &voting);
         Sys {
             env,
             registry,

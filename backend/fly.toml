@@ -28,7 +28,10 @@ kill_timeout = "35s"
   # old one is stopped, so there's no window with zero healthy instances.
   # release_command runs migration status check before deployment finishes.
   strategy = "rolling"
-  release_command = "npm rebuild better-sqlite3 && node --enable-source-maps dist/services/migrate.js status"
+  # Hermetic release gate (#599): migration parity check PLUS a native ABI
+  # smoke test so a cached Node 20 better_sqlite3.node layer fails the release
+  # instead of serving 500s from /health at runtime.
+  release_command = "node --enable-source-maps dist/services/migrate.js status && node -e \"require('better-sqlite3'); console.log('release ABI smoke ok')\""
 
 [http_service]
   internal_port = 8080

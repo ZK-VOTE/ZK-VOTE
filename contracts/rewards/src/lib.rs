@@ -267,6 +267,38 @@ impl Rewards {
         }
     }
 
+    /// Reject a root that a member removal has invalidated.
+    ///
+    /// `min_root` is the tree's monotonic revocation floor: `remove_member`
+    /// raises it to the index of the root it just produced, so every root below
+    /// it predates the removal. `remove_member` is its only writer and there is
+    /// no setter, so it can never be lowered or reset. A DAO that removes nobody
+    /// leaves it at 0, where this is a no-op.
+    ///
+    /// Asked of the tree as one `root_eligibility` question rather than three
+    /// separate lookups. All three facts live in the tree, and a caller that
+    /// remembers to ask for only two of them is exactly how Fixed mode ended up
+    /// with no revocation check at all (#audit-H3).
+    fn assert_root_not_revoked(env: &Env, ctx: PathContext, dao_id: u64, root: &U256) {
+        let tree_contract: Address = env.storage().instance().get(&TREE_CONTRACT).unwrap();
+        let code: u32 = env.invoke_contract(
+            &tree_contract,
+            &Symbol::new(env, "root_eligibility"),
+            soroban_sdk::vec![
+                env,
+                dao_id.into_val(env),
+                root.clone().into_val(env),
+                0u32.into_val(env),
+            ],
+        );
+        match code {
+            0 => {}
+            1 => panic_coarse(env, ctx, RewardsError::RootNotInHistory),
+            2 => panic_coarse(env, ctx, RewardsError::RootPredatesProposal),
+            _ => panic_coarse(env, ctx, RewardsError::RootPredatesRemoval),
+        }
+    }
+
     fn assert_admin(env: &Env, dao_id: u64, admin: &Address) {
         let registry: Address = env.storage().instance().get(&REGISTRY).unwrap();
         let dao_admin: Address = env.invoke_contract(
@@ -546,36 +578,40 @@ impl Rewards {
                 if root != eligible_root {
                     panic_coarse(&env, ctx, RewardsError::RootMismatch);
                 }
+                // SECURITY (#audit-H3): the snapshot root is the *starting
+                // point* for eligibility, not a permanent grant. A member
+                // removed after the snapshot keeps a proof against the
+                // pre-removal root — and the voting contract pins an Active
+                // Fixed snapshot against root eviction, so that root never ages
+                // out. Without consulting `min_root` here, a removed member
+                // could still claim a Vote-to-Earn reward against a Fixed-mode
+                // proposal indefinitely. Same check the Trailing arm below
+                // already performed, applied to the arm that had none.
+                Self::assert_root_not_revoked(&env, ctx, dao_id, &root);
             }
             VoteMode::Trailing => {
-                let root_valid: bool = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_ok"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
-                if !root_valid {
-                    panic_coarse(&env, ctx, RewardsError::RootNotInHistory);
-                }
-                let root_index: u32 = env.invoke_contract(
-                    &tree_contract,
-                    &symbol_short!("root_idx"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env), root.clone().into_val(&env)],
-                );
                 let earliest: u32 = env.invoke_contract(
                     &voting,
                     &Symbol::new(&env, "get_earliest_idx"),
                     soroban_sdk::vec![&env, dao_id.into_val(&env), proposal_id.into_val(&env)],
                 );
-                if root_index < earliest {
-                    panic_coarse(&env, ctx, RewardsError::RootPredatesProposal);
-                }
-                let min_valid: u32 = env.invoke_contract(
+                // The tree answers all three root conditions in one call, so the
+                // Trailing arm is a single hop too.
+                let code: u32 = env.invoke_contract(
                     &tree_contract,
-                    &symbol_short!("min_root"),
-                    soroban_sdk::vec![&env, dao_id.into_val(&env)],
+                    &Symbol::new(&env, "root_eligibility"),
+                    soroban_sdk::vec![
+                        &env,
+                        dao_id.into_val(&env),
+                        root.clone().into_val(&env),
+                        earliest.into_val(&env),
+                    ],
                 );
-                if root_index < min_valid {
-                    panic_coarse(&env, ctx, RewardsError::RootPredatesRemoval);
+                match code {
+                    0 => {}
+                    1 => panic_coarse(&env, ctx, RewardsError::RootNotInHistory),
+                    2 => panic_coarse(&env, ctx, RewardsError::RootPredatesProposal),
+                    _ => panic_coarse(&env, ctx, RewardsError::RootPredatesRemoval),
                 }
             }
         }
@@ -646,14 +682,19 @@ impl Rewards {
         .publish(&env);
     }
 
-    #[allow(unused_variables)]
+    /// Verify Groth16 proof using shared verification library.
+    ///
+    /// In a `cfg(test)` build only, an instance-storage override lets a test
+    /// decide the outcome of verification. Gated on `cfg(test)` rather than a
+    /// cargo feature so no deployable build can consult it, and there is no
+    /// setter outside tests.
     fn verify_groth16(
         env: &Env,
         vk: &VerificationKey,
         proof: &Proof,
         pub_signals: &Vec<U256>,
     ) -> bool {
-        #[cfg(any(test, feature = "testutils"))]
+        #[cfg(test)]
         {
             if let Some(override_val) = env
                 .storage()
@@ -666,14 +707,31 @@ impl Rewards {
         if pub_signals.len() + 1 != vk.ic.len() {
             return false;
         }
-        #[cfg(any(test, feature = "testutils"))]
+
+        // A test build that did not set the override has no real proof to
+        // check against, so it accepts a well-shaped statement — the
+        // long-standing behaviour of this suite. `cfg(not(test))` is the only
+        // build that ever reaches the pairing check, and it always does.
+        #[cfg(test)]
         {
+            // The IC/signal-count check above already ran; only the pairing is
+            // bypassed here.
+            let _ = (env, vk, proof, pub_signals);
             true
         }
-        #[cfg(not(any(test, feature = "testutils")))]
+        #[cfg(not(test))]
         {
             zkvote_groth16::verify_groth16(env, vk, proof, pub_signals)
         }
+    }
+
+    /// Test-only: force the outcome of proof verification for the remainder of
+    /// the test. Compiled out of every non-test build.
+    #[cfg(test)]
+    fn set_verify_override_for_tests(env: Env, accept: bool) {
+        env.storage()
+            .instance()
+            .set(&DataKey::VerifyOverride, &accept);
     }
 }
 

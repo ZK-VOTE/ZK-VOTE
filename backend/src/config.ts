@@ -115,6 +115,34 @@ function parseOptionalBoolean(
 // ENVIRONMENT SCHEMA (ZOD VALIDATION)
 // ============================================
 
+function urlListSchema(name: string) {
+  return z
+    .string()
+    .optional()
+    .refine(
+      (value) =>
+        !value ||
+        value
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .every((s) => z.string().url().safeParse(s).success),
+      `${name} must be a comma-separated list of URLs`,
+    );
+}
+
+/** Merge singular + plural URL env vars into a de-duplicated pool. */
+function urlPool(
+  fallback: string,
+  ...values: Array<string | undefined>
+): string[] {
+  const urls = values
+    .flatMap((v) => (v ? v.split(",") : []))
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return urls.length > 0 ? Array.from(new Set(urls)) : [fallback];
+}
+
 const envSchema = z.object({
   STARTUP_PROFILE: z.enum(STARTUP_PROFILES).default("all"),
   ENABLE_RELAYER: z.enum(["true", "false"]).optional(),
@@ -147,6 +175,35 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("true")
     .transform((v) => v !== "false"),
+  // Relayer key lifecycle (#746)
+  // Notification delivery (ZV-037 / #886). Every provider is optional: an
+  // unconfigured channel is simply not offered, and nothing is sent.
+  NOTIFY_EMAIL_RELAY_URL: z.string().url().optional(),
+  NOTIFY_EMAIL_RELAY_TOKEN: z.string().min(1).optional(),
+  NOTIFY_EMAIL_FROM: z.string().min(3).default("ZK-VOTE <no-reply@zkvote.local>"),
+  NOTIFY_VAPID_PUBLIC_KEY: z.string().min(1).optional(),
+  NOTIFY_VAPID_PRIVATE_KEY: z.string().min(1).optional(),
+  NOTIFY_VAPID_SUBJECT: z.string().min(1).default("mailto:ops@zkvote.local"),
+  NOTIFY_PUBLIC_URL: z.string().url().default("http://localhost:3000"),
+  NOTIFY_SUBSCRIPTION_TTL_DAYS: z.coerce.number().int().positive().default(180),
+  NOTIFY_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(50),
+  NOTIFY_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
+  RELAYER_ROTATION_DRAIN_WINDOW_MS: z.coerce.number().int().min(0).default(300000),
+  RELAYER_ROTATION_MIN_FUNDING_XLM: z.coerce.number().min(0).default(10),
+  RELAYER_KEY_MAX_AGE_DAYS: z.coerce.number().positive().default(90),
+  RELAYER_COMPROMISE_SLO_SECONDS: z.coerce.number().positive().default(300),
+  RELAYER_COMPROMISE_COOLDOWN_MS: z.coerce.number().int().min(0).default(600000),
+  RELAYER_SWEEP_SAFE_ACCOUNT: z
+    .string()
+    .regex(/^G[A-Z2-7]{55}$/, "RELAYER_SWEEP_SAFE_ACCOUNT must be a Stellar G... account")
+    .optional(),
+  RELAYER_SIGNING_TIERS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v !== "false"),
+  RELAYER_TIER_LIMITS: z.string().optional(),
+  RELAYER_COSIGNER_KEYS: z.string().optional(),
+  RELAYER_BREAK_GLASS_SECRET: z.string().min(32).optional(),
   FRIENDBOT_URL: z.string().url().optional(),
   RELAYER_SIGNER_TYPE: z
     .enum(["local", "aws_kms", "gcp_kms", "pkcs11"])
@@ -189,6 +246,17 @@ const envSchema = z.object({
   BRIDGE_CONTRACT_ID: z.string().min(1).optional(),
   /** Path to bridge circuit verification_key.json used by POST /bridge/vote */
   BRIDGE_VKEY_PATH: z.string().min(1).optional(),
+  // EVM side of the bridge relayer (ZV-038 / #887). The relay loop runs only
+  // when both the RPC URL and the Bridge.sol address are set.
+  BRIDGE_EVM_RPC_URL: z.string().url().optional(),
+  BRIDGE_EVM_CONTRACT_ADDRESS: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 20-byte address")
+    .optional(),
+  BRIDGE_EVM_CONFIRMATIONS: z.coerce.number().int().min(0).default(12),
+  BRIDGE_EVM_START_BLOCK: z.coerce.number().int().min(0).default(0),
+  BRIDGE_EVM_MAX_BLOCK_RANGE: z.coerce.number().int().positive().default(2000),
+  BRIDGE_RELAY_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   /** Salt mixed into IP hashes so truncated SHA-256 is not rainbow-tableable */
   IP_HASH_SALT: z.string().default(""),
   CIRCUIT_REGISTRY_CONTRACT_ID: z.string().min(1).optional(),
@@ -199,7 +267,24 @@ const envSchema = z.object({
   HORIZON_URL: z.string().url().optional(),
   ANCHOR_USDC_URL: z.string().url().optional(),
   ANCHOR_EURC_URL: z.string().url().optional(),
+  // Endpoint pools (#745): comma-separated, tried in health-weighted order.
+  // The singular *_URL stays the first member for backward compatibility.
+  HORIZON_URLS: urlListSchema("HORIZON_URLS"),
+  ANCHOR_USDC_URLS: urlListSchema("ANCHOR_USDC_URLS"),
+  ANCHOR_EURC_URLS: urlListSchema("ANCHOR_EURC_URLS"),
+  ENDPOINT_MAX_FINALITY_LAG_LEDGERS: z.coerce.number().int().min(0).default(5),
+  ENDPOINT_HEALTH_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
+  ENDPOINT_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  ENDPOINT_RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(3),
+  ENDPOINT_RETRY_BASE_MS: z.coerce.number().int().positive().default(200),
+  ENDPOINT_RETRY_MAX_MS: z.coerce.number().int().positive().default(5000),
+  ENDPOINT_RETRY_BUDGET_RATIO: z.coerce.number().min(0).max(1).default(0.2),
+  ENDPOINT_ARBITRATION_QUORUM: z.coerce.number().int().min(1).default(2),
   SOROSWAP_API: z.string().url().optional(),
+  SOROSWAP_CONTRACT_ID: z
+    .string()
+    .regex(/^C[A-Z2-7]{55}$/, "SOROSWAP_CONTRACT_ID must be a Stellar C... contract id")
+    .optional(),
   VOTING_VK_VERSION: z.coerce.number().int().optional(),
 
   CORS_ORIGIN: z.string().optional(),
@@ -215,6 +300,12 @@ const envSchema = z.object({
     .default("true")
     .transform((v) => v !== "false"),
   STRIP_REQUEST_BODIES: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  // Reject /vote without a wallet-session binding (#750). Off by default so
+  // the backend can ship before the frontend that sends it.
+  VOTE_SESSION_REQUIRED: z
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
@@ -365,6 +456,22 @@ const envSchema = z.object({
     .int()
     .positive()
     .default(60000),
+
+  // Shared (cross-replica) token-bucket limiter. A signed membership token is
+  // keyed by HMAC of this secret; without it, IP is only a weak fallback.
+  RATE_LIMIT_TOKEN_HMAC_SECRET: z.string().min(16).optional(),
+  RATE_LIMIT_OVERRIDES_JSON: z.string().optional(),
+
+  // DAO factory saga: real transaction-status polling (no simulated sleeps).
+  FACTORY_CONTRACT_ID: z.string().optional(),
+  FACTORY_TX_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  FACTORY_TX_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1_000),
+
+  // Fail closed: mock VK fallbacks are rejected unless explicitly enabled.
+  CIRCUIT_REGISTRY_ALLOW_MOCK: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
   RELAYER_PUBLIC_KEY: z.string().default(""),
   MAX_SPONSORED_FEE_STROOPS: z.coerce
     .number()
@@ -423,6 +530,13 @@ const envSchema = z.object({
     .default("false")
     .transform((v) => v === "true"),
   DB_DUAL_WRITE_URL: z.string().optional(),
+  DB_DUAL_WRITE_STRICT: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  // `repository` routes hot-path writes through the Kysely repository layer;
+  // `legacy` keeps the historical raw prepares until parity is proven.
+  DB_WRITE_CUTOVER: z.enum(["legacy", "repository"]).default("legacy"),
 
   DB_BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   DB_CHECKPOINT_INTERVAL_MS: z.coerce.number().int().positive().default(60000),
@@ -634,6 +748,30 @@ export const config = {
   relayerSecondaryPublicKey: validatedEnv.RELAYER_SECONDARY_PUBLIC_KEY,
   relayerMinBalanceXlm: validatedEnv.RELAYER_MIN_BALANCE_XLM,
   relayerAutoRotateLowBalance: validatedEnv.RELAYER_AUTO_ROTATE_LOW_BALANCE,
+  // Relayer key lifecycle (#746)
+  // Notification delivery (ZV-037 / #886)
+  notifications: {
+    emailRelayUrl: validatedEnv.NOTIFY_EMAIL_RELAY_URL ?? null,
+    emailRelayToken: validatedEnv.NOTIFY_EMAIL_RELAY_TOKEN ?? null,
+    emailFrom: validatedEnv.NOTIFY_EMAIL_FROM,
+    vapidPublicKey: validatedEnv.NOTIFY_VAPID_PUBLIC_KEY ?? null,
+    vapidPrivateKey: validatedEnv.NOTIFY_VAPID_PRIVATE_KEY ?? null,
+    vapidSubject: validatedEnv.NOTIFY_VAPID_SUBJECT,
+    publicUrl: validatedEnv.NOTIFY_PUBLIC_URL,
+    subscriptionTtlDays: validatedEnv.NOTIFY_SUBSCRIPTION_TTL_DAYS,
+    batchSize: validatedEnv.NOTIFY_BATCH_SIZE,
+    maxAttempts: validatedEnv.NOTIFY_MAX_ATTEMPTS,
+  },
+  relayerRotationDrainWindowMs: validatedEnv.RELAYER_ROTATION_DRAIN_WINDOW_MS,
+  relayerRotationMinFundingXlm: validatedEnv.RELAYER_ROTATION_MIN_FUNDING_XLM,
+  relayerKeyMaxAgeDays: validatedEnv.RELAYER_KEY_MAX_AGE_DAYS,
+  relayerCompromiseSloSeconds: validatedEnv.RELAYER_COMPROMISE_SLO_SECONDS,
+  relayerCompromiseCooldownMs: validatedEnv.RELAYER_COMPROMISE_COOLDOWN_MS,
+  relayerSweepSafeAccount: validatedEnv.RELAYER_SWEEP_SAFE_ACCOUNT,
+  relayerSigningTiersEnabled: validatedEnv.RELAYER_SIGNING_TIERS_ENABLED,
+  relayerTierLimits: validatedEnv.RELAYER_TIER_LIMITS,
+  relayerCosignerKeys: validatedEnv.RELAYER_COSIGNER_KEYS,
+  relayerBreakGlassSecret: validatedEnv.RELAYER_BREAK_GLASS_SECRET,
   friendbotUrl: validatedEnv.FRIENDBOT_URL,
   relayerSignerType: validatedEnv.RELAYER_SIGNER_TYPE,
   relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
@@ -676,6 +814,14 @@ export const config = {
   membershipSbtContractId: process.env.MEMBERSHIP_SBT_CONTRACT_ID,
   bridgeContractId: process.env.BRIDGE_CONTRACT_ID,
   bridgeVkeyPath: validatedEnv.BRIDGE_VKEY_PATH,
+  bridgeEvm: {
+    rpcUrl: validatedEnv.BRIDGE_EVM_RPC_URL ?? null,
+    contractAddress: validatedEnv.BRIDGE_EVM_CONTRACT_ADDRESS ?? null,
+    confirmations: validatedEnv.BRIDGE_EVM_CONFIRMATIONS,
+    startBlock: validatedEnv.BRIDGE_EVM_START_BLOCK,
+    maxBlockRange: validatedEnv.BRIDGE_EVM_MAX_BLOCK_RANGE,
+    relayMaxAttempts: validatedEnv.BRIDGE_RELAY_MAX_ATTEMPTS,
+  },
   ipHashSalt: validatedEnv.IP_HASH_SALT,
   circuitRegistryContractId: process.env.CIRCUIT_REGISTRY_CONTRACT_ID,
   rewardsContractId: process.env.REWARDS_CONTRACT_ID,
@@ -685,7 +831,33 @@ export const config = {
   horizonUrl: validatedEnv.HORIZON_URL || "https://horizon-testnet.stellar.org",
   anchorUsdcUrl: validatedEnv.ANCHOR_USDC_URL || "https://anchor.circle.com",
   anchorEurcUrl: validatedEnv.ANCHOR_EURC_URL || "https://anchor.eurc.circle.com",
+  // Endpoint pools (#745). The singular URL, when set, is always a member.
+  horizonUrls: urlPool(
+    "https://horizon-testnet.stellar.org",
+    validatedEnv.HORIZON_URL,
+    validatedEnv.HORIZON_URLS,
+  ),
+  anchorUsdcUrls: urlPool(
+    "https://anchor.circle.com",
+    validatedEnv.ANCHOR_USDC_URL,
+    validatedEnv.ANCHOR_USDC_URLS,
+  ),
+  anchorEurcUrls: urlPool(
+    "https://anchor.eurc.circle.com",
+    validatedEnv.ANCHOR_EURC_URL,
+    validatedEnv.ANCHOR_EURC_URLS,
+  ),
+  endpointMaxFinalityLagLedgers: validatedEnv.ENDPOINT_MAX_FINALITY_LAG_LEDGERS,
+  endpointHealthIntervalMs: validatedEnv.ENDPOINT_HEALTH_INTERVAL_MS,
+  endpointRequestTimeoutMs: validatedEnv.ENDPOINT_REQUEST_TIMEOUT_MS,
+  endpointRetryMaxAttempts: validatedEnv.ENDPOINT_RETRY_MAX_ATTEMPTS,
+  endpointRetryBaseMs: validatedEnv.ENDPOINT_RETRY_BASE_MS,
+  endpointRetryMaxMs: validatedEnv.ENDPOINT_RETRY_MAX_MS,
+  endpointRetryBudgetRatio: validatedEnv.ENDPOINT_RETRY_BUDGET_RATIO,
+  endpointArbitrationQuorum: validatedEnv.ENDPOINT_ARBITRATION_QUORUM,
   soroswapApi: validatedEnv.SOROSWAP_API || "https://api.soroswap.finance/quote",
+  // Soroswap fallback is disabled unless the exact router contract is pinned.
+  soroswapContractId: validatedEnv.SOROSWAP_CONTRACT_ID,
 
   // VK Version
   staticVkVersion: validatedEnv.VOTING_VK_VERSION,
@@ -708,6 +880,7 @@ export const config = {
   logClientIp: validatedEnv.LOG_CLIENT_IP,
   logRequestBody: validatedEnv.LOG_REQUEST_BODY,
   stripRequestBodies: validatedEnv.STRIP_REQUEST_BODIES,
+  voteSessionRequired: validatedEnv.VOTE_SESSION_REQUIRED,
   logSampleRate: validatedEnv.LOG_SAMPLE_RATE,
   genericErrors: validatedEnv.RELAYER_GENERIC_ERRORS,
   healthExposeDetails: validatedEnv.HEALTH_EXPOSE_DETAILS,
@@ -802,6 +975,12 @@ export const config = {
   requireClientCert: validatedEnv.REQUIRE_CLIENT_CERT,
   walletRateLimitMax: validatedEnv.WALLET_RATE_LIMIT_MAX,
   walletRateLimitWindowMs: validatedEnv.WALLET_RATE_LIMIT_WINDOW_MS,
+  rateLimitTokenHmacSecret: validatedEnv.RATE_LIMIT_TOKEN_HMAC_SECRET,
+  rateLimitOverridesJson: validatedEnv.RATE_LIMIT_OVERRIDES_JSON,
+  factoryContractId: validatedEnv.FACTORY_CONTRACT_ID,
+  factoryTxPollTimeoutMs: validatedEnv.FACTORY_TX_POLL_TIMEOUT_MS,
+  factoryTxPollIntervalMs: validatedEnv.FACTORY_TX_POLL_INTERVAL_MS,
+  circuitRegistryAllowMock: validatedEnv.CIRCUIT_REGISTRY_ALLOW_MOCK,
   relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
   maxSponsoredFeeStroops: validatedEnv.MAX_SPONSORED_FEE_STROOPS,
   // Circuit Breakers
@@ -831,6 +1010,8 @@ export const config = {
   databaseUrl: validatedEnv.DATABASE_URL,
   dbDualWrite: validatedEnv.DB_DUAL_WRITE,
   dbDualWriteUrl: validatedEnv.DB_DUAL_WRITE_URL,
+  dbDualWriteStrict: validatedEnv.DB_DUAL_WRITE_STRICT,
+  dbWriteCutover: validatedEnv.DB_WRITE_CUTOVER,
 
   // Database / WAL Resilience
   dbBusyTimeoutMs: validatedEnv.DB_BUSY_TIMEOUT_MS,

@@ -94,11 +94,11 @@ zeros[3] = 611329077813233555108290870818872894076597149257273150132177172495614
 ```bash
 # Build with testutils feature
 cd contracts/membership-tree
-cargo build --release --target wasm32-unknown-unknown --features testutils
+cargo build --release --target wasm32v1-none --features testutils
 
 # Deploy to local test network
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/membership_tree.wasm \
+  --wasm target/wasm32v1-none/release/membership_tree.wasm \
   --source mykey \
   --network testnet
 

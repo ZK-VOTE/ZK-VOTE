@@ -139,16 +139,19 @@ describe("generateSecret", () => {
 });
 
 describe("VoteProofInput type structure", () => {
-  it("has all required fields", () => {
+  it("has all required fields including numCandidates and blindingFactor", () => {
     // Type-checking test - this verifies the interface structure at compile time
     const input = {
       secret: "123",
       salt: "456",
+      blindingFactor: "789",
       root: "789",
       nullifier: "012",
       daoId: "1",
       proposalId: "2",
       voteChoice: "1",
+      numCandidates: "2",
+      relayerAddress: "0",
       commitment: "345",
       pathElements: ["a", "b"],
       pathIndices: [0, 1],
@@ -157,6 +160,8 @@ describe("VoteProofInput type structure", () => {
     // All fields should be present
     expect(input.secret).toBeDefined();
     expect(input.salt).toBeDefined();
+    expect(input.blindingFactor).toBeDefined();
+    expect(input.numCandidates).toBeDefined();
     expect(input.root).toBeDefined();
     expect(input.nullifier).toBeDefined();
     expect(input.daoId).toBeDefined();

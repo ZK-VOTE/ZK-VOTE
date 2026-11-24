@@ -1,7 +1,7 @@
 {
   "title": "ZKVote Relayer",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": { "from": "now-1h", "to": "now" },
   "templating": { "list": [{ "name": "job", "type": "query", "query": "label_values(zkvote_http_requests_total, job)", "includeAll": true, "multi": true, "current": { "text": "All", "value": ["$__all"] } }] },
@@ -16,6 +16,10 @@
     { "id": 8, "type": "timeseries", "title": "Reconciliation Mismatches", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 }, "targets": [{ "expr": "sum by (component, mismatch_type) (rate(zkvote_reconciliation_mismatch_total{job=~\"$job\"}[5m]))", "legendFormat": "{{component}} - {{mismatch_type}}" }] },
     { "id": 9, "type": "timeseries", "title": "Batch Partial Failures", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 }, "targets": [{ "expr": "sum by (batch_type, reason) (rate(zkvote_batch_partial_failure_total{job=~\"$job\"}[5m]))", "legendFormat": "{{batch_type}}: {{reason}}" }] },
     { "id": 10, "type": "timeseries", "title": "Session & Rate Limit Store Size", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 }, "targets": [{ "expr": "zkvote_session_store_size{job=~\"$job\"}", "legendFormat": "sessions" }, { "expr": "zkvote_rate_limit_store_size{job=~\"$job\"}", "legendFormat": "rate limit keys" }] },
-    { "id": 11, "type": "timeseries", "title": "DAO Reconciliation (#577)", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 }, "targets": [{ "expr": "sum by (status) (rate(zkvote_dao_reconciliation_runs_total{job=~\"$job\"}[5m]))", "legendFormat": "runs: {{status}}" }, { "expr": "sum by (mismatch_type) (rate(zkvote_reconciliation_mismatch_total{job=~\"$job\",component=\"dao_tally\"}[5m]))", "legendFormat": "dao_tally: {{mismatch_type}}" }, { "expr": "time() - zkvote_dao_reconciliation_last_ok_timestamp_seconds{job=~\"$job\"}", "legendFormat": "seconds since last clean run" }] }
+    { "id": 11, "type": "timeseries", "title": "DAO Reconciliation (#577)", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 }, "targets": [{ "expr": "sum by (status) (rate(zkvote_dao_reconciliation_runs_total{job=~\"$job\"}[5m]))", "legendFormat": "runs: {{status}}" }, { "expr": "sum by (mismatch_type) (rate(zkvote_reconciliation_mismatch_total{job=~\"$job\",component=\"dao_tally\"}[5m]))", "legendFormat": "dao_tally: {{mismatch_type}}" }, { "expr": "time() - zkvote_dao_reconciliation_last_ok_timestamp_seconds{job=~\"$job\"}", "legendFormat": "seconds since last clean run" }] },
+    { "id": 12, "type": "timeseries", "title": "Backup Age & Restore Drills (#600)", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 }, "targets": [{ "expr": "zkvote_backup_age_seconds{job=~\"$job\"}", "legendFormat": "backup age (s)" }, { "expr": "sum by (status) (rate(zkvote_backup_key_rotations_total{job=~\"$job\"}[5m]))", "legendFormat": "rotations: {{status}}" }, { "expr": "sum by (status) (rate(zkvote_backup_restore_drill_total{job=~\"$job\"}[5m]))", "legendFormat": "drills: {{status}}" }] },
+    { "id": 13, "type": "timeseries", "title": "Fee Surge / Congestion (#601)", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 }, "targets": [{ "expr": "sum by (method, error_type) (rate(zkvote_rpc_errors_total{job=~\"$job\"}[5m]))", "legendFormat": "{{method}}: {{error_type}}" }, { "expr": "zkvote_tx_confirmation_queue_depth{job=~\"$job\"}", "legendFormat": "confirmation queue depth" }] },
+    { "id": 14, "type": "timeseries", "title": "Priority Queue Starvation (ZV-110)", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 }, "targets": [{ "expr": "sum by (priority) (rate(zkvote_priority_starvation_total{job=~\"$job\"}[5m]))", "legendFormat": "{{priority}}" }] },
+    { "id": 15, "type": "timeseries", "title": "Priority Queue Depth & In-Flight (ZV-110)", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 }, "targets": [{ "expr": "zkvote_priority_queue_depth{job=~\"$job\"}", "legendFormat": "{{tier}} queued" }, { "expr": "zkvote_priority_queue_in_flight{job=~\"$job\"}", "legendFormat": "{{tier}} in-flight" }] }
   ]
 }
