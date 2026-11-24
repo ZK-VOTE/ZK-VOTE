@@ -1499,6 +1499,38 @@ export interface CardinalityAuditResult {
   }>;
 }
 
+// ============================================
+// WEBHOOK DELIVERY SUBSYSTEM METRICS (ZV-036)
+// ============================================
+
+export const webhookQueueDepth = new Gauge({
+  name: "zkvote_webhook_queue_depth",
+  help: "Current number of pending events in webhook outbox queue",
+  registers: [register],
+});
+
+export const webhookAttemptsTotal = new Counter({
+  name: "zkvote_webhook_attempts_total",
+  help: "Total webhook delivery attempts",
+  labelNames: ["status", "event_type"] as const,
+  registers: [register],
+});
+
+export const webhookDeadLetterTotal = new Counter({
+  name: "zkvote_webhook_dead_letter_total",
+  help: "Total webhook events moved to dead-letter queue",
+  labelNames: ["event_type"] as const,
+  registers: [register],
+});
+
+export const webhookDeliveryDuration = new Histogram({
+  name: "zkvote_webhook_delivery_duration_seconds",
+  help: "Webhook delivery HTTP request duration in seconds",
+  labelNames: ["status"] as const,
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+});
+
 /**
  * Audits the registry against cardinality governance rules: no prohibited
  * labels, every label declared with a bound, live children within each

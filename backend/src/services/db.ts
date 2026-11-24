@@ -1424,6 +1424,50 @@ export function initDb(dbPath?: string): DatabaseType {
     CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
     CREATE INDEX IF NOT EXISTS idx_audit_log_archived ON audit_log(archived_at);
 
+    -- Persistent Webhook Delivery Subsystem (ZV-036)
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      secret TEXT NOT NULL,
+      event_types TEXT NOT NULL DEFAULT '',
+      dao_ids TEXT NOT NULL DEFAULT '',
+      active INTEGER NOT NULL DEFAULT 1,
+      rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_active ON webhook_subscriptions(active);
+
+    CREATE TABLE IF NOT EXISTS webhook_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      event_type TEXT NOT NULL,
+      dao_id TEXT,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      processed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_outbox_queue ON webhook_outbox(status, next_attempt_at);
+    CREATE INDEX IF NOT EXISTS idx_webhook_outbox_event_id ON webhook_outbox(event_id);
+
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      outbox_id INTEGER NOT NULL,
+      subscription_id TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      status_code INTEGER,
+      response_body TEXT,
+      error TEXT,
+      duration_ms INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_outbox ON webhook_deliveries(outbox_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription ON webhook_deliveries(subscription_id, created_at);
+
     -- Core fields are immutable once written; only archived_at (set by the
     -- rotation job after export) may be updated.
     CREATE TRIGGER IF NOT EXISTS audit_log_immutable_core

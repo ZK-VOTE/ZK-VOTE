@@ -122,6 +122,8 @@ import {
   rampRoutes,
   onboardingRoutes,
   notificationRoutes,
+  proverRoutes,
+  eventsRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
 
@@ -418,6 +420,8 @@ app.use(swapRoutes);
 app.use(rampRoutes);
 app.use(onboardingRoutes);
 app.use(noStore, notificationRoutes);
+app.use(proverRoutes);
+app.use(eventsRoutes);
 
 // ============================================
 // ROUTES PHASE — DECLARATIVE REGISTRY

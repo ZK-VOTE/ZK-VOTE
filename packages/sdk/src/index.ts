@@ -19,5 +19,8 @@ export {
   checkCircuitVersion,
   UnsupportedCircuitVersionError,
   type CircuitVersionCheck,
+  SEMVER_POLICY,
+  DEPRECATION_POLICY,
+  verifyChecksum,
 } from './version'
 export * from './generated/zkv1'

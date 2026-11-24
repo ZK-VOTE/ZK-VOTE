@@ -758,6 +758,90 @@ export async function generateEncryptedVoteProof(
   return { proof: result.proof, publicSignals: result.publicSignals };
 }
 
+/**
+ * Remote Prover Client integration (ZV-035)
+ * Allows resource-constrained or mobile voters to request server-side proving
+ * with bounded concurrency, queue status tracking, and cancellation.
+ */
+export async function generateVoteProofRemote(
+  input: Record<string, unknown>,
+  options: {
+    remoteUrl?: string;
+    circuitId?: string;
+    circuitVersion?: number;
+    tenantId?: string;
+    electionDeadline?: number;
+    onProgress?: (progress: number, status: string) => void;
+    signal?: AbortSignal;
+  } = {}
+): Promise<GeneratedProof> {
+  const remoteUrl =
+    options.remoteUrl ||
+    (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_REMOTE_PROVER_URL) ||
+    "http://localhost:3001";
+
+  const circuitId = options.circuitId || "vote_v1";
+  const circuitVersion = options.circuitVersion || 1;
+  const tenantId = options.tenantId || String(input.daoId || "1");
+
+  const submitRes = await fetch(`${remoteUrl}/prover/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      circuitId,
+      circuitVersion,
+      witness: input,
+      electionDeadline: options.electionDeadline,
+      tenantId,
+    }),
+    signal: options.signal,
+  });
+
+  if (!submitRes.ok) {
+    const errData = await submitRes.json().catch(() => ({}));
+    throw new Error(
+      `Remote prover submission failed (HTTP ${submitRes.status}): ${errData.error || submitRes.statusText}`
+    );
+  }
+
+  const { jobId } = await submitRes.json();
+
+  // Poll for completion
+  while (true) {
+    if (options.signal?.aborted) {
+      await fetch(`${remoteUrl}/prover/jobs/${jobId}/cancel`, { method: "POST" }).catch(() => {});
+      throw new Error("Proving aborted by user");
+    }
+
+    await new Promise((r) => setTimeout(r, 500));
+
+    const pollRes = await fetch(`${remoteUrl}/prover/jobs/${jobId}`, { signal: options.signal });
+    if (!pollRes.ok) {
+      throw new Error(`Failed to query job status: HTTP ${pollRes.status}`);
+    }
+
+    const job = await pollRes.json();
+    if (options.onProgress) {
+      options.onProgress(job.progressPercent, job.status);
+    }
+
+    if (job.status === "completed" && job.result) {
+      return {
+        proof: job.result.proof,
+        publicSignals: job.result.publicSignals,
+      };
+    }
+
+    if (job.status === "failed") {
+      throw new Error(`Remote proving failed: ${job.error || "Unknown error"}`);
+    }
+
+    if (job.status === "cancelled") {
+      throw new Error("Remote proving was cancelled");
+    }
+  }
+}
+
 export async function generateVoteProof(
   input: VoteProofInput,
   wasmPath: string | Uint8Array,
@@ -775,6 +859,17 @@ export async function generateVoteProof(
     rustAvailable: USE_RUST_PROVER,
   });
   if (plan.route === "unavailable") {
+    // If device cannot prove locally (e.g. mobile/constrained memory), route to remote prover if configured
+    const remoteUrl =
+      typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_REMOTE_PROVER_URL;
+    if (remoteUrl) {
+      const circuitVersion = input.circuitVersion ?? "v1";
+      return generateVoteProofRemote(input as unknown as Record<string, unknown>, {
+        remoteUrl,
+        circuitId: circuitVersion === "v2" ? "vote_v2" : "vote_v1",
+        circuitVersion: circuitVersion === "v2" ? 2 : 1,
+      });
+    }
     throw new Error(plan.reason ?? "This device cannot generate the required election proof.");
   }
   activeProofGenerationCount++;

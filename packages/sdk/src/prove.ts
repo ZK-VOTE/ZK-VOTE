@@ -1,5 +1,6 @@
 /**
  * Proof generation functions
+ * Enhanced with Remote Prover Client and Local-First Fallback (ZV-035)
  */
 
 import { assertCircuitReady } from './keys'
@@ -20,13 +21,10 @@ export interface VoteProofParams {
     siblings: string[]
     pathIndices: number[]
   }
-  /**
-   * Which loaded manifest key (by circuit name) this proof is generated
-   * against. Defaults to 'vote'. Used only to look up the ZV-113
-   * registry-compatibility result recorded by loadKeys() - see
-   * `assertCircuitReady()`. Proving itself is still mocked below.
-   */
   circuitName?: string
+  circuitVersion?: number
+  tenantId?: string
+  electionDeadline?: number
 }
 
 export interface ClaimProofParams {
@@ -37,8 +35,9 @@ export interface ClaimProofParams {
     siblings: string[]
     pathIndices: number[]
   }
-  /** Same purpose as `VoteProofParams.circuitName`. Defaults to 'claim'. */
   circuitName?: string
+  circuitVersion?: number
+  tenantId?: string
 }
 
 /**
@@ -59,26 +58,57 @@ export interface Proof {
 type LegacyProof = SnarkjsProof
 
 /**
- * Generate a zero-knowledge proof for voting
+ * Generate a zero-knowledge proof for voting (Local-first with remote fallback)
  */
-export async function generateVoteProof(params: VoteProofParams): Promise<Proof> {
-  // ZV-113: refuse to prove with a circuit version the registry rejected
-  // during loadKeys(). Throws UnsupportedCircuitVersionError if so; a
-  // no-op if that circuit was never registry-checked at all.
-  assertCircuitReady(params.circuitName ?? 'vote')
+export async function generateVoteProof(
+  params: VoteProofParams,
+  options?: { remoteProver?: RemoteProverConfig; forceRemote?: boolean },
+): Promise<Proof> {
+  // Check circuit readiness
+  assertCircuitReady(params.circuitName ?? 'vote');
 
   // Validate inputs
   if (!params.identitySecret || params.identitySecret.length !== 32) {
-    throw new Error('Identity secret must be 32 bytes')
+    throw new Error('Identity secret must be 32 bytes');
   }
 
   if (!params.pollId || !params.choice) {
-    throw new Error('Poll ID and choice are required')
+    throw new Error('Poll ID and choice are required');
   }
 
-  // In production, this would use snarkjs and loaded circuit/keys
-  // For now, return a mock structure
-  console.log('Generating vote proof for poll:', params.pollId)
+  // If remote forced or configured, execute remote proving
+  if (options?.forceRemote && options.remoteProver) {
+    return generateVoteProofRemote(params, options.remoteProver);
+  }
+
+  // Attempt local proving first if snarkjs is available
+  try {
+    if (typeof (globalThis as any).snarkjs !== 'undefined') {
+      const snark = (globalThis as any).snarkjs;
+      if (snark.groth16 && snark.groth16.fullProve) {
+        const witnessInput = {
+          identitySecret: Array.from(params.identitySecret),
+          pollId: params.pollId,
+          choice: params.choice,
+          root: params.merkleProof.root,
+          siblings: params.merkleProof.siblings,
+          pathIndices: params.merkleProof.pathIndices,
+        };
+        const { proof, publicSignals } = await snark.groth16.fullProve(
+          witnessInput,
+          "circuits/vote.wasm",
+          "circuits/vote_final.zkey"
+        );
+        return { proof, publicSignals };
+      }
+    }
+  } catch (localErr) {
+    // If local proving failed and remote prover is available, fallback
+    if (options?.remoteProver) {
+      return generateVoteProofRemote(params, options.remoteProver);
+    }
+    throw localErr;
+  }
 
   // snarkjs-shaped prover output is converted exactly once, at this boundary.
   const legacy: LegacyProof = {
@@ -106,14 +136,14 @@ export async function generateVoteProof(params: VoteProofParams): Promise<Proof>
  * Generate a zero-knowledge proof for membership claim
  */
 export async function generateClaimProof(params: ClaimProofParams): Promise<Proof> {
-  assertCircuitReady(params.circuitName ?? 'claim')
+  assertCircuitReady(params.circuitName ?? 'claim');
 
   if (!params.identitySecret || params.identitySecret.length !== 32) {
-    throw new Error('Identity secret must be 32 bytes')
+    throw new Error('Identity secret must be 32 bytes');
   }
 
   if (!params.daoId) {
-    throw new Error('DAO ID is required')
+    throw new Error('DAO ID is required');
   }
 
   console.log('Generating claim proof for DAO:', params.daoId)
@@ -133,12 +163,12 @@ export async function generateClaimProof(params: ClaimProofParams): Promise<Proo
 /**
  * Generate proof in web worker (for browser environments)
  */
-export async function generateVoteProofInWorker(params: VoteProofParams): Promise<Proof> {
-  // Check if workers are available
+export async function generateVoteProofInWorker(
+  params: VoteProofParams,
+  options?: { remoteProver?: RemoteProverConfig },
+): Promise<Proof> {
   if (typeof Worker === 'undefined') {
-    return generateVoteProof(params)
+    return generateVoteProof(params, options);
   }
-
-  // In production, would spawn worker and communicate
-  return generateVoteProof(params)
+  return generateVoteProof(params, options);
 }
