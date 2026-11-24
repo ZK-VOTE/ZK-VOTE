@@ -1208,6 +1208,200 @@ export const outboxLagGauge = new Gauge({
 });
 
 // ============================================
+// STORAGE FOOTPRINT & RENT METRICS (ZV-032 / #881)
+// Bounded cardinality: labels are bounded by category, priority, reason, status
+// ============================================
+
+export const storageEntriesUsage = new Gauge({
+  name: "zkvote_storage_entries_usage",
+  help: "Current persistent storage entries by category and usage level",
+  labelNames: ["category", "status"] as const,
+  registers: [register],
+});
+
+export const storageBytesUsage = new Gauge({
+  name: "zkvote_storage_bytes_usage",
+  help: "Current persistent storage byte usage by category",
+  labelNames: ["category"] as const,
+  registers: [register],
+});
+
+export const storageLimitsConfigured = new Gauge({
+  name: "zkvote_storage_limits_configured",
+  help: "Aggregated configured storage entry and byte caps",
+  labelNames: ["type"] as const, // "entries" | "bytes"
+  registers: [register],
+});
+
+export const storageQuotaRejectionsTotal = new Counter({
+  name: "zkvote_storage_quota_rejections_total",
+  help: "Total writes rejected due to per-DAO storage footprint limits",
+  labelNames: ["category", "reason"] as const,
+  registers: [register],
+});
+
+// TTL Budget Metrics
+export const ttlBudgetConsumptionTotal = new Counter({
+  name: "zkvote_ttl_budget_consumption_total",
+  help: "Total TTL-extension budget units consumed",
+  labelNames: ["priority"] as const,
+  registers: [register],
+});
+
+export const ttlExtensionRejectionsTotal = new Counter({
+  name: "zkvote_ttl_extension_rejections_total",
+  help: "Total TTL extensions rejected due to budget exhaustion or priority rules",
+  labelNames: ["priority", "reason"] as const,
+  registers: [register],
+});
+
+export const ttlBudgetExhaustionWarnings = new Counter({
+  name: "zkvote_ttl_budget_exhaustion_warnings_total",
+  help: "Warnings triggered when a DAO approaches TTL budget exhaustion",
+  labelNames: ["priority"] as const,
+  registers: [register],
+});
+
+// Archival & Commitment Metrics
+export const archivalOperationsTotal = new Counter({
+  name: "zkvote_archival_operations_total",
+  help: "Total archival lifecycle operations (archive, restore, recommit)",
+  labelNames: ["operation", "status"] as const,
+  registers: [register],
+});
+
+export const archivalVerificationFailuresTotal = new Counter({
+  name: "zkvote_archival_verification_failures_total",
+  help: "Total cryptographic commitment verification failures during cold-state restoration",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+// ============================================
+// STORAGE RENT & TTL ALERTING (ZV-032 / ZV-044)
+// ============================================
+
+const recentAlerts = new Map<string, number>();
+const ALERT_DEDUPLICATION_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function shouldSuppressAlert(alertKey: string): boolean {
+  const now = Date.now();
+  const lastEmitted = recentAlerts.get(alertKey);
+  if (lastEmitted && now - lastEmitted < ALERT_DEDUPLICATION_WINDOW_MS) {
+    return true;
+  }
+  recentAlerts.set(alertKey, now);
+  return false;
+}
+
+export interface StorageAlertPayload {
+  alertType:
+    | "footprint_limit_warning"
+    | "footprint_limit_exceeded"
+    | "ttl_budget_warning"
+    | "ttl_budget_exhausted"
+    | "archival_failure"
+    | "verification_failure";
+  level: "warn" | "error";
+  daoId?: number;
+  details: Record<string, unknown>;
+}
+
+/**
+ * Dispatch or log rent and storage alerts. Integrates with ZV-044 alerting if
+ * configured, or surfaces structured logger alerts with deduplication.
+ */
+export function dispatchRentAlert(payload: StorageAlertPayload): void {
+  const alertKey = `${payload.alertType}:${payload.daoId ?? "global"}:${JSON.stringify(payload.details)}`;
+  if (shouldSuppressAlert(alertKey)) {
+    return;
+  }
+
+  // Check if ZV-044 global alert dispatcher exists
+  const globalAlertManager = (globalThis as any).__ZV044_ALERT_MANAGER__;
+  if (globalAlertManager && typeof globalAlertManager.dispatch === "function") {
+    try {
+      globalAlertManager.dispatch({
+        service: "storage_rent_enforcement",
+        type: payload.alertType,
+        level: payload.level,
+        daoId: payload.daoId,
+        details: payload.details,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    } catch (_) {
+      // Fallback to structured logging on dispatcher error
+    }
+  }
+
+  // Structured logging (redaction-safe)
+  console.warn(
+    JSON.stringify({
+      level: payload.level,
+      event: `alert_${payload.alertType}`,
+      daoId: payload.daoId,
+      details: payload.details,
+      timestamp: new Date().toISOString(),
+      integration: "zv044_fallback_logged",
+    }),
+  );
+}
+
+export function checkStorageFootprintAlert(
+  daoId: number,
+  currentEntries: number,
+  maxEntries: number,
+  currentBytes: number,
+  maxBytes: number,
+): void {
+  const entryRatio = maxEntries > 0 ? currentEntries / maxEntries : 0;
+  const byteRatio = maxBytes > 0 ? currentBytes / maxBytes : 0;
+
+  if (entryRatio >= 1.0 || byteRatio >= 1.0) {
+    dispatchRentAlert({
+      alertType: "footprint_limit_exceeded",
+      level: "error",
+      daoId,
+      details: { currentEntries, maxEntries, currentBytes, maxBytes, entryRatio, byteRatio },
+    });
+  } else if (entryRatio >= 0.85 || byteRatio >= 0.85) {
+    dispatchRentAlert({
+      alertType: "footprint_limit_warning",
+      level: "warn",
+      daoId,
+      details: { currentEntries, maxEntries, currentBytes, maxBytes, entryRatio, byteRatio },
+    });
+  }
+}
+
+export function checkTtlBudgetAlert(
+  daoId: number,
+  consumedBudget: number,
+  maxBudget: number,
+  priority: string,
+): void {
+  const ratio = maxBudget > 0 ? consumedBudget / maxBudget : 0;
+  if (ratio >= 1.0) {
+    ttlBudgetExhaustionWarnings.inc({ priority });
+    dispatchRentAlert({
+      alertType: "ttl_budget_exhausted",
+      level: "error",
+      daoId,
+      details: { consumedBudget, maxBudget, priority, ratio },
+    });
+  } else if (ratio >= 0.8) {
+    ttlBudgetExhaustionWarnings.inc({ priority });
+    dispatchRentAlert({
+      alertType: "ttl_budget_warning",
+      level: "warn",
+      daoId,
+      details: { consumedBudget, maxBudget, priority, ratio },
+    });
+  }
+}
+
+// ============================================
 // METRICS CARDINALITY GOVERNANCE & AUDIT (#749)
 // ============================================
 

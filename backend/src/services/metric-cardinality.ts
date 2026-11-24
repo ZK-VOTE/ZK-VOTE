@@ -121,6 +121,7 @@ export const LABEL_POLICY: Readonly<Record<string, LabelBound>> = Object.freeze(
       64,
       "DB / service operation names; single-flight key prefixes via normalizeCoalesceKey()",
     ),
+    category: capped(16, "storage and rent categories"),
     type: capped(32, "event or object types (code-defined)"),
     event_type: capped(64, "indexed contract event types"),
     pattern: capped(32, "abuse patterns"),
