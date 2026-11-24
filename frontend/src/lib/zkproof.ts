@@ -11,6 +11,9 @@ import { assertValidFieldElement, assertValidNullifier } from "../types/index";
 import { workerAvailable, proveInWorker } from "./proveInWorker";
 import { withMaskedTiming } from "./proofTiming";
 import { selectProvingPlan } from "./devicePreflight";
+// ZKV1 is generated from shared/protocol-manifest.json. The snarkjs -> ZKV1
+// conversion lives there so frontend, SDK and backend use identical bytes.
+import { snarkjsToZkv1, type SnarkjsProof } from "../generated/zkv1";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -1096,29 +1099,14 @@ export function formatProofForSoroban(proof: Groth16Proof): {
   proof_b: string;
   proof_c: string;
 } {
-  // Convert field element to BIG-ENDIAN hex (no reversal needed)
-  const toHexBE = (value: string): string => {
-    const bigInt = BigInt(value);
-    return bigInt.toString(16).padStart(64, "0");
+  // Deprecated compatibility wrapper: the canonical conversion now lives in
+  // the generated ZKV1 adapter (one boundary for SDK, frontend and backend).
+  const zkv1 = snarkjsToZkv1(proof as unknown as SnarkjsProof);
+  return {
+    proof_a: zkv1.a.slice(2),
+    proof_b: zkv1.b.slice(2),
+    proof_c: zkv1.c.slice(2),
   };
-
-  // Format pi_a (G1 point): be_bytes(X) || be_bytes(Y)
-  const proof_a = toHexBE(proof.pi_a[0]) + toHexBE(proof.pi_a[1]);
-
-  // Format pi_b (G2 point): [[x.c0, x.c1], [y.c0, y.c1]]
-  // Ethereum/Soroban format: be_bytes(X_c1) || be_bytes(X_c0) || be_bytes(Y_c1) || be_bytes(Y_c0)
-  // snarkjs outputs: [[c0, c1], [c0, c1]] where c0=real, c1=imaginary
-  // We swap within each coordinate pair: [c1, c0, c1, c0]
-  const proof_b =
-    toHexBE(proof.pi_b[0][1]) + // X.c1 (imaginary)
-    toHexBE(proof.pi_b[0][0]) + // X.c0 (real)
-    toHexBE(proof.pi_b[1][1]) + // Y.c1 (imaginary)
-    toHexBE(proof.pi_b[1][0]); // Y.c0 (real)
-
-  // Format pi_c (G1 point): be_bytes(X) || be_bytes(Y)
-  const proof_c = toHexBE(proof.pi_c[0]) + toHexBE(proof.pi_c[1]);
-
-  return { proof_a, proof_b, proof_c };
 }
 
 /**

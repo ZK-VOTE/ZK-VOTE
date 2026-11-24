@@ -17,8 +17,7 @@ import {
   Eye,
   Vote,
 } from "lucide-react";
-
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+import { RELAYER_URL } from "../config/env";
 
 interface ProposalMetadata {
   version: number;

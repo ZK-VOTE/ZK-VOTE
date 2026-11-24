@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "release": "2.0.0-upgrade-handshake",
+  "description": "Protocol-level compatibility manifest. Every contract in a release train must satisfy the declared versions before commit; prepare/verify/commit is coordinated by backend/src/services/upgradeCoordinator.ts.",
+  "contracts": {
+    "dao-registry": {
+      "version": 1,
+      "storageVersion": 1,
+      "minVersion": 1
+    },
+    "circuit-registry": {
+      "version": 1,
+      "storageVersion": 1,
+      "minVersion": 1
+    },
+    "membership-sbt": {
+      "version": 1,
+      "storageVersion": 1,
+      "minVersion": 1
+    },
+    "membership-tree": {
+      "version": 1,
+      "storageVersion": 1,
+      "minVersion": 1
+    },
+    "voting": {
+      "version": 2,
+      "storageVersion": 1,
+      "minVersion": 2,
+      "circuitId": "vote_v1"
+    },
+    "comments": {
+      "version": 1,
+      "storageVersion": 1,
+      "minVersion": 1,
+      "circuitId": "comment_v2"
+    }
+  },
+  "backendSchemaVersion": 19,
+  "upgradeOrder": [
+    "dao-registry",
+    "circuit-registry",
+    "membership-sbt",
+    "membership-tree",
+    "voting",
+    "comments"
+  ],
+  "rollbackOrder": [
+    "comments",
+    "voting",
+    "membership-tree",
+    "membership-sbt",
+    "circuit-registry",
+    "dao-registry"
+  ],
+  "readiness": {
+    "pauseVoteSubmissionDuringMigration": true,
+    "requireBackendSchemaMatch": true,
+    "requireNoCircuitOverlap": true
+  }
+}

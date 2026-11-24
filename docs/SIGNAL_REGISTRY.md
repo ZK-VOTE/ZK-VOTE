@@ -5,7 +5,7 @@
 In Groth16 zk-SNARK verification on Soroban (and EVM precompiles), public signals must match an exact, deterministic index order.
 If signals are transposed (e.g. `daoId` swapped with `proposalId`, or `nullifier` swapped with `daoId`), a cryptographic pairing check may succeed against an invalid semantic statement—allowing votes or actions to be silently credited to the wrong election scope.
 
-This document serves as the **authoritative, versioned Public Signal Registry** for all ZK-VOTE circuit families, conversion pipelines (`convert_proof_to_soroban_be.js`, `convert_vkey_to_soroban_be.js`), contract verification assembly (`zkvote-groth16`), and smart contracts (`contracts/voting/`, `contracts/comments/`).
+This document is the human-readable view of the **authoritative, versioned Public Signal Registry**. The machine-readable source of truth is `shared/protocol-manifest.json`; `scripts/generate-bindings.mjs` renders its signal tuples into the frontend, backend and SDK bindings and into the Rust verifier. `scripts/drift-guard.mjs` compares the manifest against this document, the circom `component main {public [...]}` declarations and the contract/frontend counts, so an order or count change fails CI before a vote is ever cast.
 
 ---
 

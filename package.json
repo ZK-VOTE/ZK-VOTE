@@ -292,7 +292,13 @@
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "prepare": "husky"
+    "prepare": "husky",
+    "protocol:generate": "node scripts/generate-bindings.mjs",
+    "protocol:check": "node scripts/generate-bindings.mjs --check",
+    "drift:check": "node scripts/drift-guard.mjs",
+    "drift:fix": "node scripts/drift-guard.mjs --fix",
+    "test:drift": "node --test scripts/test/drift-guard.test.mjs",
+    "test:upgrade-drill": "node --experimental-strip-types --test tests/chaos/scenarios/upgrade-migration.ts"
   },
   "repository": {
     "type": "git",

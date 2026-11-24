@@ -11,6 +11,7 @@ import { createRequire } from "node:module";
 
 import { config } from "../config.js";
 import { log } from "./logger.js";
+import { zkv1ToSnarkjs } from "../generated/zkv1.js";
 
 const require = createRequire(import.meta.url);
 
@@ -86,23 +87,13 @@ export function flattenedProofToSnarkjs(
     throw new Error("zero_proof");
   }
 
-  const xc1 = hexToDecString(b.slice(0, 64));
-  const xc0 = hexToDecString(b.slice(64, 128));
-  const yc1 = hexToDecString(b.slice(128, 192));
-  const yc0 = hexToDecString(b.slice(192, 256));
-
-  return {
-    pi_a: [hexToDecString(a.slice(0, 64)), hexToDecString(a.slice(64, 128)), "1"],
-    // snarkjs expects [[c0, c1], [c0, c1]]
-    pi_b: [
-      [xc0, xc1],
-      [yc0, yc1],
-      ["1", "0"],
-    ],
-    pi_c: [hexToDecString(c.slice(0, 64)), hexToDecString(c.slice(64, 128)), "1"],
-    protocol: "groth16",
-    curve: "bn128",
-  };
+  // Reverse conversion is performed by the same generated ZKV1 adapter used
+  // by the SDK and frontend; no second hand-rolled c0/c1 swap remains here.
+  return zkv1ToSnarkjs({
+    a: proof.a,
+    b: proof.b,
+    c: proof.c,
+  }) as SnarkjsProof;
 }
 
 export function buildBridgePublicSignals(inputs: BridgePublicInputs): string[] {

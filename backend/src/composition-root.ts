@@ -28,6 +28,8 @@ import {
 } from "./services/stellar.js";
 import type { StellarContext } from "./services/interfaces.js";
 import { initCircuitRegistry } from "./services/circuit-registry.js";
+import { LedgerService } from "./services/ledger.js";
+import { bootDualWrite } from "./services/dualWriteBoot.js";
 import { initHaltStatus } from "./services/haltStatus.js";
 import { initAntiSpam } from "./services/anti-spam.js";
 import { initTtlService } from "./services/ttl.js";
@@ -61,6 +63,8 @@ export interface AppServices {
   stellar: StellarContext;
   /** Background job scheduler for maintenance and session cleanup. */
   scheduler: JobScheduler;
+  /** Double-entry ledger. Uses the shared Kysely handle; previously unwired. */
+  ledger: LedgerService;
 }
 
 /**
@@ -70,6 +74,10 @@ export interface AppServices {
  * dependencies from here instead.
  */
 export function buildAppServices(): AppServices {
+  // Attach the shadow writer once, at boot. Off by default; a missing URL or a
+  // failed pool construction leaves the primary store untouched.
+  void bootDualWrite();
+
   const stellar: StellarContext = {
     server,
     relayerKeypair,
@@ -246,5 +254,9 @@ export function buildAppServices(): AppServices {
     ],
   });
 
-  return { config, logger, stellar, scheduler: defaultJobScheduler };
+  // The ledger is Kysely-native; routing it through the shared handle makes
+  // its writes use the same dialect as every other repository-backed path.
+  const ledger = new LedgerService(kysely as unknown as ConstructorParameters<typeof LedgerService>[0]);
+
+  return { config, logger, stellar, scheduler: defaultJobScheduler, ledger };
 }
