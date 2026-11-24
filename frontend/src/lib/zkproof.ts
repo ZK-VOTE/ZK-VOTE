@@ -430,6 +430,7 @@ export async function fetchVersionedVK(
   circuitId: string,
   version: number,
   fetchFn: typeof fetch = fetch,
+  circuitType: "Vote" | "Comment" = "Vote",
 ): Promise<VersionedVK> {
   const key = vkCacheKey(circuitId, version);
   const cached =
@@ -442,7 +443,7 @@ export async function fetchVersionedVK(
   const relayerUrl =
     (import.meta as unknown as { env: Record<string, string> })?.env
       ?.VITE_RELAYER_URL ?? "http://localhost:3001";
-  const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}`;
+  const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}?type=${circuitType.toLowerCase()}`;
 
   const res = await fetchFn(url);
   if (res.status === 410 || res.status === 409) {
@@ -458,9 +459,29 @@ export async function fetchVersionedVK(
   }
 
   const data = await res.json();
-  // Backend returns { vk, version, hash, numPublicSignals, vkVersion } or { verificationKey }
+  // Backend returns { vk, version, hash, hashScheme, numPublicSignals } or { verificationKey }
   const vk = data.vk ?? data.verificationKey ?? data;
   const hash: string = data.hash ?? data.vkHash ?? (await computeVKHash(vk));
+
+  // When the relayer marks the hash as a registry canonical hash, verify it
+  // client-side against the same canonical record before trusting or caching.
+  // A mismatched hash means the response is forged, stale, or from a different
+  // registry — fail closed.
+  if (data.hashScheme === "registry-v1") {
+    const canonical = await computeVKHash({
+      circuitId,
+      circuitType,
+      version: data.version ?? version,
+      vk,
+      numPublicSignals: data.numPublicSignals,
+    });
+    if (canonical !== hash) {
+      invalidateVKCache(circuitId, version);
+      throw new Error(
+        `VK hash mismatch for ${circuitId} v${version}: registry response is not authoritative`,
+      );
+    }
+  }
 
   // CRITICAL (#660): Bind VK to the backend version for integrity verification
   const entry: VersionedVK = {
@@ -1282,6 +1303,18 @@ export async function verifyProofWithVersionedVK(
   version: number,
 ): Promise<boolean> {
   const vkEntry = await fetchVersionedVK(circuitId, version);
+  // Bind verification to the registry's circuit ID and public-signal count.
+  if (vkEntry.circuitId !== circuitId) {
+    throw new Error(
+      `VK registry returned ${vkEntry.circuitId}; expected ${circuitId}`,
+    );
+  }
+  if (
+    typeof vkEntry.numPublicSignals === "number" &&
+    publicSignals.length !== vkEntry.numPublicSignals
+  ) {
+    return false;
+  }
   try {
     const { groth16 } = await import("snarkjs");
     const result = await groth16.verify(

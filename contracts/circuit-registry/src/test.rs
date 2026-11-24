@@ -73,6 +73,19 @@ fn test_register_circuit() {
 }
 
 #[test]
+fn test_circuit_version_starts_at_one() {
+    let (env, registry, _governance) = setup_env();
+    let client = CircuitRegistryClient::new(&env, &registry);
+    let vk = create_test_vk(&env);
+    let circuit_id = String::from_str(&env, "vote_v1");
+    let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
+
+    assert_eq!(client.get_circuit_version(&circuit_id, &CircuitType::Vote), 1);
+}
+
+#[test]
 fn test_get_vk() {
     let (env, registry, _governance) = setup_env();
     let client = CircuitRegistryClient::new(&env, &registry);

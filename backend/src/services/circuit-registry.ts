@@ -1,6 +1,19 @@
 // @ts-nocheck
+import crypto from "crypto";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import type { LoggerPort, RpcServerPort } from "./interfaces.js";
+import { config } from "../config.js";
+import { getDb } from "./db.js";
+import { ensureDurableSchema, type SqliteLike } from "./durable-schema.js";
+import { circuitRegistryOperationsTotal } from "./metrics.js";
+
+/** Raised when the on-chain registry is unavailable in production mode. */
+export class CircuitRegistryUnavailableError extends Error {
+  constructor(reason: string) {
+    super(`circuit registry unavailable: ${reason}`);
+    this.name = "CircuitRegistryUnavailableError";
+  }
+}
 
 /**
  * Dependencies the circuit-registry service needs, injected explicitly via
@@ -48,6 +61,7 @@ export interface CircuitInfo {
   registeredAt: number;
   expiration: number;
   numPublicSignals: number;
+  wasmHash?: string;
 }
 
 export interface CircuitVKResult {
@@ -59,6 +73,10 @@ export interface CircuitVKResult {
     ic: string[];
   };
   numPublicSignals: number;
+  /** Deterministic hash of the canonical on-chain record (not a mock value). */
+  hash: string;
+  version: number;
+  circuitId: string;
 }
 
 export interface CircuitStatus {
@@ -104,6 +122,20 @@ class CircuitRegistryCache {
     }
     return result;
   }
+
+  /** Drop one version, a whole circuit, or every cached circuit record. */
+  invalidate(circuitId?: string, circuitType?: string, _version?: number): void {
+    if (!circuitId) {
+      this.circuits.clear();
+      this.lastFetch = 0;
+      return;
+    }
+    for (const key of Array.from(this.circuits.keys())) {
+      if (key === `${circuitType ?? "Vote"}:${circuitId}` || key.endsWith(`:${circuitId}`)) {
+        this.circuits.delete(key);
+      }
+    }
+  }
 }
 
 const cache = new CircuitRegistryCache();
@@ -116,6 +148,10 @@ export function getCache(): CircuitRegistryCache {
   return cache;
 }
 
+/**
+ * Resolve the current circuit version from the on-chain registry. There is
+ * deliberately no mock fallback in production: a registry outage fails closed.
+ */
 export async function getCurrentVersion(
   circuitId: string,
 ): Promise<number | null> {
@@ -123,19 +159,67 @@ export async function getCurrentVersion(
   if (cached && Date.now() - cached.fetchedAt < VERSION_TTL_MS) {
     return cached.version;
   }
-  // Try to fetch from contract: get_current_version or fallback to 1
-  // If not configured, return mock version based on circuitId
-  const mockVersions: Record<string, number> = {
-    vote_v1: 1,
-    vote_v2: 2,
-    weighted_vote: 1,
-    bridge: 1,
-    comment: 1,
-    comment_v2: 2,
+
+  const args = [
+    StellarSdk.nativeToScVal(circuitId, { type: "string" }),
+    StellarSdk.nativeToScVal("Vote", { type: "symbol" }),
+  ];
+  const response = await simulateContractCall("get_circuit_version", args);
+  if (!response?.result) {
+    circuitRegistryOperationsTotal.inc({ operation: "get_current_version", result: "unavailable" });
+    if (config.circuitRegistryAllowMock && config.testMode) return null;
+    throw new CircuitRegistryUnavailableError(
+      `get_circuit_version(${circuitId}) returned no simulation result`,
+    );
+  }
+  let version: number;
+  try {
+    const value = response.result.retval;
+    version = Number(value.u32?.() ?? value.i32?.() ?? 0);
+  } catch {
+    throw new CircuitRegistryUnavailableError(
+      `get_circuit_version(${circuitId}) returned an unexpected value type`,
+    );
+  }
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw new CircuitRegistryUnavailableError(
+      `get_circuit_version(${circuitId}) returned an invalid version`,
+    );
+  }
+  versionCache.set(circuitId, { version, fetchedAt: Date.now() });
+  circuitRegistryOperationsTotal.inc({ operation: "get_current_version", result: "resolved" });
+  return version;
+}
+
+/**
+ * Invalidate cached on-chain VKs after a VkProposal execution. Writes a durable
+ * revocation record so replicas that missed the event cannot serve a stale VK.
+ */
+export function invalidateCircuitVkCache(
+  circuitId: string,
+  circuitType: "Vote" | "Comment",
+  version?: number,
+  reason = "vk_proposal_executed",
+): void {
+  invalidateVersionCache(circuitId);
+  getCache().invalidate(circuitId, circuitType, version);
+  const db = getDb() as unknown as SqliteLike & {
+    prepare(sql: string): { run(...params: unknown[]): { changes: number } };
   };
-  const ver = mockVersions[circuitId] ?? 1;
-  versionCache.set(circuitId, { version: ver, fetchedAt: Date.now() });
-  return ver;
+  ensureDurableSchema(db);
+  if (version === undefined) {
+    db.prepare("DELETE FROM circuit_vk_cache WHERE circuit_id = ? AND circuit_type = ?")
+      .run(circuitId, circuitType);
+  } else {
+    db.prepare(
+      "DELETE FROM circuit_vk_cache WHERE circuit_id = ? AND circuit_type = ? AND version <= ?",
+    ).run(circuitId, circuitType, version);
+    db.prepare(
+      `INSERT OR REPLACE INTO circuit_vk_revocations
+         (circuit_id, circuit_type, version, reason, revoked_at) VALUES (?, ?, ?, ?, ?)`,
+    ).run(circuitId, circuitType, version, reason, Date.now());
+  }
+  circuitRegistryOperationsTotal.inc({ operation: "cache_invalidate", result: "executed" });
 }
 
 export function isStaleVersion(requested: number, current: number): boolean {
@@ -257,7 +341,11 @@ export async function getVK(
   ];
 
   const response = await simulateContractCall("get_vk", args);
-  if (!response?.result) return null;
+  if (!response?.result) {
+    circuitRegistryOperationsTotal.inc({ operation: "get_vk", result: "unavailable" });
+    if (config.circuitRegistryAllowMock && config.testMode) return null;
+    throw new CircuitRegistryUnavailableError(`get_vk(${circuitId}) returned no result`);
+  }
 
   const scVal = response.result.retval;
   const mapEntries = scVal.map() ?? [];
@@ -288,10 +376,71 @@ export async function getVK(
     }
   }
 
-  return {
-    vk: parsed.vk as CircuitVKResult["vk"],
-    numPublicSignals: parsed.num_public_signals as number,
+  const vk = parsed.vk as CircuitVKResult["vk"];
+  const numPublicSignals = parsed.num_public_signals as number;
+  const version = (await getCurrentVersion(circuitId).catch(() => null)) ?? 1;
+  const canonical = JSON.stringify({
+    circuitId,
+    circuitType,
+    version,
+    vk,
+    numPublicSignals,
+  });
+  const hash = crypto.createHash("sha256").update(canonical).digest("hex");
+
+  // Durable cache: clients resolve the same VK for a given DAO/circuit/version.
+  try {
+    const db = getDb() as unknown as SqliteLike & {
+      prepare(sql: string): { run(...params: unknown[]): { changes: number } };
+    };
+    ensureDurableSchema(db);
+    const revoked = db
+      .prepare(
+        "SELECT 1 FROM circuit_vk_revocations WHERE circuit_id = ? AND circuit_type = ? AND version >= ?",
+      )
+      .get(circuitId, circuitType, version);
+    if (!revoked) {
+      db.prepare(
+        `INSERT OR REPLACE INTO circuit_vk_cache
+           (circuit_id, circuit_type, version, vk_json, hash, num_public_signals, fetched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(circuitId, circuitType, version, JSON.stringify(vk), hash, numPublicSignals, Date.now());
+    }
+  } catch {
+    // Cache is an optimization; the on-chain result above is authoritative.
+  }
+  circuitRegistryOperationsTotal.inc({ operation: "get_vk", result: "resolved" });
+
+  return { vk, numPublicSignals, hash, version, circuitId };
+}
+
+/** Read a cached VK from the durable store (never used as authority on miss). */
+export function getCachedRegistryVK(
+  circuitId: string,
+  circuitType: "Vote" | "Comment",
+  version: number,
+): CircuitVKResult | null {
+  const db = getDb() as unknown as SqliteLike & {
+    prepare(sql: string): { get(...params: unknown[]): unknown };
   };
+  ensureDurableSchema(db);
+  const row = db
+    .prepare(
+      `SELECT vk_json, hash, num_public_signals FROM circuit_vk_cache
+        WHERE circuit_id = ? AND circuit_type = ? AND version = ?`,
+    )
+    .get(circuitId, circuitType, version) as
+    | { vk_json: string; hash: string; num_public_signals: number }
+    | undefined;
+  if (!row) return null;
+  return {
+    circuitId,
+    circuitType,
+    version,
+    vk: JSON.parse(row.vk_json) as CircuitVKResult["vk"],
+    hash: row.hash,
+    numPublicSignals: row.num_public_signals,
+  } as CircuitVKResult;
 }
 
 export async function getCircuitInfo(
@@ -454,15 +603,27 @@ export async function approveVkUpgrade(proposalId: number, approver: string): Pr
 }
 
 export async function executeVkUpgrade(proposalId: number, executor: string): Promise<void> {
+  const proposal = await getVkProposal(proposalId);
   const args = [
     StellarSdk.nativeToScVal(proposalId, { type: "u32" }),
     StellarSdk.nativeToScVal(executor, { type: "address" }),
   ];
 
   const response = await simulateContractCall("execute_vk_upgrade", args);
-  if (StellarSdk.rpc.Api.isSimulationError(response)) {
-    throw new Error(response.error);
+  if (!response?.result || StellarSdk.rpc.Api.isSimulationError(response)) {
+    circuitRegistryOperationsTotal.inc({ operation: "execute_vk_upgrade", result: "failed" });
+    throw new Error("Failed to execute VK upgrade on-chain");
   }
+  // Rotation is live: every replica must stop serving the old VK immediately.
+  if (proposal) {
+    invalidateCircuitVkCache(
+      proposal.circuitId,
+      proposal.circuitType,
+      undefined,
+      `vk_proposal_${proposalId}_executed`,
+    );
+  }
+  circuitRegistryOperationsTotal.inc({ operation: "execute_vk_upgrade", result: "executed" });
 }
 
 export async function cancelVkUpgrade(proposalId: number, canceller: string): Promise<void> {

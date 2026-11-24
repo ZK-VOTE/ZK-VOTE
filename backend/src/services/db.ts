@@ -1467,6 +1467,11 @@ export function initDb(dbPath?: string): DatabaseType {
     );
   `);
 
+  // Durable state for the factory saga, shared rate limiter, VDF ordering and
+  // circuit-registry caches. Installed here so every store can rely on the
+  // tables existing before the first request (and before migrations run).
+  ensureDurableSchema(database);
+
   const versionRow = database
     .prepare("SELECT value FROM metadata WHERE key = 'schema_version'")
     .get() as MetadataRow | undefined;

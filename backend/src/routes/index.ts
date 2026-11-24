@@ -24,6 +24,7 @@ export { default as adminRoutes } from "./admin.js";
 export { default as thresholdRoutes } from "./threshold.js";
 export { default as auditRoutes } from "./audit.js";
 export { default as randomnessRoutes } from "./randomness.js";
+export { default as factoryRoutes } from "./factory.js";
 export { default as payRoutes } from "./pay.js";
 export { default as swapRoutes } from "./swap.js";
 export { default as rampRoutes } from "./ramp.js";

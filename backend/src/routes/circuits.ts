@@ -1,4 +1,5 @@
 // @ts-nocheck
+import crypto from "crypto";
 import { Router, type Request, type Response } from "express";
 
 import { log } from "../services/logger.js";
@@ -15,12 +16,45 @@ import {
   cancelVkUpgrade,
   getVkProposal,
   getDaoVkProposal,
+  CircuitRegistryUnavailableError,
   getCompatibilityMatrix,
 } from "../services/circuit-registry.js";
 import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();
+
+// Register the literal `proposal` routes BEFORE `/:circuitId/:version`, which
+// would otherwise shadow them and return a VK for circuitId="proposal".
+router.get("/circuits/vk/proposal/dao/:daoId", queryLimiter, (async (
+  req: Request,
+  res: Response,
+) => {
+  const { daoId } = req.params;
+  try {
+    const proposal = await getDaoVkProposal(Number(daoId));
+    if (!proposal) return res.status(404).json({ error: "No pending VK proposal for DAO" });
+    return res.json(proposal);
+  } catch (error) {
+    log("error", "dao_vk_proposal_error", { daoId, error: (error as Error).message });
+    return res.status(500).json({ error: "Failed to fetch DAO VK proposal" });
+  }
+}) as AsyncHandler);
+
+router.get("/circuits/vk/proposal/:proposalId", queryLimiter, (async (
+  req: Request,
+  res: Response,
+) => {
+  const { proposalId } = req.params;
+  try {
+    const proposal = await getVkProposal(Number(proposalId));
+    if (!proposal) return res.status(404).json({ error: "VK proposal not found" });
+    return res.json(proposal);
+  } catch (error) {
+    log("error", "vk_proposal_error", { proposalId, error: (error as Error).message });
+    return res.status(500).json({ error: "Failed to fetch VK proposal" });
+  }
+}) as AsyncHandler);
 
 /**
  * GET /circuits/compatibility-matrix - the SDK circuit-compatibility
@@ -109,8 +143,16 @@ router.get("/circuits/:dao/:type/status", queryLimiter, (async (
   }
 }) as AsyncHandler);
 
-// Versioned VK API (ZK-013)
-// GET /circuits/vk/:circuitId/:version -> returns versioned verification key
+function requestedCircuitType(req: Request): "Vote" | "Comment" {
+  const raw = String(req.query.type ?? "vote").toLowerCase();
+  return raw === "comment" ? "Comment" : "Vote";
+}
+
+/**
+ * Versioned VK API. The contract is the only source of truth: there is no mock
+ * hash and no all-zero fallback. Stale versions get 410 so clients invalidate
+ * their cache; unavailable registry fails closed with 503.
+ */
 router.get("/circuits/vk/:circuitId/:version", queryLimiter, (async (
   req: Request,
   res: Response,
@@ -120,11 +162,14 @@ router.get("/circuits/vk/:circuitId/:version", queryLimiter, (async (
   if (isNaN(ver) || ver < 1) {
     return res.status(400).json({ error: "Invalid version" });
   }
+  const circuitType = requestedCircuitType(req);
 
   try {
     const currentVersion = await getCurrentVersion(circuitId);
-    // Mismatch detection: stale version rejected with 410 Gone
-    if (currentVersion !== null && isStaleVersion(ver, currentVersion)) {
+    if (currentVersion === null) {
+      return res.status(503).json({ error: "Circuit registry unavailable" });
+    }
+    if (isStaleVersion(ver, currentVersion)) {
       log("warn", "stale_vk_rejected", {
         circuitId,
         requested: ver,
@@ -138,76 +183,84 @@ router.get("/circuits/vk/:circuitId/:version", queryLimiter, (async (
         isStale: true,
       });
     }
-
-    // Try circuit-registry contract if configured
-    const vkResult = await getVK(circuitId, "Vote").catch(() => null);
-    if (vkResult) {
-      return res.json({
-        circuitId,
-        version: ver,
-        vk: vkResult.vk,
-        hash: `mock_hash_${circuitId}_v${ver}`,
-        numPublicSignals: vkResult.numPublicSignals,
-        currentVersion: currentVersion ?? ver,
-        isStale: false,
-      });
+    if (ver > currentVersion) {
+      return res.status(404).json({ error: "VK version not yet published" });
     }
 
-    // Fallback: serve local VK file if available (for dev/test)
-    // For now return mock VK structure
+    const vkResult = await getVK(circuitId, circuitType);
+    if (!vkResult) {
+      return res.status(503).json({ error: "Circuit registry unavailable" });
+    }
+    // Cannot happen after the checks above, but keeps the invariant explicit.
+    if (vkResult.version !== ver) {
+      return res.status(410).json({
+        error: "Stale VK version",
+        circuitId,
+        requestedVersion: ver,
+        currentVersion: vkResult.version,
+        isStale: true,
+      });
+    }
     return res.json({
       circuitId,
+      circuitType,
       version: ver,
-      vk: {
-        alpha: "0".repeat(128),
-        beta: "0".repeat(256),
-        gamma: "0".repeat(256),
-        delta: "0".repeat(256),
-        ic: ["0".repeat(128)],
-      },
-      hash: `local_vk_hash_${circuitId}_v${ver}`,
-      numPublicSignals: circuitId.includes("weighted")
-        ? 3
-        : circuitId.includes("v2")
-          ? 6
-          : 5,
-      currentVersion: currentVersion ?? ver,
+      vk: vkResult.vk,
+      hash: vkResult.hash,
+      hashScheme: "registry-v1",
+      numPublicSignals: vkResult.numPublicSignals,
+      currentVersion,
       isStale: false,
     });
   } catch (error) {
+    const unavailable = error instanceof CircuitRegistryUnavailableError;
     log("error", "vk_fetch_error", {
       circuitId,
       version: ver,
       error: (error as Error).message,
     });
+    if (unavailable) {
+      return res.status(503).json({ error: "Circuit registry unavailable" });
+    }
     return res.status(500).json({ error: "Failed to fetch VK" });
   }
 }) as AsyncHandler);
 
-// Latest VK for circuit
+// Latest VK for circuit — resolved from the on-chain version counter.
 router.get("/circuits/vk/:circuitId", queryLimiter, (async (
   req: Request,
   res: Response,
 ) => {
   const { circuitId } = req.params;
+  const circuitType = requestedCircuitType(req);
   try {
     const currentVersion = await getCurrentVersion(circuitId);
-    const version = currentVersion ?? 1;
-    const vkResult = await getVK(circuitId, "Vote").catch(() => null);
+    if (currentVersion === null) {
+      return res.status(503).json({ error: "Circuit registry unavailable" });
+    }
+    const vkResult = await getVK(circuitId, circuitType);
+    if (!vkResult) {
+      return res.status(503).json({ error: "Circuit registry unavailable" });
+    }
     return res.json({
       circuitId,
-      version,
-      vk: vkResult?.vk ?? null,
-      hash: `mock_hash_${circuitId}_v${version}`,
-      numPublicSignals: vkResult?.numPublicSignals ?? 5,
-      currentVersion: version,
+      circuitType,
+      version: currentVersion,
+      vk: vkResult.vk,
+      hash: vkResult.hash,
+      hashScheme: "registry-v1",
+      numPublicSignals: vkResult.numPublicSignals,
+      currentVersion,
     });
   } catch (error) {
+    const unavailable = error instanceof CircuitRegistryUnavailableError;
     log("error", "vk_latest_error", {
       circuitId,
       error: (error as Error).message,
     });
-    return res.status(500).json({ error: "Failed to fetch latest VK" });
+    return res.status(unavailable ? 503 : 500).json({
+      error: unavailable ? "Circuit registry unavailable" : "Failed to fetch latest VK",
+    });
   }
 }) as AsyncHandler);
 
@@ -328,42 +381,6 @@ router.post("/circuits/vk/:proposalId/cancel", authGuard, queryLimiter, (async (
   } catch (error) {
     log("error", "vk_cancel_error", { proposalId, error: (error as Error).message });
     return res.status(500).json({ error: "Failed to cancel VK proposal" });
-  }
-}) as AsyncHandler);
-
-// Get VK proposal details
-router.get("/circuits/vk/proposal/:proposalId", queryLimiter, (async (
-  req: Request,
-  res: Response,
-) => {
-  const { proposalId } = req.params;
-  try {
-    const proposal = await getVkProposal(Number(proposalId));
-    if (!proposal) {
-      return res.status(404).json({ error: "VK proposal not found" });
-    }
-    return res.json(proposal);
-  } catch (error) {
-    log("error", "vk_proposal_error", { proposalId, error: (error as Error).message });
-    return res.status(500).json({ error: "Failed to fetch VK proposal" });
-  }
-}) as AsyncHandler);
-
-// Get DAO's pending VK proposal
-router.get("/circuits/vk/proposal/dao/:daoId", queryLimiter, (async (
-  req: Request,
-  res: Response,
-) => {
-  const { daoId } = req.params;
-  try {
-    const proposal = await getDaoVkProposal(Number(daoId));
-    if (!proposal) {
-      return res.status(404).json({ error: "No pending VK proposal for DAO" });
-    }
-    return res.json(proposal);
-  } catch (error) {
-    log("error", "dao_vk_proposal_error", { daoId, error: (error as Error).message });
-    return res.status(500).json({ error: "Failed to fetch DAO VK proposal" });
   }
 }) as AsyncHandler);
 

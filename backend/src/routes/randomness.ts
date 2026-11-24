@@ -23,6 +23,11 @@ import crypto from "crypto";
 
 import { log } from "../services/logger.js";
 import {
+  randomnessStore,
+  OrderingCommittedError,
+} from "../services/randomness-store.js";
+import { randomnessOperationsTotal } from "../services/metrics.js";
+import {
   authGuard,
   auditLog,
   bodyLimit,
@@ -44,8 +49,10 @@ import { z } from "zod";
 
 const router = Router();
 
-// ─── In-memory store (replace with DB-backed store in production) ────────────
-// keyed by `${daoId}` → OrderingState
+// ─── Durable ordering state ──────────────────────────────────────────────────
+// State, shares and checkpoints live in randomnessStore (SQLite). Nothing in
+// this module is kept in process memory, so ordering is replayable after a
+// restart and identical across replicas.
 
 interface ThresholdShare {
   authorityId: string;
@@ -79,8 +86,6 @@ interface OrderingState {
   /** Whether this state has been committed (immutable) */
   committed: boolean;
 }
-
-const orderingStore = new Map<number, OrderingState>();
 
 // ─── Zod schemas ─────────────────────────────────────────────────────────────
 
@@ -193,6 +198,24 @@ function combineShares(shareHexes: string[]): string {
   return combined.toString("hex");
 }
 
+/**
+ * Derive the final seed from persisted inputs only: VDF output XOR-combined
+ * threshold shares. Used both at finalize and independently at verify.
+ */
+function deriveFinalSeed(state: {
+  vdfOutput: string;
+  shares: Array<{ shareHex: string }>;
+}): string {
+  const authorityContribution = combineShares(
+    state.shares.map((s) => s.shareHex),
+  );
+  return crypto
+    .createHash("sha256")
+    .update(Buffer.from(state.vdfOutput, "hex"))
+    .update(Buffer.from(authorityContribution, "hex"))
+    .digest("hex");
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 /**
@@ -221,7 +244,9 @@ router.post(
     } = (req as any).validatedBody as z.infer<typeof seedBodySchema>;
 
     try {
-      if (orderingStore.has(daoId) && orderingStore.get(daoId)!.committed) {
+      const existing = randomnessStore.get(daoId);
+      if (existing?.committed) {
+        randomnessOperationsTotal.inc({ operation: "seed", result: "rejected" });
         return res.status(409).json({
           error: "Ordering for this DAO is already committed and immutable",
         });
@@ -253,23 +278,18 @@ router.post(
       // Compute replay nonce (before shares are mixed in)
       const replayNonce = computeReplayNonce(daoId, normalizedIds, vdfOutput);
 
-      const state: OrderingState = {
+      // Persist before responding so a restart can resume from this seed.
+      const state = randomnessStore.create({
         daoId,
         vdfInput,
         vdfOutput,
         vdfCheckpoints: checkpoints,
         vdfIterations: iterations,
-        shares: [],
-        requiredShares,
-        combinedSeed: "",
-        ordering: [],
         proposalIds: normalizedIds,
-        finalizedAt: null,
+        requiredShares,
         replayNonce,
-        committed: false,
-      };
-
-      orderingStore.set(daoId, state);
+      });
+      randomnessOperationsTotal.inc({ operation: "seed", result: "committed" });
 
       log("info", "randomness_vdf_done", {
         daoId,
@@ -320,57 +340,54 @@ router.post(
       .validatedBody as z.infer<typeof contributeBodySchema>;
 
     try {
-      const state = orderingStore.get(daoId);
-      if (!state) {
+      if (!randomnessStore.get(daoId)) {
+        randomnessOperationsTotal.inc({ operation: "contribute", result: "rejected" });
         return res.status(404).json({
           error:
             "No pending randomness computation for this DAO. Call /randomness/seed first.",
         });
       }
-      if (state.committed) {
-        return res.status(409).json({
-          error: "Ordering is already committed and immutable",
-        });
-      }
-      if (state.finalizedAt !== null) {
-        return res.status(409).json({
-          error: "Ordering is already finalized",
-        });
-      }
 
-      // Prevent duplicate contributions
-      if (state.shares.some((s) => s.authorityId === authorityId)) {
-        return res.status(409).json({
-          error: `Authority ${authorityId} has already submitted a share`,
-        });
-      }
-
-      state.shares.push({ authorityId, shareHex, submittedAt: Date.now() });
+      const result = randomnessStore.addShare({ daoId, authorityId, shareHex });
+      randomnessOperationsTotal.inc({
+        operation: "contribute",
+        result: result.added ? "committed" : "duplicate",
+      });
 
       log("info", "randomness_share_received", {
         daoId,
         authorityId,
-        sharesCount: state.shares.length,
-        requiredShares: state.requiredShares,
+        sharesCount: result.sharesReceived,
+        requiredShares: result.requiredShares,
       });
 
       res.json({
         success: true,
         daoId,
         authorityId,
-        sharesReceived: state.shares.length,
-        requiredShares: state.requiredShares,
-        ready: state.shares.length >= state.requiredShares,
+        sharesReceived: result.sharesReceived,
+        requiredShares: result.requiredShares,
+        ready: result.sharesReceived >= result.requiredShares,
         status:
-          state.shares.length >= state.requiredShares
+          result.sharesReceived >= result.requiredShares
             ? "ready_to_finalize"
             : "awaiting_shares",
       });
     } catch (err) {
-      log("error", "randomness_contribute_failed", {
+      const committed = err instanceof OrderingCommittedError;
+      randomnessOperationsTotal.inc({
+        operation: "contribute",
+        result: committed ? "late_share_rejected" : "failed",
+      });
+      log("warn", "randomness_contribute_rejected", {
         daoId,
         error: (err as Error).message,
       });
+      if (committed) {
+        return res.status(409).json({
+          error: "Ordering is already committed; late shares are rejected",
+        });
+      }
       res.status(500).json({ error: "Failed to record contribution" });
     }
   }) as AsyncHandler,
@@ -397,49 +414,35 @@ router.post(
     >;
 
     try {
-      const state = orderingStore.get(daoId);
-      if (!state) {
+      const current = randomnessStore.get(daoId);
+      if (!current) {
+        randomnessOperationsTotal.inc({ operation: "finalize", result: "rejected" });
         return res.status(404).json({
           error: "No pending randomness computation for this DAO",
         });
       }
-      if (state.finalizedAt !== null) {
-        // Idempotent – return existing ordering
+      if (current.finalizedAt !== null) {
+        // Idempotent – return the persisted committed ordering.
+        randomnessOperationsTotal.inc({ operation: "finalize", result: "replayed" });
         return res.json({
           success: true,
           daoId,
-          ordering: state.ordering,
-          combinedSeed: state.combinedSeed.slice(0, 16) + "...",
-          replayNonce: state.replayNonce,
-          finalizedAt: state.finalizedAt,
+          ordering: current.ordering,
+          combinedSeed: current.combinedSeed.slice(0, 16) + "...",
+          replayNonce: current.replayNonce,
+          finalizedAt: current.finalizedAt,
           status: "finalized",
         });
       }
-      if (state.shares.length < state.requiredShares) {
-        return res.status(400).json({
-          error: `Insufficient shares: received ${state.shares.length}, need ${state.requiredShares}`,
-        });
-      }
 
-      // Combine all authority shares into a single random contribution
-      const authorityContribution = combineShares(
-        state.shares.map((s) => s.shareHex),
-      );
-
-      // Mix VDF output with threshold contribution:
-      //   finalSeed = SHA256( vdfOutput || authorityContribution )
-      // The VDF prevents precomputation; the threshold mix ensures no single
-      // party (including the admin who triggered the VDF) controls the outcome.
-      const finalSeedBuf = crypto
-        .createHash("sha256")
-        .update(Buffer.from(state.vdfOutput, "hex"))
-        .update(Buffer.from(authorityContribution, "hex"))
-        .digest();
-
-      state.combinedSeed = finalSeedBuf.toString("hex");
-      state.ordering = seededShuffle(state.proposalIds, state.combinedSeed);
-      state.finalizedAt = Date.now();
-      state.committed = true;
+      const state = randomnessStore.finalize({
+        daoId,
+        compute: (s) => {
+          const combinedSeed = deriveFinalSeed(s);
+          return { combinedSeed, ordering: seededShuffle(s.proposalIds, combinedSeed) };
+        },
+      });
+      randomnessOperationsTotal.inc({ operation: "finalize", result: "committed" });
 
       log("info", "randomness_finalized", {
         daoId,
@@ -458,10 +461,18 @@ router.post(
         status: "finalized",
       });
     } catch (err) {
-      log("error", "randomness_finalize_failed", {
+      const insufficient = (err as Error).message.startsWith("Insufficient shares");
+      randomnessOperationsTotal.inc({
+        operation: "finalize",
+        result: insufficient ? "rejected" : "failed",
+      });
+      log("warn", "randomness_finalize_rejected", {
         daoId,
         error: (err as Error).message,
       });
+      if (insufficient) {
+        return res.status(400).json({ error: (err as Error).message });
+      }
       res.status(500).json({ error: "Failed to finalize ordering" });
     }
   }) as AsyncHandler,
@@ -483,14 +494,18 @@ router.get(
     const { daoId } = (req as any).validatedParams as { daoId: number };
 
     try {
-      const state = orderingStore.get(daoId);
+      // Read from the durable store — identical after restart/across replicas.
+      const state = randomnessStore.get(daoId);
       if (!state || state.finalizedAt === null) {
+        randomnessOperationsTotal.inc({ operation: "ordering", result: "rejected" });
         return res.status(404).json({
           error:
             "No finalized ordering found for this DAO. Ordering may not have been computed yet.",
         });
       }
+      randomnessOperationsTotal.inc({ operation: "ordering", result: "served" });
 
+      const commit = randomnessStore.getCommitRecord(daoId);
       res.json({
         daoId,
         ordering: state.ordering,
@@ -501,6 +516,10 @@ router.get(
         sharesUsed: state.shares.length,
         finalizedAt: state.finalizedAt,
         committed: state.committed,
+        version: state.version,
+        commit: commit
+          ? { version: commit.version, payloadHash: commit.payloadHash, recordedAt: commit.recordedAt }
+          : undefined,
         status: "finalized",
       });
     } catch (err) {
@@ -532,14 +551,16 @@ router.get(
     const { daoId } = (req as any).validatedParams as { daoId: number };
 
     try {
-      const state = orderingStore.get(daoId);
+      // Everything below is recomputed from persisted inputs — no process memory.
+      const state = randomnessStore.get(daoId);
       if (!state || state.finalizedAt === null) {
+        randomnessOperationsTotal.inc({ operation: "verify", result: "rejected" });
         return res.status(404).json({
           error: "No finalized ordering found for this DAO",
         });
       }
 
-      // 1. Verify the VDF output against stored checkpoints
+      // 1. Verify the VDF output against stored checkpoints.
       const vdfValid = verifyVdf(
         state.vdfInput,
         state.vdfIterations,
@@ -547,29 +568,58 @@ router.get(
         state.vdfCheckpoints,
       );
 
-      // 2. Verify replay nonce matches
+      // 2. Verify replay nonce and that the stored inputs are normalized.
       const recomputedNonce = computeReplayNonce(
         daoId,
         state.proposalIds,
         state.vdfOutput,
       );
       const nonceValid = recomputedNonce === state.replayNonce;
+      const inputsValid =
+        JSON.stringify(normalizeProposalIds(state.proposalIds)) ===
+        JSON.stringify(state.proposalIds);
+      const thresholdValid = state.shares.length >= state.requiredShares;
 
-      // 3. Re-derive the ordering from the combined seed and verify it matches
-      const recomputedOrdering = seededShuffle(
-        state.proposalIds,
-        state.combinedSeed,
-      );
+      // 3. Re-derive the combined seed from the stored VDF output AND the
+      // persisted shares (the old code trusted the stored combinedSeed).
+      const recomputedSeed = deriveFinalSeed(state);
+      const seedValid = recomputedSeed === state.combinedSeed;
+      const recomputedOrdering = seededShuffle(state.proposalIds, recomputedSeed);
       const orderingValid =
         JSON.stringify(recomputedOrdering) === JSON.stringify(state.ordering);
 
-      const allValid = vdfValid && nonceValid && orderingValid;
+      // 4. Check the immutable commit record matches the persisted inputs.
+      const commit = randomnessStore.getCommitRecord(daoId);
+      const commitValid =
+        commit !== null &&
+        commit.payloadHash ===
+          crypto
+            .createHash("sha256")
+            .update(JSON.stringify(commit.payload))
+            .digest("hex");
 
+      const allValid =
+        vdfValid &&
+        nonceValid &&
+        inputsValid &&
+        thresholdValid &&
+        seedValid &&
+        orderingValid &&
+        commitValid;
+
+      randomnessOperationsTotal.inc({
+        operation: "verify",
+        result: allValid ? "valid" : "invalid",
+      });
       log("info", "randomness_verified", {
         daoId,
         vdfValid,
         nonceValid,
+        inputsValid,
+        thresholdValid,
+        seedValid,
         orderingValid,
+        commitValid,
         allValid,
       });
 
@@ -579,10 +629,19 @@ router.get(
         checks: {
           vdfOutputValid: vdfValid,
           replayNonceValid: nonceValid,
+          inputsValid,
+          thresholdValid,
+          combinedSeedValid: seedValid,
           orderingValid,
+          commitRecordValid: commitValid,
         },
         replayNonce: state.replayNonce,
         finalizedAt: state.finalizedAt,
+        version: state.version,
+        authoritySet: state.shares.map((s) => s.authorityId),
+        shareHashes: state.shares.map((s) =>
+          crypto.createHash("sha256").update(s.shareHex).digest("hex"),
+        ),
       });
     } catch (err) {
       log("error", "randomness_verify_failed", {

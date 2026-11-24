@@ -380,6 +380,22 @@ const envSchema = z.object({
     .int()
     .positive()
     .default(60000),
+
+  // Shared (cross-replica) token-bucket limiter. A signed membership token is
+  // keyed by HMAC of this secret; without it, IP is only a weak fallback.
+  RATE_LIMIT_TOKEN_HMAC_SECRET: z.string().min(16).optional(),
+  RATE_LIMIT_OVERRIDES_JSON: z.string().optional(),
+
+  // DAO factory saga: real transaction-status polling (no simulated sleeps).
+  FACTORY_CONTRACT_ID: z.string().optional(),
+  FACTORY_TX_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  FACTORY_TX_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1_000),
+
+  // Fail closed: mock VK fallbacks are rejected unless explicitly enabled.
+  CIRCUIT_REGISTRY_ALLOW_MOCK: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
   RELAYER_PUBLIC_KEY: z.string().default(""),
   MAX_SPONSORED_FEE_STROOPS: z.coerce
     .number()
@@ -868,6 +884,12 @@ export const config = {
   requireClientCert: validatedEnv.REQUIRE_CLIENT_CERT,
   walletRateLimitMax: validatedEnv.WALLET_RATE_LIMIT_MAX,
   walletRateLimitWindowMs: validatedEnv.WALLET_RATE_LIMIT_WINDOW_MS,
+  rateLimitTokenHmacSecret: validatedEnv.RATE_LIMIT_TOKEN_HMAC_SECRET,
+  rateLimitOverridesJson: validatedEnv.RATE_LIMIT_OVERRIDES_JSON,
+  factoryContractId: validatedEnv.FACTORY_CONTRACT_ID,
+  factoryTxPollTimeoutMs: validatedEnv.FACTORY_TX_POLL_TIMEOUT_MS,
+  factoryTxPollIntervalMs: validatedEnv.FACTORY_TX_POLL_INTERVAL_MS,
+  circuitRegistryAllowMock: validatedEnv.CIRCUIT_REGISTRY_ALLOW_MOCK,
   relayerPublicKey: validatedEnv.RELAYER_PUBLIC_KEY,
   maxSponsoredFeeStroops: validatedEnv.MAX_SPONSORED_FEE_STROOPS,
   // Circuit Breakers
