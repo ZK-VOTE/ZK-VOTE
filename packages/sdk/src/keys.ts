@@ -157,6 +157,100 @@ class KeyManager {
   }
 }
 
+// ── On-chain registry VK resolution ──────────────────────────────────────────
+
+export interface RegistryVK {
+  circuitId: string
+  circuitType: 'Vote' | 'Comment'
+  version: number
+  vk: unknown
+  hash: string
+  numPublicSignals: number
+  currentVersion: number
+}
+
+const registryVkCache = new Map<string, RegistryVK>()
+
+function registryCacheKey(circuitId: string, version: number, circuitType: string): string {
+  return `${circuitId}::${circuitType}::${version}`
+}
+
+/**
+ * Resolve a VK from the relayer's on-chain-registry-backed endpoint, verifying
+ * the canonical registry hash before caching it. A 410 response invalidates
+ * the cached entry so an on-chain rotation cannot be served from SDK memory.
+ */
+export async function resolveRegistryVK(
+  circuitId: string,
+  version: number,
+  options: {
+    relayerUrl?: string
+    circuitType?: 'Vote' | 'Comment'
+    fetchFn?: typeof fetch
+  } = {},
+): Promise<RegistryVK> {
+  const circuitType = options.circuitType ?? 'Vote'
+  const key = registryCacheKey(circuitId, version, circuitType)
+  const cached = registryVkCache.get(key)
+  if (cached) return cached
+
+  const base = (options.relayerUrl ?? 'http://localhost:3001').replace(/\/$/, '')
+  const url = `${base}/circuits/vk/${encodeURIComponent(circuitId)}/${version}?type=${circuitType.toLowerCase()}`
+  const response = await (options.fetchFn ?? fetch)(url)
+  if (response.status === 410 || response.status === 409) {
+    invalidateRegistryVK(circuitId, circuitType)
+    throw new Error(`Stale VK for ${circuitId} v${version}`)
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to resolve registry VK: HTTP ${response.status}`)
+  }
+  const data = await response.json() as Partial<RegistryVK> & { hashScheme?: string }
+  const entry: RegistryVK = {
+    circuitId,
+    circuitType,
+    version: data.version ?? version,
+    vk: data.vk,
+    hash: data.hash ?? '',
+    numPublicSignals: data.numPublicSignals ?? 0,
+    currentVersion: data.currentVersion ?? data.version ?? version,
+  }
+  if (data.hashScheme === 'registry-v1') {
+    const canonical = createHash('sha256')
+      .update(JSON.stringify({
+        circuitId,
+        circuitType,
+        version: entry.version,
+        vk: entry.vk,
+        numPublicSignals: entry.numPublicSignals,
+      }))
+      .digest('hex')
+    if (entry.hash !== canonical) {
+      throw new Error(`VK hash mismatch for ${circuitId} v${version}: registry response is not authoritative`)
+    }
+  }
+  registryVkCache.set(key, entry)
+  return entry
+}
+
+/** Drop cached VKs after a VkProposal execution (all versions or one circuit). */
+export function invalidateRegistryVK(
+  circuitId?: string,
+  circuitType: 'Vote' | 'Comment' = 'Vote',
+  version?: number,
+): void {
+  if (!circuitId) {
+    registryVkCache.clear()
+    return
+  }
+  if (version !== undefined) {
+    registryVkCache.delete(registryCacheKey(circuitId, version, circuitType))
+    return
+  }
+  for (const key of Array.from(registryVkCache.keys())) {
+    if (key.startsWith(`${circuitId}::`)) registryVkCache.delete(key)
+  }
+}
+
 // Singleton instance
 const keyManager = new KeyManager()
 

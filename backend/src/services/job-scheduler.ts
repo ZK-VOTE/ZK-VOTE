@@ -11,6 +11,8 @@
 import { createLogger } from "./logger.js";
 import { runMaintenanceTasks } from "./authTokens.js";
 import { getDb } from "./db.js";
+import { factoryOrchestrator } from "./factory-orchestrator.js";
+import { reloadQuotaOverridesFromConfig } from "../middleware/rateLimiter.js";
 import {
   session_store_size,
   rate_limit_store_size,
@@ -81,10 +83,16 @@ export class JobScheduler {
     cleanedSessions: number;
     tokenMaintenance: any;
     rateLimitKeys: number;
+    recoveredSagas: number;
   }> {
     if (this.running) {
       logger.debug("job_scheduler_skip_concurrent_tick");
-      return { cleanedSessions: 0, tokenMaintenance: null, rateLimitKeys: 0 };
+      return {
+        cleanedSessions: 0,
+        tokenMaintenance: null,
+        rateLimitKeys: 0,
+        recoveredSagas: 0,
+      };
     }
 
     this.running = true;
@@ -95,17 +103,28 @@ export class JobScheduler {
       // 2. Auth token maintenance
       const tokenMaintenance = runMaintenanceTasks();
 
-      // 3. Update gauge metrics
+      // 3. Reconcile live quota overrides and update gauge metrics
+      try {
+        reloadQuotaOverridesFromConfig();
+      } catch (err) {
+        logger.warn("quota_override_reload_failed", {
+          error: (err as Error).message,
+        });
+      }
       const rateLimitKeys = this.updateStoreMetrics();
       this.updateBackupAge();
 
       // 4. State reconciliation check
       this.checkStateReconciliation();
 
+      // 5. Resume factory sagas stranded by a process restart.
+      const recoveredSagas = await this.recoverStalledSagas();
+
       return {
         cleanedSessions,
         tokenMaintenance,
         rateLimitKeys,
+        recoveredSagas,
       };
     } finally {
       this.running = false;
@@ -168,6 +187,26 @@ export class JobScheduler {
       // metrics registry may be unavailable in unit tests
     }
     return count;
+  }
+
+  /**
+   * Resume DAO-creation sagas that are still `in_progress`/`failed` after a
+   * restart. Each saga resumes from its last committed step; stepping is
+   * idempotent so a recovered worker never redeploys an existing component.
+   */
+  async recoverStalledSagas(): Promise<number> {
+    try {
+      const count = await factoryOrchestrator.recoverStalled();
+      if (count > 0) {
+        logger.info("factory_sagas_recovered", { count });
+      }
+      return count;
+    } catch (err) {
+      logger.error("factory_saga_recovery_failed", {
+        error: (err as Error).message,
+      });
+      return 0;
+    }
   }
 
   /**

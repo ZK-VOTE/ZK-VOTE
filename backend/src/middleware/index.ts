@@ -28,6 +28,18 @@ export {
   SENSITIVE_FIELDS,
 } from "./audit.js";
 export {
+  checkRateLimit,
+  getRateLimitStatus,
+  getRateLimitKey,
+  getSharedRateLimitStoreSize,
+  rateLimitKeyFromRequest,
+  reloadQuotaOverridesFromConfig,
+  setQuotaOverride,
+  sharedRateLimiter,
+  SharedRateLimitStore,
+  DEFAULT_RATE_LIMIT_CONFIG as SHARED_RATE_LIMIT_CONFIG,
+} from "./rateLimiter.js";
+export {
   voteLimiter,
   walletRateLimiter,
   queryLimiter,

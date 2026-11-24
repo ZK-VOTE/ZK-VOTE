@@ -50,6 +50,16 @@ import {
   type CircuitBreaker,
 } from "./circuit-breaker.js";
 import { withSpan } from "./tracing.js";
+import {
+  DEFAULT_TIER_LIMITS,
+  parseCosigners,
+  parseTierLimits,
+  SigningPolicy,
+} from "./relayer-signing-policy.js";
+import {
+  RelayerRotationOrchestrator,
+  SqliteKeyLifecycleStore,
+} from "./relayer-rotation.js";
 import type { Groth16Proof } from "../types/index.js";
 // #541 Soroban rent economics: Persistent costs ~10x Temporary. Roots/config
 // stay Persistent/Instance (long-lived, TTL-extended); leaves/ephemeral data
@@ -721,11 +731,6 @@ export class RpcPoolManager {
     );
     if (!recent) await this.checkHealth();
   }
-      // Update Prometheus gauges per endpoint (host only, #749)
-      rpcEndpointLatency.set(
-        { endpoint: normalizeEndpoint(ep.url) },
-        ep.latencyMs / 1000,
-      );
 
   /**
    * Read state that feeds a proof witness from up to `quorum` fresh
@@ -820,7 +825,10 @@ export class RpcPoolManager {
     const results = this.endpoints.map((ep) => this.statusOf(ep, tip));
     for (const ep of results) {
       const labels = { dependency: "soroban_rpc", endpoint: endpointLabel(ep.url) };
-      rpcEndpointLatency.set({ url: ep.url }, ep.latencyMs / 1000);
+      rpcEndpointLatency.set(
+        { endpoint: normalizeEndpoint(ep.url) },
+        ep.latencyMs / 1000,
+      );
       endpointHealthy.set(labels, ep.healthy ? 1 : 0);
       if (ep.lagLedgers !== null) endpointLedgerLag.set(labels, ep.lagLedgers);
     }

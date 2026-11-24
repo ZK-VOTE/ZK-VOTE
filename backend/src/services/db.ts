@@ -31,6 +31,7 @@ import {
   incrementTransactionCounter,
 } from "./walResilience.js";
 import { config } from "../config.js";
+import { ensureDurableSchema } from "./durable-schema.js";
 
 /** Optional Prometheus sink — wired from boot so db.ts stays testable without prom-client. */
 export interface DbMetricsSink {
@@ -1425,6 +1426,11 @@ export function initDb(dbPath?: string): DatabaseType {
       UNIQUE(dao_id, ledger, tx_hash, type)
     );
   `);
+
+  // Durable state for the factory saga, shared rate limiter, VDF ordering and
+  // circuit-registry caches. Installed here so every store can rely on the
+  // tables existing before the first request (and before migrations run).
+  ensureDurableSchema(database);
 
   const versionRow = database
     .prepare("SELECT value FROM metadata WHERE key = 'schema_version'")

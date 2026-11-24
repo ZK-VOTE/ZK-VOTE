@@ -107,6 +107,7 @@ import {
   graduatedSlowDown,
   degradationContext,
   metricsMiddleware,
+  sharedRateLimiter,
 } from "./middleware/index.js";
 
 import {
@@ -132,6 +133,7 @@ import {
   thresholdRoutes,
   auditRoutes,
   randomnessRoutes,
+  factoryRoutes,
   payRoutes,
   swapRoutes,
   rampRoutes,
@@ -323,6 +325,16 @@ app.use(requestLogger);
 // Graduated throttling (delays before a client is hard rate-limited)
 app.use(graduatedSlowDown);
 
+// Shared, cross-replica bucket for privileged auth/admin key endpoints (#511).
+// Keyed by signed membership token / client id with IP as a weak fallback.
+const authBucketLimiter = sharedRateLimiter("auth");
+app.use((req, res, next) => {
+  if (/^\/(api\/v[12]\/)?(auth|admin|factory)(\/|$)/.test(req.path)) {
+    return authBucketLimiter(req, res, next);
+  }
+  next();
+});
+
 // Audit middleware - must be after body parsing and requestLogger, before routes
 // Audits every mutating route (POST/PUT/PATCH/DELETE) with PII redaction, append-only
 app.use(auditMiddleware);
@@ -380,6 +392,7 @@ app.use(noStore, adminRoutes);
 app.use(noStore, thresholdRoutes);
 app.use(auditRoutes);
 app.use(noStore, randomnessRoutes);
+app.use(noStore, factoryRoutes);
 app.use(payRoutes);
 app.use(swapRoutes);
 app.use(rampRoutes);
@@ -422,6 +435,7 @@ function mountV1(): void {
   v1Router.use(noStore, thresholdRoutes);
   v1Router.use(auditRoutes);
   v1Router.use(noStore, randomnessRoutes);
+  v1Router.use(noStore, factoryRoutes);
   v1Router.use(payRoutes);
   v1Router.use(swapRoutes);
   v1Router.use(rampRoutes);
@@ -457,6 +471,7 @@ function mountV2(): void {
   v2Router.use(noStore, thresholdRoutes);
   v2Router.use(auditRoutes);
   v2Router.use(noStore, randomnessRoutes);
+  v2Router.use(noStore, factoryRoutes);
   v2Router.use(payRoutes);
   v2Router.use(swapRoutes);
   v2Router.use(rampRoutes);

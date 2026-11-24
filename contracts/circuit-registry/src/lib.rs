@@ -119,6 +119,8 @@ pub enum DataKey {
     VkProposal(u32),
     VkProposalCounter,
     DaoVkProposal(u64),
+    /// Per-circuit version, incremented when a VkProposal is executed.
+    CircuitVersion(String, CircuitType),
 }
 
 #[soroban_sdk::contractevent]
@@ -304,6 +306,12 @@ impl CircuitRegistry {
         env.storage().persistent().set(&key, &circuit);
         Self::bump_persistent(&env, &key);
 
+        // Single source of truth for VK versioning. Starts at 1 and is bumped
+        // by execute_vk_upgrade, so clients can detect stale cached VKs.
+        let version_key = DataKey::CircuitVersion(circuit_id.clone(), circuit_type);
+        env.storage().persistent().set(&version_key, &1u32);
+        Self::bump_persistent(&env, &version_key);
+
         CircuitRegisteredEvent {
             circuit_id,
             circuit_type,
@@ -322,6 +330,23 @@ impl CircuitRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
         Self::bump_persistent(&env, &key);
         circuit
+    }
+
+    /// Current on-chain version of a circuit's verification key.
+    pub fn get_circuit_version(
+        env: Env,
+        circuit_id: String,
+        circuit_type: CircuitType,
+    ) -> u32 {
+        Self::bump_instance(&env);
+        let key = DataKey::CircuitVersion(circuit_id.clone(), circuit_type);
+        let version: u32 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+        Self::bump_persistent(&env, &key);
+        version
     }
 
     pub fn get_vk(env: Env, circuit_id: String, circuit_type: CircuitType) -> CircuitVKMap {
@@ -664,6 +689,14 @@ impl CircuitRegistry {
         circuit.registered_at = now;
         env.storage().persistent().set(&circuit_key, &circuit);
         Self::bump_persistent(&env, &circuit_key);
+
+        let version_key =
+            DataKey::CircuitVersion(proposal.circuit_id.clone(), proposal.circuit_type);
+        let previous_version: u32 = env.storage().persistent().get(&version_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&version_key, &(previous_version + 1));
+        Self::bump_persistent(&env, &version_key);
 
         VkProposalExecutedEvent {
             proposal_id,
