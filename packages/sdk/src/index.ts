@@ -11,6 +11,20 @@ export * from './cache'
 export * from './types'
 export * from './registry'
 export {
+  ZKVoteError,
+  InvalidInputError,
+  KeysNotLoadedError,
+  KeysNotVerifiedError,
+  KeyLoadError,
+  KeyIntegrityError,
+  ProofGenerationError,
+  VerificationError,
+  NetworkError,
+  CacheError,
+  WorkerUnavailableError,
+  AbortError
+} from './types'
+export {
   VERSION,
   CIRCUIT_COMPATIBILITY,
   isCircuitCompatible,
@@ -19,4 +33,5 @@ export {
   checkCircuitVersion,
   UnsupportedCircuitVersionError,
   type CircuitVersionCheck,
+  MOCKS_REMOVED_IN,
 } from './version'

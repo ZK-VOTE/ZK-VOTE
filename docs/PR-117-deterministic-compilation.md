@@ -142,3 +142,42 @@ The infrastructure for deterministic compilation was largely already in place. T
 3. Verified all acceptance criteria are met
 
 The existing scripts (compile-circuits.sh, verify-circuits.sh, sign-circuits.sh) and Dockerfile provide a complete deterministic compilation pipeline.
+
+---
+
+## Relationship to the Signed Proving-Key Supply Chain (ZV-024 / ZV-033 / ZV-034)
+
+PR-117's reproducibility guarantees are the foundation that makes the signed
+artifact supply chain in [PROVING_KEY_SUPPLY_CHAIN.md](PROVING_KEY_SUPPLY_CHAIN.md)
+meaningful:
+
+1. **Reproducible `wasm`/`r1cs`**: the pinned Circom 2.1.8 toolchain and Docker
+   build mean an independent verifier can rebuild the circuit and compare the
+   wasm digest against the signed manifest's `artifacts.wasm.sha256`. Without
+   deterministic compilation, a manifest digest would only pin an opaque blob.
+2. **Canonical VK bytes**: the verification key exported from the zkey is
+   serialised with sorted keys before hashing (`computeVkHash` in
+   `circuits/ceremony/verify-ceremony.js`, mirrored by the browser verifier's
+   canonical JSON). Two exporters that differ only in key order produce the
+   same digest, which is exactly the PR-117 principle applied to JSON.
+3. **The zkey remains ceremony-bound, not build-bound**: as noted in §Security
+   Considerations above, `vote_final.zkey` cannot be reproduced from source.
+   Instead the trusted-setup ceremony transcript hash (`verifyCeremony()`) is
+   bound into the signed manifest, the transparency-log entry and the
+   on-chain `CircuitInfo.ceremony_transcript_hash`. Deterministic compilation
+   covers the wasm side; the ceremony covers the zkey side; the manifest ties
+   both to one circuit ID and version.
+4. **Verification tooling**: `circuits/ceremony/verify-ceremony.js` extends the
+   existing ceremony verifier with `generate-key`, `generate-manifest` and
+   `verify-artifacts`. The frontend counterpart
+   (`frontend/src/lib/zkproof.vkcache.ts`) verifies the signature, transparency
+   log, registry ceremony hash and streamed artifact digests before witness
+   generation. The PGP checksum signing from PR-117 remains useful for
+   source/build provenance and is independent of the Ed25519 release-key
+   rotation policy described in the supply-chain document.
+
+Practical flow: build reproducibly (`./scripts/compile-circuits.sh --docker`)
+→ verify checksums (`./scripts/verify-circuits.sh`) → run the MPC ceremony and
+`verifyCeremony()` → publish zkey/wasm/vkey with a signed v1 manifest and
+transparency entry → pin the ceremony hash in the circuit registry → clients
+load through `loadVerifiedArtifacts()`.

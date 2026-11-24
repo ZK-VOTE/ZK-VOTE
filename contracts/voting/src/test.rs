@@ -1,5 +1,8 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _, Ledger as _},
+    Env, InvokeError, String,
+};
 
 // The crate is `#![no_std]`; `std::panic::catch_unwind` is needed so a single
 // test can assert that a call is rejected *and* then inspect the state it left
@@ -5643,4 +5646,313 @@ fn test_min_satisfiable_num_candidates_admits_a_binary_vote() {
             "voteChoice={choice} must be below the circuit's numCandidates bound"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Relayer binding (#361 / ZV-029)
+//
+// The proof's public signals stay at 6. These tests exercise the off-circuit
+// binding: caller-supplied relayer + require_auth(), the optional guardian
+// allowlist, submission-context attribution, single/batch parity and legacy
+// entrypoint compatibility.
+// ---------------------------------------------------------------------------
+
+/// Set up an election whose VK and proposal are ready for an anonymous vote.
+/// Returns (env, client, voting address, proposal id, eligible root).
+fn setup_relayer_election() -> (Env, VotingClient<'static>, Address, u64, U256) {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let voting = VotingClient::new(&env, &voting_id);
+    let registry = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let tree = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let sbt = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let admin = Address::generate(&env);
+
+    sbt.set_member(&1u64, &member, &true);
+    registry.set_admin(&1u64, &admin);
+    let root = U256::from_u32(&env, 12345);
+    tree.set_root(&1u64, &root);
+    voting.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let proposal_id = voting.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Relayer binding"),
+        &String::from_str(&env, ""),
+        &(env.ledger().timestamp() + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+    let eligible_root = voting.get_proposal(&1u64, &proposal_id).eligible_root;
+    (env, voting, voting_id, proposal_id, eligible_root)
+}
+
+/// Assert that a `try_*` call failed with a specific contract error. The
+/// generated client's error type is `Result<Error, InvokeError>`; convert the
+/// expected `VotingError` discriminant to the `Error` the host reports.
+fn is_contract_error<T>(
+    result: &Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<soroban_sdk::Error, InvokeError>,
+    >,
+    expected: VotingError,
+) -> bool {
+    match result {
+        Err(Ok(err)) => *err == soroban_sdk::Error::from_contract_error(expected as u32),
+        _ => false,
+    }
+}
+
+/// `#[contractevent]` publishes non-topic fields as a map keyed by field name.
+/// True when that map contains the given address as a value.
+fn event_data_contains_address(
+    event: &soroban_sdk::xdr::ContractEvent,
+    address: &Address,
+) -> bool {
+    if let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body {
+        let target: soroban_sdk::xdr::ScVal = address.clone().into();
+        if let soroban_sdk::xdr::ScVal::Map(Some(entries)) = &body.data {
+            return entries.iter().any(|entry| entry.val == target);
+        }
+    }
+    false
+}
+
+/// Number of non-topic fields in a `contractevent` map (0 when not a map).
+fn event_data_field_count(event: &soroban_sdk::xdr::ContractEvent) -> usize {
+    if let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body {
+        if let soroban_sdk::xdr::ScVal::Map(Some(entries)) = &body.data {
+            return entries.len() as usize;
+        }
+    }
+    0
+}
+
+#[test]
+fn test_relayer_auth_required() {
+    let (env, voting, _voting_id, proposal_id, root) = setup_relayer_election();
+    let relayer = Address::generate(&env);
+
+    // Setup auth was mocked; remove every authorization entry so even a
+    // well-formed relayer cannot satisfy `relayer.require_auth()`.
+    env.set_auths(&[] as &[soroban_sdk::xdr::SorobanAuthorizationEntry]);
+    let result = voting.try_vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 1001),
+        &root,
+        &create_dummy_proof(&env),
+        &relayer,
+    );
+    assert!(
+        result.is_err(),
+        "a relayer that did not sign must not be able to submit"
+    );
+}
+
+#[test]
+fn test_unauthorized_relayer_rejected() {
+    let (env, voting, _voting_id, proposal_id, root) = setup_relayer_election();
+    let guardian = voting.guardian();
+    let allowed = Address::generate(&env);
+    let intruder = Address::generate(&env);
+
+    voting.add_relayer(&guardian, &allowed);
+    assert!(voting.is_relayer_set_configured());
+    assert!(voting.is_authorized_relayer(&allowed));
+    assert!(!voting.is_authorized_relayer(&intruder));
+
+    // Auth is mocked for both, so the only thing rejecting the intruder is
+    // the allowlist check in the shared helper.
+    let result = voting.try_vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 1002),
+        &root,
+        &create_dummy_proof(&env),
+        &intruder,
+    );
+    assert!(is_contract_error(
+        &result,
+        VotingError::InvalidRelayerAddress
+    ));
+}
+
+#[test]
+fn test_relayer_attribution_event_emitted_without_voter_identity() {
+    let (env, voting, voting_id, proposal_id, root) = setup_relayer_election();
+    let relayer = Address::generate(&env);
+    let nullifier = U256::from_u32(&env, 1003);
+
+    voting.vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &root,
+        &create_dummy_proof(&env),
+        &relayer,
+    );
+    // `Events::all()` only sees the last invocation, so capture the log here
+    // before making any further contract calls.
+    let contract_events = env.events().all().filter_by_contract(&voting_id);
+
+    assert_eq!(voting.get_proposal(&1u64, &proposal_id).yes_votes, 1);
+    assert!(voting.is_nullifier_used(&1u64, &proposal_id, &nullifier));
+
+    let attributed = contract_events
+        .events()
+        .iter()
+        .filter(|event| event_data_contains_address(event, &relayer))
+        .count();
+    assert_eq!(
+        attributed, 1,
+        "one relayer attribution event for the submission"
+    );
+
+    // The event carries exactly (nullifier, relayer, path) as data — no voter
+    // address, secret, salt, blinding factor or commitment is published.
+    let event = contract_events
+        .events()
+        .iter()
+        .find(|event| event_data_contains_address(event, &relayer))
+        .expect("attribution event");
+    assert_eq!(
+        event_data_field_count(event),
+        3,
+        "attribution has only nullifier, relayer and path"
+    );
+}
+
+#[test]
+fn test_batch_relayer_parity() {
+    let (env, voting, _voting_id, proposal_id, root) = setup_relayer_election();
+    let guardian = voting.guardian();
+    let allowed = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    voting.add_relayer(&guardian, &allowed);
+
+    let make_vote = |offset: u32, choice: bool| BatchVote {
+        vote_choice: choice,
+        nullifier: U256::from_u32(&env, 2000 + offset),
+        root: root.clone(),
+        proof: create_dummy_proof(&env),
+    };
+    // MAX_BATCH_SIZE is 1 on this build (BN254 pairing metering), so a single
+    // ballot is the largest permitted batch. It still exercises the exact
+    // shared helper used by the single-vote path.
+    let votes = soroban_sdk::vec![&env, make_vote(1, true)];
+
+    // Same helper as the single path rejects the unauthorized relayer.
+    let rejected = voting.try_cast_votes_with_relayer(&1u64, &proposal_id, &votes, &intruder);
+    assert!(is_contract_error(
+        &rejected,
+        VotingError::InvalidRelayerAddress
+    ));
+    assert_eq!(voting.get_proposal(&1u64, &proposal_id).yes_votes, 0);
+
+    // The authorized relayer succeeds and attributes every ballot.
+    let count = voting.cast_votes_with_relayer(&1u64, &proposal_id, &votes, &allowed);
+    assert_eq!(count, 1);
+    // Capture events before any further contract call: `Events::all()` only
+    // returns events from the most recent invocation.
+    let batch_events = env.events().all();
+    let attributed = batch_events
+        .events()
+        .iter()
+        .filter(|event| event_data_contains_address(event, &allowed))
+        .count();
+    assert_eq!(attributed, 1, "one attribution event per batched ballot");
+
+    let proposal = voting.get_proposal(&1u64, &proposal_id);
+    assert_eq!(proposal.yes_votes, 1);
+    assert_eq!(proposal.no_votes, 0);
+}
+
+#[test]
+fn test_relayer_rotation_behavior() {
+    let (env, voting, _voting_id, proposal_id, root) = setup_relayer_election();
+    let guardian = voting.guardian();
+    let old = Address::generate(&env);
+    let new = Address::generate(&env);
+
+    voting.add_relayer(&guardian, &old);
+    assert!(voting.is_relayer_set_configured());
+
+    // Rotation is atomic: old loses, new gains in the same transaction.
+    voting.rotate_relayer(&guardian, &old, &new);
+    assert!(!voting.is_authorized_relayer(&old));
+    assert!(voting.is_authorized_relayer(&new));
+
+    let rejected = voting.try_vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 1004),
+        &root,
+        &create_dummy_proof(&env),
+        &old,
+    );
+    assert!(is_contract_error(
+        &rejected,
+        VotingError::InvalidRelayerAddress
+    ));
+
+    voting.vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &true,
+        &U256::from_u32(&env, 1005),
+        &root,
+        &create_dummy_proof(&env),
+        &new,
+    );
+
+    // Removing the last member deactivates the set: any signing relayer works.
+    voting.remove_relayer(&guardian, &new);
+    assert!(!voting.is_relayer_set_configured());
+    let anyone = Address::generate(&env);
+    voting.vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &false,
+        &U256::from_u32(&env, 1006),
+        &root,
+        &create_dummy_proof(&env),
+        &anyone,
+    );
+}
+
+#[test]
+fn test_legacy_entrypoint_relayer_opt_in() {
+    let (env, voting, _voting_id, proposal_id, root) = setup_relayer_election();
+    let guardian = voting.guardian();
+    let relayer = Address::generate(&env);
+    let nullifier = U256::from_u32(&env, 1007);
+
+    assert!(!voting.require_relayer_on_legacy());
+    voting.set_require_relayer_on_legacy(&guardian, &true);
+    assert!(voting.require_relayer_on_legacy());
+
+    let rejected = voting.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &root,
+        &create_dummy_proof(&env),
+    );
+    assert!(is_contract_error(&rejected, VotingError::RelayerRequired));
+
+    // The relayer-aware entrypoint is unaffected by the policy.
+    voting.vote_with_relayer(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &root,
+        &create_dummy_proof(&env),
+        &relayer,
+    );
+    assert!(voting.is_nullifier_used(&1u64, &proposal_id, &nullifier));
 }

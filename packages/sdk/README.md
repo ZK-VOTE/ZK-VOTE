@@ -2,6 +2,14 @@
 
 Zero-knowledge proof generation and verification SDK for anonymous voting on Stellar Soroban.
 
+> **v2.0.0 — breaking release.** All proof-generation and verification mocks have
+> been **removed**. Proving now runs real `snarkjs` Groth16 with WASM witness
+> calculation and zkeys; verification runs `snarkjs.groth16.verify` against a
+> pinned verification key; identity derivation uses **Poseidon** (BN254) instead
+> of SHA-256. Derivation outputs are decimal BN254 field elements so they match
+> `circuits/` and the Soroban host known-answer tests. See the
+> [changelog](#changelog) below.
+
 ## Features
 
 - **Proof Generation**: Generate Groth16 zero-knowledge proofs for votes and membership claims
@@ -29,7 +37,7 @@ import {
 
 // Initialize SDK
 await loadKeys({
-  manifestUrl: "https://cdn.zkvote.io/keys/v1/manifest.json",
+  manifestUrl: "https://cdn.zkvote.io/keys/v2/manifest.json",
 });
 
 // Derive identity
@@ -43,10 +51,14 @@ const proof = await generateVoteProof({
   pollId: "poll-123",
   choice: "option-a",
   merkleProof: {
-    root: "0x...",
-    siblings: ["0x...", "0x..."],
+    root: "12345678901234567890", // decimal BN254 field elements
+    siblings: ["9876543210", "1122334455"],
     pathIndices: [0, 1],
   },
+  // Optional, but required for a meaningful circuit proof:
+  daoId: "1",
+  proposalId: "42",
+  numCandidates: 3,
 });
 
 // Submit proof to voting contract
@@ -59,7 +71,7 @@ await submitVote(proof);
 
 ```typescript
 await loadKeys({
-  manifestUrl: "https://cdn.zkvote.io/keys/v1/manifest.json",
+  manifestUrl: "https://cdn.zkvote.io/keys/v2/manifest.json",
 });
 
 // Verify integrity
@@ -78,6 +90,39 @@ await loadKeys({
   offlinePack: true,
 });
 ```
+
+### Explicit artifacts / offline air-gapped use
+
+Keys can be supplied as decoded bytes (no network and no bundled placeholders):
+
+```typescript
+await loadKeys({
+  artifacts: {
+    vote: {
+      wasm: voteWasmBytes,   // Uint8Array
+      zkey: voteZkeyBytes,   // Uint8Array
+      vkey: voteVerificationKey, // snarkjs verification key JSON
+    },
+  },
+});
+await verifyKeyIntegrity(); // recomputes SHA-256 over wasm || zkey || vkey
+```
+
+The manifest's `hash` is `sha256:` + the hex digest of `wasm || zkey || vkey-JSON`,
+and `size` is the total byte length. Both are checked on load.
+
+### Verification key pinning
+
+```typescript
+import { setPinnedVerificationKey, verifyVoteProof } from "@zkvote/sdk";
+
+setPinnedVerificationKey(voteVerificationKey);
+const ok = await verifyVoteProof(proof, expectedPublicSignals);
+```
+
+`verifyVoteProof` validates the proof/key structure (throws a typed
+`VerificationError` for a wrong protocol, curve or malformed key) and returns
+`false` for an invalid proof, wrong public signals or a wrong key.
 
 ## Caching
 
@@ -173,10 +218,42 @@ SDK version 1.0.0 supports circuits:
 
 See [COMPATIBILITY.md](./COMPATIBILITY.md) for full compatibility matrix.
 
+## Poseidon & domain tags
+
+Derivation is Poseidon over BN254 Fr (S-box x^5, 8 full rounds; 56/57/56/60
+partial rounds for widths 2/3/4/5; circomlib round constants/MDS). It matches
+`circuits/utils/poseidon_test_vectors.json` and the Soroban host KATs.
+
+Outputs are decimal field elements. Domain tags (SHA-256(label) mod p, except
+`CLAIM` which is ascii("claim")):
+
+| Derivation | Tag |
+|---|---|
+| `deriveIdentityCommitment` | `SHA256("ZK-VOTE-COMMITMENT") mod p` = `1966604...76515161` (identical to `DOMAIN_TAG` in `vote_template.circom`) |
+| `deriveNullifier` | `SHA256("ZK-VOTE-NULLIFIER") mod p` |
+| `deriveTrapdoor` | `SHA256("ZK-VOTE-TRAPDOOR") mod p` |
+
+For the exact circuit hashes use `deriveCircuitCommitment(secret, salt, blindingFactor)`,
+`deriveCircuitNullifier(secret, daoId, proposalId)` and
+`deriveCircuitClaimNullifier(...)`.
+
+## Changelog
+
+### 2.0.0 (breaking)
+- Removed all mock proofs and unconditional verification success.
+- Real snarkjs Groth16 proving (WASM witness + zkey) with `AbortSignal` support
+  and real Node `worker_threads` / browser Web Worker proving.
+- Real Groth16 verification against a pinned or manifest-supplied VK.
+- Replaced SHA-256 identity derivation with domain-separated Poseidon.
+- Real artifact loading (manifest URL / local files / injected bytes) with
+  SHA-256 integrity checks, size validation, typed errors and cache integration.
+- Added a typed error hierarchy exported from the package root.
+- Derivation outputs are decimal BN254 field elements.
+
 ## Error Handling
 
 ```typescript
-import { ErrorCodes } from "@zkvote/sdk";
+import { ErrorCodes, ZKVoteError, KeysNotLoadedError } from "@zkvote/sdk";
 
 try {
   const proof = await generateVoteProof(params);

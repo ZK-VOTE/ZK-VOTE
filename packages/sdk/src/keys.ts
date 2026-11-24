@@ -1,10 +1,34 @@
 /**
- * Key management and verification
+ * Key management and verification.
+ *
+ * Proving artifacts (wasm + zkey + verification key) are loaded from a versioned
+ * manifest, an offline pack or provided directly by the caller. Every artifact
+ * is decoded to real bytes, size-checked and hashed with SHA-256 before it can
+ * be used for proving or verification. There are no bundled placeholders.
+ *
+ * Pre-v2 manifests whose artifact references are bare placeholder tokens are
+ * still readable for backwards compatibility (and so the registry-compatibility
+ * gate can be used independently of artifact loading); they are never used for
+ * real proving.
  */
 
 import { createHash } from 'crypto'
 import type { RegistryClient } from './registry'
 import { checkCircuitVersion, UnsupportedCircuitVersionError, type CircuitVersionCheck } from './version'
+// @ts-ignore - subpath export needs node16 resolution in tsup's dts pass
+import { sha256 } from '@noble/hashes/sha256'
+// @ts-ignore - subpath export needs node16 resolution in tsup's dts pass
+import { bytesToHex } from '@noble/hashes/utils'
+import type { VerificationKey } from './types'
+import {
+  KeyIntegrityError,
+  KeyLoadError,
+  KeysNotLoadedError,
+  KeysNotVerifiedError,
+  InvalidInputError,
+  NetworkError
+} from './types'
+import { getCached, setCached } from './cache'
 
 export interface KeyManifestEntry {
   wasm: string
@@ -24,6 +48,8 @@ export interface KeyManifestEntry {
 
 export interface KeyManifest {
   version: string
+  /** Base URL/path used to resolve relative artifact references. */
+  baseUrl?: string
   keys: {
     [circuitName: string]: KeyManifestEntry
   }
@@ -37,7 +63,8 @@ export interface KeyManifest {
 
 export interface KeyLoadOptions {
   manifestUrl?: string
-  offlinePack?: boolean
+  /** `true` uses `./keys/manifest.json`; a string is an explicit base URL/path. */
+  offlinePack?: boolean | string
   cacheDir?: string
   /**
    * Registry client used to runtime-check each manifest key's
@@ -52,32 +79,192 @@ export interface KeyLoadOptions {
    * before loading any key.
    */
   expectedManifestHash?: string
+  /** Supply a manifest object directly (already parsed). */
+  manifest?: KeyManifest
+  /** Supply decoded artifacts directly — useful for bundled/embedded keys. */
+  artifacts?: Record<string, CircuitArtifacts>
+  /** Override fetch (tests / non-standard environments). */
+  fetchImpl?: typeof fetch
+}
+
+/** Decoded, ready-to-use artifacts for one circuit. */
+export interface CircuitArtifacts {
+  wasm: Uint8Array
+  zkey: Uint8Array
+  vkey: VerificationKey
+}
+
+/** Legacy (pre-v2) manifest key: artifact references, not decoded bytes. */
+interface LegacyKey {
+  wasm: string
+  zkey: string
+  vkey: string
+}
+
+function toBytes(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return value
+  if (value instanceof ArrayBuffer) return new Uint8Array(value)
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer as ArrayBuffer, value.byteOffset, value.byteLength)
+  throw new KeyLoadError('Expected binary artifact data (Uint8Array or ArrayBuffer)')
+}
+
+function canonicalVkeyBytes(vkey: VerificationKey): Uint8Array {
+  // snarkjs exports keys with stable key order; sort anyway so the digest is
+  // independent of how the JSON was parsed/serialised.
+  const sorted: Record<string, unknown> = {}
+  for (const key of Object.keys(vkey).sort()) {
+    sorted[key] = (vkey as unknown as Record<string, unknown>)[key]
+  }
+  return new TextEncoder().encode(JSON.stringify(sorted))
+}
+
+/** SHA-256 of `wasm || zkey || canonical(vkey JSON)`, formatted as `sha256:<hex>`. */
+export function computeArtifactHash(artifacts: CircuitArtifacts): string {
+  const total = artifacts.wasm.length + artifacts.zkey.length + canonicalVkeyBytes(artifacts.vkey).length
+  const bundle = new Uint8Array(total)
+  bundle.set(artifacts.wasm, 0)
+  bundle.set(artifacts.zkey, artifacts.wasm.length)
+  bundle.set(canonicalVkeyBytes(artifacts.vkey), artifacts.wasm.length + artifacts.zkey.length)
+  return 'sha256:' + bytesToHex(sha256(bundle))
+}
+
+/** Total byte length of the artifact bundle (wasm + zkey + vkey JSON). */
+export function computeArtifactSize(artifacts: CircuitArtifacts): number {
+  return artifacts.wasm.length + artifacts.zkey.length + canonicalVkeyBytes(artifacts.vkey).length
+}
+
+function normaliseHash(hash: string): string {
+  return hash.startsWith('sha256:') ? hash : 'sha256:' + hash
+}
+
+function assertVerificationKey(value: unknown): VerificationKey {
+  if (!value || typeof value !== 'object') {
+    throw new KeyIntegrityError('Verification key is not a JSON object')
+  }
+  const vk = value as VerificationKey
+  if (vk.protocol !== 'groth16' || vk.curve !== 'bn128') {
+    throw new KeyIntegrityError('Verification key has the wrong protocol or curve', {
+      protocol: vk.protocol,
+      curve: vk.curve
+    })
+  }
+  if (!Array.isArray(vk.IC) || typeof vk.nPublic !== 'number' || vk.IC.length !== vk.nPublic + 1) {
+    throw new KeyIntegrityError('Verification key IC vector length does not match nPublic', {
+      nPublic: vk.nPublic,
+      icLength: Array.isArray(vk.IC) ? vk.IC.length : null
+    })
+  }
+  return vk
+}
+
+/** Upstream's legacy key shape/hash, kept so old manifests remain readable. */
+function legacyKey(circuitName: string): LegacyKey {
+  return {
+    wasm: `wasm_${circuitName}`,
+    zkey: `zkey_${circuitName}`,
+    vkey: `vkey_${circuitName}`
+  }
+}
+
+function hashLegacyKey(key: LegacyKey): string {
+  const hash = createHash('sha256')
+  hash.update(JSON.stringify(key))
+  return 'sha256:' + hash.digest('hex')
+}
+
+/** True for pre-v2 manifests whose "wasm"/"zkey"/"vkey" are bare tokens, not resource paths. */
+function hasLegacyReferences(info: KeyManifestEntry): boolean {
+  return [info.wasm, info.zkey, info.vkey].every(
+    (ref) => typeof ref === 'string' && ref.length > 0 && ref.length < 32 && !/[/.]/.test(ref)
+  )
+}
+
+function isLegacyKey(key: CircuitArtifacts | LegacyKey): key is LegacyKey {
+  return typeof (key as LegacyKey).wasm === 'string'
 }
 
 class KeyManager {
   private manifest?: KeyManifest
-  private loadedKeys: Map<string, any> = new Map()
-  private verified: boolean = false
+  private loadedKeys = new Map<string, CircuitArtifacts | LegacyKey>()
+  private hashes = new Map<string, string>()
+  private verified = false
   /** Per-circuit registry compatibility result from the most recent loadKeys() (ZV-113). */
-  private compatibility: Map<string, CircuitVersionCheck> = new Map()
+  private compatibility = new Map<string, CircuitVersionCheck>()
   /** Circuits whose registry check threw during loadKeys(), by circuit name, re-thrown by getKey()/assertCircuitReady(). */
-  private unsupported: Map<string, UnsupportedCircuitVersionError> = new Map()
+  private unsupported = new Map<string, UnsupportedCircuitVersionError>()
 
-  /**
-   * Load proving keys from manifest
-   */
   async loadKeys(options: KeyLoadOptions): Promise<void> {
     console.log('Loading proving keys...')
     this.compatibility.clear()
     this.unsupported.clear()
 
-    if (options.offlinePack) {
-      await this.loadOfflineKeys(options)
-    } else if (options.manifestUrl) {
-      await this.loadFromManifest(options.manifestUrl, options)
+    let manifest: KeyManifest
+    let base = ''
+    let hasLegacyKeys = false
+
+    if (options.artifacts && Object.keys(options.artifacts).length > 0) {
+      // Real, decoded artifacts supplied directly (embedded/bundled keys).
+      manifest =
+        options.manifest ??
+        ({
+          version: 'embedded',
+          keys: Object.fromEntries(
+            Object.entries(options.artifacts).map(([name, a]) => [
+              name,
+              { wasm: '', zkey: '', vkey: '', hash: computeArtifactHash(a), size: computeArtifactSize(a) }
+            ])
+          )
+        } as KeyManifest)
+      this.assertManifestHash(manifest, options.expectedManifestHash)
+      for (const [name, artifactsForCircuit] of Object.entries(options.artifacts)) {
+        const decoded: CircuitArtifacts = {
+          wasm: toBytes(artifactsForCircuit.wasm),
+          zkey: toBytes(artifactsForCircuit.zkey),
+          vkey: assertVerificationKey(artifactsForCircuit.vkey)
+        }
+        this.loadedKeys.set(name, decoded)
+        this.hashes.set(name, computeArtifactHash(decoded))
+      }
     } else {
-      throw new Error('Must provide either manifestUrl or offlinePack option')
+      if (options.manifest) {
+        manifest = options.manifest
+        base = manifest.baseUrl ?? ''
+      } else if (options.manifestUrl) {
+        manifest = await this.fetchManifest(options.manifestUrl, options.fetchImpl)
+        base = new URL('.', options.manifestUrl).toString()
+      } else if (options.offlinePack) {
+        const offlineBase = typeof options.offlinePack === 'string' ? options.offlinePack : './keys'
+        base = offlineBase.replace(/\/?$/, '/')
+        manifest = await this.fetchManifest(base + 'manifest.json', options.fetchImpl)
+      } else {
+        throw new InvalidInputError('Must provide manifestUrl, offlinePack, manifest or artifacts')
+      }
+
+      this.assertManifestHash(manifest, options.expectedManifestHash)
+
+      for (const [circuitName, info] of Object.entries(manifest.keys)) {
+        if (hasLegacyReferences(info)) {
+          // Backwards compatibility: pre-v2 manifests carried placeholder
+          // references instead of artifact URLs. Record the keys so the
+          // registry compatibility gate still works, but never prove with them.
+          const legacy = legacyKey(circuitName)
+          this.loadedKeys.set(circuitName, legacy)
+          this.hashes.set(circuitName, hashLegacyKey(legacy))
+          hasLegacyKeys = true
+        } else {
+          const circuitArtifacts = await this.loadArtifact(circuitName, info, base, options.fetchImpl)
+          this.loadedKeys.set(circuitName, circuitArtifacts)
+          this.hashes.set(circuitName, computeArtifactHash(circuitArtifacts))
+        }
+      }
     }
+
+    this.manifest = manifest
+    this.verified = true
+    // Re-check against the manifest so a bad size/hash cannot slip through.
+    // Legacy manifests are checked by verifyKeyIntegrity() instead, so that a
+    // caller can use the registry gate without shipping real artifacts.
+    if (!hasLegacyKeys) this.verifyIntegrityOrThrow()
 
     if (options.registry) {
       await this.checkCompatibility(options.registry)
@@ -93,7 +280,7 @@ class KeyManager {
    * tries to prove with that one bad circuit isn't blocked from using the
    * others in the same manifest.
    */
-  private async checkCompatibility(registry: import('./registry').RegistryClient): Promise<void> {
+  private async checkCompatibility(registry: RegistryClient): Promise<void> {
     if (!this.manifest) return
     for (const [circuitName, keyInfo] of Object.entries(this.manifest.keys)) {
       if (!keyInfo.circuitId || keyInfo.circuitVersion === undefined) continue
@@ -140,109 +327,193 @@ class KeyManager {
     }
   }
 
-  /**
-   * Verify integrity of loaded keys
-   */
+  /** Verify all loaded artifacts against the manifest. Returns false on mismatch. */
   async verifyKeyIntegrity(): Promise<boolean> {
-    if (!this.manifest) {
-      throw new Error('No keys loaded')
+    try {
+      this.verifyIntegrityOrThrow()
+      return this.verified
+    } catch {
+      this.verified = false
+      return false
     }
+  }
 
-    console.log('Verifying key integrity...')
+  /** Verify all loaded artifacts, throwing a typed error on mismatch. */
+  verifyIntegrityOrThrow(): void {
+    if (!this.manifest) throw new KeyLoadError('No key manifest has been loaded')
+    if (this.loadedKeys.size === 0) throw new KeyLoadError('No key artifacts have been loaded')
 
-    for (const [circuitName, keyInfo] of Object.entries(this.manifest.keys)) {
-      const loadedKey = this.loadedKeys.get(circuitName)
-      if (!loadedKey) {
-        console.error(`Key not loaded: ${circuitName}`)
-        return false
+    for (const [circuitName, info] of Object.entries(this.manifest.keys)) {
+      const key = this.loadedKeys.get(circuitName)
+      if (!key) {
+        throw new KeyIntegrityError(`Key not loaded: ${circuitName}`)
       }
-
-      // Verify hash
-      const computedHash = this.computeHash(loadedKey)
-      if (computedHash !== keyInfo.hash) {
-        console.error(`Hash mismatch for ${circuitName}`)
-        return false
+      if (isLegacyKey(key)) {
+        // Pre-v2 manifests hashed the placeholder object itself.
+        const hash = hashLegacyKey(key)
+        if (info.hash && normaliseHash(info.hash) !== hash) {
+          throw new KeyIntegrityError(`Hash mismatch for ${circuitName}`, {
+            expected: normaliseHash(info.hash),
+            actual: hash
+          })
+        }
+        continue
+      }
+      const artifacts = key
+      if (artifacts.wasm.length === 0 || artifacts.zkey.length === 0) {
+        throw new KeyIntegrityError(`Key artifact is empty: ${circuitName}`)
+      }
+      const size = computeArtifactSize(artifacts)
+      if (info.size > 0 && size !== info.size) {
+        throw new KeyIntegrityError(`Size mismatch for ${circuitName}`, {
+          expected: info.size,
+          actual: size
+        })
+      }
+      const hash = computeArtifactHash(artifacts)
+      if (info.hash && normaliseHash(info.hash) !== hash) {
+        throw new KeyIntegrityError(`Hash mismatch for ${circuitName}`, {
+          expected: normaliseHash(info.hash),
+          actual: hash
+        })
       }
     }
-
     this.verified = true
-    return true
   }
 
-  /**
-   * Get loaded key for circuit
-   */
-  getKey(circuitName: string): any {
-    if (!this.verified) {
-      throw new Error('Keys not verified. Call verifyKeyIntegrity() first')
-    }
-    this.assertCircuitReady(circuitName)
-
+  /** Get decoded artifacts for a circuit. */
+  getKey(circuitName: string): CircuitArtifacts {
     const key = this.loadedKeys.get(circuitName)
-    if (!key) {
-      throw new Error(`Key not found: ${circuitName}`)
-    }
-
-    return key
+    if (!key) throw new KeysNotLoadedError(`No artifacts loaded for circuit: ${circuitName}`)
+    if (!this.verified) throw new KeysNotVerifiedError()
+    this.assertCircuitReady(circuitName)
+    return key as CircuitArtifacts
   }
 
-  /**
-   * Check if keys are loaded
-   */
+  /** Get the pinned verification key for a circuit. */
+  getVerificationKey(circuitName = 'vote'): VerificationKey {
+    return this.getKey(circuitName).vkey
+  }
+
   isLoaded(): boolean {
     return this.loadedKeys.size > 0
   }
 
-  private async loadFromManifest(manifestUrl: string, options: KeyLoadOptions): Promise<void> {
-    // Fetch manifest
-    const response = await fetch(manifestUrl)
-    if (!response.ok) {
-      throw new Error(`Failed to fetch manifest: ${response.statusText}`)
-    }
+  listLoadedKeys(): string[] {
+    return Array.from(this.loadedKeys.keys())
+  }
 
-    const manifest = (await response.json()) as KeyManifest
-    this.assertManifestHash(manifest, options.expectedManifestHash)
-    this.manifest = manifest
+  /** Discard all loaded artifacts (mainly for tests / key rotation). */
+  reset(): void {
+    this.manifest = undefined
+    this.loadedKeys.clear()
+    this.hashes.clear()
+    this.verified = false
+    this.compatibility.clear()
+    this.unsupported.clear()
+  }
 
-    // Load each key
-    for (const [circuitName, keyInfo] of Object.entries(manifest.keys)) {
-      console.log(`Loading key: ${circuitName} (${this.formatBytes(keyInfo.size)})`)
-
-      // In production, would fetch actual keys
-      // For now, store placeholder
-      this.loadedKeys.set(circuitName, {
-        wasm: `wasm_${circuitName}`,
-        zkey: `zkey_${circuitName}`,
-        vkey: `vkey_${circuitName}`
-      })
+  private async fetchManifest(url: string, fetchImpl?: typeof fetch): Promise<KeyManifest> {
+    try {
+      const bytes = await this.fetchBytes(url, fetchImpl)
+      const parsed = JSON.parse(new TextDecoder().decode(bytes)) as KeyManifest
+      if (!parsed || typeof parsed.version !== 'string' || !parsed.keys || typeof parsed.keys !== 'object') {
+        throw new KeyIntegrityError('Malformed key manifest', { url })
+      }
+      return parsed
+    } catch (err) {
+      if (err instanceof KeyIntegrityError) throw err
+      throw new KeyLoadError(`Failed to load key manifest: ${url}`, { cause: err })
     }
   }
 
-  private async loadOfflineKeys(options: KeyLoadOptions): Promise<void> {
-    // Load keys bundled with the SDK
-    console.log('Loading offline key pack...')
-
-    // Placeholder - would load from bundled files
-    const manifest: KeyManifest = {
-      version: '1.0.0',
-      keys: {
-        vote: {
-          wasm: 'bundled',
-          zkey: 'bundled',
-          vkey: 'bundled',
-          hash: 'sha256:...',
-          size: 45000000
-        }
-      }
+  private async loadArtifact(
+    circuitName: string,
+    info: KeyManifestEntry,
+    base: string,
+    fetchImpl?: typeof fetch
+  ): Promise<CircuitArtifacts> {
+    if (!info.wasm || !info.zkey || !info.vkey) {
+      throw new KeyLoadError(`Manifest is missing artifact references for ${circuitName}`)
     }
-    this.assertManifestHash(manifest, options.expectedManifestHash)
-    this.manifest = manifest
 
-    this.loadedKeys.set('vote', {
-      wasm: 'bundled_wasm',
-      zkey: 'bundled_zkey',
-      vkey: 'bundled_vkey'
-    })
+    const wasmBytes = await this.fetchCached(info.wasm, base, fetchImpl)
+    const zkeyBytes = await this.fetchCached(info.zkey, base, fetchImpl)
+    const vkeyBytes = await this.fetchCached(info.vkey, base, fetchImpl)
+    let vkey: VerificationKey
+    try {
+      vkey = assertVerificationKey(JSON.parse(new TextDecoder().decode(vkeyBytes)))
+    } catch (err) {
+      if (err instanceof KeyIntegrityError) throw err
+      throw new KeyIntegrityError(`Malformed verification key for ${circuitName}`, { cause: err })
+    }
+
+    return { wasm: wasmBytes, zkey: zkeyBytes, vkey }
+  }
+
+  private async fetchCached(ref: string, base: string, fetchImpl?: typeof fetch): Promise<Uint8Array> {
+    const url = this.resolve(ref, base)
+    const cacheKey = `zkvote:artifact:${url}`
+    const cached = getCached<Uint8Array>(cacheKey)
+    if (cached) return cached
+    const bytes = await this.fetchBytes(url, fetchImpl)
+    setCached(cacheKey, bytes, bytes.byteLength, { hash: undefined })
+    return bytes
+  }
+
+  private resolve(ref: string, base: string): string {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(ref)) return ref
+    if (!base) return ref
+    if (/^https?:\/\//i.test(base)) return new URL(ref, base).toString()
+    return base.replace(/\/?$/, '/') + ref.replace(/^\.?\//, '')
+  }
+
+  private async fetchBytes(url: string, fetchImpl?: typeof fetch): Promise<Uint8Array> {
+    if (/^https?:\/\//i.test(url)) {
+      const doFetch = fetchImpl ?? globalThis.fetch
+      if (typeof doFetch !== 'function') {
+        throw new NetworkError(`fetch is unavailable; cannot load ${url}`)
+      }
+      let response: Response
+      try {
+        response = await doFetch(url)
+      } catch (err) {
+        throw new NetworkError(`Failed to fetch ${url}`, { cause: err })
+      }
+      if (!response.ok) {
+        throw new NetworkError(`Failed to fetch ${url}: ${response.status} ${response.statusText}`)
+      }
+      const bytes = await this.responseBytes(response)
+      if (bytes.byteLength === 0) throw new KeyIntegrityError(`Empty artifact: ${url}`)
+      return bytes
+    }
+
+    // Local file path (Node / Electron). Dynamic import keeps browser bundles clean.
+    try {
+      // @ts-ignore - dynamic import of a Node builtin; tsup dts uses an older module target
+      const { readFile } = await import('node:fs/promises')
+      const data: Uint8Array = await readFile(url)
+      if (data.byteLength === 0) throw new KeyIntegrityError(`Empty artifact: ${url}`)
+      return data
+    } catch (err) {
+      if (err instanceof KeyIntegrityError) throw err
+      throw new KeyLoadError(`Failed to read local artifact: ${url}`, { cause: err })
+    }
+  }
+
+  /** Read a response body, tolerating test doubles that only implement json(). */
+  private async responseBytes(response: Response): Promise<Uint8Array> {
+    if (typeof response.arrayBuffer === 'function') {
+      const buffer = await response.arrayBuffer()
+      if (!buffer || buffer.byteLength === 0) throw new KeyIntegrityError('Empty response body')
+      return new Uint8Array(buffer)
+    }
+    const json = (response as unknown as { json?: () => Promise<unknown> }).json
+    if (typeof json === 'function') {
+      const data = await json.call(response)
+      return new TextEncoder().encode(JSON.stringify(data))
+    }
+    throw new KeyIntegrityError('Response body is unreadable')
   }
 
   /**
@@ -270,52 +541,39 @@ class KeyManager {
     hash.update(JSON.stringify(manifest.keys))
     return 'sha256:' + hash.digest('hex')
   }
-
-  private computeHash(key: any): string {
-    // In production, would compute actual hash of key data
-    const hash = createHash('sha256')
-    hash.update(JSON.stringify(key))
-    return 'sha256:' + hash.digest('hex')
-  }
-
-  private formatBytes(bytes: number): string {
-    if (bytes < 1024) return bytes + ' B'
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
-  }
 }
 
 // Singleton instance
 const keyManager = new KeyManager()
 
-/**
- * Load proving keys
- */
+/** Load proving keys from manifest, offline pack or explicit artifacts. */
 export async function loadKeys(options: KeyLoadOptions): Promise<void> {
   return keyManager.loadKeys(options)
 }
 
-/**
- * Verify key integrity
- */
+/** Verify integrity of loaded keys (returns false rather than throwing). */
 export async function verifyKeyIntegrity(): Promise<boolean> {
   return keyManager.verifyKeyIntegrity()
 }
 
-/**
- * Check if keys are loaded
- */
-export function areKeysLoaded(): boolean {
-  return keyManager.isLoaded()
+/** Verify integrity of loaded keys, throwing a typed error on mismatch. */
+export function verifyKeyIntegrityOrThrow(): void {
+  keyManager.verifyIntegrityOrThrow()
 }
 
-/**
- * Get the loaded, verified key for a circuit (throws if keys were never
- * verified, the circuit was never loaded, or it failed its registry
- * compatibility check - see `assertCircuitReady`).
- */
-export function getKey(circuitName: string): any {
+/** Get decoded artifacts for a circuit. */
+export function getKey(circuitName: string): CircuitArtifacts {
   return keyManager.getKey(circuitName)
+}
+
+/** Get the pinned verification key for a circuit. */
+export function getVerificationKey(circuitName = 'vote'): VerificationKey {
+  return keyManager.getVerificationKey(circuitName)
+}
+
+/** Check if keys are loaded. */
+export function areKeysLoaded(): boolean {
+  return keyManager.isLoaded()
 }
 
 /**
@@ -331,8 +589,18 @@ export function getCompatibilityReport(): { checks: CircuitVersionCheck[]; unsup
  * Get the key for a circuit, by name, without going through getKey()'s
  * "verified" requirement - just the registry-compatibility gate. Lets
  * prove.ts refuse to prove with an unsupported circuit version even
- * before/independent of the (separately mocked) hash-integrity check.
+ * before/independent of the hash-integrity check.
  */
 export function assertCircuitReady(circuitName: string): void {
   keyManager.assertCircuitReady(circuitName)
+}
+
+/** List loaded circuit names. */
+export function listLoadedKeys(): string[] {
+  return keyManager.listLoadedKeys()
+}
+
+/** Discard all loaded artifacts. */
+export function resetKeys(): void {
+  keyManager.reset()
 }

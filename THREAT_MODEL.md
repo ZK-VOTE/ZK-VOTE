@@ -396,95 +396,108 @@ See [`docs/post-quantum-evaluation.md`](docs/post-quantum-evaluation.md) and [`d
 
 ### Explicitly deferred (not addressed by #167)
 
-- **Relayer front-running / proof-to-relayer binding**: this threat model
-  already documents relayer front-running as an accepted, low-severity risk
-  ("tally unaffected because votes are additive") rather than something the
-  system currently prevents. Binding a proof to a specific relayer would
-  mean adding `relayer_address` as a new circuit public signal, which
-  cascades into the Groth16 verifier's on-chain check and a new trusted
-  setup — a change that touches the same failure surface as a new
-  cryptographic parameter set and needs its own dedicated, carefully
-  reviewed pass rather than being bundled into this one.
+- **Relayer front-running / proof-to-relayer binding**: resolved by the
+  dedicated relayer-binding work described under "Relayer Binding (#361 /
+  ZV-029)" below. The binding is enforced off-circuit (caller-supplied
+  relayer + `require_auth()` + single-use nullifier), *not* by adding a
+  `relayer_address` circuit signal — that earlier approach was abandoned
+  because a public signal binds nothing a contract can verify and it broke
+  the Groth16 IC length. No new trusted setup was needed.
 - **Circuit constraint-count optimization** (tracked separately, #123): a
   multi-week circuit-engineering task independent of the security fixes
   above.
 
-## Relayer Address Binding (Issue #361)
+## Relayer Binding (Issue #361 / ZV-029)
 
-**Threat (from #167 deferred list)**: A malicious relayer could intercept
-a ZK proof and resubmit it through a different channel (different relayer or
-delayed resubmission) for strategic advantage. While the tally remains
-unaffected (votes are additive), voters may have preferences about:
+**Threat**: A relayer sees a ZK vote proof before submitting it. It can delay
+it, drop it, or try to push the same proof through a second channel under a
+different relayer identity. The tally is additive, so reordering does not
+change the result, but voters care about *which operator* carried their ballot
+and about not being deanonymized by attribution.
 
-- Which relayer processes their vote (trust/latency)
-- Voting order (time-sensitive elections)
-- Proof reuse prevention (cross-relayer replay)
+### Why the old 7th-signal design was abandoned
 
-**Mitigation (implemented in #361)**: Add `relayer_address` as the 7th public
-signal in the vote circuit (`vote.circom`) and 10th in the re-voting circuit
-(`vote_v2.circom`). The contract:
+Closed #361 originally added `relayerAddress` as a 7th public signal to
+`circuits/vote.circom`, with the contract passing a zero sentinel for it. That
+was wrong for two reasons:
 
-1. **Extracts relayer address** from the transaction signer (`env.invoker()`)
-2. **Converts to field element** via SHA-256 hash: `relayer_signal = SHA256(address_xdr)`
-3. **Validates field membership** (must be < BN254 scalar field modulus r, non-zero)
-4. **Includes in public signals** passed to Groth16 verifier
-5. **Proof verification fails** if `relayer_address` in circuit ≠ `actual_relayer_submitting`
+1. **A public signal binds nothing the verifier cannot check.** A Soroban
+   contract cannot observe which account invoked it, and `Env::auths()` is
+   test-only, so the signal was decorative.
+2. **It broke the verification key.** 7 public signals require 8 IC points,
+   while the contract's `VOTE_CIRCUIT_IC_LEN` and every call site used 6/7, so
+   no VK could be registered and the anonymous path was non-functional.
+   `scripts/drift-guard.mjs` now fails the build on any such disagreement.
 
-**Security properties**:
+The signal and its zero sentinel are gone. Public signals stay at 6:
+`[root, nullifier, daoId, proposalId, voteChoice, numCandidates]`.
 
-- **Proof binding**: A proof generated with `relayer_address=A` cannot be
-  resubmitted through relayer B; the pairing check will fail
-- **No nullifier pollution**: Nullifier remains deterministic per (voter, election),
-  unaffected by relayer change
-- **Election-scoped**: Each proof is bound to a specific relayer for a specific
-  election; not a global signature
-- **Frontend responsibility**: Frontend must pass correct relayer address when
-  generating proofs; incorrect address causes vote rejection
+### Enforced design
 
-**What this prevents**:
+The relayer is a **caller-supplied `Address`** on the relayer-aware
+entrypoints (`vote_with_relayer`, `vote_bls381_with_relayer`,
+`cast_votes_with_relayer`). `require_authorized_relayer`:
 
-- ✅ Cross-relayer proof reuse
-- ✅ Selective front-running via relayer switching
-- ✅ Proof harvesting and replay by malicious observer
+1. rejects the contract's own address as a sentinel;
+2. calls **`relayer.require_auth()`** — the relayer must have signed this
+   submission;
+3. when a guardian-managed allowlist is configured, requires membership
+   (`InvalidRelayerAddress` otherwise). With no allowlist the relayer's own
+   auth is still required, so unconfigured deployments work.
 
-**What this does NOT prevent**:
+### Submission-context attribution (no deanonymization)
 
-- ❌ Front-running within a single relayer (still possible)
-- ❌ Censorship (relayer can still drop votes)
-- ❌ Ordering attacks if coordinated with proposer
-- ❌ Nullifier censorship (relayer knows nullifier from proof)
+`RelayerAttributionEvent` carries `(dao_id, proposal_id, nullifier, relayer,
+path)`. It contains **no voter address, secret, salt, blinding factor or
+commitment**. The nullifier is already public in `VoteEvent`; attribution
+therefore does not link a voter identity to a relayer.
 
-**Privacy impact**: Relayer address is now a public signal (visible on-chain in
-proof verification). Voters with different relayers will have different proofs.
-No new privacy leakage: relayer addresses are already known from transaction
-signing.
+### Why a different relayer cannot submit an intercepted proof
 
-**Backward compatibility**: This is a breaking change:
+The nullifier is consumed in the checks-effects-interactions phase, before
+proof verification. It is scoped to `(dao_id, proposal_id)`. Once relayer A's
+submission succeeds, relayer B replaying the same `(proof, nullifier)` fails
+with `AlreadySubmitted`. The attribution event records which relayer spent it
+first. This is the enforceable form of the binding the 7th signal claimed to
+provide.
 
-- Old 6-signal proofs (without relayer_address) will fail verification with
-  new 7-signal verification keys
-- Clients must upgrade to new circuit version to generate compatible proofs
-- Old proofs are explicitly rejected by the new contract
+### Batch parity
 
-**Code changes**:
+`cast_votes_with_relayer` uses the same `require_authorized_relayer` and
+`emit_relayer_attribution` helpers as the single-vote path, emitting one
+attribution event per ballot. There is no BLS batch entrypoint; the BLS single
+path uses the same helpers.
 
-- `circuits/vote.circom`: `signal input relayerAddress` added to template,
-  included in public signals list
-- `circuits/vote_v2.circom`: Same changes for re-voting circuit (10 signals total)
-- `contracts/voting/src/lib.rs`:
-  - Constants: `NUM_PUBLIC_SIGNALS = 7`, `VOTE_CIRCUIT_IC_LEN = 8`
-  - Error codes: `InvalidRelayerAddress = 69`, `RelayerMismatch = 70`
-  - Helper: `address_to_u256()` converts address to field element
-  - Both `vote()` and `vote_bls381()` validate and include relayer signal
-- `frontend/src/lib/zkproof.ts`: Pass relayer address when generating proofs
-- `backend/src/services/stellar.ts`: Extract relayer from keypair, pass to frontend
+### Rotation
 
-**Deployment impact**:
+Guardian-only `add_relayer` / `remove_relayer` / `rotate_relayer` manage the
+allowlist (`RelayerRotationEvent`). Removing the last member deactivates the
+set. `set_require_relayer_on_legacy(true)` opts into refusing the legacy
+relayer-less entrypoints; by default they remain callable for backward
+compatibility.
 
-- New verification keys must be generated (IC vector length: 7 → 8)
-- Groth16 trusted setup must be rerun (new circuit, new parameters)
-- KAT (Known Answer Test) must validate circuit and on-chain match
-- All clients must upgrade to new frontend/backend before voting
+### What this prevents / does not prevent
+
+- ✅ A different relayer resubmitting an intercepted proof (`AlreadySubmitted`)
+- ✅ Unauthorized relayers submitting when an allowlist is configured
+- ✅ Auditable relayer attribution without voter deanonymization
+- ❌ Censorship by a relayer that already holds the proof
+- ❌ Ordering changes within a single authorized relayer (tally is additive)
+
+### Privacy impact
+
+The relayer address is visible on-chain (it signs the transaction and appears
+in the attribution event); relayer addresses were already public from tx
+signing. The voter remains known only by the election-scoped nullifier, so
+attribution does not deanonymize them.
+
+### Backward compatibility
+
+No circuit change, no new verification key, no trusted setup. Existing
+`vote` / `vote_bls381` / `cast_votes` signatures are unchanged; their callers
+keep compiling. Clients that want attribution use the `*_with_relayer`
+entrypoints. See `RELAYER_BINDING_DESIGN.md` and
+`RELAYER_BINDING_IMPLEMENTATION_STATUS.md`.
 
 ## Voter Deanonymization at Registration (Issue #122)
 

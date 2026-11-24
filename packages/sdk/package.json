@@ -1,15 +1,15 @@
 {
   "name": "@zkvote/sdk",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "ZKVote Proving SDK - Zero-knowledge proof generation and verification",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/index.js"
     }
   },
   "files": [
@@ -20,6 +20,7 @@
   ],
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "typecheck": "tsc --noEmit --target ES2022 --module esnext --moduleResolution bundler --skipLibCheck --esModuleInterop --strict false src/*.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build && npm test"
@@ -41,6 +42,8 @@
     "directory": "packages/sdk"
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "circomlibjs": "^0.1.7",
     "snarkjs": "^0.7.0"
   },
   "devDependencies": {

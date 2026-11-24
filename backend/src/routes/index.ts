@@ -24,6 +24,7 @@ export { default as adminRoutes } from "./admin.js";
 export { default as thresholdRoutes } from "./threshold.js";
 export { default as auditRoutes } from "./audit.js";
 export { default as randomnessRoutes } from "./randomness.js";
+// payRoutes registers /pay, /pay/batch, /pay/vote (relayer fee-bump) and /pay/metrics.
 export { default as payRoutes } from "./pay.js";
 export { default as swapRoutes } from "./swap.js";
 export { default as rampRoutes } from "./ramp.js";

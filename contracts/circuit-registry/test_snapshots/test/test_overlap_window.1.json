@@ -96,6 +96,9 @@
                 },
                 {
                   "u32": 5
+                },
+                {
+                  "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
                 }
               ]
             }
@@ -194,6 +197,9 @@
                 },
                 {
                   "u32": 6
+                },
+                {
+                  "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
                 }
               ]
             }
@@ -309,6 +315,74 @@
           "ext": "v0"
         },
         "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "CeremonyTranscriptHash"
+                  },
+                  {
+                    "string": "vote_v1"
+                  },
+                  {
+                    "vec": [
+                      {
+                        "symbol": "Vote"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 535680
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "CeremonyTranscriptHash"
+                  },
+                  {
+                    "string": "vote_v2"
+                  },
+                  {
+                    "vec": [
+                      {
+                        "symbol": "Vote"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 535680
       },
       {
         "entry": {
@@ -713,6 +787,18 @@
                   "storage": [
                     {
                       "key": {
+                        "symbol": "admins"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "gov"
                       },
                       "val": {
@@ -721,7 +807,23 @@
                     },
                     {
                       "key": {
+                        "symbol": "min_tl"
+                      },
+                      "val": {
+                        "u64": "86400"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "ver"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "vk_qrm"
                       },
                       "val": {
                         "u32": 1
