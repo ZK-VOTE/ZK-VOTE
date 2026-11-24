@@ -298,11 +298,11 @@ impl CircuitRegistry {
         wasm_hash: BytesN<32>,
         expiration: u64,
         num_public_signals: u32,
-        /// #726: SHA-256 hash of the MPC ceremony transcript (output of
-        /// `circuits/ceremony/verify-ceremony.js`). Required for all new
-        /// circuit registrations; absent provenance is rejected so that
-        /// downstream verifiers can always trace any on-chain VK back to
-        /// its trusted-setup ceremony.
+        // #726: SHA-256 hash of the MPC ceremony transcript (output of
+        // `circuits/ceremony/verify-ceremony.js`). Required for all new
+        // circuit registrations; absent provenance is rejected so that
+        // downstream verifiers can always trace any on-chain VK back to
+        // its trusted-setup ceremony.
         ceremony_transcript_hash: Option<BytesN<32>>,
     ) {
         Self::bump_instance(&env);

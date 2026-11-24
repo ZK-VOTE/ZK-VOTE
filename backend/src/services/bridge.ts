@@ -7,6 +7,15 @@
 
 import * as StellarSdk from "@stellar/stellar-sdk";
 import type { LoggerPort, RpcServerPort } from "./interfaces.js";
+import {
+  BridgeRelayStore,
+  VOTE_FORWARDED_TOPIC,
+  decodeVoteForwardedLog,
+  runRelayCycle,
+  type EvmRpc,
+  type RelayCycleResult,
+  type RelayRecord,
+} from "./bridge-evm.js";
 
 //__BRIDGE_DEPS_START__
 /**
@@ -39,6 +48,19 @@ export interface BridgeDeps {
   u256ToScVal(hexString: string): StellarSdk.xdr.ScVal;
   /** Structured logger (called as `deps.log(level, event, meta)`). */
   log: LoggerPort["log"];
+  /**
+   * EVM side (#887): Bridge.sol's JSON-RPC endpoint and address. Without it
+   * the relay loop has nothing to watch and does not run.
+   */
+  evm?: {
+    rpc: EvmRpc;
+    contractAddress: string;
+    confirmations: number;
+    startBlock: number;
+    maxBlockRange: number;
+    maxAttempts: number;
+    store?: BridgeRelayStore;
+  };
 }
 
 let bridgeDeps: BridgeDeps | null = null;
@@ -61,8 +83,9 @@ function deps(): BridgeDeps {
 // ============================================
 
 export interface EVMVoteEvent {
-  daoId: number;
-  proposalId: number;
+  /** u64 on Soroban; decimal string when it comes from an EVM uint256. */
+  daoId: number | string;
+  proposalId: number | string;
   nullifier: string;
   voteChoice: number;
   voteRoot: string;
@@ -82,26 +105,54 @@ export interface RelayResult {
 
 let relayRunning = false;
 let relayInterval: ReturnType<typeof setInterval> | null = null;
-let lastProcessedBlock = 0;
+let defaultStore: BridgeRelayStore | null = null;
+
+function relayStore(): BridgeRelayStore {
+  return deps().evm?.store ?? (defaultStore ??= new BridgeRelayStore());
+}
 
 // ============================================
 // EVM EVENT POLLING
 // ============================================
 
 /**
- * Poll EVM bridge contract for VoteForwarded events
- * In production, use WebSocket or event subscription
- * For now, poll via RPC
+ * Reads the finalized VoteForwarded events after the relayer's checkpoint,
+ * without advancing it (the relay cycle owns the checkpoint). Returns an
+ * empty list when the EVM side is not configured.
  */
 export async function pollEVMEvents(): Promise<EVMVoteEvent[]> {
-  // In production, this would:
-  // 1. Connect to Ethereum node via ethers.js
-  // 2. Query Bridge contract events since last processed block
-  // 3. Parse VoteForwarded events
-  //
-  // For now, return empty array (placeholder)
-  deps().log("info", "evm_poll", { lastBlock: lastProcessedBlock });
-  return [];
+  const evm = deps().evm;
+  if (!evm) return [];
+  const head = await evm.rpc.blockNumber();
+  const finalized = head - evm.confirmations;
+  const checkpoint = relayStore().getCheckpoint(evm.contractAddress);
+  const from = checkpoint ? checkpoint.blockNumber + 1 : evm.startBlock;
+  if (from > finalized) return [];
+  const logs = await evm.rpc.getLogs({
+    address: evm.contractAddress,
+    fromBlock: from,
+    toBlock: Math.min(finalized, from + evm.maxBlockRange - 1),
+    topics: [VOTE_FORWARDED_TOPIC],
+  });
+  const events: EVMVoteEvent[] = [];
+  for (const log of logs) {
+    if (log.removed) continue;
+    try {
+      const vote = decodeVoteForwardedLog(log);
+      events.push({
+        daoId: vote.daoId,
+        proposalId: vote.proposalId,
+        nullifier: vote.nullifier,
+        voteChoice: vote.voteChoice,
+        voteRoot: vote.voteRoot,
+        txHash: vote.txHash,
+        blockNumber: vote.blockNumber,
+      });
+    } catch {
+      /* not a well-formed VoteForwarded log; the relay cycle logs these */
+    }
+  }
+  return events;
 }
 
 /**
@@ -127,8 +178,8 @@ export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
     const contract = new StellarSdk.Contract(deps().bridgeContractId!);
 
     const args = [
-      StellarSdk.nativeToScVal(event.daoId, { type: "u64" }),
-      StellarSdk.nativeToScVal(event.proposalId, { type: "u64" }),
+      StellarSdk.nativeToScVal(BigInt(event.daoId), { type: "u64" }),
+      StellarSdk.nativeToScVal(BigInt(event.proposalId), { type: "u64" }),
       StellarSdk.nativeToScVal(event.voteChoice === 1, { type: "bool" }),
       scNullifier,
       scVoteRoot,
@@ -219,44 +270,79 @@ export async function relayVote(event: EVMVoteEvent): Promise<RelayResult> {
 // RELAY LOOP
 // ============================================
 
+const toEvent = (vote: RelayRecord): EVMVoteEvent => ({
+  daoId: vote.daoId,
+  proposalId: vote.proposalId,
+  nullifier: vote.nullifier,
+  voteChoice: vote.voteChoice,
+  voteRoot: vote.voteRoot,
+  txHash: vote.evmTxHash,
+  blockNumber: vote.blockNumber,
+});
+
 /**
- * Process a batch of EVM events
+ * One relay pass (#887): reorg check, scan of finalized blocks, then a
+ * Soroban `relay_vote` per pending vote, with status tracked per vote.
+ * Returns null when the EVM side is not configured or a pass is running.
  */
-async function processEvents(): Promise<void> {
-  if (relayRunning) return;
+export async function processEvents(): Promise<RelayCycleResult | null> {
+  const evm = deps().evm;
+  if (!evm || relayRunning) return null;
   relayRunning = true;
 
   try {
-    const events = await pollEVMEvents();
-
-    for (const event of events) {
-      const result = await relayVote(event);
-      if (!result.success) {
-        deps().log("warn", "relay_event_failed", {
-          txHash: event.txHash,
-          error: result.error,
-        });
-      }
-      lastProcessedBlock = Math.max(lastProcessedBlock, event.blockNumber);
+    const result = await runRelayCycle({
+      rpc: evm.rpc,
+      store: relayStore(),
+      contract: evm.contractAddress,
+      confirmations: evm.confirmations,
+      startBlock: evm.startBlock,
+      maxBlockRange: evm.maxBlockRange,
+      maxAttempts: evm.maxAttempts,
+      relay: (vote) => relayVote(toEvent(vote)),
+      log: (level, event, meta) => deps().log(level, event, meta),
+    });
+    if (result.observed || result.relayed || result.failed || result.reorg) {
+      deps().log("info", "relay_cycle", { ...result });
     }
+    return result;
   } catch (err) {
     deps().log("error", "relay_loop_error", { error: (err as Error).message });
+    return null;
   } finally {
     relayRunning = false;
   }
+}
+
+/** Relay state for the status route. */
+export function getRelayStatus() {
+  const evm = deps().evm;
+  if (!evm) return { configured: false as const };
+  return {
+    configured: true as const,
+    contractAddress: evm.contractAddress,
+    confirmations: evm.confirmations,
+    checkpoint: relayStore().getCheckpoint(evm.contractAddress),
+    votes: relayStore().counts(),
+  };
+}
+
+/** Status of one forwarded vote, or null when the relayer has not seen it. */
+export function getRelayedVote(daoId: string, proposalId: string, nullifier: string) {
+  return relayStore().get(daoId, proposalId, nullifier);
 }
 
 /**
  * Start the relay service
  */
 export function startRelay(intervalMs: number = 10000): void {
-  if (relayInterval) return;
+  if (relayInterval || !deps().evm) return;
 
   deps().log("info", "relay_started", { intervalMs });
-  relayInterval = setInterval(processEvents, intervalMs);
+  relayInterval = setInterval(() => void processEvents(), intervalMs);
 
   // Process immediately
-  processEvents();
+  void processEvents();
 }
 
 /**

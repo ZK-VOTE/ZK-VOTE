@@ -846,6 +846,22 @@ export const relayerSigningRefusedTotal = new Counter({
   registers: [register],
 });
 
+// Notification delivery (ZV-037 / #886). `channel` is email | webpush;
+// `result` is sent | retry | gone | skipped. No destination or token is a label.
+export const notificationDeliveriesTotal = new Counter({
+  name: "zkvote_notification_deliveries_total",
+  help: "Notification delivery attempts by channel and result",
+  labelNames: ["channel", "result"] as const,
+  registers: [register],
+});
+
+export const notificationDeadLetterTotal = new Counter({
+  name: "zkvote_notification_dead_letter_total",
+  help: "Notifications moved to the dead-letter queue after exhausting retries",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
 export const relayerSigningTierTotal = new Counter({
   name: "zkvote_relayer_signing_tier_total",
   help: "Relayer signatures by signing tier",

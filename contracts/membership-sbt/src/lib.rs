@@ -90,7 +90,7 @@ pub const SECONDS_PER_DAY: u64 = 86_400;
 // during the window; once the TTL expires the key is gone and the next epoch
 // starts at zero automatically, with no explicit reset needed.
 pub const MAX_MINTS_PER_EPOCH: u32 = 50;
-const EPOCH_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
+pub const EPOCH_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

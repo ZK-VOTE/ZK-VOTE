@@ -314,6 +314,88 @@ and can corrupt tallies.
 
 ---
 
+## Bridge relayer: EVM → Soroban (ZV-038 / #887)
+
+### `VoteForwarded` (Bridge.sol, EVM)
+
+Emitted by `Bridge.castVote` once a Groth16 proof verifies. It is the only event the relayer reads.
+
+| Field | Type | Indexed | Description |
+|-------|------|---------|-------------|
+| `daoId` | uint256 | ✓ | DAO identifier |
+| `proposalId` | uint256 | ✓ | Proposal identifier |
+| `nullifier` | uint256 | | Vote nullifier (relayed as `U256`) |
+| `voteChoice` | uint256 | | 0 = against, 1 = for |
+| `voteRoot` | uint256 | | Anchored vote root the proof was checked against |
+| `memberAddr` | uint256 | | Field-encoded Stellar member address (not relayed) |
+| `chainId` | uint256 | | EVM chain id bound into the proof (#649) |
+
+The relayer filters on topic `0xfdfc70c1…16ef` and reads the views `getSbtRoot`, `getVoteRoot` and `sbtRootBlock`. `contracts/bridge/evm/test/RelayerAbi.test.js` pins these constants to the compiled ABI.
+
+### Finality and reorgs
+
+1. **Confirmations.** The relayer reads only blocks at least `BRIDGE_EVM_CONFIRMATIONS` deep (default 12). Choose it for the chain's finality: 12 suits Ethereum mainnet probabilistic finality; use 64 or more for "finalized" semantics, and 0 only on a local dev chain.
+2. **Checkpoint.** After each scan the last block's number and hash are stored (`bridge_relay_checkpoints`). Scanning resumes there after a restart.
+3. **Reorg detection.** If the chain's hash at the checkpoint height no longer matches, a reorg deeper than the confirmation depth happened. The relayer rewinds by twice the confirmation depth and rescans:
+   - votes from the orphaned blocks that were not yet relayed become `rolled_back`; if the vote reappears on the canonical chain it returns to `pending` and is relayed once;
+   - a vote already relayed becomes `orphaned` and is logged at error level (`bridge_evm_reorg`). It is never relayed again; an operator decides whether the Soroban side needs action. If it reappears on the canonical chain it returns to `relayed`.
+4. **Exactly once.** Votes are keyed by (DAO, proposal, nullifier), the same key the Soroban bridge uses, so no vote is relayed twice.
+
+### Status
+
+Each vote has a status: `pending`, `relayed` (with the Stellar transaction hash), `failed` (after `BRIDGE_RELAY_MAX_ATTEMPTS`), `rolled_back` or `orphaned`.
+
+| Route | Purpose |
+|---|---|
+| `GET /bridge/relay/status` | Checkpoint and per-status counts |
+| `GET /bridge/relay/:daoId/:proposalId/:nullifier` | One vote's status and hashes |
+| `POST /bridge/relay` (auth) | Run one relay pass now |
+| `GET /bridge/roots/:daoId/:proposalId` | Roots anchored on Bridge.sol; the bridge panel shows and submits these |
+
+Configuration: `BRIDGE_EVM_RPC_URL`, `BRIDGE_EVM_CONTRACT_ADDRESS`, `BRIDGE_EVM_CONFIRMATIONS`, `BRIDGE_EVM_START_BLOCK`, `BRIDGE_EVM_MAX_BLOCK_RANGE` and `BRIDGE_RELAY_MAX_ATTEMPTS`. The relay loop runs only when the RPC URL and contract address are set.
+
+## Notification delivery (ZV-037 / #886)
+
+Some events are also delivered to people who asked for them, by email or browser push. This is opt-in and anonymous.
+
+### Events
+
+| Notification | Source |
+|---|---|
+| `election_started` | `ProposalEvent` (indexed as `proposal_created`) |
+| `election_ended` | `ProposalClosedEvent` (indexed as `proposal_closed`) |
+| `dispute_outcome` | A dispute case resolved by the second reviewer of a payment hold |
+
+Only named, non-identifying fields reach a notification: the DAO id, the proposal id and its closing time, and a dispute's resolution text. Creator addresses, nullifiers and vote choices are never copied.
+
+### Preferences and privacy
+
+- `POST /api/v1/notifications/subscriptions` with `{ channel, destination, eventTypes?, daoIds? }` returns a random contact token. The token is the only handle on the subscription: it is not linked to a wallet, a membership or a vote.
+- `GET`/`PATCH`/`DELETE /api/v1/notifications/subscriptions/:token` reads, changes (and renews) or removes it. `GET /api/v1/notifications/channels` lists the configured channels and the VAPID public key.
+- Every email carries a one-click unsubscribe link (`/api/v1/notifications/unsubscribe?token=…`) and `List-Unsubscribe` / `List-Unsubscribe-Post` headers.
+- Subscriptions expire after `NOTIFY_SUBSCRIPTION_TTL_DAYS` (default 180) unless renewed; expired rows are skipped and purged hourly. A push subscription the push service reports gone (404/410) is removed.
+- Templates HTML-escape user content and redact every Stellar account, muxed or contract address, so no wallet address appears in a message.
+
+### Delivery
+
+Publishing an event writes one job per matching destination into the durable `jobs` outbox (ZV-069) and returns. A worker drains it in batches of `NOTIFY_BATCH_SIZE`. Delivery does not depend on the SSE stream or any open connection, and survives restarts. The business key (event id, channel, destination hash) means a re-indexed event or a duplicate subscription is delivered once.
+
+Provider failures are retried with exponential back-off. After `NOTIFY_MAX_ATTEMPTS` the job moves to the dead-letter state (`status = 'dead'`).
+
+| Metric | Labels |
+|---|---|
+| `zkvote_notification_deliveries_total` | `channel`, `result` (`sent`, `retry`, `gone`, `skipped`) |
+| `zkvote_notification_dead_letter_total` | `channel` |
+
+### Providers
+
+| Channel | Provider | Configuration |
+|---|---|---|
+| `email` | HTTP relay: the message is POSTed as JSON (`from`, `to`, `subject`, `text`, `html`, `headers`) | `NOTIFY_EMAIL_RELAY_URL`, `NOTIFY_EMAIL_RELAY_TOKEN`, `NOTIFY_EMAIL_FROM` |
+| `webpush` | RFC 8291 payload encryption (`aes128gcm`) and RFC 8292 VAPID | `NOTIFY_VAPID_PUBLIC_KEY`, `NOTIFY_VAPID_PRIVATE_KEY`, `NOTIFY_VAPID_SUBJECT` |
+
+An unconfigured channel is not offered. Other providers plug in with `registerProvider()` from `backend/src/services/notifications`. `generateVapidKeys()` there creates a VAPID key pair. `NOTIFY_PUBLIC_URL` sets the base of the links in messages.
+
 ## Indexing Guide
 
 To efficiently consume these events:

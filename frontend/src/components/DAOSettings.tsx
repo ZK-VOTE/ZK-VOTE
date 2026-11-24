@@ -14,6 +14,7 @@ import {
 // LoadingSpinner is imported but currently unused (may be used for future loading states)
 import { ConfirmModal } from "./ui/ConfirmModal";
 import DAOProfileEditor from "./DAOProfileEditor";
+import NotificationSettings from "./NotificationSettings";
 import { Settings, Users, FileText, Loader2, ShieldAlert } from "lucide-react";
 
 /** Mirrors backend/src/services/haltStatus.ts's HALT_TIERS (ZV-114 / #954). */
@@ -336,6 +337,12 @@ export default function DAOSettings({
           isLoading={isTogglingMembership || isTogglingProposals}
         />
       )}
+
+      <Card>
+        <CardContent className="pt-6">
+          <NotificationSettings daoId={String(daoId)} />
+        </CardContent>
+      </Card>
     </div>
   );
 }

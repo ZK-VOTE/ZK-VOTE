@@ -9,6 +9,10 @@
  */
 
 import crypto from "crypto";
+import {
+  notificationFromDisputeResolution,
+  publishNotificationEventSafely,
+} from "./notifications/index.js";
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
 import { dispatchAbuseDetectionToSiem } from "./abuse-siem.js";
@@ -713,6 +717,10 @@ export function reviewHold(
     db.prepare(
       `UPDATE dispute_cases SET status = 'resolved', resolved_at = ?, resolution = ? WHERE id = ?`
     ).run(now, reason, hold.disputeCaseId);
+    // Tell subscribers the outcome (#886). Never throws into the review.
+    publishNotificationEventSafely(
+      notificationFromDisputeResolution({ caseId: hold.disputeCaseId, resolution: reason }),
+    );
   }
 
   log("info", "abuse_hold_released", {

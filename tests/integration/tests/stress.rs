@@ -12,7 +12,10 @@
 //! - Concurrent operations: Tests parallel member/proposal operations
 //! - Tree operations: Tests Merkle tree under load
 
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Symbol, U256};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, BytesN, Env, String, Symbol, U256,
+};
 
 // Import actual contract clients from crates (not WASM)
 use dao_registry::DaoRegistryClient;
@@ -110,6 +113,44 @@ fn setup_dao_with_options(
     (registry, sbt, tree, voting, admin, dao_id)
 }
 
+/// Mints memberships at a pace the SBT contract accepts.
+///
+/// `membership-sbt` allows at most `MAX_MINTS_PER_EPOCH` mints per DAO per
+/// epoch of `EPOCH_LEDGERS` ledgers (#770). A real bulk onboarding of hundreds
+/// of members spans several epochs, so the stress tests do the same: when a DAO
+/// has used its allowance, the ledger moves on to the next epoch.
+#[derive(Default)]
+struct MintPacer {
+    minted_this_epoch: std::collections::HashMap<u64, u32>,
+}
+
+impl MintPacer {
+    /// Records a mint that happened outside the pacer (the admin's, in setup).
+    fn note(&mut self, dao_id: u64) {
+        *self.minted_this_epoch.entry(dao_id).or_insert(0) += 1;
+    }
+
+    fn mint(
+        &mut self,
+        env: &Env,
+        sbt: &MembershipSbtClient,
+        dao_id: &u64,
+        to: &Address,
+        admin: &Address,
+        alias: &Option<String>,
+    ) {
+        if self.minted_this_epoch.get(dao_id).copied().unwrap_or(0)
+            >= membership_sbt::MAX_MINTS_PER_EPOCH
+        {
+            env.ledger()
+                .with_mut(|ledger| ledger.sequence_number += membership_sbt::EPOCH_LEDGERS);
+            self.minted_this_epoch.clear();
+        }
+        sbt.mint(dao_id, to, admin, alias);
+        self.note(*dao_id);
+    }
+}
+
 /// Generate a deterministic commitment from an index
 fn commitment_from_index(env: &Env, index: u32) -> U256 {
     // Simple deterministic commitment: just use the index padded to 256 bits
@@ -129,12 +170,14 @@ fn stress_many_members_and_proposals() {
     env.cost_estimate().budget().reset_unlimited();
 
     let (_, sbt, _, voting, admin, dao_id) = setup_dao(&env);
+    let mut pacer = MintPacer::default();
+    pacer.note(dao_id); // the admin, minted in setup
 
     // Add a few hundred members
     println!("Adding 300 members...");
     for i in 0..300u32 {
         let member = Address::generate(&env);
-        sbt.mint(&dao_id, &member, &admin, &None);
+        pacer.mint(&env, &sbt, &dao_id, &member, &admin, &None);
         if i % 50 == 0 {
             println!("  Added {} members", i);
         }
@@ -230,11 +273,13 @@ fn stress_merkle_tree_registrations() {
     env.cost_estimate().budget().reset_unlimited();
 
     let (_, sbt, tree, _, admin, dao_id) = setup_dao(&env);
+    let mut pacer = MintPacer::default();
+    pacer.note(dao_id); // the admin, minted in setup
 
     println!("Registering 100 commitments to Merkle tree...");
     for i in 0..100u32 {
         let member = Address::generate(&env);
-        sbt.mint(&dao_id, &member, &admin, &None);
+        pacer.mint(&env, &sbt, &dao_id, &member, &admin, &None);
 
         let commitment = commitment_from_index(&env, i);
         tree.self_register(&dao_id, &commitment, &member);
@@ -306,12 +351,14 @@ fn stress_member_aliases() {
     env.cost_estimate().budget().reset_unlimited();
 
     let (_, sbt, _, _, admin, dao_id) = setup_dao(&env);
+    let mut pacer = MintPacer::default();
+    pacer.note(dao_id); // the admin, minted in setup
 
     println!("Adding 200 members with aliases...");
     for i in 0..200u32 {
         let member = Address::generate(&env);
         let alias = String::from_str(&env, &format!("Member{:04}", i));
-        sbt.mint(&dao_id, &member, &admin, &Some(alias.clone()));
+        pacer.mint(&env, &sbt, &dao_id, &member, &admin, &Some(alias.clone()));
 
         if i % 50 == 0 {
             println!("  Added {} members with aliases", i);
@@ -356,6 +403,7 @@ fn stress_mixed_operations() {
 
     println!("Running mixed stress test...");
     println!("  Creating 20 DAOs with varied operations...");
+    let mut pacer = MintPacer::default();
 
     for i in 0..20u32 {
         let admin = Address::generate(&env);
@@ -363,7 +411,7 @@ fn stress_mixed_operations() {
         let dao_id = registry.create_dao(&name, &admin, &true, &true, &None); // open_membership=true for self_register
 
         tree.init_tree(&dao_id, &18, &Symbol::new(&env, "BN254"), &admin);
-        sbt.mint(&dao_id, &admin, &admin, &None);
+        pacer.mint(&env, &sbt, &dao_id, &admin, &admin, &None);
         voting.set_vk(&dao_id, &dummy_vk(&env), &admin);
 
         // Add varying number of members per DAO
@@ -375,7 +423,7 @@ fn stress_mixed_operations() {
             } else {
                 None
             };
-            sbt.mint(&dao_id, &member, &admin, &alias);
+            pacer.mint(&env, &sbt, &dao_id, &member, &admin, &alias);
 
             // Register some to the tree
             if j % 3 == 0 {

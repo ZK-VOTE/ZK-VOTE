@@ -526,16 +526,213 @@ export class RelayerKeyManager {
    *
    * Every signature also passes the tier/halt policy when one is installed.
    */
-  public async signTransaction(tx: StellarSdk.Transaction): Promise<void> {
-    const active = this.getActiveKey();
-    if (!active) {
-      throw new Error("No active relayer signer available");
+  public async signTransaction(
+    tx: StellarSdk.Transaction | StellarSdk.FeeBumpTransaction,
+    auth: SignAuthorization = {},
+  ): Promise<void> {
+    const key = this.resolveSigningKey(tx, auth);
+    if (auth.purpose === "sweep" && !this.signingPolicy) {
+      // The policy is what pins a sweep to the safe account; without it a
+      // sweep purpose would be an unchecked way to sign with a revoked key.
+      this.refuse("sweep_unauthorized", "Sweep signing requires an installed signing policy");
     }
-    await active.signer.signTransaction(tx);
-    active.txCount++;
-    active.lastUsedAt = new Date().toISOString();
+    try {
+      const classification = this.signingPolicy?.authorize(tx, auth);
+      if (classification) {
+        relayerSigningTierTotal.inc({ tier: classification.tier });
+      }
+    } catch (err) {
+      if (err instanceof SigningRefusedError) {
+        relayerSigningRefusedTotal.inc({ reason: err.reason });
+      }
+      throw err;
+    }
+
+    await key.signer.signTransaction(tx as StellarSdk.Transaction);
+    key.txCount++;
+    key.lastUsedAt = new Date().toISOString();
+    this.recordOutstanding(tx, key.publicKey);
     // By role, not key id: ids grow with every rotation (#749).
-    relayerKeyTransactionsTotal.inc({ role: active.role });
+    relayerKeyTransactionsTotal.inc({ role: key.role });
+  }
+
+  private refuse(reason: string, message: string): never {
+    relayerSigningRefusedTotal.inc({ reason });
+    throw new SigningRefusedError(reason, message);
+  }
+
+  private resolveSigningKey(
+    tx: StellarSdk.Transaction | StellarSdk.FeeBumpTransaction,
+    auth: SignAuthorization,
+  ): RelayerManagedKey {
+    const source = transactionSourceAccount(tx);
+    const owner = source
+      ? Array.from(this.keys.values()).find((k) => k.publicKey === source)
+      : undefined;
+
+    // A sweep exists only to empty a compromised account; on any other
+    // identity the purpose would be a way around the tier gate.
+    if (auth.purpose === "sweep" && owner?.status !== "compromised") {
+      this.refuse("sweep_unauthorized", "Sweep signing is only allowed for a compromised relayer account");
+    }
+
+    if (!owner) {
+      const active = this.getActiveKey();
+      if (!active) {
+        this.refuse("no_active_key", "No active relayer signer available");
+      }
+      return active;
+    }
+
+    if (REVOKED_STATUSES.has(owner.status)) {
+      if (auth.purpose === "sweep" && owner.status === "compromised") return owner;
+      this.refuse(
+        "identity_revoked",
+        `Relayer key ${owner.id} is ${owner.status}; refusing to sign for ${owner.publicKey}`,
+      );
+    }
+    if (owner.id === this.activeKeyId) return owner;
+    if (owner.status === "draining") {
+      if ((owner.drainUntil ?? 0) > Date.now()) return owner;
+      this.finishDrain(owner.id);
+      this.refuse(
+        "drain_window_closed",
+        `Drain window for relayer key ${owner.id} has closed; rebuild the transaction under the active identity`,
+      );
+    }
+    this.refuse(
+      "identity_inactive",
+      `Relayer key ${owner.id} is ${owner.status}, not active; rebuild under the active identity`,
+    );
+  }
+
+  private recordOutstanding(
+    tx: StellarSdk.Transaction | StellarSdk.FeeBumpTransaction,
+    publicKey: string,
+  ): void {
+    const now = Date.now();
+    const hash = tx.hash().toString("hex");
+    this.outstanding.set(hash, { hash, publicKey, signedAt: now });
+    // Insertion order is age order: drop expired or excess entries from the front.
+    for (const [h, sig] of this.outstanding) {
+      const expired = now - sig.signedAt >= RelayerKeyManager.OUTSTANDING_TTL_MS;
+      if (!expired && this.outstanding.size <= RelayerKeyManager.MAX_OUTSTANDING) break;
+      this.outstanding.delete(h);
+    }
+  }
+
+  /** Recent signatures by `publicKey` that may still be in flight. */
+  public getOutstandingSignatures(publicKey: string): OutstandingSignature[] {
+    const cutoff = Date.now() - RelayerKeyManager.OUTSTANDING_TTL_MS;
+    return Array.from(this.outstanding.values()).filter(
+      (s) => s.publicKey === publicKey && s.signedAt >= cutoff,
+    );
+  }
+
+  /** Close a key's drain window: it returns to idle standby. */
+  public finishDrain(keyId: string): void {
+    const key = this.keys.get(keyId);
+    if (!key || key.status !== "draining") return;
+    key.status = "standby";
+    key.drainUntil = null;
+    logger.info("relayer_key_drain_finished", { keyId, publicKey: key.publicKey });
+    this.updateMetrics();
+  }
+
+  /** Close every drain window whose deadline has passed. Returns closed ids. */
+  public expireDrains(now = Date.now()): string[] {
+    const closed: string[] = [];
+    for (const key of this.keys.values()) {
+      if (key.status === "draining" && (key.drainUntil ?? 0) <= now) {
+        this.finishDrain(key.id);
+        closed.push(key.id);
+      }
+    }
+    return closed;
+  }
+
+  /**
+   * Revoke a key immediately. Signing for its account stops at once (sweep
+   * excepted for "compromised"); it can never be made active again. Does not
+   * choose a successor — the rotation orchestrator does that.
+   */
+  public revokeKey(
+    keyIdOrPublicKey: string,
+    reason: string,
+    status: "revoked" | "compromised" = "compromised",
+  ): RelayerManagedKey {
+    const key = this.findKey(keyIdOrPublicKey);
+    if (!key) throw new Error(`Relayer key ${keyIdOrPublicKey} not found`);
+    key.status = status;
+    key.role = "deprecated";
+    key.drainUntil = null;
+    key.revokedReason = reason;
+    if (this.activeKeyId === key.id) this.activeKeyId = null;
+    logger.warn("relayer_key_revoked", { keyId: key.id, publicKey: key.publicKey, status, reason });
+    this.updateMetrics();
+    return key;
+  }
+
+  /**
+   * Apply revocations persisted by a previous process. A compromised secret
+   * that is still in RELAYER_SECRET_KEY must not come back as the active key
+   * after a restart: it is revoked and the best standby takes over, or — with
+   * no standby — nothing is active and signing fails closed.
+   */
+  public applyPersistedRevocations(revoked: Map<string, string>): string[] {
+    this.persistedRevocations = new Map(revoked);
+    const applied: string[] = [];
+    for (const key of this.keys.values()) {
+      const reason = revoked.get(key.publicKey);
+      if (reason !== undefined && !REVOKED_STATUSES.has(key.status)) {
+        this.revokeKey(key.id, reason, "compromised");
+        applied.push(key.id);
+      }
+    }
+    if (applied.length > 0 && !this.activeKeyId) {
+      const successor = this.bestStandby();
+      if (successor) {
+        successor.role = "primary";
+        successor.status = "active";
+        successor.activatedAt = new Date().toISOString();
+        this.activeKeyId = successor.id;
+        logger.warn("relayer_revoked_key_replaced_on_boot", { activeKeyId: successor.id });
+      } else {
+        logger.error("relayer_no_unrevoked_key_on_boot", { revoked: applied });
+      }
+    }
+    this.updateMetrics();
+    return applied;
+  }
+
+  public isPubliclyRevoked(publicKey: string): boolean {
+    return this.persistedRevocations.has(publicKey);
+  }
+
+  public findKey(keyIdOrPublicKey: string): RelayerManagedKey | undefined {
+    return (
+      this.keys.get(keyIdOrPublicKey) ||
+      Array.from(this.keys.values()).find((k) => k.publicKey === keyIdOrPublicKey)
+    );
+  }
+
+  /** Standby keys that could take over, best balance first. */
+  public standbyCandidates(): RelayerManagedKey[] {
+    return Array.from(this.keys.values())
+      .filter(
+        (k) =>
+          k.id !== this.activeKeyId &&
+          !REVOKED_STATUSES.has(k.status) &&
+          k.status !== "deprecated" &&
+          k.status !== "exhausted" &&
+          k.status !== "draining" &&
+          !this.persistedRevocations.has(k.publicKey),
+      )
+      .sort((a, b) => (b.balanceXlm ?? 0) - (a.balanceXlm ?? 0));
+  }
+
+  private bestStandby(): RelayerManagedKey | undefined {
+    return this.standbyCandidates()[0];
   }
 
   /**
@@ -1136,6 +1333,16 @@ export class RelayerKeyManager {
     }
     for (const [role, balance] of minBalance) relayerKeyBalance.set({ role }, balance);
     for (const [role, age] of maxAge) relayerKeyAgeSeconds.set({ role }, age);
+
+    // Standbys known to hold enough XLM to take over immediately.
+    relayerFundedStandbyKeys.set(
+      this.standbyCandidates().filter(
+        (k) => k.balanceXlm !== null && k.balanceXlm >= this.minBalanceThresholdXlm,
+      ).length,
+    );
+    relayerDrainingKeys.set(
+      Array.from(this.keys.values()).filter((k) => k.status === "draining").length,
+    );
   }
 
   /**

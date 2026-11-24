@@ -82,6 +82,8 @@ import {
   triggerDaoMembershipSync,
 } from "./services/sync.js";
 import { startIndexer, stopIndexer } from "./services/indexer.js";
+import { startNotificationWorker } from "./services/notifications/index.js";
+import { startRelay, stopRelay } from "./services/bridge.js";
 import { startTTLRenewal, stopTTLRenewal } from "./services/ttl.js";
 import {
   startSbtTransferWatch,
@@ -136,8 +138,12 @@ import {
   swapRoutes,
   rampRoutes,
   onboardingRoutes,
+  notificationRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
+
+/** Set once the notification worker starts; called on shutdown. */
+let stopNotificationWorker: (() => void) | null = null;
 import openApiSpec from "./openapi.js";
 
 // ============================================
@@ -388,6 +394,7 @@ app.use(payRoutes);
 app.use(swapRoutes);
 app.use(rampRoutes);
 app.use(onboardingRoutes);
+app.use(noStore, notificationRoutes);
 
 // ============================================
 // API VERSIONING (#139)
@@ -431,6 +438,7 @@ function mountV1(): void {
   v1Router.use(swapRoutes);
   v1Router.use(rampRoutes);
   v1Router.use(onboardingRoutes);
+  v1Router.use(noStore, notificationRoutes);
 }
 
 mountV1();
@@ -701,6 +709,10 @@ async function startBackgroundServices(): Promise<void> {
   ensureLegacyTokenMigrated();
   startAuthScheduler();
   services.scheduler.start();
+  // Drains the notification outbox (#886); independent of SSE connections.
+  stopNotificationWorker = startNotificationWorker();
+  // EVM → Soroban vote relay (#887); a no-op unless Bridge.sol is configured.
+  if (!config.testMode) startRelay();
 
   try {
     const database = getDb();
@@ -769,6 +781,8 @@ async function stopBackgroundServices(): Promise<void> {
   stopScheduledBackups();
   services.scheduler.stop();
   stopAuthScheduler();
+  stopNotificationWorker?.();
+  stopRelay();
   stopEndpointHealthMonitor();
 
   // Drain any outstanding confirmation waits so callers never hang on exit.

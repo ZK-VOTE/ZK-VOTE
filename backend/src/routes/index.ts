@@ -28,3 +28,4 @@ export { default as payRoutes } from "./pay.js";
 export { default as swapRoutes } from "./swap.js";
 export { default as rampRoutes } from "./ramp.js";
 export { default as onboardingRoutes } from "./onboarding.js";
+export { default as notificationRoutes } from "./notifications.js";

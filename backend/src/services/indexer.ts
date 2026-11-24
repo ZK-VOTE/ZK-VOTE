@@ -7,6 +7,10 @@
  */
 
 import * as StellarSdk from "@stellar/stellar-sdk";
+import {
+  notificationFromIndexedEvent,
+  publishNotificationEventSafely,
+} from "./notifications/index.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db.js";
@@ -71,6 +75,15 @@ const EVENT_TYPES: Record<string, string> = {
   DelegateChanged: "token_delegate",
   Checkpoint: "token_checkpoint",
 };
+
+/**
+ * Election start/end notifications (#886). Runs only for newly stored events,
+ * so a re-indexed ledger does not notify twice, and never throws into the indexer.
+ */
+function notifySubscribers(event: EventInput): void {
+  const notification = notificationFromIndexedEvent(event);
+  if (notification) publishNotificationEventSafely(notification);
+}
 
 /** Parsed event from the chain */
 interface ParsedEvent {
@@ -370,6 +383,7 @@ async function pollEvents(
                   };
                   if (db.addEvent(eventInput)) {
                     count++;
+                    notifySubscribers(eventInput);
                     recordInteraction("db", "db.addEvent", {
                       daoId: eventInput.daoId,
                       type: eventInput.type,
@@ -799,6 +813,7 @@ export async function drainEventQueue(): Promise<number> {
       for (const item of batch) {
         if (db.addEvent(item)) {
           processed++;
+          notifySubscribers(item);
           indexerEventsProcessed.inc({ event_type: "stream_indexed" }, 1);
         }
       }

@@ -36,6 +36,7 @@ import { initExclusionProof } from "./services/exclusion-proof.js";
 import { initTtlChecker } from "./services/ttl-checker.js";
 import { initSyncService } from "./services/sync.js";
 import { initBridgeRelay } from "./services/bridge.js";
+import { createEvmRpc } from "./services/bridge-evm.js";
 import { initOnboardingFunnel } from "./services/onboardingFunnel.js";
 import * as indexer from "./services/indexer.js";
 import { kysely } from "./services/kysely.js";
@@ -201,6 +202,18 @@ export function buildAppServices(): AppServices {
     withSequenceLock,
     u256ToScVal,
     log: logger.log.bind(logger),
+    // EVM side of the relayer (#887): only when Bridge.sol is configured.
+    evm:
+      config.bridgeEvm.rpcUrl && config.bridgeEvm.contractAddress
+        ? {
+            rpc: createEvmRpc(config.bridgeEvm.rpcUrl),
+            contractAddress: config.bridgeEvm.contractAddress,
+            confirmations: config.bridgeEvm.confirmations,
+            startBlock: config.bridgeEvm.startBlock,
+            maxBlockRange: config.bridgeEvm.maxBlockRange,
+            maxAttempts: config.bridgeEvm.relayMaxAttempts,
+          }
+        : undefined,
   });
 
   // Wire the SBT transfer-watch service with explicit dependencies (#358):
