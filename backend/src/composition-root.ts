@@ -11,7 +11,14 @@
  * validation; the returned container is passed to the app wiring.
  */
 
-import { config } from "./config.js";
+import {
+  config,
+  isValidContractId,
+  resolveStartupProfile,
+  type ResolvedStartupProfile,
+  type StartupProfile,
+  type StartupProfileInput,
+} from "./config.js";
 import { log, logger } from "./services/logger.js";
 import {
   server,
@@ -32,6 +39,23 @@ import { initAntiSpam } from "./services/anti-spam.js";
 import { initTtlService } from "./services/ttl.js";
 import { initSbtGuard } from "./services/sbt-guard.js";
 import { initExclusionProof } from "./services/exclusion-proof.js";
+// Settlement / double-entry ledger (#516 follow-up): the composition root is
+// the only place these singleton-style services get their stores wired.
+import {
+  initLedger,
+  createInMemoryLedgerStore,
+  createSqliteLedgerStore,
+  type LedgerStore,
+} from "./services/ledger.js";
+import {
+  initSettlementReconciliation,
+  createInMemorySettlementStore,
+  createSqliteSettlementStore,
+  handleAnchorCallback,
+  systemTimers,
+  type SettlementStore,
+} from "./services/settlementReconciliation.js";
+import { initAnchor } from "./services/anchor.js";
 import { initTtlChecker } from "./services/ttl-checker.js";
 import { initSyncService } from "./services/sync.js";
 import { initBridgeRelay } from "./services/bridge.js";
@@ -47,6 +71,76 @@ import {
 } from "./services/ttl-checker.js";
 import { markDegraded, markHealthy } from "./services/service-health.js";
 import { JobScheduler, defaultJobScheduler } from "./services/job-scheduler.js";
+import {
+  createWorker,
+  WorkerRegistry,
+  type BackgroundWorker,
+} from "./services/worker.js";
+
+// Background loops/timers are declared here (the composition root) so the
+// entry point does not own service lifecycles. The service implementations
+// themselves remain untouched.
+import * as ipfsService from "./services/ipfs.js";
+import { initPinManager } from "./services/ipfs-pin-manager.js";
+import {
+  startMonitor as startPinMonitor,
+  stopMonitor as stopPinMonitor,
+} from "./services/ipfs-monitor.js";
+import {
+  startConfirmationWorker,
+  stopConfirmationWorker,
+} from "./services/confirmation-queue.js";
+import {
+  startDaoSync,
+  stopDaoSync,
+  startMembershipSync,
+  stopMembershipSync,
+} from "./services/sync.js";
+import { startTTLRenewal, stopTTLRenewal } from "./services/ttl.js";
+import {
+  startSbtTransferWatch,
+  stopSbtTransferWatch,
+} from "./services/sbt-guard.js";
+import {
+  startAuthScheduler,
+  stopAuthScheduler,
+  ensureLegacyTokenMigrated,
+} from "./services/authScheduler.js";
+import {
+  startMemoryMonitor,
+  stopMemoryMonitor,
+} from "./services/memory-monitor.js";
+import {
+  startWalCheckpointing,
+  stopWalResilience,
+  startWalMonitor,
+  startPeriodicBackups,
+  performInitialCheckpoint,
+  detectAndHandleWalIssue,
+} from "./services/walResilience.js";
+import {
+  startScheduledBackups,
+  stopScheduledBackups,
+} from "./services/backup.js";
+
+/** DI services whose `init*` functions the root has called. */
+export const ROOT_INITIALIZED_SERVICES = [
+  "circuit-registry",
+  "anti-spam",
+  "ttl",
+  "ttl-checker",
+  "sync",
+  "bridge",
+  "sbt-guard",
+  "exclusion-proof",
+  "job-scheduler",
+  "ledger",
+  "settlement-reconciliation",
+  "anchor",
+] as const;
+
+export type InitializedServiceName =
+  (typeof ROOT_INITIALIZED_SERVICES)[number];
 
 /** The explicitly-wired service container. */
 export interface AppServices {
@@ -58,6 +152,17 @@ export interface AppServices {
   stellar: StellarContext;
   /** Background job scheduler for maintenance and session cleanup. */
   scheduler: JobScheduler;
+  /** Resolved startup profile (role flags). */
+  startup: ResolvedStartupProfile;
+  /** Alias for `startup.profile`, convenient for route/worker gating. */
+  profile: StartupProfile;
+  enableRelayer: boolean;
+  enableIndexer: boolean;
+  enableApi: boolean;
+  /** Names of DI services initialized by this root instance. */
+  initializedServices: readonly InitializedServiceName[];
+  /** All background workers, wired but NOT started. */
+  workers: WorkerRegistry;
 }
 
 /**
@@ -66,7 +171,20 @@ export interface AppServices {
  * foundational services (logger/stellar/db); consumer services get their
  * dependencies from here instead.
  */
-export function buildAppServices(): AppServices {
+export function buildAppServices(
+  profile?: StartupProfileInput | StartupProfile,
+): AppServices {
+  // Resolve the startup profile first so every downstream wiring decision
+  // (routes, workers) can be tagged with the enabled roles.
+  const startup = resolveStartupProfile(
+    profile ?? {
+      profile: config.startupProfile,
+      enableRelayer: config.enableRelayer,
+      enableIndexer: config.enableIndexer,
+      enableApi: config.enableApi,
+    },
+  );
+
   const stellar: StellarContext = {
     server,
     relayerKeypair,
@@ -202,19 +320,225 @@ export function buildAppServices(): AppServices {
   // Wire the exclusion-proof service with explicit dependencies (#358).
   initExclusionProof({ getDb: dbService.getDb, log: logger.log.bind(logger) });
 
-  log("info", "composition_root_wired", {
-    services: [
-      "circuit-registry",
-      "anti-spam",
-      "ttl",
-      "ttl-checker",
-      "sbt-guard",
-      "exclusion-proof",
-      "sync",
-      "bridge",
-      "job-scheduler",
-    ],
+  // Wire the double-entry ledger and settlement reconciliation. Both prefer a
+  // SQLite-backed store so evidence survives restarts; when no database is
+  // available (unit tests, early bootstrap) we fall back to an in-memory store
+  // rather than silently dropping postings.
+  let ledgerStore: LedgerStore;
+  let settlementStore: SettlementStore;
+  try {
+    const writeDb = dbService.getWriteDb();
+    ledgerStore = createSqliteLedgerStore(writeDb);
+    settlementStore = createSqliteSettlementStore(writeDb);
+  } catch (error) {
+    log("warn", "composition_root_ledger_memory_fallback", {
+      error: (error as Error).message,
+    });
+    ledgerStore = createInMemoryLedgerStore();
+    settlementStore = createInMemorySettlementStore();
+  }
+  initLedger({ store: ledgerStore, logger });
+  initSettlementReconciliation({
+    store: settlementStore,
+    ledgerStore,
+    logger,
+    timers: systemTimers,
+  });
+  initAnchor({
+    logger,
+    onCallback: (event) => handleAnchorCallback(event),
   });
 
-  return { config, logger, stellar, scheduler: defaultJobScheduler };
+  const services: AppServices = {
+    config,
+    logger,
+    stellar,
+    scheduler: defaultJobScheduler,
+    startup,
+    profile: startup.profile,
+    enableRelayer: startup.enableRelayer,
+    enableIndexer: startup.enableIndexer,
+    enableApi: startup.enableApi,
+    initializedServices: ROOT_INITIALIZED_SERVICES,
+    // Assigned immediately below; the worker definitions close over `services`
+    // lazily so this two-step construction is safe.
+    workers: null as unknown as WorkerRegistry,
+  };
+  services.workers = buildWorkerRegistry(services);
+
+  log("info", "composition_root_wired", {
+    services: ROOT_INITIALIZED_SERVICES,
+    profile: startup.profile,
+    enabled: {
+      relayer: startup.enableRelayer,
+      indexer: startup.enableIndexer,
+      api: startup.enableApi,
+    },
+    workers: services.workers.list().map((worker: BackgroundWorker) => worker.name),
+  });
+
+  return services;
+}
+
+/**
+ * Optional callback used by the memory-monitor worker. The composition root
+ * defaults to a no-op; `index.ts` injects `gracefulShutdown` into it to avoid a
+ * circular import between the entry point and the composition root.
+ */
+let onMemoryThreshold: () => void = () => undefined;
+
+export function setMemoryThresholdHandler(handler: () => void): void {
+  onMemoryThreshold = handler;
+}
+
+/**
+ * Declare every background loop/timer as a worker. Nothing is started here —
+ * the entry point starts the registry (or a subset, per profile) in its
+ * `workers` startup phase. Extracting these from `index.ts` keeps their exact
+ * start/stop behavior while making them individually testable.
+ */
+export function buildWorkerRegistry(services: AppServices): WorkerRegistry {
+  const registry = new WorkerRegistry({
+    drainTimeoutMs: config.shutdownDrainTimeoutMs,
+    onEvent: (event) => {
+      if (event.type === "error" || event.type === "timeout") {
+        log("warn", "worker_registry_event", {
+          type: event.type,
+          worker: event.worker,
+          error: event.error instanceof Error ? event.error.message : event.error,
+        });
+      }
+    },
+  });
+
+  const hasContractId = (id: string | undefined): boolean =>
+    !!id && isValidContractId(id);
+  const contractIdsForIndexer = (): string[] => {
+    const ids = [config.votingContractId!, config.treeContractId!];
+    if (hasContractId(config.daoRegistryContractId))
+      ids.push(config.daoRegistryContractId!);
+    if (hasContractId(config.membershipSbtContractId))
+      ids.push(config.membershipSbtContractId!);
+    return ids;
+  };
+
+  const pinMonitorEnabled =
+    services.enableApi && config.ipfsEnabled && !!config.pinataJwt;
+  const indexerWorkerEnabled = services.enableIndexer && config.indexerEnabled;
+  const daoRegistryEnabled = hasContractId(config.daoRegistryContractId);
+  const membershipEnabled = hasContractId(config.membershipSbtContractId);
+
+  registry.registerAll([
+    createWorker({
+      name: "ipfs-pin-monitor",
+      enabled: pinMonitorEnabled,
+      start: () => {
+        ipfsService.initPinata(config.pinataJwt!, config.pinataGateway);
+        initPinManager(config.ipfsBackupDir, config.web3StorageToken);
+        startPinMonitor({
+          scanIntervalMs: config.pinVerifyIntervalMs,
+          alertThreshold: config.pinAlertThreshold,
+          autoRepin: config.pinAutoRepin,
+          repinFn: ipfsService.repinCallback,
+        });
+      },
+      stop: () => stopPinMonitor(),
+    }),
+    createWorker({
+      name: "indexer",
+      enabled: indexerWorkerEnabled,
+      start: async () => {
+        await indexer.startIndexer(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          services.stellar.server as any,
+          contractIdsForIndexer(),
+          config.indexerPollIntervalMs,
+        );
+      },
+      stop: () => indexer.stopIndexer(),
+    }),
+    createWorker({
+      name: "dao-sync",
+      enabled: services.enableRelayer && daoRegistryEnabled,
+      start: () => startDaoSync(),
+      stop: () => stopDaoSync(),
+    }),
+    createWorker({
+      name: "membership-sync",
+      enabled: services.enableRelayer && membershipEnabled,
+      start: () => startMembershipSync(),
+      stop: () => stopMembershipSync(),
+    }),
+    createWorker({
+      name: "sbt-transfer-watch",
+      enabled: services.enableRelayer && membershipEnabled,
+      start: () => startSbtTransferWatch(),
+      stop: () => stopSbtTransferWatch(),
+    }),
+    createWorker({
+      name: "ttl-renewal",
+      enabled: services.enableRelayer,
+      start: () => startTTLRenewal(),
+      stop: () => stopTTLRenewal(),
+    }),
+    createWorker({
+      name: "auth-scheduler",
+      enabled: services.enableApi,
+      start: () => {
+        ensureLegacyTokenMigrated();
+        startAuthScheduler();
+      },
+      stop: () => stopAuthScheduler(),
+    }),
+    createWorker({
+      name: "job-scheduler",
+      enabled: services.enableRelayer,
+      start: () => services.scheduler.start(),
+      stop: () => services.scheduler.stop(),
+    }),
+    createWorker({
+      name: "wal-resilience",
+      enabled: services.enableApi,
+      start: () => {
+        const database = dbService.getDb();
+        const dbPath = database.name;
+        performInitialCheckpoint(database);
+        detectAndHandleWalIssue(database, dbPath);
+        startWalCheckpointing(database);
+        startWalMonitor(database, dbPath);
+        startPeriodicBackups(database, dbPath);
+        if (config.backupEncryptionEnabled) {
+          startScheduledBackups(config.backupIntervalMs);
+        }
+      },
+      stop: () => {
+        stopWalResilience();
+        stopScheduledBackups();
+      },
+    }),
+    createWorker({
+      name: "memory-monitor",
+      enabled: services.enableRelayer,
+      start: () => {
+        startMemoryMonitor(() => {
+          log("warn", "memory_threshold_exceeded_triggering_shutdown", {
+            pid: process.pid,
+          });
+          // The entry point injects the shutdown callback (see index.ts) so
+          // this worker keeps the original behavior without importing it.
+          onMemoryThreshold();
+        });
+      },
+      stop: () => stopMemoryMonitor(),
+    }),
+    createWorker({
+      name: "confirmation-worker",
+      enabled: services.enableApi,
+      start: () => startConfirmationWorker(),
+      stop: () => stopConfirmationWorker(),
+      health: () => ({ queue: "confirmation" }),
+    }),
+  ]);
+
+  return registry;
 }

@@ -40,10 +40,86 @@ for (const file of envFiles) {
 dotenv.config();
 
 // ============================================
+// STARTUP PROFILE (#358 follow-up)
+// ============================================
+
+/** Roles a process can be started as. `all` is the backwards-compatible default. */
+export const STARTUP_PROFILES = ["all", "relayer", "indexer", "api"] as const;
+
+export type StartupProfile = (typeof STARTUP_PROFILES)[number];
+
+/** Input accepted by `resolveStartupProfile` and `buildAppServices`. */
+export interface StartupProfileInput {
+  profile?: StartupProfile;
+  /** Explicit overrides; when omitted they are derived from `profile`. */
+  enableRelayer?: boolean;
+  enableIndexer?: boolean;
+  enableApi?: boolean;
+}
+
+/** Fully resolved role flags. */
+export interface ResolvedStartupProfile {
+  profile: StartupProfile;
+  enableRelayer: boolean;
+  enableIndexer: boolean;
+  enableApi: boolean;
+}
+
+/**
+ * Resolve a startup profile into explicit role flags. An `all` profile enables
+ * every role; the single-role profiles enable exactly one. Explicit boolean
+ * overrides always win, so deployments can combine roles without a new enum.
+ */
+export function resolveStartupProfile(
+  input: StartupProfileInput | StartupProfile = {},
+): ResolvedStartupProfile {
+  const options: StartupProfileInput =
+    typeof input === "string" ? { profile: input } : input;
+  const profile = options.profile ?? "all";
+  if (!STARTUP_PROFILES.includes(profile)) {
+    throw new Error(
+      `Unknown STARTUP_PROFILE "${profile}"; expected one of ${STARTUP_PROFILES.join(", ")}`,
+    );
+  }
+
+  const defaults: ResolvedStartupProfile =
+    profile === "all"
+      ? {
+          profile,
+          enableRelayer: true,
+          enableIndexer: true,
+          enableApi: true,
+        }
+      : {
+          profile,
+          enableRelayer: profile === "relayer",
+          enableIndexer: profile === "indexer",
+          enableApi: profile === "api",
+        };
+
+  return {
+    ...defaults,
+    enableRelayer: options.enableRelayer ?? defaults.enableRelayer,
+    enableIndexer: options.enableIndexer ?? defaults.enableIndexer,
+    enableApi: options.enableApi ?? defaults.enableApi,
+  };
+}
+
+function parseOptionalBoolean(
+  value: "true" | "false" | undefined,
+): boolean | undefined {
+  return value === undefined ? undefined : value === "true";
+}
+
+// ============================================
 // ENVIRONMENT SCHEMA (ZOD VALIDATION)
 // ============================================
 
 const envSchema = z.object({
+  STARTUP_PROFILE: z.enum(STARTUP_PROFILES).default("all"),
+  ENABLE_RELAYER: z.enum(["true", "false"]).optional(),
+  ENABLE_INDEXER: z.enum(["true", "false"]).optional(),
+  ENABLE_API: z.enum(["true", "false"]).optional(),
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),
@@ -478,6 +554,14 @@ function validateBootEnv(): EnvConfig {
 // Validate environment on module load
 const validatedEnv = validateBootEnv();
 
+/** Role flags derived from STARTUP_PROFILE + explicit ENABLE_* overrides. */
+const resolvedStartupProfile = resolveStartupProfile({
+  profile: validatedEnv.STARTUP_PROFILE,
+  enableRelayer: parseOptionalBoolean(validatedEnv.ENABLE_RELAYER),
+  enableIndexer: parseOptionalBoolean(validatedEnv.ENABLE_INDEXER),
+  enableApi: parseOptionalBoolean(validatedEnv.ENABLE_API),
+});
+
 // ============================================
 // VALIDATION HELPERS
 // ============================================
@@ -503,6 +587,13 @@ export function isValidContractId(
 export const config = {
   // Environment
   NODE_ENV: validatedEnv.NODE_ENV,
+
+  // Startup profile (#358 follow-up). `all` keeps legacy behaviour: relayer,
+  // indexer and API are all started in a single process.
+  startupProfile: resolvedStartupProfile.profile,
+  enableRelayer: resolvedStartupProfile.enableRelayer,
+  enableIndexer: resolvedStartupProfile.enableIndexer,
+  enableApi: resolvedStartupProfile.enableApi,
 
   // Server
   port: validatedEnv.PORT,
@@ -1058,4 +1149,102 @@ export function validateEnv(): void {
     );
     process.exit(1);
   }
+}
+
+/** Thrown by `validateStartupConfig` (throwable counterpart of `validateEnv`). */
+export class StartupConfigError extends Error {
+  constructor(readonly errors: readonly string[]) {
+    super(`Startup configuration validation failed: ${errors.join("; ")}`);
+    this.name = "StartupConfigError";
+  }
+}
+
+export interface StartupValidationInput {
+  /** Profile whose enabled roles determine which keys are critical. */
+  profile?: StartupProfileInput | StartupProfile;
+  /** Env overrides for tests (only keys present here override config). */
+  env?: Record<string, string | undefined>;
+  /** Override the production check (defaults to config.NODE_ENV). */
+  isProduction?: boolean;
+  /** Override test-mode relaxations (defaults to config.testMode). */
+  testMode?: boolean;
+}
+
+/**
+ * Fail-closed startup validation. Unlike `validateEnv()` (which hard-exits for
+ * backwards compatibility), this throws `StartupConfigError` so the startup
+ * phase helper can record a failed `config` phase.
+ *
+ * Production (or any non-test-mode process) requires the keys needed to sign
+ * and submit votes. `testMode` keeps the existing relaxations for optional
+ * contract IDs and short auth tokens.
+ */
+export function validateStartupConfig(
+  input: StartupValidationInput = {},
+): void {
+  const env = input.env ?? {};
+  const read = (
+    key: string,
+    fallback: string | undefined,
+  ): string | undefined =>
+    Object.prototype.hasOwnProperty.call(env, key) ? env[key] : fallback;
+
+  const profile = resolveStartupProfile(
+    input.profile ?? {
+      profile: config.startupProfile,
+      enableRelayer: config.enableRelayer,
+      enableIndexer: config.enableIndexer,
+      enableApi: config.enableApi,
+    },
+  );
+  const isProduction = input.isProduction ?? config.NODE_ENV === "production";
+  const testMode = input.testMode ?? config.testMode;
+  const errors: string[] = [];
+
+  const votingContractId = read("VOTING_CONTRACT_ID", config.votingContractId);
+  const treeContractId = read("TREE_CONTRACT_ID", config.treeContractId);
+  const relayerSecretKey = read("RELAYER_SECRET_KEY", config.relayerSecretKey);
+  const relayerAuthToken = read("RELAYER_AUTH_TOKEN", config.relayerAuthToken);
+  const authMasterKey = read("AUTH_MASTER_KEY", config.authMasterKey);
+
+  if (!testMode) {
+    if (!votingContractId) errors.push("VOTING_CONTRACT_ID is required");
+    if (!treeContractId) errors.push("TREE_CONTRACT_ID is required");
+    if (!relayerSecretKey) errors.push("RELAYER_SECRET_KEY is required");
+    if (!relayerAuthToken) errors.push("RELAYER_AUTH_TOKEN is required");
+    if (profile.enableApi && !authMasterKey)
+      errors.push("AUTH_MASTER_KEY is required for the API profile");
+  }
+
+  if (isProduction) {
+    const corsValue =
+      read("CORS_ORIGIN", undefined) ??
+      read("CORS_ORIGINS", undefined) ??
+      config.corsOrigins.join(",");
+    const origins = corsValue
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean);
+    if (origins.length === 0 || origins.includes("*")) {
+      errors.push(
+        "CORS_ORIGIN must be set to explicit origins in production (no wildcards)",
+      );
+    }
+    if (
+      relayerAuthToken &&
+      relayerAuthToken.length < 32 &&
+      !testMode
+    ) {
+      errors.push("RELAYER_AUTH_TOKEN must be at least 32 characters in production");
+    }
+  }
+
+  if (votingContractId && !isValidContractId(votingContractId)) {
+    errors.push("VOTING_CONTRACT_ID is not a valid Stellar contract ID");
+  }
+  if (treeContractId && !isValidContractId(treeContractId)) {
+    errors.push("TREE_CONTRACT_ID is not a valid Stellar contract ID");
+  }
+
+  if (errors.length > 0) throw new StartupConfigError(errors);
 }

@@ -6,9 +6,13 @@ import {
   getCircuitInfo,
   getDaoMigration,
   getDaoCurrentCircuit,
-  getVK,
   getCurrentVersion,
   isStaleVersion,
+  resolveVk,
+  invalidateVkCache,
+  invalidateVersionCache,
+  CircuitRegistryUnavailableError,
+  StaleVkError,
   proposeVkUpgrade,
   approveVkUpgrade,
   executeVkUpgrade,
@@ -20,6 +24,63 @@ import { authGuard, bodyLimit, queryLimiter } from "../middleware/index.js";
 import type { AsyncHandler } from "../types/index.js";
 
 const router = Router();
+
+/** Circuit type is a strict enum; unknown values fall back to Vote. */
+function normalizeCircuitType(value: unknown): "Vote" | "Comment" {
+  if (typeof value !== "string") return "Vote";
+  const normalized = value.toLowerCase();
+  return normalized === "comment" ? "Comment" : "Vote";
+}
+
+function optionalDaoId(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = typeof value === "number" ? value : parseInt(String(value), 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Build the binding clients send alongside witness generation + proof verification. */
+function circuitBinding(result: {
+  circuitId: string;
+  circuitType: "Vote" | "Comment";
+  version: number;
+  numPublicSignals: number;
+  hash: string;
+  ceremonyTranscriptHash?: string;
+  daoId?: number;
+}) {
+  return {
+    circuitId: result.circuitId,
+    circuitType: result.circuitType,
+    version: result.version,
+    numPublicSignals: result.numPublicSignals,
+    hash: result.hash,
+    ceremonyTranscriptHash: result.ceremonyTranscriptHash ?? null,
+    daoId: result.daoId ?? null,
+  };
+}
+
+/** Map fail-closed registry errors to JSON status codes. */
+function registryError(res: Response, error: unknown, context: string): Response {
+  if (error instanceof StaleVkError) {
+    return res.status(410).json({
+      error: "Stale VK version",
+      code: error.code,
+      circuitId: error.circuitId,
+      requestedVersion: error.requestedVersion,
+      currentVersion: error.currentVersion,
+      isStale: true,
+    });
+  }
+  if (error instanceof CircuitRegistryUnavailableError) {
+    return res.status(503).json({
+      error: "Circuit registry unavailable",
+      code: error.code,
+      detail: error.message,
+    });
+  }
+  log("error", context, { error: (error as Error).message });
+  return res.status(500).json({ error: "Failed to resolve circuit VK" });
+}
 
 // Existing: circuit status for DAO migration
 router.get("/circuits/:dao/:type/status", queryLimiter, (async (
@@ -87,66 +148,44 @@ router.get("/circuits/vk/:circuitId/:version", queryLimiter, (async (
     return res.status(400).json({ error: "Invalid version" });
   }
 
+  const circuitType = normalizeCircuitType(req.query.circuitType);
+  const daoId = optionalDaoId(req.query.daoId);
+
   try {
-    const currentVersion = await getCurrentVersion(circuitId);
-    // Mismatch detection: stale version rejected with 410 Gone
-    if (currentVersion !== null && isStaleVersion(ver, currentVersion)) {
-      log("warn", "stale_vk_rejected", {
-        circuitId,
-        requested: ver,
-        current: currentVersion,
-      });
-      return res.status(410).json({
-        error: "Stale VK version",
-        circuitId,
-        requestedVersion: ver,
-        currentVersion,
-        isStale: true,
-      });
-    }
-
-    // Try circuit-registry contract if configured
-    const vkResult = await getVK(circuitId, "Vote").catch(() => null);
-    if (vkResult) {
-      return res.json({
-        circuitId,
-        version: ver,
-        vk: vkResult.vk,
-        hash: `mock_hash_${circuitId}_v${ver}`,
-        numPublicSignals: vkResult.numPublicSignals,
-        currentVersion: currentVersion ?? ver,
-        isStale: false,
-      });
-    }
-
-    // Fallback: serve local VK file if available (for dev/test)
-    // For now return mock VK structure
-    return res.json({
+    const resolved = await resolveVk({
+      daoId,
+      circuitId,
+      circuitType,
+      version: ver,
+    });
+    log("info", "vk_resolved", {
       circuitId,
       version: ver,
-      vk: {
-        alpha: "0".repeat(128),
-        beta: "0".repeat(256),
-        gamma: "0".repeat(256),
-        delta: "0".repeat(256),
-        ic: ["0".repeat(128)],
-      },
-      hash: `local_vk_hash_${circuitId}_v${ver}`,
-      numPublicSignals: circuitId.includes("weighted")
-        ? 3
-        : circuitId.includes("v2")
-          ? 6
-          : 5,
-      currentVersion: currentVersion ?? ver,
+      source: resolved.source,
+      hash: resolved.hash,
+    });
+    return res.json({
+      circuitId: resolved.circuitId,
+      circuitType: resolved.circuitType,
+      version: resolved.version,
+      vk: resolved.vk,
+      hash: resolved.hash,
+      numPublicSignals: resolved.numPublicSignals,
+      currentVersion: resolved.currentVersion,
+      ceremonyTranscriptHash: resolved.ceremonyTranscriptHash ?? null,
+      circuitBinding: circuitBinding(resolved),
+      source: resolved.source,
       isStale: false,
     });
   } catch (error) {
-    log("error", "vk_fetch_error", {
-      circuitId,
-      version: ver,
-      error: (error as Error).message,
-    });
-    return res.status(500).json({ error: "Failed to fetch VK" });
+    if (error instanceof StaleVkError) {
+      log("warn", "stale_vk_rejected", {
+        circuitId,
+        requested: ver,
+        current: error.currentVersion,
+      });
+    }
+    return registryError(res, error, "vk_fetch_error");
   }
 }) as AsyncHandler);
 
@@ -156,24 +195,24 @@ router.get("/circuits/vk/:circuitId", queryLimiter, (async (
   res: Response,
 ) => {
   const { circuitId } = req.params;
+  const circuitType = normalizeCircuitType(req.query.circuitType);
+  const daoId = optionalDaoId(req.query.daoId);
   try {
-    const currentVersion = await getCurrentVersion(circuitId);
-    const version = currentVersion ?? 1;
-    const vkResult = await getVK(circuitId, "Vote").catch(() => null);
+    const resolved = await resolveVk({ daoId, circuitId, circuitType });
     return res.json({
-      circuitId,
-      version,
-      vk: vkResult?.vk ?? null,
-      hash: `mock_hash_${circuitId}_v${version}`,
-      numPublicSignals: vkResult?.numPublicSignals ?? 5,
-      currentVersion: version,
+      circuitId: resolved.circuitId,
+      circuitType: resolved.circuitType,
+      version: resolved.version,
+      vk: resolved.vk,
+      hash: resolved.hash,
+      numPublicSignals: resolved.numPublicSignals,
+      currentVersion: resolved.currentVersion,
+      ceremonyTranscriptHash: resolved.ceremonyTranscriptHash ?? null,
+      circuitBinding: circuitBinding(resolved),
+      source: resolved.source,
     });
   } catch (error) {
-    log("error", "vk_latest_error", {
-      circuitId,
-      error: (error as Error).message,
-    });
-    return res.status(500).json({ error: "Failed to fetch latest VK" });
+    return registryError(res, error, "vk_latest_error");
   }
 }) as AsyncHandler);
 
@@ -192,21 +231,58 @@ router.post("/circuits/verify-version", bodyLimit("5kb"), queryLimiter, (async (
       .status(400)
       .json({ error: "circuitId, proposalVersion, clientVersion required" });
   }
-  const mismatch = proposalVersion !== clientVersion;
-  const currentVersion = await getCurrentVersion(circuitId);
-  const stale =
-    currentVersion !== null
-      ? isStaleVersion(clientVersion, currentVersion)
-      : false;
-  return res.json({
-    circuitId,
-    proposalVersion,
-    clientVersion,
-    mismatch,
-    stale,
-    currentVersion,
-    shouldInvalidate: mismatch || stale,
-  });
+  const circuitType = normalizeCircuitType(req.body?.circuitType);
+  const daoId = optionalDaoId(req.body?.daoId);
+
+  try {
+    // Rotation observation via polling: if the DAO's proposal has executed,
+    // drop cached VKs before answering the client's preflight check.
+    if (daoId !== undefined) {
+      const proposal = await getDaoVkProposal(daoId).catch(() => null);
+      if (proposal?.status === "Executed") {
+        invalidateVkCache({
+          daoId,
+          circuitId: proposal.circuitId,
+          circuitType: proposal.circuitType,
+        });
+        invalidateVersionCache(proposal.circuitId);
+        log("info", "vk_rotation_observed", {
+          daoId,
+          circuitId: proposal.circuitId,
+          proposalId: proposal.id,
+        });
+      }
+    }
+
+    const currentVersion = await getCurrentVersion(circuitId, circuitType);
+    const mismatch = proposalVersion !== clientVersion;
+    const stale = isStaleVersion(clientVersion, currentVersion);
+
+    let resolved = null;
+    if (!stale) {
+      resolved = await resolveVk({
+        daoId,
+        circuitId,
+        circuitType,
+        version: clientVersion,
+      });
+    }
+
+    return res.json({
+      circuitId,
+      circuitType,
+      proposalVersion,
+      clientVersion,
+      mismatch,
+      stale,
+      currentVersion,
+      shouldInvalidate: mismatch || stale,
+      hash: resolved?.hash ?? null,
+      circuitBinding: resolved ? circuitBinding(resolved) : null,
+    });
+  } catch (error) {
+    return registryError(res, error, "verify_version_error");
+  }
 }) as AsyncHandler);
 
 // Propose a VK upgrade (timelock + multi-sig)
@@ -274,7 +350,16 @@ router.post("/circuits/vk/:proposalId/execute", authGuard, queryLimiter, (async 
 ) => {
   const { proposalId } = req.params;
   try {
+    const proposal = await getVkProposal(Number(proposalId)).catch(() => null);
     await executeVkUpgrade(Number(proposalId), req.user?.address ?? "");
+    if (proposal) {
+      invalidateVkCache({
+        daoId: proposal.daoId,
+        circuitId: proposal.circuitId,
+        circuitType: proposal.circuitType,
+      });
+      invalidateVersionCache(proposal.circuitId);
+    }
     return res.json({ success: true });
   } catch (error) {
     log("error", "vk_execute_error", { proposalId, error: (error as Error).message });

@@ -510,6 +510,10 @@ export function costBasedLimiter(opts: {
   message: string;
 }): RequestHandler {
   const store = getStore(opts.name);
+  // Keep the store alive for this limiter instance (it registers metrics and
+  // is shared with the other limiter factories) even though this particular
+  // limiter tracks cost locally.
+  void store;
   const costTracking = new Map<string, { cost: number; resetTime: number }>();
 
   return (req: Request, res: Response, next: NextFunction) => {

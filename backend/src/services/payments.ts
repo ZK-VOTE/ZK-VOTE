@@ -9,6 +9,7 @@ import { relayerKeypair } from "./stellar.js";
 import { relayerKeyManager } from "./relayerKeyManager.js";
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
+import { postTransfer, stellarAmountToMinor } from "./ledger.js";
 
 const horizonServer = new (StellarSdk.Horizon as any).Server((config as any).horizonUrl || "https://horizon-testnet.stellar.org");
 log("info", "payments_loaded", {});
@@ -47,6 +48,34 @@ export interface BatchResult {
   ops: number;
 }
 
+/**
+ * Mirror a successfully submitted Stellar payment into the double-entry
+ * ledger: DEBIT relayer(source) and CREDIT destination for the same integer
+ * minor-unit amount. Posting is best-effort — a ledger failure must not turn
+ * an already-accepted on-chain payment into an application error.
+ */
+function recordPaymentPosting(op: PaymentOp, txHash: string, postingGroupId: string): void {
+  try {
+    const amountMinor = stellarAmountToMinor(op.amount);
+    postTransfer({
+      postingGroupId,
+      sourceAccount: `stellar:${relayerKeypair.publicKey()}`,
+      destinationAccount: `stellar:${op.destination}`,
+      asset: op.asset,
+      amountMinor,
+      createdAt: new Date().toISOString(),
+    });
+    log("info", "payment_ledger_posted", { asset: op.asset, hash: txHash, postingGroupId });
+  } catch (error) {
+    log("warn", "payment_ledger_post_failed", {
+      asset: op.asset,
+      hash: txHash,
+      postingGroupId,
+      error: (error as Error).message,
+    });
+  }
+}
+
 // Single payment (uses relayerKeypair as source, withSequenceLock for high volume) — via Horizon (classic, not Soroban)
 export async function sendPayment(op: PaymentOp): Promise<{ hash: string }> {
   log("info", "payment_via_horizon", {});
@@ -63,6 +92,7 @@ export async function sendPayment(op: PaymentOp): Promise<{ hash: string }> {
   try {
     const res: any = await (horizonServer as any).submitTransaction(tx);
     log("info", "payment_sent", { asset: op.asset, amount, dest: dest.slice(0, 8) + "...", hash: res.hash });
+    recordPaymentPosting(op, res.hash, `payment_${res.hash}`);
     return { hash: res.hash };
   } catch (e: any) {
     const data = e.response?.data || e.response?.body || e.message;
@@ -91,6 +121,8 @@ export async function sendBatch(ops: PaymentOp[]): Promise<BatchResult> {
   await relayerKeyManager.signTransaction(tx);
   const res: any = await (horizonServer as any).submitTransaction(tx);
   log("info", "batch_sent", { ops: ops.length, hash: res.hash });
+  // Each operation gets its own balanced posting group, keyed by tx hash + index.
+  ops.forEach((op, index) => recordPaymentPosting(op, res.hash, `batch_${res.hash}_${index}`));
   return { hash: res.hash, ops: ops.length };
 }
 
@@ -107,6 +139,9 @@ export async function swapStrictSend(sendAsset: PaymentAsset, destAsset: Payment
     .build();
   await relayerKeyManager.signTransaction(tx);
   const res: any = await (horizonServer as any).submitTransaction(tx);
+  // Cross-asset swaps are deliberately not posted here: a single balanced
+  // posting group must contain one asset. Swap legs are posted by settlement
+  // reconciliation once the destination asset is actually observed.
   return { hash: res.hash };
 }
 

@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, String, Symbol, Vec, U256,
+    BytesN, Env, String, Symbol, Vec, U256,
 };
 
 use zkvote_groth16::{verify_groth16, Proof, VerificationKey};
@@ -37,6 +37,7 @@ pub enum RegistryError {
     VkProposalInvalidQuorum = 15,
     VkProposalAlreadyCancelled = 16,
     NotAdmin = 17,
+    InvalidCeremonyHash = 18,
 }
 
 #[contracttype]
@@ -77,6 +78,20 @@ pub struct CircuitVKMap {
     pub num_public_signals: u32,
 }
 
+/// Additive, richer VK record. `get_vk` is unchanged for existing callers;
+/// this struct is returned by the new `get_vk_record` getter so clients can
+/// bind a proof to one exact circuit instance (version + ceremony transcript).
+#[contracttype]
+#[derive(Clone)]
+pub struct VkRecord {
+    pub vk: VerificationKey,
+    pub num_public_signals: u32,
+    pub version: u32,
+    pub ceremony_transcript_hash: Option<String>,
+    pub circuit_id: String,
+    pub registered_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VkProposalStatus {
@@ -111,6 +126,9 @@ pub enum DataKey {
     VkProposal(u32),
     VkProposalCounter,
     DaoVkProposal(u64),
+    // Additive keys: never collide with the existing ones above.
+    CircuitVersion(String, CircuitType),
+    CeremonyHash(String, CircuitType),
 }
 
 #[soroban_sdk::contractevent]
@@ -178,6 +196,15 @@ pub struct VkProposalCancelledEvent {
     #[topic]
     pub proposal_id: u32,
     pub cancelled_by: Address,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CeremonyHashUpdatedEvent {
+    #[topic]
+    pub circuit_id: String,
+    pub circuit_type: CircuitType,
+    pub ceremony_transcript_hash: String,
 }
 
 #[contract]
@@ -278,6 +305,80 @@ impl CircuitRegistry {
         CircuitVKMap {
             vk: circuit.vk,
             num_public_signals: circuit.num_public_signals,
+        }
+    }
+
+    /// Governance-only ceremony transcript hash setter. Additive: does not
+    /// change `register_circuit` or any existing storage key/signature.
+    pub fn set_ceremony_hash(
+        env: Env,
+        circuit_id: String,
+        circuit_type: CircuitType,
+        ceremony_transcript_hash: String,
+    ) {
+        Self::bump_instance(&env);
+        Self::assert_governance(&env);
+
+        if ceremony_transcript_hash.is_empty() {
+            panic_with_error!(&env, RegistryError::InvalidCeremonyHash);
+        }
+
+        let circuit_key = DataKey::Circuit(circuit_id.clone(), circuit_type);
+        if !env.storage().persistent().has(&circuit_key) {
+            panic_with_error!(&env, RegistryError::CircuitNotFound);
+        }
+
+        let key = DataKey::CeremonyHash(circuit_id.clone(), circuit_type);
+        env.storage()
+            .persistent()
+            .set(&key, &ceremony_transcript_hash);
+        Self::bump_persistent(&env, &key);
+
+        CeremonyHashUpdatedEvent {
+            circuit_id,
+            circuit_type,
+            ceremony_transcript_hash,
+        }
+        .publish(&env);
+    }
+
+    /// Additive richer getter. Returns the same VK as `get_vk` plus the
+    /// monotonic version, ceremony transcript hash, circuit id and timestamp.
+    pub fn get_vk_record(env: Env, circuit_id: String, circuit_type: CircuitType) -> VkRecord {
+        Self::bump_instance(&env);
+        let key = DataKey::Circuit(circuit_id.clone(), circuit_type);
+        let circuit: CircuitInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+
+        let now = env.ledger().timestamp();
+        if circuit.expiration != 0 && now > circuit.expiration {
+            panic_with_error!(&env, RegistryError::CircuitExpired);
+        }
+        Self::bump_persistent(&env, &key);
+
+        let version_key = DataKey::CircuitVersion(circuit_id.clone(), circuit_type);
+        let version: u32 = env
+            .storage()
+            .persistent()
+            .get(&version_key)
+            .unwrap_or(1);
+
+        let ceremony_key = DataKey::CeremonyHash(circuit_id.clone(), circuit_type);
+        let ceremony_transcript_hash: Option<String> = env
+            .storage()
+            .persistent()
+            .get(&ceremony_key);
+
+        VkRecord {
+            vk: circuit.vk,
+            num_public_signals: circuit.num_public_signals,
+            version,
+            ceremony_transcript_hash,
+            circuit_id,
+            registered_at: circuit.registered_at,
         }
     }
 
@@ -581,6 +682,20 @@ impl CircuitRegistry {
         env.storage().persistent().set(&circuit_key, &circuit);
         Self::bump_persistent(&env, &circuit_key);
 
+        // Bump the circuit's monotonic version. Clients detect the rotation and
+        // invalidate cached VKs whenever this value changes.
+        let version_key =
+            DataKey::CircuitVersion(proposal.circuit_id.clone(), proposal.circuit_type);
+        let previous_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&version_key)
+            .unwrap_or(1);
+        env.storage()
+            .persistent()
+            .set(&version_key, &previous_version.saturating_add(1));
+        Self::bump_persistent(&env, &version_key);
+
         VkProposalExecutedEvent {
             proposal_id,
             circuit_id: proposal.circuit_id.clone(),
@@ -648,6 +763,83 @@ impl CircuitRegistry {
             .instance()
             .get(&VERSION_KEY)
             .unwrap_or(VERSION)
+    }
+}
+
+// Additive regression tests for the ceremony-hash / version record. Kept in
+// lib.rs so no existing test file needs to be touched.
+#[cfg(test)]
+mod registry_rotation_tests {
+    extern crate std;
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    fn test_vk(env: &Env, fill: u8) -> VerificationKey {
+        let alpha = BytesN::from_array(env, &[fill; 64]);
+        let g2 = BytesN::from_array(env, &[fill; 128]);
+        VerificationKey {
+            alpha: alpha.clone(),
+            beta: g2.clone(),
+            gamma: g2.clone(),
+            delta: g2,
+            ic: Vec::from_array(env, [alpha]),
+        }
+    }
+
+    #[test]
+    fn vk_record_tracks_ceremony_hash_and_rotation_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let governance = Address::generate(&env);
+        let registry = env.register(CircuitRegistry, (governance.clone(),));
+        let client = CircuitRegistryClient::new(&env, &registry);
+
+        let circuit_id = String::from_str(&env, "vote_v1");
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        client.register_circuit(
+            &circuit_id,
+            &CircuitType::Vote,
+            &test_vk(&env, 1),
+            &wasm_hash,
+            &0,
+            &5,
+        );
+
+        let initial = client.get_vk_record(&circuit_id, &CircuitType::Vote);
+        assert_eq!(initial.version, 1);
+        assert_eq!(initial.num_public_signals, 5);
+        assert_eq!(initial.ceremony_transcript_hash, None);
+
+        let ceremony = String::from_str(&env, "ceremony-abc123");
+        client.set_ceremony_hash(&circuit_id, &CircuitType::Vote, &ceremony);
+        let with_hash = client.get_vk_record(&circuit_id, &CircuitType::Vote);
+        assert_eq!(with_hash.ceremony_transcript_hash, Some(ceremony));
+
+        let start = env.ledger().timestamp();
+        let proposal_id = client.propose_vk_upgrade(
+            &circuit_id,
+            &CircuitType::Vote,
+            &test_vk(&env, 2),
+            &wasm_hash,
+            &10,
+            &1,
+            &Some(1u64),
+            &governance,
+        );
+        client.approve_vk_upgrade(&proposal_id, &governance);
+        env.ledger().with_mut(|l| l.timestamp = start + 11);
+        client.execute_vk_upgrade(&proposal_id, &governance);
+
+        let rotated = client.get_vk_record(&circuit_id, &CircuitType::Vote);
+        assert_eq!(rotated.version, 2);
+        assert_eq!(rotated.num_public_signals, 5);
+        assert_eq!(
+            rotated.ceremony_transcript_hash,
+            Some(String::from_str(&env, "ceremony-abc123"))
+        );
+
+        // The original getter stays byte-for-byte compatible.
+        assert_eq!(client.get_vk(&circuit_id, &CircuitType::Vote).num_public_signals, 5);
     }
 }
 

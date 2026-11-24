@@ -41,8 +41,11 @@ router.get("/metrics", async (req: Request, res: Response) => {
   if (!token || !expected) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  const bufA = Buffer.from(token);
-  const bufB = Buffer.from(expected);
+  // `timingSafeEqual` expects an ArrayBufferView backed by ArrayBuffer;
+  // Node's Buffer typings widen the backing store to ArrayBufferLike, so
+  // normalize through Uint8Array.from to keep the strict typecheck green.
+  const bufA = Uint8Array.from(Buffer.from(token));
+  const bufB = Uint8Array.from(Buffer.from(expected));
   if (bufA.length !== bufB.length || !timingSafeEqual(bufA, bufB)) {
     return res.status(401).json({ error: "Unauthorized" });
   }

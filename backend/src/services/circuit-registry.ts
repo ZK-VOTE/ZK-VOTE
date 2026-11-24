@@ -16,6 +16,11 @@ export interface CircuitRegistryDeps {
   callWithTimeout<T>(fn: () => Promise<T>, label: string): Promise<T>;
   /** circuit-registry contract id (may be unset → simulated calls return null). */
   circuitRegistryContractId: string | undefined;
+  /**
+   * Explicit test-mode flag. Defaults to RELAYER_TEST_MODE so the deterministic
+   * mock provider can never be selected implicitly in production.
+   */
+  testMode?: boolean;
   /** Network passphrase for transaction building. */
   networkPassphrase: string;
   /** Logger (defaults to the module logger if not provided). */
@@ -30,7 +35,10 @@ let deps: CircuitRegistryDeps | null = null;
  * /circuits routes.
  */
 export function initCircuitRegistry(d: CircuitRegistryDeps): void {
-  deps = d;
+  deps = {
+    ...d,
+    testMode: d.testMode ?? process.env.RELAYER_TEST_MODE === "true",
+  };
 }
 
 function getDeps(): CircuitRegistryDeps {
@@ -74,6 +82,57 @@ export interface CircuitStatus {
   };
 }
 
+/** Thrown when the registry cannot be read. Always fail closed. */
+export class CircuitRegistryUnavailableError extends Error {
+  readonly status = 503;
+  readonly code = "CIRCUIT_REGISTRY_UNAVAILABLE";
+  constructor(message: string) {
+    super(message);
+    this.name = "CircuitRegistryUnavailableError";
+  }
+}
+
+/** Thrown when a client asks for a VK version that has been rotated out. */
+export class StaleVkError extends Error {
+  readonly status = 410;
+  readonly code = "STALE_VK_VERSION";
+  constructor(
+    public readonly circuitId: string,
+    public readonly requestedVersion: number,
+    public readonly currentVersion: number,
+  ) {
+    super(
+      `Stale VK: ${circuitId} v${requestedVersion} is no longer current (current v${currentVersion})`,
+    );
+    this.name = "StaleVkError";
+  }
+}
+
+/** Rich on-chain record returned by the additive `get_vk_record` contract fn. */
+export interface VkRecord extends CircuitVKResult {
+  circuitId: string;
+  circuitType: "Vote" | "Comment";
+  version: number;
+  registeredAt: number;
+  ceremonyTranscriptHash?: string;
+}
+
+export interface ResolveVkParams {
+  daoId?: number;
+  circuitId: string;
+  circuitType?: "Vote" | "Comment";
+  /** Omit to resolve the DAO/circuit's current version. */
+  version?: number;
+}
+
+export interface ResolvedVk extends VkRecord {
+  hash: string;
+  currentVersion: number;
+  daoId?: number;
+  /** "on-chain" | "test-mode-mock" — synthetic keys are always labelled. */
+  source: string;
+}
+
 class CircuitRegistryCache {
   private circuits: Map<string, CircuitInfo> = new Map();
   private lastFetch: number = 0;
@@ -108,34 +167,126 @@ class CircuitRegistryCache {
 
 const cache = new CircuitRegistryCache();
 
-// Version tracking for ZK-013
+// Version tracking + centralized, fail-closed VK resolution (ZK-013).
 const versionCache = new Map<string, { version: number; fetchedAt: number }>();
 const VERSION_TTL_MS = 60_000;
+
+/**
+ * Resolved VK cache. Entries are keyed by DAO + circuit + circuit type +
+ * version so a rotation for one DAO can never leak a stale key into another.
+ */
+const resolvedVkCache = new Map<string, ResolvedVk>();
+
+function versionKey(circuitId: string, circuitType: string): string {
+  return `${circuitId}:${circuitType}`;
+}
+
+function resolvedKey(params: {
+  daoId?: number;
+  circuitId: string;
+  circuitType?: string;
+  version: number;
+}): string {
+  return `${params.daoId ?? "*"}:${params.circuitId}:${params.circuitType ?? "Vote"}:${params.version}`;
+}
 
 export function getCache(): CircuitRegistryCache {
   return cache;
 }
 
+/** Deterministic preimage for the canonical VK hash (shared with SDK/client). */
+export function stableStringifyVk(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringifyVk(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringifyVk(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * Canonical SHA-256 of the on-chain VK record: domain + circuitId + version +
+ * ceremony transcript hash + stable-stringified VK. Never a mock template.
+ */
+export async function computeCanonicalVkHash(input: {
+  vk: CircuitVKResult["vk"];
+  circuitId: string;
+  version: number;
+  ceremonyTranscriptHash?: string;
+}): Promise<string> {
+  const preimage = [
+    "zkvote-vk-v1",
+    input.circuitId,
+    String(input.version),
+    input.ceremonyTranscriptHash ?? "",
+    stableStringifyVk(input.vk),
+  ].join("\n");
+  const bytes = new TextEncoder().encode(preimage);
+  const cryptoApi = (globalThis as unknown as { crypto?: { subtle: SubtleCrypto } }).crypto;
+  if (!cryptoApi?.subtle) {
+    throw new CircuitRegistryUnavailableError(
+      "Canonical VK hashing requires Web Crypto (globalThis.crypto.subtle)",
+    );
+  }
+  const digest = await cryptoApi.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** Deterministic test-mode versions. Never consulted when testMode is false. */
+const TEST_MODE_VERSIONS: Record<string, number> = {
+  vote_v1: 1,
+  vote_v2: 2,
+  weighted_vote: 1,
+  bridge: 1,
+  comment: 1,
+  comment_v2: 2,
+};
+
+/**
+ * Resolve the current version from the registry. In production an unavailable
+ * registry throws (fail closed); only explicit test mode may use the labelled
+ * deterministic mock table.
+ */
 export async function getCurrentVersion(
   circuitId: string,
-): Promise<number | null> {
-  const cached = versionCache.get(circuitId);
+  circuitType: "Vote" | "Comment" = "Vote",
+): Promise<number> {
+  const key = versionKey(circuitId, circuitType);
+  const cached = versionCache.get(key);
   if (cached && Date.now() - cached.fetchedAt < VERSION_TTL_MS) {
     return cached.version;
   }
-  // Try to fetch from contract: get_current_version or fallback to 1
-  // If not configured, return mock version based on circuitId
-  const mockVersions: Record<string, number> = {
-    vote_v1: 1,
-    vote_v2: 2,
-    weighted_vote: 1,
-    bridge: 1,
-    comment: 1,
-    comment_v2: 2,
-  };
-  const ver = mockVersions[circuitId] ?? 1;
-  versionCache.set(circuitId, { version: ver, fetchedAt: Date.now() });
-  return ver;
+
+  const { testMode } = getDeps();
+  if (testMode) {
+    const ver = TEST_MODE_VERSIONS[circuitId] ?? 1;
+    versionCache.set(key, { version: ver, fetchedAt: Date.now() });
+    getDeps().logger.warn("circuit_registry_mock_version", {
+      circuitId,
+      circuitType,
+      version: ver,
+      source: "test-mode-mock",
+    });
+    return ver;
+  }
+
+  try {
+    const record = await getVkRecord(circuitId, circuitType);
+    versionCache.set(key, { version: record.version, fetchedAt: Date.now() });
+    return record.version;
+  } catch (error) {
+    throw new CircuitRegistryUnavailableError(
+      `Cannot resolve current version for ${circuitId}/${circuitType}: ${(error as Error).message}`,
+    );
+  }
 }
 
 export function isStaleVersion(requested: number, current: number): boolean {
@@ -150,8 +301,94 @@ export function detectVKMismatch(
 }
 
 export function invalidateVersionCache(circuitId?: string): void {
-  if (!circuitId) versionCache.clear();
-  else versionCache.delete(circuitId);
+  if (!circuitId) {
+    versionCache.clear();
+    return;
+  }
+  for (const key of versionCache.keys()) {
+    if (key === circuitId || key.startsWith(`${circuitId}:`)) {
+      versionCache.delete(key);
+    }
+  }
+}
+
+/**
+ * Invalidate resolved VK cache entries. With no arguments everything is
+ * dropped (rotation safety net); with a scope only matching DAO/circuit/type/
+ * version entries are dropped.
+ */
+export function invalidateVkCache(
+  scope: {
+    daoId?: number;
+    circuitId?: string;
+    circuitType?: string;
+    version?: number;
+  } = {},
+): void {
+  const scoped = Object.keys(scope).some((key) => scope[key] !== undefined);
+  if (!scoped) {
+    resolvedVkCache.clear();
+    return;
+  }
+  for (const key of Array.from(resolvedVkCache.keys())) {
+    const [dao, circuit, type, ver] = key.split(":");
+    if (scope.daoId !== undefined && dao !== String(scope.daoId)) continue;
+    if (scope.circuitId !== undefined && circuit !== scope.circuitId) continue;
+    if (scope.circuitType !== undefined && type !== scope.circuitType) continue;
+    if (scope.version !== undefined && ver !== String(scope.version)) continue;
+    resolvedVkCache.delete(key);
+  }
+}
+
+/**
+ * Central VK resolution used by routes and clients. All consumers get the same
+ * `{ vk, hash, version, numPublicSignals, currentVersion }` for a given
+ * DAO/circuit/version. Fails closed when the registry is unavailable.
+ */
+export async function resolveVk(params: ResolveVkParams): Promise<ResolvedVk> {
+  const {
+    daoId,
+    circuitId,
+    circuitType = "Vote",
+    version,
+  } = params;
+  const { testMode } = getDeps();
+  const currentVersion = await getCurrentVersion(circuitId, circuitType);
+  const resolvedVersion = version ?? currentVersion;
+
+  if (isStaleVersion(resolvedVersion, currentVersion)) {
+    throw new StaleVkError(circuitId, resolvedVersion, currentVersion);
+  }
+
+  const key = resolvedKey({ daoId, circuitId, circuitType, version: resolvedVersion });
+  const cached = resolvedVkCache.get(key);
+  if (cached) return cached;
+
+  const record = await getVkRecord(circuitId, circuitType);
+  if (record.version !== resolvedVersion) {
+    // The on-chain record has rotated past the requested version.
+    throw new StaleVkError(circuitId, resolvedVersion, record.version);
+  }
+
+  const hash = await computeCanonicalVkHash({
+    vk: record.vk,
+    circuitId,
+    version: resolvedVersion,
+    ceremonyTranscriptHash: record.ceremonyTranscriptHash,
+  });
+
+  const resolved: ResolvedVk = {
+    ...record,
+    circuitId,
+    circuitType,
+    version: resolvedVersion,
+    currentVersion,
+    daoId,
+    hash,
+    source: testMode ? "test-mode-mock" : "on-chain",
+  };
+  resolvedVkCache.set(key, resolved);
+  return resolved;
 }
 
 async function simulateContractCall(
@@ -203,51 +440,137 @@ async function simulateContractCall(
   }
 }
 
-export async function getVK(
+/** Parse a Groth16 VerificationKey ScVal map into hex strings. */
+function parseVkScVal(vkVal: StellarSdk.xdr.ScVal): CircuitVKResult["vk"] {
+  const vkMap = vkVal.map() ?? [];
+  const vk: Record<string, unknown> = {};
+  for (const vkEntry of vkMap) {
+    const vkKey = vkEntry.key().sym()?.toString() ?? "";
+    const val = vkEntry.val();
+    if (vkKey === "ic") {
+      vk.ic = (val.vec() ?? []).map((elem: StellarSdk.xdr.ScVal) =>
+        Buffer.from(elem.bytes() ?? []).toString("hex"),
+      );
+    } else {
+      vk[vkKey] = Buffer.from(val.bytes() ?? []).toString("hex");
+    }
+  }
+  return vk as CircuitVKResult["vk"];
+}
+
+/** Parse the richer `get_vk_record` return map. */
+function parseVkRecordScVal(
+  scVal: StellarSdk.xdr.ScVal,
   circuitId: string,
   circuitType: "Vote" | "Comment",
-): Promise<CircuitVKResult | null> {
+): VkRecord {
+  const parsed: Record<string, unknown> = {};
+  for (const entry of scVal.map() ?? []) {
+    const key = entry.key().sym()?.toString() ?? "";
+    const val = entry.val();
+    try {
+      if (key === "vk") parsed.vk = parseVkScVal(val);
+      else if (key === "num_public_signals") {
+        parsed.numPublicSignals = Number(val.u32() ?? val.i32() ?? 0);
+      } else if (key === "version") {
+        parsed.version = Number(val.u32() ?? val.i32() ?? 1) || 1;
+      } else if (
+        key === "ceremony_transcript_hash" ||
+        key === "ceremony_hash"
+      ) {
+        parsed.ceremonyTranscriptHash =
+          val.str()?.toString() ?? Buffer.from(val.bytes() ?? []).toString("hex") ?? "";
+      } else if (key === "registered_at") {
+        parsed.registeredAt = Number(val.u64()?.toString() ?? val.i64()?.toString() ?? 0);
+      } else if (key === "circuit_id") {
+        parsed.circuitId = val.str()?.toString() ?? "";
+      }
+    } catch {
+      // Ignore fields we cannot decode; required fields are validated below.
+    }
+  }
+  if (!parsed.vk || typeof parsed.numPublicSignals !== "number") {
+    throw new CircuitRegistryUnavailableError(
+      `Malformed VK record for ${circuitId}/${circuitType}`,
+    );
+  }
+  return {
+    vk: parsed.vk as CircuitVKResult["vk"],
+    numPublicSignals: parsed.numPublicSignals,
+    version: (parsed.version as number) ?? 1,
+    registeredAt: (parsed.registeredAt as number) ?? 0,
+    circuitId: (parsed.circuitId as string) || circuitId,
+    circuitType,
+    ceremonyTranscriptHash: (parsed.ceremonyTranscriptHash as string) || undefined,
+  };
+}
+
+/** Deterministic, clearly-labelled mock record — test mode ONLY. */
+function testModeVkRecord(circuitId: string, circuitType: "Vote" | "Comment"): VkRecord {
+  const version = TEST_MODE_VERSIONS[circuitId] ?? 1;
+  const seed = `${circuitId}:${circuitType}:${version}`;
+  return {
+    vk: {
+      alpha: `mock-alpha-${Buffer.from(seed).toString("hex")}`,
+      beta: `mock-beta-${Buffer.from(seed).toString("hex")}`,
+      gamma: `mock-gamma-${Buffer.from(seed).toString("hex")}`,
+      delta: `mock-delta-${Buffer.from(seed).toString("hex")}`,
+      ic: [`mock-ic-0-${Buffer.from(seed).toString("hex")}`],
+    },
+    numPublicSignals: circuitId.includes("weighted") ? 3 : circuitId.includes("v2") || circuitId.includes("comment") ? 6 : 5,
+    version,
+    registeredAt: 0,
+    circuitId,
+    circuitType,
+    ceremonyTranscriptHash: undefined,
+  };
+}
+
+/**
+ * Read the full on-chain VK record. Production fails closed if the registry is
+ * not configured or the call fails; test mode returns a labelled mock record.
+ */
+export async function getVkRecord(
+  circuitId: string,
+  circuitType: "Vote" | "Comment",
+): Promise<VkRecord> {
+  const { testMode, logger } = getDeps();
+  if (testMode) {
+    // Deterministic, clearly-labelled provider: no RPC and no on-chain reads.
+    logger.warn("circuit_registry_mock_vk", {
+      circuitId,
+      circuitType,
+      source: "test-mode-mock",
+    });
+    return testModeVkRecord(circuitId, circuitType);
+  }
+
   const args = [
     StellarSdk.nativeToScVal(circuitId, { type: "string" }),
     StellarSdk.nativeToScVal(circuitType, { type: "symbol" }),
   ];
 
-  const response = await simulateContractCall("get_vk", args);
-  if (!response?.result) return null;
-
-  const scVal = response.result.retval;
-  const mapEntries = scVal.map() ?? [];
-  const parsed: Record<string, unknown> = {};
-
-  for (const entry of mapEntries) {
-    const key = entry.key().sym()?.toString() ?? "";
-    const val = entry.val();
-    if (key === "num_public_signals") {
-      parsed[key] = Number(val.u32() ?? val.i32() ?? 0);
-    } else if (key === "vk") {
-      const vkMap = val.map() ?? [];
-      const vk: Record<string, unknown> = {};
-      for (const vkEntry of vkMap) {
-        const vkKey = vkEntry.key().sym()?.toString() ?? "";
-        const vkVal = vkEntry.val();
-        if (vkKey === "ic") {
-          const points: string[] = [];
-          for (const elem of vkVal.vec() ?? []) {
-            points.push(Buffer.from(elem.bytes() ?? []).toString("hex"));
-          }
-          vk[vkKey] = points;
-        } else {
-          vk[vkKey] = Buffer.from(vkVal.bytes() ?? []).toString("hex");
-        }
-      }
-      parsed[key] = vk;
-    }
+  const response = await simulateContractCall("get_vk_record", args);
+  if (response?.result?.retval) {
+    return parseVkRecordScVal(response.result.retval, circuitId, circuitType);
   }
 
-  return {
-    vk: parsed.vk as CircuitVKResult["vk"],
-    numPublicSignals: parsed.num_public_signals as number,
-  };
+  throw new CircuitRegistryUnavailableError(
+    `Circuit registry unavailable: cannot read VK record for ${circuitId}/${circuitType}`,
+  );
+}
+
+/**
+ * Backwards-compatible thin wrapper around the canonical record read.
+ * Fail-closed: errors from the registry propagate instead of being swallowed
+ * into a synthetic or empty result.
+ */
+export async function getVK(
+  circuitId: string,
+  circuitType: "Vote" | "Comment",
+): Promise<CircuitVKResult | null> {
+  const record = await getVkRecord(circuitId, circuitType);
+  return { vk: record.vk, numPublicSignals: record.numPublicSignals };
 }
 
 export async function getCircuitInfo(
@@ -419,6 +742,25 @@ export async function executeVkUpgrade(proposalId: number, executor: string): Pr
   if (StellarSdk.rpc.Api.isSimulationError(response)) {
     throw new Error(response.error);
   }
+
+  // Rotation just happened on-chain: drop every cached VK/version for the
+  // affected DAO + circuit. The full clear is a safety net so no stale entry
+  // can survive a proposal whose metadata could not be read back.
+  try {
+    const proposal = await getVkProposal(proposalId);
+    if (proposal) {
+      invalidateVkCache({
+        daoId: proposal.daoId,
+        circuitId: proposal.circuitId,
+        circuitType: proposal.circuitType,
+      });
+      invalidateVersionCache(proposal.circuitId);
+    }
+  } catch {
+    /* best effort: the unconditional clear below still applies */
+  }
+  invalidateVkCache();
+  invalidateVersionCache();
 }
 
 export async function cancelVkUpgrade(proposalId: number, canceller: string): Promise<void> {
