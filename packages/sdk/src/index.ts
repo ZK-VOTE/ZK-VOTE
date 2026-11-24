@@ -20,3 +20,4 @@ export {
   UnsupportedCircuitVersionError,
   type CircuitVersionCheck,
 } from './version'
+export * from './generated/zkv1'

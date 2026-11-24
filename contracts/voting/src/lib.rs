@@ -382,6 +382,15 @@ pub enum VotingError {
     TtlBudgetExceeded = 125,
     /// Invalid TTL priority level supplied.
     InvalidTtlPriority = 126,
+    // ── Protocol-level upgrade handshake ────────────────────────────────────
+    /// No prepared upgrade exists for the supplied version pair.
+    UpgradeNotPrepared = 127,
+    /// The prepared upgrade has not passed the verify step.
+    UpgradeNotVerified = 128,
+    /// The supplied compatibility manifest hash does not match the prepared one.
+    UpgradeManifestMismatch = 129,
+    /// Vote submission is paused by an in-progress protocol migration.
+    MigrationInProgress = 130,
 }
 
 impl VotingError {
@@ -785,6 +794,15 @@ pub enum DataKey {
     HaltResumeApprovals,
     /// Per-DAO TTL extension budget and consumption tracker (#881).
     TtlBudget(u64), // dao_id -> TtlExtensionBudget
+
+    // ── Protocol upgrade handshake ──────────────────────────────────────────
+    // Appended last so all pre-existing storage discriminants stay stable.
+    /// Prepared upgrade details, keyed by target version.
+    UpgradePrepared(u32),
+    /// Set once the prepared upgrade has passed cross-contract verification.
+    UpgradeVerified(u32),
+    /// Whether vote submission is paused for a migration window.
+    MigrationWindow,
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -1035,6 +1053,19 @@ pub struct ContractMigrationInfo {
     pub storage_version: u32,
     pub payload_hash: BytesN<32>,
     pub applied_at: u64,
+}
+
+/// Compatibility manifest handed to the prepare/verify/commit upgrade sequence.
+/// `manifest_hash` binds the whole release train: a target prepared against one
+/// manifest cannot be committed against another.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradeManifestInfo {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub storage_version: u32,
+    pub manifest_hash: BytesN<32>,
+    pub prepared_at: u64,
 }
 
 #[contracttype]
@@ -1309,6 +1340,35 @@ pub struct StorageMigratedEvent {
 pub struct ContractRollbackEvent {
     pub from: u32,
     pub to: u32,
+}
+
+/// Emitted when a release-train manifest is prepared on-chain.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpgradePreparedEvent {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub manifest_hash: BytesN<32>,
+}
+
+/// Emitted when readiness checks pass and the upgrade becomes committable.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpgradeVerifiedEvent {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub storage_version: u32,
+    pub manifest_hash: BytesN<32>,
+}
+
+/// Emitted when the migration window opens/closes, so indexers can reject or
+/// queue votes submitted during it.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationWindowEvent {
+    pub open: bool,
+    pub from_version: u32,
+    pub to_version: u32,
 }
 
 #[soroban_sdk::contractevent]
@@ -2030,11 +2090,87 @@ impl Voting {
             .get(&DataKey::UpgradeMigration(version))
     }
 
+    /// Step 1 of the protocol upgrade handshake. Stores the compatibility
+    /// manifest this upgrade is prepared against; it does not change any
+    /// version or Wasm and is therefore safe to rehearse.
+    pub fn prepare_upgrade_from_registry(
+        env: Env,
+        from_version: u32,
+        to_version: u32,
+        storage_version: u32,
+        manifest_hash: BytesN<32>,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_registry(&env);
+
+        let current_version = Self::version(env.clone());
+        if current_version != from_version || to_version <= from_version {
+            panic_with_error!(&env, VotingError::UpgradeVersionMismatch);
+        }
+        if storage_version < Self::storage_version(env.clone()) {
+            panic_with_error!(&env, VotingError::StorageVersionDowngrade);
+        }
+
+        let key = DataKey::UpgradePrepared(to_version);
+        let info = UpgradeManifestInfo {
+            from_version,
+            to_version,
+            storage_version,
+            manifest_hash: manifest_hash.clone(),
+            prepared_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &info);
+        Self::bump_persistent(&env, &key);
+        env.storage().persistent().remove(&DataKey::UpgradeVerified(to_version));
+        UpgradePreparedEvent {
+            from_version,
+            to_version,
+            manifest_hash,
+        }
+        .publish(&env);
+    }
+
+    /// Step 2 of the handshake: confirm the prepared manifest is still the one
+    /// being deployed and open the migration window (votes rejected/queued).
+    pub fn verify_upgrade_from_registry(env: Env, to_version: u32, manifest_hash: BytesN<32>) {
+        Self::bump_instance(&env);
+        Self::require_registry(&env);
+
+        let key = DataKey::UpgradePrepared(to_version);
+        let prepared: UpgradeManifestInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::UpgradeNotPrepared));
+        if prepared.manifest_hash != manifest_hash {
+            panic_with_error!(&env, VotingError::UpgradeManifestMismatch);
+        }
+        let verified_key = DataKey::UpgradeVerified(to_version);
+        env.storage().persistent().set(&verified_key, &true);
+        Self::bump_persistent(&env, &verified_key);
+
+        env.storage().instance().set(&DataKey::MigrationWindow, &true);
+        MigrationWindowEvent {
+            open: true,
+            from_version: prepared.from_version,
+            to_version,
+        }
+        .publish(&env);
+        UpgradeVerifiedEvent {
+            from_version: prepared.from_version,
+            to_version,
+            storage_version: prepared.storage_version,
+            manifest_hash,
+        }
+        .publish(&env);
+    }
+
     /// Registry-gated upgrade entrypoint.
     ///
     /// The registry enforces DAO-admin governance and the timelock. This hook
     /// verifies the expected current version, records storage migration
-    /// metadata, then swaps this contract's Wasm.
+    /// metadata, then swaps this contract's Wasm. Commit is rejected unless a
+    /// matching manifest was prepared and verified first.
     pub fn apply_upgrade_from_registry(
         env: Env,
         wasm_hash: BytesN<32>,
@@ -2056,6 +2192,25 @@ impl Voting {
         }
         if migration_payload.len() > MAX_UPGRADE_PAYLOAD_LEN {
             panic_with_error!(&env, VotingError::UpgradePayloadTooLarge);
+        }
+
+        // Commit gate: only a prepared+verified release train may be applied.
+        let prepared: UpgradeManifestInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UpgradePrepared(to_version))
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::UpgradeNotPrepared));
+        if prepared.from_version != from_version
+            || prepared.storage_version != storage_version
+        {
+            panic_with_error!(&env, VotingError::UpgradeManifestMismatch);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::UpgradeVerified(to_version))
+        {
+            panic_with_error!(&env, VotingError::UpgradeNotVerified);
         }
 
         let payload_hash: BytesN<32> = env.crypto().sha256(&migration_payload).into();
@@ -2088,6 +2243,21 @@ impl Voting {
         }
         .publish(&env);
 
+        // Commit closes the readiness barrier; the new Wasm takes over next.
+        env.storage().instance().remove(&DataKey::MigrationWindow);
+        MigrationWindowEvent {
+            open: false,
+            from_version,
+            to_version,
+        }
+        .publish(&env);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UpgradePrepared(to_version));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UpgradeVerified(to_version));
+
         env.deployer().update_current_contract_wasm(wasm_hash);
     }
 
@@ -2107,6 +2277,31 @@ impl Voting {
         }
 
         env.storage().instance().set(&VERSION_KEY, &to_version);
+
+        // Cascade the rollback within this contract: restore the storage layout
+        // recorded at commit, invalidate the applied-migration record and close
+        // any open migration window. Circuit IDs are restored by the registry
+        // orchestrator's compensating call in the same release train.
+        if let Some(migration) = env
+            .storage()
+            .persistent()
+            .get::<_, ContractMigrationInfo>(&DataKey::UpgradeMigration(from_version))
+        {
+            env.storage()
+                .instance()
+                .set(&STORAGE_VERSION_KEY, &migration.storage_version);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::UpgradeMigration(from_version));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UpgradePrepared(from_version));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UpgradeVerified(from_version));
+        env.storage().instance().remove(&DataKey::MigrationWindow);
+
         let key = DataKey::UpgradeRollback(from_version);
         env.storage().persistent().set(&key, &to_version);
         Self::bump_persistent(&env, &key);
@@ -2114,6 +2309,12 @@ impl Voting {
         ContractRollbackEvent {
             from: from_version,
             to: to_version,
+        }
+        .publish(&env);
+        MigrationWindowEvent {
+            open: false,
+            from_version,
+            to_version,
         }
         .publish(&env);
 
@@ -2412,6 +2613,15 @@ impl Voting {
     fn require_tier_not_halted(env: &Env, tier: u32) {
         if Self::tier_is_halted(env, tier) {
             panic_with_error!(env, VotingError::ContractPaused);
+        }
+        // A protocol migration holds an explicit readiness barrier on vote
+        // submission. Votes arriving in this window are rejected with a
+        // dedicated error so relayers can queue them for retry, never partially
+        // process them against a half-upgraded contract/CVK pair.
+        if tier == HALT_TIER_VOTE_SUBMISSION
+            && env.storage().instance().has(&DataKey::MigrationWindow)
+        {
+            panic_with_error!(env, VotingError::MigrationInProgress);
         }
     }
 

@@ -454,6 +454,13 @@ const envSchema = z.object({
     .default("false")
     .transform((v) => v === "true"),
   DB_DUAL_WRITE_URL: z.string().optional(),
+  DB_DUAL_WRITE_STRICT: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  // `repository` routes hot-path writes through the Kysely repository layer;
+  // `legacy` keeps the historical raw prepares until parity is proven.
+  DB_WRITE_CUTOVER: z.enum(["legacy", "repository"]).default("legacy"),
 
   DB_BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   DB_CHECKPOINT_INTERVAL_MS: z.coerce.number().int().positive().default(60000),
@@ -912,6 +919,8 @@ export const config = {
   databaseUrl: validatedEnv.DATABASE_URL,
   dbDualWrite: validatedEnv.DB_DUAL_WRITE,
   dbDualWriteUrl: validatedEnv.DB_DUAL_WRITE_URL,
+  dbDualWriteStrict: validatedEnv.DB_DUAL_WRITE_STRICT,
+  dbWriteCutover: validatedEnv.DB_WRITE_CUTOVER,
 
   // Database / WAL Resilience
   dbBusyTimeoutMs: validatedEnv.DB_BUSY_TIMEOUT_MS,

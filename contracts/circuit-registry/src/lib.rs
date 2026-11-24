@@ -554,6 +554,33 @@ impl CircuitRegistry {
         Self::bump_persistent(&env, &current_key);
     }
 
+    /// Compensating step for a release-train rollback: restore the circuit ID
+    /// that was active before a migration. Governance-gated like the forward
+    /// setter, and additive-only — it never deletes a registered circuit.
+    pub fn restore_current_circuit(
+        env: Env,
+        dao_id: u64,
+        circuit_type: CircuitType,
+        circuit_id: String,
+    ) {
+        Self::bump_instance(&env);
+        Self::assert_governance(&env);
+
+        let circuit_key = DataKey::Circuit(circuit_id.clone(), circuit_type.clone());
+        if !env.storage().persistent().has(&circuit_key) {
+            panic_with_error!(&env, RegistryError::CircuitNotFound);
+        }
+        let current_key = DataKey::DaoCurrentCircuit(dao_id, circuit_type.clone());
+        env.storage().persistent().set(&current_key, &circuit_id);
+        Self::bump_persistent(&env, &current_key);
+        CircuitUpgradedEvent {
+            dao_id,
+            circuit_type,
+            to_circuit_id: circuit_id,
+        }
+        .publish(&env);
+    }
+
     pub fn propose_vk_upgrade(
         env: Env,
         circuit_id: String,

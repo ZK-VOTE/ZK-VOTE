@@ -492,15 +492,56 @@ fi
 For each contract:
 
 - [x] Add `version()` function
-- [ ] Implement `upgrade()` with admin check
+- [x] Implement `upgrade()` with admin check (registry-gated `apply_upgrade_from_registry`)
 - [ ] Implement `migrate()` for data migration
-- [ ] Add `ContractUpgraded` event
-- [ ] Add governance multi-sig (production)
-- [ ] Add timelock mechanism (production)
-- [ ] Implement `rollback()` capability
-- [ ] Write upgrade tests
+- [x] Add `ContractUpgraded` event
+- [x] Add governance multi-sig (DAO registry)
+- [x] Add timelock mechanism (DAO registry `eta`/`expires_at`)
+- [x] Implement `rollback()` capability (registry-gated, now restores storage version)
+- [x] Write upgrade tests
 - [ ] Update deployment scripts
-- [ ] Document migration procedures
+- [x] Document migration procedures
+
+## Protocol-level upgrade handshake (implemented)
+
+The per-contract hooks above are necessary but not sufficient: a train can be
+partially applied and leave voting paired with an incompatible circuit or
+backend schema. The following protocol layer is now in place:
+
+1. **Compatibility manifest** — `releases/compatibility-manifest.json` declares
+   the required version, storage version and circuit ID of every contract in
+   the train, the backend schema version, and the upgrade/rollback order. Its
+   canonical SHA-256 is the train identity (`manifestHash()` in
+   `backend/src/services/upgradeCoordinator.ts`).
+2. **prepare → verify → commit** — voting exposes
+   `prepare_upgrade_from_registry`, `verify_upgrade_from_registry` and the
+   registry-gated `apply_upgrade_from_registry`. Commit is rejected with
+   `UpgradeNotPrepared` (127), `UpgradeNotVerified` (128) or
+   `UpgradeManifestMismatch` (129) unless the prepared manifest hash and
+   storage version match. The TypeScript `UpgradeCoordinator` performs the same
+   sequence train-wide and re-checks compatibility at commit time.
+3. **Readiness barrier** — `verify` opens a migration window on voting.
+   `require_tier_not_halted(VOTE_SUBMISSION)` rejects votes with
+   `MigrationInProgress` (130) while the window is open, so a vote is either
+   rejected/queued or fully processed — never partially processed against a
+   half-upgraded CVK. The relayer's `degraded-mode.ts` queue path is the
+   client-side companion.
+4. **Cascading rollback** — `rollback_upgrade_from_registry` restores
+   `VERSION_KEY`, `STORAGE_VERSION_KEY`, invalidates the applied-migration
+   record and emits `MigrationWindowEvent { open: false }`.
+   `circuit-registry::restore_current_circuit` restores the prior circuit ID
+   under governance. `UpgradeCoordinator.rollbackPlan()` walks the exact
+   reverse of `upgradeOrder`.
+5. **Events** — `UpgradePreparedEvent`, `UpgradeVerifiedEvent`,
+   `MigrationWindowEvent` and `ContractRollbackEvent` are emitted on-chain,
+   mapped in `backend/src/services/indexer.ts` and typed in
+   `backend/src/generated/contract-events.ts` so indexers and notifications can
+   observe the window and the manifest hash.
+
+Backend SQL migrations are coordinated via `backendSchemaVersion`: the
+coordinator refuses to verify or commit when `checkSchemaDrift()` fails or the
+schema version differs from the manifest. This is exercised in the election-day
+upgrade chaos scenario (`tests/chaos/scenarios/upgrade-migration.ts`).
 
 ---
 

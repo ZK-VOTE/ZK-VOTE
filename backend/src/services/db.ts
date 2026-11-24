@@ -31,7 +31,13 @@ import {
   incrementTransactionCounter,
 } from "./walResilience.js";
 import { config } from "../config.js";
-import { ensureDurableSchema } from "./durable-schema.js";
+import {
+  configureRepository,
+  getRepository,
+  isRepositoryCutoverEnabled,
+  type WriteExecutor,
+} from "./repository.js";
+import { mirrorWrite } from "./dualWrite.js";
 
 /** Optional Prometheus sink — wired from boot so db.ts stays testable without prom-client. */
 export interface DbMetricsSink {
@@ -44,6 +50,40 @@ export interface DbMetricsSink {
 
 /** Object holder avoids TDZ if metrics wires during circular ESM init. */
 const metricsState: { sink: DbMetricsSink | null } = { sink: null };
+
+// ── Repository cutover seam ────────────────────────────────────────────────
+// SQL for the hot paths is built by Kysely in repository.ts. The executor below
+// only runs the compiled, parameterized statement on the primary handle; it
+// never interpolates values. When dual-write is off, mirroring is a no-op, so
+// disabling it cannot lose data on the authoritative store.
+let repositoryConfigured = false;
+function ensureRepositoryConfigured(): void {
+  if (repositoryConfigured) return;
+  const executor: WriteExecutor = {
+    run(sql, params) {
+      const result = getWriteDb().prepare(sql).run(...(params as unknown[]));
+      return { changes: result.changes, lastInsertRowid: result.lastInsertRowid };
+    },
+    transaction<T>(fn: () => T): T {
+      return getWriteDb().transaction(fn)();
+    },
+  };
+  configureRepository({
+    db: kysely,
+    executor,
+    mirror: (sql, params) => mirrorWrite(sql, [...params]),
+    strict: config.dbDualWriteStrict,
+    cutover: config.dbWriteCutover,
+  });
+  repositoryConfigured = true;
+}
+
+/** Returns the repository when the cutover flag routes writes through it. */
+function repositoryForWrites() {
+  ensureRepositoryConfigured();
+  if (!isRepositoryCutoverEnabled()) return null;
+  return getRepository();
+}
 
 export function setDbMetricsSink(sink: DbMetricsSink | null): void {
   metricsState.sink = sink;
@@ -2447,6 +2487,12 @@ export function recordTransactionLog(
   txHash: string,
   status: string = "PENDING",
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.recordTransactionLog(nullifierHash, txHash, status, Date.now());
+    incrementTransactionCounter();
+    return;
+  }
   const database = getWriteDb();
   database
     .prepare(
@@ -2469,6 +2515,11 @@ export function updateTransactionLogStatus(
   status: string,
   txHash?: string,
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.updateTransactionLogStatus(nullifierHash, status, txHash, Date.now());
+    return;
+  }
   const database = getWriteDb();
   if (txHash) {
     database
@@ -2542,6 +2593,12 @@ export function getVoteSubmission(
  * Insert a new pending vote submission. Returns false if nullifier already exists (idempotency race).
  */
 export function insertVoteSubmission(nullifierHash: string): boolean {
+  const repo = repositoryForWrites();
+  if (repo) {
+    const inserted = repo.insertVoteSubmission(nullifierHash, Date.now());
+    if (inserted) incrementTransactionCounter();
+    return inserted;
+  }
   const database = getWriteDb();
   const now = Date.now();
   const result = database
@@ -2561,6 +2618,11 @@ export function updateVoteSubmission(
   status: "confirmed" | "failed",
   txHash?: string,
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.updateVoteSubmission(nullifierHash, status, txHash, Date.now());
+    return;
+  }
   const database = getWriteDb();
   const now = Date.now();
   if (txHash) {
@@ -4038,6 +4100,12 @@ export function storeVoteReceipt(
   daoId: number,
   status: "confirmed" | "pending" | "failed" = "confirmed",
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.storeVoteReceipt(nullifier, txHash, proposalId, daoId, status, Date.now());
+    incrementTransactionCounter();
+    return;
+  }
   const database = getWriteDb();
   try {
     database

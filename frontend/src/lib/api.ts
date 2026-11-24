@@ -9,7 +9,6 @@ import type {
 // from config/env.ts so all three service URLs stay in one place.
 import { RELAYER_URL } from "../config/env";
 
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
 // Relayer shared secrets must NEVER be baked into the public JS bundle (#647).
 // Browser writes authenticate via CSRF + origin checks; server-to-server
 // clients supply X-Relayer-Auth from a private environment.

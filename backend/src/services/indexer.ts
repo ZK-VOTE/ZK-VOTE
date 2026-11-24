@@ -74,6 +74,17 @@ const EVENT_TYPES: Record<string, string> = {
   TransferEvent: "token_transfer",
   DelegateChanged: "token_delegate",
   Checkpoint: "token_checkpoint",
+  // Protocol upgrade / migration (prepare -> verify -> commit / rollback).
+  // Indexers use these to pause vote ingestion during a migration window and
+  // to surface the manifest hash that pins the release train.
+  ContractUpgraded: "contract_upgraded",
+  StorageMigratedEvent: "storage_migrated",
+  ContractRollbackEvent: "contract_rollback",
+  UpgradePreparedEvent: "upgrade_prepared",
+  UpgradeVerifiedEvent: "upgrade_verified",
+  MigrationWindowEvent: "migration_window",
+  DaoMigrationEvent: "circuit_migration_started",
+  CircuitUpgradedEvent: "circuit_upgraded",
 };
 
 /**

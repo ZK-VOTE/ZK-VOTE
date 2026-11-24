@@ -212,6 +212,35 @@ export interface CircuitUpgradedEvent {
   toCircuitId: string;
 }
 
+/** Protocol upgrade handshake events (prepare -> verify -> commit / rollback). */
+export interface UpgradePreparedEvent {
+  type: "UpgradePreparedEvent";
+  fromVersion: number;
+  toVersion: number;
+  manifestHash: string;
+}
+
+export interface UpgradeVerifiedEvent {
+  type: "UpgradeVerifiedEvent";
+  fromVersion: number;
+  toVersion: number;
+  storageVersion: number;
+  manifestHash: string;
+}
+
+export interface MigrationWindowEvent {
+  type: "MigrationWindowEvent";
+  open: boolean;
+  fromVersion: number;
+  toVersion: number;
+}
+
+export interface ContractRollbackEvent {
+  type: "ContractRollbackEvent";
+  from: number;
+  to: number;
+}
+
 // ============================================
 // Union Type & Utilities
 // ============================================
@@ -239,7 +268,11 @@ export type SmartContractEvent =
   | CommentDeletedEvent
   | CircuitRegisteredEvent
   | DaoMigrationEvent
-  | CircuitUpgradedEvent;
+  | CircuitUpgradedEvent
+  | UpgradePreparedEvent
+  | UpgradeVerifiedEvent
+  | MigrationWindowEvent
+  | ContractRollbackEvent;
 
 /**
  * Type guard to check if an event matches a specific type
