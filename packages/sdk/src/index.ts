@@ -23,3 +23,4 @@ export {
   DEPRECATION_POLICY,
   verifyChecksum,
 } from './version'
+export * from './generated/zkv1'

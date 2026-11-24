@@ -11,6 +11,9 @@ import { assertValidFieldElement, assertValidNullifier } from "../types/index";
 import { workerAvailable, proveInWorker } from "./proveInWorker";
 import { withMaskedTiming } from "./proofTiming";
 import { selectProvingPlan } from "./devicePreflight";
+// ZKV1 is generated from shared/protocol-manifest.json. The snarkjs -> ZKV1
+// conversion lives there so frontend, SDK and backend use identical bytes.
+import { snarkjsToZkv1, type SnarkjsProof } from "../generated/zkv1";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -427,6 +430,7 @@ export async function fetchVersionedVK(
   circuitId: string,
   version: number,
   fetchFn: typeof fetch = fetch,
+  circuitType: "Vote" | "Comment" = "Vote",
 ): Promise<VersionedVK> {
   const key = vkCacheKey(circuitId, version);
   const cached =
@@ -439,7 +443,7 @@ export async function fetchVersionedVK(
   const relayerUrl =
     (import.meta as unknown as { env: Record<string, string> })?.env
       ?.VITE_RELAYER_URL ?? "http://localhost:3001";
-  const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}`;
+  const url = `${relayerUrl}/circuits/vk/${encodeURIComponent(circuitId)}/${version}?type=${circuitType.toLowerCase()}`;
 
   const res = await fetchFn(url);
   if (res.status === 410 || res.status === 409) {
@@ -455,9 +459,29 @@ export async function fetchVersionedVK(
   }
 
   const data = await res.json();
-  // Backend returns { vk, version, hash, numPublicSignals, vkVersion } or { verificationKey }
+  // Backend returns { vk, version, hash, hashScheme, numPublicSignals } or { verificationKey }
   const vk = data.vk ?? data.verificationKey ?? data;
   const hash: string = data.hash ?? data.vkHash ?? (await computeVKHash(vk));
+
+  // When the relayer marks the hash as a registry canonical hash, verify it
+  // client-side against the same canonical record before trusting or caching.
+  // A mismatched hash means the response is forged, stale, or from a different
+  // registry — fail closed.
+  if (data.hashScheme === "registry-v1") {
+    const canonical = await computeVKHash({
+      circuitId,
+      circuitType,
+      version: data.version ?? version,
+      vk,
+      numPublicSignals: data.numPublicSignals,
+    });
+    if (canonical !== hash) {
+      invalidateVKCache(circuitId, version);
+      throw new Error(
+        `VK hash mismatch for ${circuitId} v${version}: registry response is not authoritative`,
+      );
+    }
+  }
 
   // CRITICAL (#660): Bind VK to the backend version for integrity verification
   const entry: VersionedVK = {
@@ -1191,29 +1215,14 @@ export function formatProofForSoroban(proof: Groth16Proof): {
   proof_b: string;
   proof_c: string;
 } {
-  // Convert field element to BIG-ENDIAN hex (no reversal needed)
-  const toHexBE = (value: string): string => {
-    const bigInt = BigInt(value);
-    return bigInt.toString(16).padStart(64, "0");
+  // Deprecated compatibility wrapper: the canonical conversion now lives in
+  // the generated ZKV1 adapter (one boundary for SDK, frontend and backend).
+  const zkv1 = snarkjsToZkv1(proof as unknown as SnarkjsProof);
+  return {
+    proof_a: zkv1.a.slice(2),
+    proof_b: zkv1.b.slice(2),
+    proof_c: zkv1.c.slice(2),
   };
-
-  // Format pi_a (G1 point): be_bytes(X) || be_bytes(Y)
-  const proof_a = toHexBE(proof.pi_a[0]) + toHexBE(proof.pi_a[1]);
-
-  // Format pi_b (G2 point): [[x.c0, x.c1], [y.c0, y.c1]]
-  // Ethereum/Soroban format: be_bytes(X_c1) || be_bytes(X_c0) || be_bytes(Y_c1) || be_bytes(Y_c0)
-  // snarkjs outputs: [[c0, c1], [c0, c1]] where c0=real, c1=imaginary
-  // We swap within each coordinate pair: [c1, c0, c1, c0]
-  const proof_b =
-    toHexBE(proof.pi_b[0][1]) + // X.c1 (imaginary)
-    toHexBE(proof.pi_b[0][0]) + // X.c0 (real)
-    toHexBE(proof.pi_b[1][1]) + // Y.c1 (imaginary)
-    toHexBE(proof.pi_b[1][0]); // Y.c0 (real)
-
-  // Format pi_c (G1 point): be_bytes(X) || be_bytes(Y)
-  const proof_c = toHexBE(proof.pi_c[0]) + toHexBE(proof.pi_c[1]);
-
-  return { proof_a, proof_b, proof_c };
 }
 
 /**
@@ -1389,6 +1398,18 @@ export async function verifyProofWithVersionedVK(
   version: number,
 ): Promise<boolean> {
   const vkEntry = await fetchVersionedVK(circuitId, version);
+  // Bind verification to the registry's circuit ID and public-signal count.
+  if (vkEntry.circuitId !== circuitId) {
+    throw new Error(
+      `VK registry returned ${vkEntry.circuitId}; expected ${circuitId}`,
+    );
+  }
+  if (
+    typeof vkEntry.numPublicSignals === "number" &&
+    publicSignals.length !== vkEntry.numPublicSignals
+  ) {
+    return false;
+  }
   try {
     const { groth16 } = await import("snarkjs");
     const result = await groth16.verify(

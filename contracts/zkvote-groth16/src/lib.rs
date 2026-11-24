@@ -53,6 +53,10 @@ pub mod proof_canonicalization;
 // Audit-friendly, versioned proof serialization format (ZKV1)
 pub mod serialization;
 
+// Constants generated from shared/protocol-manifest.json. Keep the Rust wire
+// format and the TS bindings byte-for-byte identical.
+pub mod generated;
+
 /// Whether the no-op verifier is compiled in. Always `false` in any build that
 /// could be deployed; exposed so tests can assert the invariant directly
 /// instead of inferring it from behaviour.

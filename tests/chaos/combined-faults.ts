@@ -10,7 +10,10 @@ export enum FaultType {
   NETWORK_CONGESTION = 'network_congestion',
   BACKEND_DEGRADATION = 'backend_degradation',
   PUSH_FAILURE = 'push_failure',
-  DISPUTE_SURGE = 'dispute_surge'
+  DISPUTE_SURGE = 'dispute_surge',
+  /** Protocol upgrade train applied while votes are in flight (ZV upgrade drill). */
+  CONTRACT_UPGRADE = 'contract_upgrade',
+  MIGRATION_WINDOW = 'migration_window'
 }
 
 export interface FaultConfig {

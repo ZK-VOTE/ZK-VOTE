@@ -1,7 +1,12 @@
 /**
- * Routes Module Index
+ * Routes Module Index + declarative route registry.
  *
- * Re-exports all route modules for convenient importing.
+ * Historically this file was a flat list of re-exports and `index.ts` held a
+ * hand-written list of `app.use(...)` calls. The registry below makes the
+ * mount order, required services, DI-service prerequisites and startup profile
+ * explicit, and `mountRoutes()` validates those requirements **before**
+ * mounting anything. The original named re-exports remain as aliases so no
+ * existing import site needs to change.
  */
 
 export { default as healthRoutes, initHealthRoutes } from "./health.js";
@@ -24,6 +29,7 @@ export { default as adminRoutes } from "./admin.js";
 export { default as thresholdRoutes } from "./threshold.js";
 export { default as auditRoutes } from "./audit.js";
 export { default as randomnessRoutes } from "./randomness.js";
+export { default as factoryRoutes } from "./factory.js";
 export { default as payRoutes } from "./pay.js";
 export { default as swapRoutes } from "./swap.js";
 export { default as rampRoutes } from "./ramp.js";

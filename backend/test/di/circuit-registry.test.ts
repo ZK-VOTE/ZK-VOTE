@@ -112,15 +112,24 @@ test("circuit-registry: uses the injected mock server, not a global", async () =
   assert.equal(simulateCalls, 1);
 });
 
-test("circuit-registry: getCurrentVersion caches per circuit id", async () => {
-  initCircuitRegistry(mockDeps());
+test("circuit-registry: getCurrentVersion is sourced from the contract and cached", async () => {
+  const deps = mockDeps();
+  deps.server = {
+    getAccount: async () => new StellarSdk.Account(TEST_ADDR, "1"),
+    simulateTransaction: async () => ({
+      result: { retval: StellarSdk.nativeToScVal(2, { type: "u32" }) },
+      minResourceFee: "0",
+      cost: { cpuInsns: "0", memBytes: "0" },
+    }),
+  } as never;
+  initCircuitRegistry(deps);
   invalidateVersionCache();
 
-  const v1 = await getCurrentVersion("vote_v2");
-  assert.equal(v1, 2); // mock table: vote_v2 -> 2
-  const v2 = await getCurrentVersion("vote_v2");
-  assert.equal(v2, 2);
-  assert.equal(await getCurrentVersion("unknown_circuit"), 1);
+  // There is no mock version table: the contract value is authoritative for
+  // every circuit id, and the cached value is reused within the TTL.
+  assert.equal(await getCurrentVersion("vote_v2"), 2);
+  assert.equal(await getCurrentVersion("vote_v2"), 2);
+  assert.equal(await getCurrentVersion("unknown_circuit"), 2);
 
   invalidateVersionCache("vote_v2");
 });

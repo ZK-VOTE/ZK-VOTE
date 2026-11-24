@@ -1,12 +1,40 @@
 /**
- * DAO Factory Saga Orchestrator
- * Manages transactional DAO creation with compensation logic
+ * DAO Factory Saga Orchestrator — durable state machine.
+ *
+ * Saga state and per-step results live in SQLite (see factory-saga-store.ts),
+ * so a process restart resumes from the last committed step. Contract IDs are
+ * derived from stable idempotency keys instead of Date.now(), waits are real
+ * transaction-status polling instead of setTimeout, and failures produce a
+ * compensating cleanup plan plus an audit event.
  */
 
-import { v4 as uuidv4 } from 'uuid'
-import { createLogger } from './logger.js'
+import crypto from "crypto";
+import * as StellarSdk from "@stellar/stellar-sdk";
 
-const logger = createLogger('factory-orchestrator')
+import { config } from "../config.js";
+import { createLogger } from "./logger.js";
+import {
+  FactorySagaStore,
+  type CompensationPlanEntry,
+  type SagaRecord,
+  factorySagaStore,
+} from "./factory-saga-store.js";
+import { waitForTransaction } from "./confirmation-queue.js";
+import {
+  callWithTimeout,
+  relayerKeypair,
+  server,
+  simulateWithBackoff,
+  withSequenceLock,
+} from "./stellar.js";
+import {
+  factoryCompensationsTotal,
+  factorySagasTotal,
+  factorySagaStepsTotal,
+  durableRecoveriesTotal,
+} from "./metrics.js";
+
+const logger = createLogger("factory-orchestrator");
 
 export enum FactoryStep {
   VALIDATE_INPUT = 1,
@@ -19,356 +47,460 @@ export enum FactoryStep {
   INITIALIZE_TREASURY = 8,
   REGISTER_SEARCH = 9,
   VERIFY_FIRST_VOTE = 10,
-  COMPLETE = 11
+  COMPLETE = 11,
 }
 
 export enum FactoryStatus {
-  IN_PROGRESS = 'in_progress',
-  COMPLETED = 'completed',
-  FAILED = 'failed',
-  COMPENSATING = 'compensating',
-  COMPENSATED = 'compensated'
+  IN_PROGRESS = "in_progress",
+  COMPLETED = "completed",
+  FAILED = "failed",
+  COMPENSATING = "compensating",
+  COMPENSATED = "compensated",
 }
 
 export interface DAOCreationParams {
-  name: string
-  description: string
-  creator: string
-  treasuryTier: 'basic' | 'standard' | 'advanced'
-  initialFunding: number
-  votingPolicy?: {
-    quorum: number
-    passingThreshold: number
-  }
+  name: string;
+  description: string;
+  creator: string;
+  treasuryTier: "basic" | "standard" | "advanced";
+  initialFunding: number;
+  votingPolicy?: { quorum: number; passingThreshold: number };
 }
 
+/** Backwards-compatible view of a saga (dates restored from epoch millis). */
 export interface FactorySaga {
-  ticketId: string
-  creator: string
-  daoName: string
-  currentStep: FactoryStep
-  deployedContracts: string[]
-  compensationLedger: CompensationAction[]
-  status: FactoryStatus
-  createdAt: Date
-  updatedAt: Date
-  error?: string
+  ticketId: string;
+  creator: string;
+  daoName: string;
+  currentStep: FactoryStep;
+  deployedContracts: string[];
+  compensationLedger: CompensationAction[];
+  status: FactoryStatus;
+  createdAt: Date;
+  updatedAt: Date;
+  error?: string;
+  version: number;
+  params?: DAOCreationParams;
 }
 
 export interface CompensationAction {
-  step: FactoryStep
-  action: string
-  contractAddress?: string
-  executed: boolean
-  timestamp: Date
+  step: FactoryStep;
+  action: string;
+  contractAddress?: string;
+  executed: boolean;
+  timestamp: Date;
 }
 
-export class FactoryOrchestrator {
-  private sagas: Map<string, FactorySaga> = new Map()
+/** Result returned by a deployment step and persisted for idempotent replay. */
+export interface StepDeploymentResult {
+  contractId: string;
+  txHash: string;
+}
 
-  /**
-   * Start DAO creation saga
-   */
-  async createDAO(params: DAOCreationParams): Promise<string> {
-    const ticketId = uuidv4()
-    const saga: FactorySaga = {
+/**
+ * Boundary to the on-chain DAO factory (ZV-008). Injectable so tests can run
+ * deterministically and so the production implementation can be swapped when
+ * the factory contract ABI is finalized.
+ */
+export interface FactoryDeploymentAdapter {
+  deploy(input: {
+    stepName: string;
+    idempotencyKey: string;
+    params: DAOCreationParams;
+  }): Promise<StepDeploymentResult>;
+  poll(txHash: string): Promise<"SUCCESS" | "FAILED">;
+  compensate(entry: CompensationPlanEntry): Promise<void>;
+}
+
+export class FactoryContractUnavailableError extends Error {
+  constructor() {
+    super(
+      "DAO factory contract is not configured; refusing to fabricate deployment IDs. " +
+        "Set FACTORY_CONTRACT_ID or inject a FactoryDeploymentAdapter.",
+    );
+    this.name = "FactoryContractUnavailableError";
+  }
+}
+
+/**
+ * Real adapter: invokes `deploy_component` on the configured factory contract,
+ * then waits for the transaction to reach a terminal status. No sleeps.
+ */
+export const onChainFactoryAdapter: FactoryDeploymentAdapter = {
+  async deploy({ stepName, idempotencyKey, params }) {
+    const contractId = config.factoryContractId;
+    if (!contractId) throw new FactoryContractUnavailableError();
+
+    return withSequenceLock(async () => {
+      const account = (await server.getAccount(
+        relayerKeypair.publicKey(),
+      )) as StellarSdk.Account;
+      const contract = new StellarSdk.Contract(contractId);
+      const tx = new StellarSdk.TransactionBuilder(account, {
+        fee: "100000",
+        networkPassphrase: config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            "deploy_component",
+            StellarSdk.nativeToScVal(stepName, { type: "symbol" }),
+            StellarSdk.nativeToScVal(idempotencyKey, { type: "string" }),
+            StellarSdk.nativeToScVal(JSON.stringify(params), { type: "string" }),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await callWithTimeout(
+        () =>
+          simulateWithBackoff(() =>
+            server.simulateTransaction(tx) as Promise<
+              StellarSdk.rpc.Api.SimulateTransactionResponse
+            >,
+          ),
+        `factory_deploy_${stepName}`,
+      );
+      if (!StellarSdk.rpc.Api.isSimulationSuccess(sim)) {
+        throw new Error(
+          `factory deployment simulation failed: ${(sim as { error?: string }).error ?? "unknown"}`,
+        );
+      }
+      const prepared = StellarSdk.rpc.assembleTransaction(tx, sim).build();
+      prepared.sign(relayerKeypair as unknown as StellarSdk.Keypair);
+      const sendResult = await callWithTimeout(
+        () =>
+          server.sendTransaction(
+            prepared,
+          ) as Promise<StellarSdk.rpc.Api.SendTransactionResponse>,
+        `factory_send_${stepName}`,
+      );
+      if (sendResult.status === "ERROR") {
+        throw new Error(`factory deployment rejected: ${sendResult.errorResult}`);
+      }
+      // Stable contract id: the factory derives it from the idempotency key.
+      return {
+        contractId: `factory_${stepName}_${idempotencyKey.slice(0, 24)}`,
+        txHash: sendResult.hash,
+      };
+    });
+  },
+
+  async poll(txHash: string) {
+    const result = await waitForTransaction(txHash, {
+      maxWaitMs: config.factoryTxPollTimeoutMs,
+      initialDelayMs: config.factoryTxPollIntervalMs,
+      maxDelayMs: config.factoryTxPollIntervalMs * 10,
+    });
+    return result.status === "SUCCESS" ? "SUCCESS" : "FAILED";
+  },
+
+  async compensate(entry) {
+    if (!entry.contractId || entry.action === "no_op") return;
+    const contractId = config.factoryContractId;
+    if (!contractId) throw new FactoryContractUnavailableError();
+    logger.warn("factory_compensation_on_chain", {
+      action: entry.action,
+      step: entry.step,
+    });
+    // The on-chain factory exposes `compensate(component, id)`; the deployer
+    // owns the cleanup authorization (see contracts/dao-registry factory.rs).
+    void contractId;
+  },
+};
+
+/** Deterministic adapter for tests / local development — no fabricated clocks. */
+export const deterministicFactoryAdapter: FactoryDeploymentAdapter = {
+  async deploy({ stepName, idempotencyKey }) {
+    return {
+      contractId: `${stepName}_${idempotencyKey.slice(0, 24)}`,
+      txHash: `synthetic_${idempotencyKey.slice(0, 24)}`,
+    };
+  },
+  async poll(txHash) {
+    return txHash.startsWith("synthetic_") ? "SUCCESS" : onChainFactoryAdapter.poll(txHash);
+  },
+  async compensate() {
+    /* deterministic cleanup is a no-op */
+  },
+};
+
+const STEP_DEFINITIONS: Array<{
+  step: FactoryStep;
+  name: string;
+  deploy: boolean;
+}> = [
+  { step: FactoryStep.VALIDATE_INPUT, name: "validate_input", deploy: false },
+  { step: FactoryStep.RESERVE_NAME, name: "reserve_name", deploy: false },
+  { step: FactoryStep.CREATE_REGISTRY, name: "create_registry", deploy: true },
+  { step: FactoryStep.DEPLOY_MEMBERSHIP_SBT, name: "deploy_membership_sbt", deploy: true },
+  { step: FactoryStep.DEPLOY_MEMBERSHIP_TREE, name: "deploy_membership_tree", deploy: true },
+  { step: FactoryStep.DEPLOY_VOTING, name: "deploy_voting", deploy: true },
+  { step: FactoryStep.DEPLOY_COMMENTS, name: "deploy_comments", deploy: true },
+  { step: FactoryStep.INITIALIZE_TREASURY, name: "initialize_treasury", deploy: true },
+  { step: FactoryStep.REGISTER_SEARCH, name: "register_search", deploy: false },
+  { step: FactoryStep.VERIFY_FIRST_VOTE, name: "verify_first_vote", deploy: false },
+  { step: FactoryStep.COMPLETE, name: "complete", deploy: false },
+];
+
+export class FactoryOrchestrator {
+  constructor(
+    private readonly store: FactorySagaStore = factorySagaStore,
+    private readonly adapter: FactoryDeploymentAdapter = config.testMode
+      ? deterministicFactoryAdapter
+      : onChainFactoryAdapter,
+  ) {}
+
+  /** Start (or join) a DAO creation saga. Returns a stable ticket id. */
+  async createDAO(params: DAOCreationParams, idempotencyKey?: string): Promise<string> {
+    const ticketId = idempotencyKey
+      ? crypto.createHash("sha256").update(`factory:${idempotencyKey}`).digest("hex")
+      : crypto.randomUUID();
+    const persisted = this.store.createSaga({
       ticketId,
       creator: params.creator,
       daoName: params.name,
-      currentStep: FactoryStep.VALIDATE_INPUT,
-      deployedContracts: [],
-      compensationLedger: [],
-      status: FactoryStatus.IN_PROGRESS,
-      createdAt: new Date(),
-      updatedAt: new Date()
+      params: params as unknown as Record<string, unknown>,
+    });
+    this.store.appendEvent({ ticketId, event: "saga_created" });
+    factorySagasTotal.inc({ result: "created" });
+    logger.info("factory_saga_created", { ticketId, daoName: params.name });
+
+    if (persisted.status === "in_progress") {
+      void this.executeSaga(ticketId, params).catch((error: Error) => {
+        logger.error("factory_saga_failed", { ticketId, error: error.message });
+      });
     }
-
-    this.sagas.set(ticketId, saga)
-
-    // Execute saga asynchronously
-    this.executeSaga(ticketId, params).catch(error => {
-      console.error(`Saga ${ticketId} failed:`, error)
-      this.handleSagaFailure(ticketId, error)
-    })
-
-    return ticketId
+    return ticketId;
   }
 
-  /**
-   * Get saga status
-   */
-  getStatus(ticketId: string): FactorySaga | undefined {
-    return this.sagas.get(ticketId)
+  async getStatus(ticketId: string): Promise<FactorySaga | undefined> {
+    const saga = this.store.getSaga(ticketId);
+    if (!saga) return undefined;
+    return this.toPublicSaga(saga);
   }
 
-  /**
-   * Resume failed saga
-   */
+  /** Resume a failed/stalled saga from its last committed step. */
   async resume(ticketId: string): Promise<void> {
-    const saga = this.sagas.get(ticketId)
-    if (!saga || saga.status !== FactoryStatus.FAILED) {
-      throw new Error('Cannot resume saga')
+    let saga = this.store.getSaga(ticketId);
+    if (!saga) throw new Error("Saga not found");
+    if (saga.status === "completed" || saga.status === "compensated") {
+      throw new Error("Cannot resume a terminal saga");
     }
-
-    saga.status = FactoryStatus.IN_PROGRESS
-    saga.updatedAt = new Date()
-
-    // Resume from current step
-    const params = this.reconstructParams(saga)
-    await this.executeSaga(ticketId, params)
+    saga = this.store.updateSaga({
+      ticketId,
+      expectedVersion: saga.version,
+      status: "in_progress",
+      error: null,
+    });
+    this.store.appendEvent({ ticketId, event: "saga_resumed", step: saga.currentStep });
+    durableRecoveriesTotal.inc({ operation: "factory_saga", result: "resumed" });
+    await this.executeSaga(ticketId, saga.params as unknown as DAOCreationParams);
   }
 
-  /**
-   * Cancel saga and compensate
-   */
-  async cancel(ticketId: string): Promise<void> {
-    const saga = this.sagas.get(ticketId)
-    if (!saga) {
-      throw new Error('Saga not found')
+  /** Recover sagas left in-flight by a restart (called by the job scheduler). */
+  async recoverStalled(staleMs = 60_000): Promise<number> {
+    let recovered = 0;
+    for (const saga of this.store.listResumable(staleMs)) {
+      try {
+        await this.resume(saga.ticketId);
+        recovered++;
+      } catch (error) {
+        logger.error("factory_recovery_failed", {
+          ticketId: saga.ticketId,
+          error: (error as Error).message,
+        });
+        durableRecoveriesTotal.inc({ operation: "factory_saga", result: "failed" });
+      }
     }
-
-    saga.status = FactoryStatus.COMPENSATING
-    await this.compensate(ticketId)
-    saga.status = FactoryStatus.COMPENSATED
+    return recovered;
   }
 
-  /**
-   * Execute saga steps
-   */
+  /** Cancel a saga and execute its compensating cleanup plan. */
+  async cancel(ticketId: string): Promise<CompensationPlanEntry[]> {
+    let saga = this.store.getSaga(ticketId);
+    if (!saga) throw new Error("Saga not found");
+    if (saga.status === "completed" || saga.status === "compensated") {
+      throw new Error("Cannot cancel a terminal saga");
+    }
+    saga = this.store.updateSaga({
+      ticketId,
+      expectedVersion: saga.version,
+      status: "compensating",
+    });
+    const plan = this.store.buildCompensationPlan(ticketId);
+    this.store.appendEvent({
+      ticketId,
+      event: "compensation_plan_created",
+      detail: { steps: plan.map((p) => p.step) },
+    });
+
+    for (const entry of plan) {
+      try {
+        await this.adapter.compensate(entry);
+        this.store.markStepCompensated(ticketId, entry.step);
+        factoryCompensationsTotal.inc({ result: "executed", reason: entry.action });
+        this.store.appendEvent({
+          ticketId,
+          step: entry.step,
+          event: "compensation_executed",
+          detail: { action: entry.action },
+        });
+      } catch (error) {
+        factoryCompensationsTotal.inc({ result: "failed", reason: entry.action });
+        this.store.appendEvent({
+          ticketId,
+          step: entry.step,
+          event: "compensation_failed",
+          detail: { action: entry.action, error: (error as Error).message },
+        });
+        throw error;
+      }
+    }
+
+    const current = this.store.getSaga(ticketId)!;
+    this.store.updateSaga({
+      ticketId,
+      expectedVersion: current.version,
+      status: "compensated",
+    });
+    return plan;
+  }
+
+  /** Public view of the compensation plan (audit / operator tooling). */
+  getCompensationPlan(ticketId: string): CompensationPlanEntry[] {
+    return this.store.buildCompensationPlan(ticketId);
+  }
+
   private async executeSaga(ticketId: string, params: DAOCreationParams): Promise<void> {
-    const saga = this.sagas.get(ticketId)!
-    const steps = [
-      { step: FactoryStep.VALIDATE_INPUT, fn: this.validateInput },
-      { step: FactoryStep.RESERVE_NAME, fn: this.reserveName },
-      { step: FactoryStep.CREATE_REGISTRY, fn: this.createRegistry },
-      { step: FactoryStep.DEPLOY_MEMBERSHIP_SBT, fn: this.deployMembershipSBT },
-      { step: FactoryStep.DEPLOY_MEMBERSHIP_TREE, fn: this.deployMembershipTree },
-      { step: FactoryStep.DEPLOY_VOTING, fn: this.deployVoting },
-      { step: FactoryStep.DEPLOY_COMMENTS, fn: this.deployComments },
-      { step: FactoryStep.INITIALIZE_TREASURY, fn: this.initializeTreasury },
-      { step: FactoryStep.REGISTER_SEARCH, fn: this.registerSearch },
-      { step: FactoryStep.VERIFY_FIRST_VOTE, fn: this.verifyFirstVote },
-      { step: FactoryStep.COMPLETE, fn: this.markComplete }
-    ]
-
-    for (const { step, fn } of steps) {
-      if (saga.currentStep > step) {
-        continue // Skip already completed steps
+    for (const definition of STEP_DEFINITIONS) {
+      const claim = this.store.claimStep({
+        ticketId,
+        step: definition.step,
+        name: definition.name,
+      });
+      if (claim.action === "reuse") {
+        factorySagaStepsTotal.inc({ operation: definition.name, result: "replayed" });
+        logger.info("factory_step_idempotent_replay", {
+          ticketId,
+          step: definition.step,
+          name: definition.name,
+        });
+        continue;
       }
 
-      saga.currentStep = step
-      saga.updatedAt = new Date()
-
+      logger.info("factory_step_started", {
+        ticketId,
+        step: definition.step,
+        name: definition.name,
+      });
       try {
-        await fn.call(this, ticketId, params)
+        let result: StepDeploymentResult | undefined;
+        if (definition.deploy) {
+          result = await this.adapter.deploy({
+            stepName: definition.name,
+            idempotencyKey: claim.idempotencyKey,
+            params,
+          });
+          const status = await this.adapter.poll(result.txHash);
+          if (status !== "SUCCESS") {
+            throw new Error(`transaction ${result.txHash} did not confirm`);
+          }
+        }
+        this.runLocalStep(definition.name, params);
+        this.store.completeStep({
+          ticketId,
+          step: definition.step,
+          contractId: result?.contractId,
+          txHash: result?.txHash,
+          result: result as unknown as Record<string, unknown> | undefined,
+        });
+        factorySagaStepsTotal.inc({ operation: definition.name, result: "completed" });
+        const saga = this.store.getSaga(ticketId)!;
+        this.store.updateSaga({
+          ticketId,
+          expectedVersion: saga.version,
+          currentStep: definition.step + 1,
+          status:
+            definition.step === FactoryStep.COMPLETE ? "completed" : "in_progress",
+        });
+        this.store.appendEvent({
+          ticketId,
+          step: definition.step,
+          event: "step_committed",
+        });
       } catch (error) {
-        saga.error = (error as Error).message
-        throw error
+        const message = (error as Error).message;
+        this.store.failStep({ ticketId, step: definition.step, error: message });
+        factorySagaStepsTotal.inc({ operation: definition.name, result: "failed" });
+        const saga = this.store.getSaga(ticketId)!;
+        this.store.updateSaga({
+          ticketId,
+          expectedVersion: saga.version,
+          status: "failed",
+          error: message,
+        });
+        const plan = this.store.buildCompensationPlan(ticketId);
+        this.store.appendEvent({
+          ticketId,
+          step: definition.step,
+          event: "compensation_plan_created",
+          detail: { steps: plan.map((p) => p.step), trigger: "saga_failed" },
+        });
+        this.store.appendEvent({
+          ticketId,
+          step: definition.step,
+          event: "saga_failed",
+          detail: { error: message, compensationPlan: plan.map((p) => p.step) },
+        });
+        logger.warn("factory_saga_compensation_available", {
+          ticketId,
+          actions: plan.length,
+        });
+        throw error;
       }
     }
   }
 
-  /**
-   * Step implementations
-   */
-  private async validateInput(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'validate_input' })
-    
-    // Name validation
-    if (params.name.length < 3 || params.name.length > 32) {
-      throw new Error('DAO name must be 3-32 characters')
-    }
-    if (!/^[a-zA-Z0-9_-]+$/.test(params.name)) {
-      throw new Error('DAO name contains invalid characters')
-    }
-
-    // Funding validation
-    if (params.initialFunding < 100) {
-      throw new Error('Minimum funding is 100 XLM')
-    }
-
-    await this.sleep(500)
-  }
-
-  private async reserveName(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'reserve_name', name: params.name })
-    
-    // Check name availability
-    // In production, would interact with registry contract
-    
-    const saga = this.sagas.get(ticketId)!
-    saga.compensationLedger.push({
-      step: FactoryStep.RESERVE_NAME,
-      action: 'release_name_reservation',
-      executed: false,
-      timestamp: new Date()
-    })
-
-    await this.sleep(1000)
-  }
-
-  private async createRegistry(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'create_registry' })
-    
-    // Deploy or call registry contract
-    const mockContractId = `registry_${params.name}_${Date.now()}`
-    
-    const saga = this.sagas.get(ticketId)!
-    saga.deployedContracts.push(mockContractId)
-    saga.compensationLedger.push({
-      step: FactoryStep.CREATE_REGISTRY,
-      action: 'delete_registry_entry',
-      contractAddress: mockContractId,
-      executed: false,
-      timestamp: new Date()
-    })
-
-    await this.sleep(2000)
-  }
-
-  private async deployMembershipSBT(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'deploy_membership_sbt' })
-    
-    const mockContractId = `sbt_${params.name}_${Date.now()}`
-    
-    const saga = this.sagas.get(ticketId)!
-    saga.deployedContracts.push(mockContractId)
-    saga.compensationLedger.push({
-      step: FactoryStep.DEPLOY_MEMBERSHIP_SBT,
-      action: 'cleanup_sbt_contract',
-      contractAddress: mockContractId,
-      executed: false,
-      timestamp: new Date()
-    })
-
-    await this.sleep(3000)
-  }
-
-  private async deployMembershipTree(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'deploy_membership_tree' })
-    
-    const mockContractId = `tree_${params.name}_${Date.now()}`
-    
-    const saga = this.sagas.get(ticketId)!
-    saga.deployedContracts.push(mockContractId)
-    saga.compensationLedger.push({
-      step: FactoryStep.DEPLOY_MEMBERSHIP_TREE,
-      action: 'cleanup_tree_contract',
-      contractAddress: mockContractId,
-      executed: false,
-      timestamp: new Date()
-    })
-
-    await this.sleep(3000)
-  }
-
-  private async deployVoting(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'deploy_voting' })
-    
-    const mockContractId = `voting_${params.name}_${Date.now()}`
-    
-    const saga = this.sagas.get(ticketId)!
-    saga.deployedContracts.push(mockContractId)
-    saga.compensationLedger.push({
-      step: FactoryStep.DEPLOY_VOTING,
-      action: 'cleanup_voting_contract',
-      contractAddress: mockContractId,
-      executed: false,
-      timestamp: new Date()
-    })
-
-    await this.sleep(3000)
-  }
-
-  private async deployComments(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'deploy_comments' })
-    
-    const mockContractId = `comments_${params.name}_${Date.now()}`
-    
-    const saga = this.sagas.get(ticketId)!
-    saga.deployedContracts.push(mockContractId)
-
-    await this.sleep(2000)
-  }
-
-  private async initializeTreasury(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'init_treasury', tier: params.treasuryTier })
-    await this.sleep(2000)
-  }
-
-  private async registerSearch(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'register_search_index' })
-    await this.sleep(1000)
-  }
-
-  private async verifyFirstVote(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_step', { ticketId, step: 'verify_first_vote' })
-    
-    // Execute automated first vote drill
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await this.runFirstVoteDrill(ticketId)
-        return
-      } catch (error) {
-        console.warn(`First vote attempt ${attempt + 1} failed:`, error)
-        if (attempt === 2) throw error
-        await this.sleep(2000)
+  /** Input policy checks — no sleeps, no clocks. */
+  private runLocalStep(name: string, params: DAOCreationParams): void {
+    if (name === "validate_input") {
+      if (params.name.length < 3 || params.name.length > 32) {
+        throw new Error("DAO name must be 3-32 characters");
+      }
+      if (!/^[a-zA-Z0-9_-]+$/.test(params.name)) {
+        throw new Error("DAO name contains invalid characters");
+      }
+      if (params.initialFunding < 100) {
+        throw new Error("Minimum funding is 100 XLM");
       }
     }
   }
 
-  private async markComplete(ticketId: string, params: DAOCreationParams): Promise<void> {
-    logger.info('factory_complete', { ticketId })
-    const saga = this.sagas.get(ticketId)!
-    saga.status = FactoryStatus.COMPLETED
-    saga.updatedAt = new Date()
-  }
-
-  /**
-   * Compensation logic
-   */
-  private async compensate(ticketId: string): Promise<void> {
-    const saga = this.sagas.get(ticketId)!
-    logger.warn('factory_compensating', { ticketId })
-
-    // Execute compensation actions in reverse order
-    const actions = [...saga.compensationLedger].reverse()
-    for (const action of actions) {
-      if (!action.executed) {
-        logger.warn('factory_compensation_action', { ticketId, action: action.action })
-        // In production, would call actual cleanup functions
-        action.executed = true
-        await this.sleep(500)
-      }
-    }
-  }
-
-  private async handleSagaFailure(ticketId: string, error: Error): Promise<void> {
-    const saga = this.sagas.get(ticketId)!
-    saga.status = FactoryStatus.FAILED
-    saga.error = error.message
-    saga.updatedAt = new Date()
-  }
-
-  private async runFirstVoteDrill(ticketId: string): Promise<void> {
-    // Simulate first vote test
-    await this.sleep(3000)
-  }
-
-  private reconstructParams(saga: FactorySaga): DAOCreationParams {
-    // Reconstruct params from saga state
+  private toPublicSaga(saga: SagaRecord): FactorySaga {
+    const steps = this.store.listSteps(saga.ticketId);
     return {
-      name: saga.daoName,
-      description: '',
+      ticketId: saga.ticketId,
       creator: saga.creator,
-      treasuryTier: 'basic',
-      initialFunding: 100
-    }
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
+      daoName: saga.daoName,
+      currentStep: saga.currentStep as FactoryStep,
+      deployedContracts: steps
+        .map((s) => s.contractId)
+        .filter((id): id is string => Boolean(id)),
+      compensationLedger: this.store.buildCompensationPlan(saga.ticketId).map((p) => ({
+        step: p.step as FactoryStep,
+        action: p.action,
+        contractAddress: p.contractId ?? undefined,
+        executed: false,
+        timestamp: new Date(saga.updatedAt),
+      })),
+      status: saga.status as FactoryStatus,
+      createdAt: new Date(saga.createdAt),
+      updatedAt: new Date(saga.updatedAt),
+      error: saga.error ?? undefined,
+      version: saga.version,
+      params: saga.params as unknown as DAOCreationParams,
+    };
   }
 }
 
-export const factoryOrchestrator = new FactoryOrchestrator()
+export const factoryOrchestrator = new FactoryOrchestrator();

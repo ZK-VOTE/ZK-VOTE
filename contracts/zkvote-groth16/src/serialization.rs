@@ -39,28 +39,29 @@ use soroban_sdk::{Bytes, BytesN, Env};
 
 use crate::{CurveId, Groth16Error, Proof};
 
-/// Current wire-format version. Bump on any incompatible layout change.
-pub const PROOF_FORMAT_VERSION: u8 = 1;
+/// Current wire-format version. Generated from `shared/protocol-manifest.json`;
+/// bump the manifest and regenerate on any incompatible layout change.
+pub const PROOF_FORMAT_VERSION: u8 = crate::generated::PROOF_FORMAT_VERSION;
 
 /// Length in bytes of a G1 point encoding (x || y, 32B each).
-const G1_LEN: usize = 64;
+const G1_LEN: usize = crate::generated::G1_LEN;
 /// Length in bytes of a G2 point encoding (x1 || x2 || y1 || y2, 32B each).
-const G2_LEN: usize = 128;
+const G2_LEN: usize = crate::generated::G2_LEN;
 /// Total length of a serialized BN254 ZKV1 proof:
 /// 1 (version) + 1 (curve_id) + 64 (A) + 128 (B) + 64 (C).
-pub const SERIALIZED_PROOF_LEN: usize = 1 + 1 + G1_LEN + G2_LEN + G1_LEN;
+pub const SERIALIZED_PROOF_LEN: usize = crate::generated::SERIALIZED_PROOF_LEN;
 
 fn curve_id_to_byte(curve: CurveId) -> u8 {
     match curve {
-        CurveId::Bn254 => 0,
-        CurveId::Bls12381 => 1,
+        CurveId::Bn254 => crate::generated::CURVE_BN254,
+        CurveId::Bls12381 => crate::generated::CURVE_BLS12381,
     }
 }
 
 fn curve_id_from_byte(byte: u8) -> Result<CurveId, Groth16Error> {
     match byte {
-        0 => Ok(CurveId::Bn254),
-        1 => Ok(CurveId::Bls12381),
+        crate::generated::CURVE_BN254 => Ok(CurveId::Bn254),
+        crate::generated::CURVE_BLS12381 => Ok(CurveId::Bls12381),
         _ => Err(Groth16Error::InvalidProofFormat),
     }
 }
