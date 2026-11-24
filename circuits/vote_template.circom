@@ -27,18 +27,19 @@ include "merkle_tree.circom";
 // a prover could supply a proof valid under one numCandidates value while the contract
 // tallies using a different (potentially larger) count.
 //
-// #361 RELAYER BINDING — NOT IMPLEMENTED, DELIBERATELY
+// #361 / ZV-029 RELAYER BINDING — ENFORCED OFF-CIRCUIT, DELIBERATELY
 //
-// A 7th public signal `relayerAddress` was added here at one point. It is
-// removed, and the reason matters:
+// A 7th public signal `relayerAddress` was added here at one point. It was
+// removed (along with the zero sentinel the contract passed for it), and the
+// reason matters:
 //
 //   * A public signal binds nothing unless the verifier checks it. The relayer
-//     cannot be checked: `Env::auths()` is `#[cfg(any(test,
-//     feature = "testutils"))]` in soroban-sdk and there is no production
-//     equivalent, because a Soroban contract cannot observe who invoked it.
-//     So the signal was decorative.
-//   * It was not merely decorative, it was destructive. With 7 public signals a
-//     Groth16 verification key has 8 IC points, but the contract's
+//     cannot be checked in-circuit or on-chain from the proof: `Env::auths()`
+//     is `#[cfg(any(test, feature = "testutils"))]` in soroban-sdk and there
+//     is no production equivalent — a Soroban contract cannot observe who
+//     invoked it. The signal was decorative.
+//   * It was not merely decorative, it was destructive. With 7 public signals
+//     a Groth16 verification key has 8 IC points, but the contract's
 //     `VOTE_CIRCUIT_IC_LEN` and every call site still assumed 6/7. A key for
 //     THIS circuit could never be registered (`validate_vk` rejects any other
 //     IC length) and the checked-in 6-signal key could never verify — the
@@ -46,12 +47,19 @@ include "merkle_tree.circom";
 //     because the tests build synthetic keys from the contract's own constant.
 //     scripts/drift-guard.mjs now fails the build on any such disagreement.
 //
-// The enforceable form of relayer binding needs no new public signal: take the
-// relayer as a call argument and `relayer.require_auth()`, which cryptographically
-// proves that account submitted the transaction. See RELAYER_BINDING_DESIGN.md
-// for that design and the front-running analysis that motivates it.
+// The enforceable form of relayer binding needs no new public signal. The
+// caller supplies an `Address` to `vote_with_relayer` / `vote_bls381_with_relayer`
+// / `cast_votes_with_relayer`, and the contract calls `relayer.require_auth()`,
+// which cryptographically proves that account signed the transaction. A
+// guardian-managed allowlist adds rotation (`add_relayer` / `remove_relayer` /
+// `rotate_relayer`); with no allowlist configured the supplied relayer's own
+// auth is still required. Attribution is emitted as a `RelayerAttributionEvent`
+// carrying only (dao_id, proposal_id, nullifier, relayer) — no voter identity —
+// and because the nullifier is single-use per election, a proof intercepted
+// and replayed by a different relayer is rejected as `AlreadySubmitted`.
+// See RELAYER_BINDING_DESIGN.md for the design and front-running analysis.
 //
-// The front-running risk that binding was meant to address is bounded today by
+// The remaining front-running risk (ordering within one relayer) is bounded by
 // the nullifier being single-use per election and the tally being additive;
 // see THREAT_MODEL.md "Sybil bounds" and the anonymous-submission section.
 template Vote(levels) {

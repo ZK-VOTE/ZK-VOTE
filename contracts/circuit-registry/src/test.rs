@@ -3,7 +3,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events, Ledger},
     Address, BytesN, Env, String, Vec,
 };
 
@@ -64,7 +64,7 @@ fn test_register_circuit() {
     let circuit_id = String::from_str(&env, "vote_v1");
     let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
 
-    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
 
     let circuit = client.get_circuit(&circuit_id, &CircuitType::Vote);
     assert_eq!(circuit.circuit_id, circuit_id);
@@ -93,7 +93,7 @@ fn test_get_vk() {
     let circuit_id = String::from_str(&env, "vote_v1");
     let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
 
-    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
 
     let vk_map = client.get_vk(&circuit_id, &CircuitType::Vote);
     assert_eq!(vk_map.num_public_signals, 5);
@@ -109,8 +109,8 @@ fn test_dao_migration() {
     let v1_id = String::from_str(&env, "vote_v1");
     let v2_id = String::from_str(&env, "vote_v2");
 
-    client.register_circuit(&v1_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
-    client.register_circuit(&v2_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &6);
+    client.register_circuit(&v1_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
+    client.register_circuit(&v2_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &6, &Some(BytesN::from_array(&env, &[1u8; 32])));
 
     let now = env.ledger().timestamp();
     let deadline = now + 86400;
@@ -134,8 +134,8 @@ fn test_overlap_window() {
     let v1_id = String::from_str(&env, "vote_v1");
     let v2_id = String::from_str(&env, "vote_v2");
 
-    client.register_circuit(&v1_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
-    client.register_circuit(&v2_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &6);
+    client.register_circuit(&v1_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
+    client.register_circuit(&v2_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &6, &Some(BytesN::from_array(&env, &[1u8; 32])));
 
     let now = env.ledger().timestamp();
     let deadline = now + 86400;
@@ -158,8 +158,8 @@ fn test_finalize_migration() {
     let v1_id = String::from_str(&env, "vote_v1");
     let v2_id = String::from_str(&env, "vote_v2");
 
-    client.register_circuit(&v1_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
-    client.register_circuit(&v2_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &6);
+    client.register_circuit(&v1_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
+    client.register_circuit(&v2_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &6, &Some(BytesN::from_array(&env, &[1u8; 32])));
 
     let now = env.ledger().timestamp();
     let deadline = now + 86400;
@@ -181,7 +181,7 @@ fn test_dao_current_circuit() {
     let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
 
     let circuit_id = String::from_str(&env, "vote_v1");
-    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
     client.set_dao_current_circuit(&1, &CircuitType::Vote, &circuit_id);
 
     let current = client.get_dao_current_circuit(&1, &CircuitType::Vote);
@@ -197,8 +197,8 @@ fn test_cannot_register_duplicate_circuit() {
     let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
     let circuit_id = String::from_str(&env, "vote_v1");
 
-    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
-    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5);
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
 }
 
 #[test]
@@ -218,10 +218,113 @@ fn test_cannot_get_expired_circuit() {
         &wasm_hash,
         &(now + 100),
         &5,
+        &Some(BytesN::from_array(&env, &[1u8; 32])),
     );
 
     env.ledger().with_mut(|l| l.timestamp = now + 200);
     client.get_vk(&circuit_id, &CircuitType::Vote);
+}
+
+#[test]
+fn test_ceremony_transcript_hash_binding() {
+    let (env, registry, _governance) = setup_env();
+    let client = CircuitRegistryClient::new(&env, &registry);
+    let vk = create_test_vk(&env);
+    let circuit_id = String::from_str(&env, "vote_v2");
+    let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let ceremony_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
+    // The hash supplied at registration is persisted and returned on read.
+    assert_eq!(
+        client.get_circuit(&circuit_id, &CircuitType::Vote).ceremony_transcript_hash,
+        Some(BytesN::from_array(&env, &[1u8; 32]))
+    );
+
+    let events_before = env.events().all().events().len();
+    client.set_ceremony_transcript_hash(&circuit_id, &CircuitType::Vote, &ceremony_hash);
+    assert_eq!(env.events().all().events().len(), events_before + 1);
+    assert_eq!(
+        client.get_circuit(&circuit_id, &CircuitType::Vote).ceremony_transcript_hash,
+        Some(ceremony_hash.clone())
+    );
+
+    // A zero hash clears the binding (e.g. when revoking a bad ceremony).
+    client.set_ceremony_transcript_hash(
+        &circuit_id,
+        &CircuitType::Vote,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+    assert_eq!(
+        client.get_circuit(&circuit_id, &CircuitType::Vote).ceremony_transcript_hash,
+        None
+    );
+}
+
+#[test]
+fn test_legacy_circuit_record_still_decodes() {
+    let (env, registry, _governance) = setup_env();
+    let client = CircuitRegistryClient::new(&env, &registry);
+    let vk = create_test_vk(&env);
+    let circuit_id = String::from_str(&env, "vote_v1");
+    let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.register_circuit(&circuit_id, &CircuitType::Vote, &vk, &wasm_hash, &0, &5, &Some(BytesN::from_array(&env, &[1u8; 32])));
+
+    // Simulate a record written by the pre-ZV-033 registry (7 fields).
+    env.as_contract(&registry, || {
+        let key = DataKey::Circuit(circuit_id.clone(), CircuitType::Vote);
+        let legacy = StoredCircuitInfo {
+            circuit_id: circuit_id.clone(),
+            circuit_type: CircuitType::Vote,
+            vk,
+            wasm_hash,
+            registered_at: 0,
+            expiration: 0,
+            num_public_signals: 5,
+        };
+        env.storage().persistent().set(&key, &legacy);
+        // A real pre-ZV-033 record has no separate ceremony-hash entry either.
+        let ceremony_key =
+            DataKey::CeremonyTranscriptHash(circuit_id.clone(), CircuitType::Vote);
+        env.storage().persistent().remove(&ceremony_key);
+    });
+
+    let circuit = client.get_circuit(&circuit_id, &CircuitType::Vote);
+    assert_eq!(circuit.num_public_signals, 5);
+    assert_eq!(circuit.ceremony_transcript_hash, None);
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_ceremony_transcript_hash_setter_is_governance_only() {
+    let env = Env::default();
+    let governance = Address::generate(&env);
+    let registry = env.register(CircuitRegistry, (governance.clone(),));
+    let client = CircuitRegistryClient::new(&env, &registry);
+    let vk = create_test_vk(&env);
+    let circuit_id = String::from_str(&env, "vote_v1");
+    let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+    // Seed a circuit directly: mock_all_auths is deliberately not enabled, so
+    // even registration would fail governance auth. The setter must require it.
+    env.as_contract(&registry, || {
+        let key = DataKey::Circuit(circuit_id.clone(), CircuitType::Vote);
+        let stored = StoredCircuitInfo {
+            circuit_id: circuit_id.clone(),
+            circuit_type: CircuitType::Vote,
+            vk,
+            wasm_hash,
+            registered_at: 0,
+            expiration: 0,
+            num_public_signals: 5,
+        };
+        env.storage().persistent().set(&key, &stored);
+    });
+    client.set_ceremony_transcript_hash(
+        &circuit_id,
+        &CircuitType::Vote,
+        &BytesN::from_array(&env, &[1u8; 32]),
+    );
 }
 
 #[test]

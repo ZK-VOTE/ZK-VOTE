@@ -71,10 +71,23 @@ export async function generateVoteProof(
   if (!params.identitySecret || params.identitySecret.length !== 32) {
     throw new Error('Identity secret must be 32 bytes');
   }
+}
 
   if (!params.pollId || !params.choice) {
     throw new Error('Poll ID and choice are required');
   }
+  if (!Array.isArray(proof.siblings) || !Array.isArray(proof.pathIndices)) {
+    throw new InvalidInputError('Merkle siblings and pathIndices arrays are required')
+  }
+  if (proof.siblings.length !== proof.pathIndices.length) {
+    throw new InvalidInputError('Merkle siblings and pathIndices must have the same length')
+  }
+  for (const index of proof.pathIndices) {
+    if (index !== 0 && index !== 1) {
+      throw new InvalidInputError('Merkle path indices must be 0 or 1')
+    }
+  }
+}
 
   // If remote forced or configured, execute remote proving
   if (options?.forceRemote && options.remoteProver) {
@@ -133,7 +146,8 @@ export async function generateVoteProof(
 }
 
 /**
- * Generate a zero-knowledge proof for membership claim
+ * Build the exact circuit input object for `vote.circom` (6 public signals).
+ * Exported so callers/tests can inspect the witness inputs.
  */
 export async function generateClaimProof(params: ClaimProofParams): Promise<Proof> {
   assertCircuitReady(params.circuitName ?? 'claim');
@@ -141,12 +155,37 @@ export async function generateClaimProof(params: ClaimProofParams): Promise<Proo
   if (!params.identitySecret || params.identitySecret.length !== 32) {
     throw new Error('Identity secret must be 32 bytes');
   }
+  const salt = params.salt
+    ? toFieldString(params.salt, 'salt')
+    : poseidonHash([DOMAIN_TAGS.TRAPDOOR, secret]).toString()
+  const blindingFactor = params.blindingFactor
+    ? toFieldString(params.blindingFactor, 'blindingFactor')
+    : poseidonHash([DOMAIN_TAGS.NULLIFIER, secret, salt]).toString()
+  const nullifier = poseidonHash([secret, daoId, proposalId]).toString()
 
   if (!params.daoId) {
     throw new Error('DAO ID is required');
   }
+}
 
-  console.log('Generating claim proof for DAO:', params.daoId)
+/** Build the exact circuit input object for `claim.circom` (5 public signals). */
+export function buildClaimCircuitInputs(params: ClaimProofParams): CircuitInputs {
+  assertSecret(params.identitySecret)
+  assertMerkleProof(params.membershipProof)
+  if (!params.daoId) throw new InvalidInputError('DAO ID is required')
+
+  const secret = fieldFromBytes(params.identitySecret)
+  const daoId = toFieldString(params.daoId, 'daoId')
+  const proposalId = toFieldString(params.proposalId ?? params.daoId, 'proposalId')
+  const salt = params.salt
+    ? toFieldString(params.salt, 'salt')
+    : poseidonHash([DOMAIN_TAGS.TRAPDOOR, secret]).toString()
+  const voteNullifier = params.voteNullifier
+    ? toFieldString(params.voteNullifier, 'voteNullifier')
+    : poseidonHash([secret, daoId, proposalId]).toString()
+  const claimNullifier = params.claimNullifier
+    ? toFieldString(params.claimNullifier, 'claimNullifier')
+    : poseidonHash([secret, daoId, proposalId, DOMAIN_TAGS.CLAIM]).toString()
 
   const legacy: LegacyProof = {
     pi_a: ['1', '2', '1'],

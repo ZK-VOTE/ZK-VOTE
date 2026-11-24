@@ -275,7 +275,10 @@ pub enum VotingError {
     InvalidRevealSchedule = 90,
     /// Weight exceeds the proposal's sybil cap
     WeightAboveSybilCap = 91,
-    /// The submitting relayer address is not the one bound into the proof
+    /// The caller-supplied relayer is not permitted to submit this vote: it is
+    /// the contract itself, or it is not in the guardian's authorized-relayer
+    /// set. (Binding is via `require_auth()` on the supplied address, not via
+    /// a circuit public signal — see the design note at `NUM_PUBLIC_SIGNALS`.)
     InvalidRelayerAddress = 92,
     /// Verification key has not been attested by an MPC ceremony transcript
     VkNotAttested = 93,
@@ -314,6 +317,13 @@ pub enum VotingError {
     /// check a prover picks the commitment — and therefore the vote weight —
     /// freely, since it is a *public* input of `weighted_vote.circom`.
     UnknownBalanceCommitment = 113,
+    /// A legacy `vote`/`vote_bls381`/`cast_votes` entrypoint was called while
+    /// the guardian has opted into mandatory relayer binding. Use the
+    /// `*_with_relayer` entrypoint instead.
+    // NOTE: originally 98 in the feature branch, but upstream reserves 97
+    // (`EncryptedTallyNotReady`) and 98 (`InvalidCiphertext`). Renumbered to
+    // the next free discriminant (127) rather than reusing an upstream code.
+    RelayerRequired = 127,
 
     // ── Coarse categories (100–106) ────────────────────────────────────────
     // An anonymous submission collapses to one of these so a relayer cannot
@@ -501,16 +511,28 @@ pub const MAX_VOTE_BATCH: u32 = zkvote_groth16::batch::MAX_BATCH_SIZE;
 /// the checked-in verification key's IC vector does not have exactly one more
 /// element than this count.
 ///
-/// #361 considered a 7th `relayerAddress` signal. It is deliberately absent:
-/// a public signal binds nothing unless the verifier checks it, and the relayer
-/// cannot be checked here. `Env::auths()` is `#[cfg(any(test,
-/// feature = "testutils"))]` in soroban-sdk, and there is no production
-/// equivalent — a contract cannot observe who invoked it. Shipping the signal
-/// anyway would have made `VOTE_CIRCUIT_IC_LEN` 8 while every call site still
-/// built 6 public signals, so no verification key could ever be registered and
-/// the whole anonymous vote path was dead. The enforceable form of relayer
-/// binding is a caller-supplied address plus `relayer.require_auth()`, which
-/// does not need a new public signal; see RELAYER_BINDING_DESIGN.md.
+/// #361 once added a 7th `relayerAddress` public signal. It was removed, and
+/// the placeholder that fed it (a zero sentinel) went with it: a public signal
+/// binds nothing unless the verifier checks it, and the relayer *cannot* be
+/// checked here. `Env::auths()` is `#[cfg(any(test,
+/// feature = "testutils"))]` in soroban-sdk and there is no production
+/// equivalent — a contract cannot observe who invoked it. The only thing that
+/// was actually enforced was the IC length: shipping 7 signals made
+/// `VOTE_CIRCUIT_IC_LEN` 8 while every call site still built 6, so no
+/// verification key could be registered and the whole anonymous vote path was
+/// dead (the drift guard in `scripts/drift-guard.mjs` now fails the build on
+/// any such disagreement).
+///
+/// The enforceable design needs no new public signal. The relayer is passed
+/// as a call argument to `vote_with_relayer`/`vote_bls381_with_relayer`/
+/// `cast_votes_with_relayer`, and `relayer.require_auth()` proves that account
+/// signed the submission. An optional guardian-managed allowlist adds rotation
+/// via `add_relayer`/`remove_relayer`/`rotate_relayer`; with no allowlist, the
+/// relayer's own auth is still required. Attribution is emitted as a
+/// `RelayerAttributionEvent` carrying only `(dao_id, proposal_id, nullifier,
+/// relayer)`, and the single-use nullifier makes a proof replayed by a
+/// different relayer fail as `AlreadySubmitted`. See RELAYER_BINDING_DESIGN.md
+/// and RELAYER_BINDING_IMPLEMENTATION_STATUS.md.
 ///
 /// IC (inner commitment) vector length for Groth16 VK = num_public_inputs + 1
 const NUM_PUBLIC_SIGNALS: u32 = 6;
@@ -1309,6 +1331,53 @@ pub struct VoteBatchEvent {
     pub no_votes: u32,
 }
 
+/// Attribution for one anonymous submission (#361 / ZV-029).
+///
+/// The event deliberately carries only the nullifier — the voter's
+/// election-scoped pseudonym — and the relayer that signed the submission.
+/// There is no voter address, secret, salt, blinding factor or commitment
+/// here, so publishing it does not deanonymize the voter. It exists so an
+/// observer can audit *which operator* pushed a given nullifier, without
+/// learning *who* cast the ballot.
+///
+/// The nullifier is consumed on first submission, so a proof intercepted by a
+/// different relayer is rejected as `AlreadySubmitted` on replay — the
+/// attribution record is what makes that rejection attributable.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelayerAttributionEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub nullifier: U256,
+    pub relayer: Address,
+    /// `"vote"`, `"batch"`, or `"bls381"` — which entrypoint was used.
+    pub path: Symbol,
+}
+
+/// Guardian-managed relayer allowlist rotation.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelayerRotationEvent {
+    #[topic]
+    pub relayer: Address,
+    #[topic]
+    pub action: Symbol, // "added", "removed", "rotated"
+    pub previous: Option<Address>,
+    pub guardian: Address,
+}
+
+/// Change to the opt-in legacy-entrypoint relayer policy.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelayerPolicyEvent {
+    #[topic]
+    pub action: Symbol, // "legacy_policy"
+    pub required: bool,
+    pub guardian: Address,
+}
+
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtRiskVoterAlert {
@@ -2010,6 +2079,106 @@ impl Voting {
     fn require_registry(env: &Env) {
         let registry: Address = env.storage().instance().get(&REGISTRY).unwrap();
         registry.require_auth();
+    }
+
+    // ── Relayer binding helpers (#361 / ZV-029) ──────────────────────────────
+
+    /// Whether the guardian has configured a non-empty authorized-relayer set.
+    fn relayer_set_enabled(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::RelayerSetEnabled)
+            .unwrap_or(false)
+    }
+
+    /// Raw allowlist membership. `false` when no set is configured; use
+    /// [`Self::relayer_set_enabled`] to distinguish "not configured" from
+    /// "configured but not a member".
+    pub fn is_authorized_relayer(env: Env, relayer: Address) -> bool {
+        Self::bump_instance(&env);
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::AuthorizedRelayer(relayer))
+            .unwrap_or(false)
+    }
+
+    pub fn is_relayer_set_configured(env: Env) -> bool {
+        Self::bump_instance(&env);
+        Self::relayer_set_enabled(&env)
+    }
+
+    pub fn require_relayer_on_legacy(env: Env) -> bool {
+        Self::bump_instance(&env);
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::RequireRelayerOnLegacy)
+            .unwrap_or(false)
+    }
+
+    /// Authorize the caller-supplied relayer for a single submission.
+    ///
+    /// This is the *only* enforcement point used by the anonymous vote,
+    /// BLS vote and batch paths. `require_auth()` is unconditional — even an
+    /// unconfigured deployment must have the supplied relayer sign the
+    /// transaction — so removing the circuit's 7th signal weakened nothing.
+    /// When the allowlist is configured the signer must also be a member.
+    fn require_authorized_relayer(env: &Env, ctx: PathContext, relayer: &Address) {
+        // The contract itself can never sign for itself as a relayer. Reject
+        // that sentinel rather than producing a confusing auth failure.
+        if relayer == &env.current_contract_address() {
+            panic_coarse(env, ctx, VotingError::InvalidRelayerAddress);
+        }
+        relayer.require_auth();
+        if Self::relayer_set_enabled(env)
+            && !env
+                .storage()
+                .instance()
+                .get::<_, bool>(&DataKey::AuthorizedRelayer(relayer.clone()))
+                .unwrap_or(false)
+        {
+            panic_coarse(env, ctx, VotingError::InvalidRelayerAddress);
+        }
+    }
+
+    /// Attribute a submission to its relayer without deanonymizing the voter.
+    ///
+    /// Only the nullifier (already public in `VoteEvent`) and the relayer
+    /// address are recorded. No voter address, secret or commitment is ever
+    /// written here. The nullifier is consumed on the first successful
+    /// submission, so a proof intercepted and replayed by a *different*
+    /// relayer is refused as `AlreadySubmitted` — attribution tells you which
+    /// relayer spent it first.
+    fn emit_relayer_attribution(
+        env: &Env,
+        dao_id: u64,
+        proposal_id: u64,
+        nullifier: &U256,
+        relayer: &Address,
+        path: Symbol,
+    ) {
+        RelayerAttributionEvent {
+            dao_id,
+            proposal_id,
+            nullifier: nullifier.clone(),
+            relayer: relayer.clone(),
+            path,
+        }
+        .publish(env);
+    }
+
+    /// Legacy `vote`/`vote_bls381`/`cast_votes` carry no relayer argument.
+    /// They stay functional for backward compatibility unless the guardian
+    /// opts in to mandatory binding, in which case clients must migrate to the
+    /// `*_with_relayer` entrypoints.
+    fn check_legacy_relayer(env: &Env, ctx: PathContext) {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::RequireRelayerOnLegacy)
+            .unwrap_or(false)
+        {
+            panic_coarse(env, ctx, VotingError::RelayerRequired);
+        }
     }
 
     fn require_not_paused(env: &Env) {
@@ -4269,6 +4438,12 @@ impl Voting {
     ///
     /// Privacy-preserving: commitment is NOT a public parameter.
     /// Revocation is enforced by zeroing leaves in the Merkle tree.
+    ///
+    /// Legacy entrypoint kept for backward compatibility with existing
+    /// clients. It has no relayer argument, so it cannot enforce relayer
+    /// attribution; the guardian may refuse it with
+    /// `set_require_relayer_on_legacy`. New clients should call
+    /// [`Voting::vote_with_relayer`].
     pub fn vote(
         env: Env,
         dao_id: u64,
@@ -4278,11 +4453,67 @@ impl Voting {
         root: U256,
         proof: Proof,
     ) {
+        Self::submit_vote(
+            env,
+            dao_id,
+            proposal_id,
+            vote_choice,
+            nullifier,
+            root,
+            proof,
+            None,
+        );
+    }
+
+    /// Relayer-bound anonymous vote submission.
+    ///
+    /// The relayer is a call argument, not a circuit signal: the proof keeps
+    /// exactly 6 public signals, and `relayer.require_auth()` proves that this
+    /// account signed the transaction. The submission is attributed to it via
+    /// `RelayerAttributionEvent`. A proof replayed by a different relayer
+    /// fails on the already-consumed nullifier.
+    pub fn vote_with_relayer(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        vote_choice: bool,
+        nullifier: U256,
+        root: U256,
+        proof: Proof,
+        relayer: Address,
+    ) {
+        Self::submit_vote(
+            env,
+            dao_id,
+            proposal_id,
+            vote_choice,
+            nullifier,
+            root,
+            proof,
+            Some(relayer),
+        );
+    }
+
+    /// Shared implementation behind `vote` and `vote_with_relayer`.
+    fn submit_vote(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        vote_choice: bool,
+        nullifier: U256,
+        root: U256,
+        proof: Proof,
+        relayer: Option<Address>,
+    ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
         Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
 
         let ctx = PathContext::Anonymous;
+        match &relayer {
+            Some(r) => Self::require_authorized_relayer(&env, ctx, r),
+            None => Self::check_legacy_relayer(&env, ctx),
+        }
 
         // ── DEFENSE-IN-DEPTH: Set reentrancy lock BEFORE any state mutations ──
         Self::set_reentrancy_lock(&env);
@@ -4452,6 +4683,21 @@ impl Voting {
 
         // Clear reentrancy lock before emitting event
         Self::clear_reentrancy_lock(&env);
+
+        // Attribution is tied to the submission context, not to the proof's
+        // public signals. The nullifier is already spent (CEI above), so a
+        // second submission by another relayer is rejected before it reaches
+        // this point.
+        if let Some(r) = &relayer {
+            Self::emit_relayer_attribution(
+                &env,
+                dao_id,
+                proposal_id,
+                &nullifier,
+                r,
+                symbol_short!("vote"),
+            );
+        }
 
         VoteEvent {
             dao_id,
@@ -4849,7 +5095,8 @@ impl Voting {
         .publish(&env);
     }
 
-    /// Cast a BLS12-381-backed anonymous vote.
+    /// Cast a BLS12-381-backed anonymous vote. Legacy entrypoint; see
+    /// [`Voting::vote`] for the backward-compatibility note.
     pub fn vote_bls381(
         env: Env,
         dao_id: u64,
@@ -4859,8 +5106,61 @@ impl Voting {
         root: U256,
         proof: ProofBls381,
     ) {
+        Self::submit_vote_bls381(
+            env,
+            dao_id,
+            proposal_id,
+            vote_choice,
+            nullifier,
+            root,
+            proof,
+            None,
+        );
+    }
+
+    /// Relayer-bound BLS12-381 anonymous vote. Same enforcement as the BN254
+    /// path: `relayer.require_auth()`, optional allowlist membership, and
+    /// `RelayerAttributionEvent`. The proof still has 6 public signals.
+    pub fn vote_bls381_with_relayer(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        vote_choice: bool,
+        nullifier: U256,
+        root: U256,
+        proof: ProofBls381,
+        relayer: Address,
+    ) {
+        Self::submit_vote_bls381(
+            env,
+            dao_id,
+            proposal_id,
+            vote_choice,
+            nullifier,
+            root,
+            proof,
+            Some(relayer),
+        );
+    }
+
+    fn submit_vote_bls381(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        vote_choice: bool,
+        nullifier: U256,
+        root: U256,
+        proof: ProofBls381,
+        relayer: Option<Address>,
+    ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+
+        let ctx = PathContext::Anonymous;
+        match &relayer {
+            Some(r) => Self::require_authorized_relayer(&env, ctx, r),
+            None => Self::check_legacy_relayer(&env, ctx),
+        }
 
         // ── DEFENSE-IN-DEPTH: Set reentrancy lock BEFORE any state mutations ──
         Self::set_reentrancy_lock(&env);
@@ -4961,9 +5261,12 @@ impl Voting {
                 election_config.num_candidates
             },
         );
-        // 7th public signal (#361). Derived from the account that authorized
-        // this call, NOT supplied by the caller, so a proof minted for one
-        // relayer cannot be replayed through another.
+        // Exactly 6 public signals — no relayerAddress signal. Relayer binding
+        // happens at the transaction layer (`require_authorized_relayer`) and
+        // is recorded via `RelayerAttributionEvent`; a public signal binds
+        // nothing because a contract cannot observe who signed. The previous
+        // 7th-signal/zero-sentinel design is gone — see the design note above
+        // `NUM_PUBLIC_SIGNALS`.
 
         let pub_signals = soroban_sdk::vec![
             &env,
@@ -4996,6 +5299,17 @@ impl Voting {
 
         // Clear reentrancy lock before emitting event
         Self::clear_reentrancy_lock(&env);
+
+        if let Some(r) = &relayer {
+            Self::emit_relayer_attribution(
+                &env,
+                dao_id,
+                proposal_id,
+                &nullifier,
+                r,
+                symbol_short!("bls381"),
+            );
+        }
 
         VoteEvent {
             dao_id,
@@ -5201,8 +5515,33 @@ impl Voting {
     /// relayer that hits `InvalidProof` should re-submit the votes singly (or
     /// bisect) to find the culprit rather than dropping them all.
     ///
-    /// Returns the number of votes recorded.
+    /// Returns the number of votes recorded. Legacy entrypoint; see
+    /// [`Voting::vote`] for the backward-compatibility note.
     pub fn cast_votes(env: Env, dao_id: u64, proposal_id: u64, votes: Vec<BatchVote>) -> u32 {
+        Self::submit_vote_batch(env, dao_id, proposal_id, votes, None)
+    }
+
+    /// Relayer-bound batch submission. Enforces exactly the same relayer auth
+    /// and allowlist rule as a single `vote_with_relayer`, and attributes every
+    /// ballot in the batch to the same relayer. Shared helpers keep the two
+    /// paths from drifting.
+    pub fn cast_votes_with_relayer(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        votes: Vec<BatchVote>,
+        relayer: Address,
+    ) -> u32 {
+        Self::submit_vote_batch(env, dao_id, proposal_id, votes, Some(relayer))
+    }
+
+    fn submit_vote_batch(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        votes: Vec<BatchVote>,
+        relayer: Option<Address>,
+    ) -> u32 {
         // A batch is a relayer submitting other people's votes, so errors
         // collapse to coarse codes for the same reason a single vote's do:
         // a per-vote reason would say which voter in the batch failed.
@@ -5210,6 +5549,10 @@ impl Voting {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
         Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
+        match &relayer {
+            Some(r) => Self::require_authorized_relayer(&env, ctx, r),
+            None => Self::check_legacy_relayer(&env, ctx),
+        }
         Self::set_reentrancy_lock(&env);
 
         let count = votes.len();
@@ -5996,6 +6339,9 @@ impl Voting {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
         Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
+        // Another legacy relayer-less entrypoint: honour the guardian's
+        // opt-in requirement that submissions go through `*_with_relayer`.
+        Self::check_legacy_relayer(&env, PathContext::Anonymous);
         Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
         Self::assert_in_field(&env, PathContext::Anonymous, &root);
 
@@ -6101,9 +6447,11 @@ impl Voting {
                 election_config.num_candidates
             },
         );
-        // 7th public signal (#361). Derived from the account that authorized
-        // this call, NOT supplied by the caller, so a proof minted for one
-        // relayer cannot be replayed through another.
+        // Exactly 6 public signals. The abandoned 7th `relayerAddress` signal
+        // and its zero sentinel are not here: binding is done by the caller-
+        // supplied relayer + `require_auth()` on the relayer-aware entrypoints
+        // (`vote_with_relayer` etc.), not by a signal the verifier cannot tie
+        // to a signer. See the design note at `NUM_PUBLIC_SIGNALS`.
 
         let pub_signals = soroban_sdk::vec![
             &env,

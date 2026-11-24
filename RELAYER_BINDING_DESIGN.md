@@ -1,325 +1,186 @@
-# Relayer Binding Design (#361)
+# Relayer Binding Design (#361 / ZV-029)
 
-## Overview
+## Status
 
-This feature adds `relayer_address` as a public signal to the vote circuit, binding ZK proofs to specific relayers. This prevents front-running attacks where a malicious intermediary could intercept a proof, resubmit it through a different relayer for a different outcome, or delay/censor submissions.
+**Current design — enforced off-circuit.** The relayer is a caller-supplied
+`Address`, bound to the submission by `relayer.require_auth()` and recorded by a
+`RelayerAttributionEvent`. The vote circuit keeps **6** public signals. The
+earlier 7th `relayerAddress` public signal was removed; see
+"Why the 7th signal was removed" below.
 
-## Motivation
+Closed #361 covered *signing* (the relay signs the transaction it submits).
+This design covers *end-to-end enforcement*: every anonymous submission must
+carry a relayer that has authorized the call, and its identity is attributed to
+the submission context. `FEATURE_361_COMPLETION_SUMMARY.md` distinguishes the
+two.
 
-From THREAT_MODEL.md, we currently document:
+## Threat and goal
 
-> **Can do (malicious)**: drop or delay submissions; replay the same payload (contract rejects reused nullifier); submit malformed tx to cause failure; **front-run ordering of votes** (tally unaffected because votes are additive); censor specific nullifiers by withholding.
+A relayer sees the vote payload before submitting it. It can drop or delay it,
+or try to resubmit the same proof through a different channel. The tally is
+additive, so reordering does not change the result, but voters still care about
+*who* carried their ballot and about not being deanonymized.
 
-While the tally is unaffected by front-running (votes are additive), voters may have preferences about:
-1. **Voting order** - in elections with time-sensitive parameters
-2. **Relayer identity** - delegation of trust to a specific relay operator
-3. **Proof linkage** - preventing a proof from being used with different relayers
+Goals:
 
-By binding the proof to the relayer's address, we prevent:
-- **Cross-relayer proof reuse**: A proof generated for relayer A cannot be used with relayer B
-- **Selective front-running**: A relayer cannot defer a vote and then rush it through at a strategic time
-- **Proof harvesting**: A malicious observer cannot steal proofs and submit them through their own relayer
+1. A proof intercepted by a different relayer cannot be submitted as a new
+   vote.
+2. Anonymous vote content stays unlinkable to the relayer identity — the event
+   must not reveal a voter address, secret, salt or commitment.
+3. Batch submission enforces the same check as a single vote.
+4. Operators can rotate the set of authorized relayers without a contract
+   upgrade.
 
-## Design Decisions
+Non-goals: preventing censorship by the relayer that already holds the proof,
+or preventing ordering changes within a single relayer (the tally is additive).
 
-### 1. Relayer Address as Public Signal
+## Why the 7th signal was removed
 
-**Choice**: Add `relayer_address` as the 7th public signal (after `numCandidates`).
+An earlier iteration added `signal input relayerAddress` as a 7th public signal
+to `circuits/vote.circom` and passed a **zero sentinel** for it from the
+contract. That design was abandoned because:
 
-**Why public, not private?**
-- The relayer's address is public (it signs transactions)
-- Contract must verify it matches the actual relayer submitting the tx
-- Field membership validation is cheap on-chain
-- Enables transparency: voters can confirm their proof is bound to their intended relayer
+- **A public signal binds nothing unless the verifier checks it.** A Soroban
+  contract cannot learn which account signed the transaction from the proof,
+  and `Env::auths()` is `#[cfg(any(test, feature = "testutils"))]` — test-only.
+  There is no production equivalent. The extra signal was decorative.
+- **It broke the verification key.** With 7 public signals a Groth16 key has 8
+  IC points, while `VOTE_CIRCUIT_IC_LEN` and every call site still built 6/7.
+  No key could be registered (`validate_vk` rejects any other IC length), so
+  the whole anonymous vote path was non-functional while tests passed because
+  they synthesize keys from the contract's own constant. `scripts/drift-guard.mjs`
+  now fails the build on any such disagreement.
 
-**Why not private?**
-- Private signals complicate front-end proof generation (would need circuit-specific proof object per relayer)
-- Public signals maintain the "proof as credentials" model where voters can share/verify bindings
+No circuit change is required, no new trusted setup is needed, and the checked-in
+verification key remains valid.
 
-### 2. Signal Constraints
+## Enforced design
 
-**Relayer address format**: 
-- Stellar contract address (56 chars, e.g., `CAUQ...YHG4`)
-- Converted to U256 via standard address hashing (same as on-chain)
-- Must be < BN254 scalar field modulus (r)
-- Cannot be zero (validated on-chain)
+### 1. Caller-supplied relayer + `require_auth()`
 
-**Circuit-level constraints**:
-- Relayer address is unconstrained in the circuit (no equality check needed)
-- Public input is a field element: `signal input relayerAddress`
-- On-chain verification: contract reads relayer key from env and verifies match
+New entrypoints take an explicit relayer:
 
-### 3. Domain Separation
-
-**Current nullifier**: `Poseidon(secret, daoId, proposalId)`
-
-**Why not include relayer in nullifier?**
-- Nullifiers must remain deterministic per (voter, election) pair
-- Changing nullifiers would break double-vote prevention if the relayer changes
-- Nullifier uniqueness is election-scoped, not relayer-scoped
-
-**Solution**: Relayer binding is enforced via circuit public signal + contract verification, not via nullifier modification.
-
-### 4. Field Membership Validation
-
-**On-chain validation** (contract/voting.rs):
 ```rust
-// Validate relayer_address is in BN254 scalar field
-Self::assert_in_field(&env, &relayer_address)?;
+pub fn vote_with_relayer(
+    env: Env, dao_id: u64, proposal_id: u64, vote_choice: bool,
+    nullifier: U256, root: U256, proof: Proof, relayer: Address,
+)
+pub fn vote_bls381_with_relayer(..., proof: ProofBls381, relayer: Address)
+pub fn cast_votes_with_relayer(
+    env: Env, dao_id: u64, proposal_id: u64,
+    votes: Vec<BatchVote>, relayer: Address,
+) -> u32
+```
 
-// Validate relayer_address is non-zero
-if relayer_address == U256::from_u32(&env, 0) {
-    panic_with_error!(&env, VotingError::InvalidRelayerAddress);
-}
+All three funnel into the shared helper `require_authorized_relayer`, which:
 
-// Extract actual relayer from transaction context
-let actual_relayer = Self::get_relayer_from_env(&env);
+1. rejects the contract's own address as a sentinel relayer;
+2. calls `relayer.require_auth()` — the relayer must have signed this invocation;
+3. if the guardian has configured an allowlist, checks that the relayer is a
+   member (`InvalidRelayerAddress` otherwise).
 
-// Verify proof signal matches actual relayer
-if relayer_address != actual_relayer {
-    panic_with_error!(&env, VotingError::RelayerMismatch);
+`require_auth()` is unconditional. When no allowlist exists, the deployment
+falls back to "whoever supplied the relayer must sign for itself", so an
+unconfigured deployment still works.
+
+The proof's public signals stay at
+`[root, nullifier, daoId, proposalId, voteChoice, numCandidates]` — 6 values,
+7 IC points. The relayer is *never* placed in the circuit.
+
+### 2. Attribution bound to the submission context
+
+`emit_relayer_attribution` publishes:
+
+```rust
+RelayerAttributionEvent {
+    dao_id, proposal_id,      // topics
+    nullifier,                // voter's election-scoped pseudonym
+    relayer,                  // account that signed the submission
+    path: Symbol,             // "vote" | "batch" | "bls381"
 }
 ```
 
-### 5. Backward Compatibility
+There is deliberately **no voter address, secret, salt, blinding factor or
+commitment** in this event. The nullifier is already public in `VoteEvent`, so
+attribution adds no linkability between a voter and a relayer beyond what the
+submission itself reveals.
 
-**Old proofs (6 signals) vs new proofs (7 signals)**:
-- Old proofs will have IC vector length = 7 (6 signals + 1)
-- New proofs will have IC vector length = 8 (7 signals + 1)
-- Contract version increments to handle both (initial phase) or only accepts new proofs (breaking change)
+### 3. Why a different relayer cannot resubmit a proof
 
-**Recommended approach**: Breaking change in contract upgrade
-- New circuit requires recompilation of all tests
-- Old contracts accept 6-signal proofs, new contracts only accept 7-signal proofs
-- Deployment: new voting contract with updated circuit
-- Migration: clients regenerate proofs with new circuit
+The nullifier is consumed in the checks-effects-interactions phase, *before*
+proof verification and cross-contract calls. It is scoped to `(dao_id,
+proposal_id)`. Once relayer A's submission succeeds, relayer B replaying the
+byte-identical `(proof, nullifier)` tuple hits `nullifier_is_used` and fails
+with `AlreadySubmitted`. Relayer attribution tells an indexer which relayer
+spent the nullifier first. This is the enforceable replacement for the old
+"proof bound to relayerAddress" claim.
 
-## Implementation Path
+### 4. Batch parity
 
-### Phase 1: Circuit Changes
+`cast_votes_with_relayer` uses the same `require_authorized_relayer` and the
+same `emit_relayer_attribution` helpers as the single-vote path. One event is
+emitted per ballot, each carrying the batch relayer. Errors are coarse-mapped
+the same way so a relayer cannot probe which ballot in a batch failed. There is
+no BLS batch entrypoint; `vote_bls381_with_relayer` is the BLS single path and
+uses the same helpers.
 
-1. Update `circuits/vote.circom`:
-   - Add `signal input relayerAddress` as 7th public signal
-   - Update component main statement: `component main {public [root, nullifier, daoId, proposalId, voteChoice, numCandidates, relayerAddress]}`
-   - No circuit logic changes (just a pass-through signal)
+### 5. Relayer rotation
 
-2. Update `circuits/vote_v2.circom` (if exists):
-   - Same changes as vote.circom
+Guardian-only entrypoints maintain the allowlist:
 
-3. Recompile and regenerate Groth16 setup:
-   ```bash
-   cd circuits
-   npm run compile
-   npm run setup
-   ```
+| Entrypoint | Effect |
+|---|---|
+| `add_relayer(guardian, relayer)` | Add a member; first add activates the set |
+| `remove_relayer(guardian, relayer)` | Remove a member; last removal deactivates the set |
+| `rotate_relayer(guardian, old, new)` | Atomically remove `old` and add `new` |
+| `set_require_relayer_on_legacy(guardian, required)` | Opt in to refusing legacy entrypoints |
 
-4. Update verification keys:
-   - New IC vector length: 8 (was 7)
-   - Must regenerate all contract VKs
+Views: `is_authorized_relayer`, `is_relayer_set_configured`,
+`require_relayer_on_legacy`. Each rotation emits a `RelayerRotationEvent`;
+policy changes emit `RelayerPolicyEvent`. All writes require
+`guardian.require_auth()` and `require_guardian`.
 
-### Phase 2: Contract Changes
+### 6. Backward compatibility
 
-1. Update voting contract constants:
-   ```rust
-   const NUM_PUBLIC_SIGNALS: u32 = 7; // was 6
-   const VOTE_CIRCUIT_IC_LEN: u32 = 8; // was 7 (= NUM_PUBLIC_SIGNALS + 1)
-   ```
+Existing `vote`, `vote_bls381`, `cast_votes` and `vote_with_circuit` signatures
+are unchanged, so no in-repo caller needs updating. They delegate to shared
+internal implementations (`submit_vote`, `submit_vote_bls381`,
+`submit_vote_batch`) with `relayer = None`; those skip attribution because they
+have no relayer argument. A guardian can set `RequireRelayerOnLegacy = true`
+to make them fail with `RelayerRequired`, forcing clients onto the
+`*_with_relayer` entrypoints. This is opt-in so existing deployments and tests
+keep working.
 
-2. Add relayer address validation:
-   ```rust
-   // In vote() function, after nullifier validation
-   Self::assert_in_field(&env, &relayer_address);
-   if relayer_address == U256::from_u32(&env, 0) {
-       panic_with_error!(&env, VotingError::InvalidRelayerAddress);
-   }
-   
-   // Extract relayer address from env context
-   let actual_relayer = env.current_contract_address(); // or from signer
-   let relayer_u256 = Self::address_to_u256(&actual_relayer);
-   
-   if relayer_address != relayer_u256 {
-       panic_with_error!(&env, VotingError::RelayerMismatch);
-   }
-   ```
+## Security properties
 
-3. Update public signals vector in vote():
-   ```rust
-   let relayer_signal = U256::from_address(&env, &actual_relayer);
-   
-   let pub_signals = soroban_sdk::vec![
-       &env,
-       root.clone(),
-       nullifier.clone(),
-       dao_signal,
-       proposal_signal,
-       vote_signal,
-       num_candidates_signal,
-       relayer_signal,  // NEW
-   ];
-   ```
+| Property | How it is enforced |
+|---|---|
+| Relayer must sign | `relayer.require_auth()` in `require_authorized_relayer` |
+| Unauthorized relayer rejected | Allowlist membership check (opt-in) |
+| Different relayer cannot replay a proof | Single-use, election-scoped nullifier (`AlreadySubmitted`) |
+| Voter stays anonymous | Attribution event carries only the nullifier + relayer |
+| Batch parity | Shared helpers across single and batch entrypoints |
+| Rotation without upgrade | Guardian-managed allowlist storage keys |
+| IC length stable | 6 public signals; `VOTE_CIRCUIT_IC_LEN = 7`; drift guard |
 
-4. Add new error variant:
-   ```rust
-   #[contracterror]
-   #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-   pub enum VotingError {
-       // ... existing errors ...
-       InvalidRelayerAddress = 71,
-       RelayerMismatch = 72,
-   }
-   ```
+## What this does NOT prevent
 
-### Phase 3: Backend Changes
+- Censorship by a relayer that already holds the proof.
+- Front-running/ordering within a single authorized relayer (tally is additive).
+- Linking a relayer to a voter beyond what the public nullifier already allows.
 
-1. Update `backend/src/services/stellar.ts`:
-   - Extract relayer address from keypair: `relayerKeypair.publicKey()`
-   - Convert address to U256 field element for circuit
+## Files
 
-2. Update proof generation:
-   - In `generateVoteProof()` (frontend or backend), add relayer_address to inputs
-
-3. Update vote submission:
-   ```typescript
-   async submitVote(daoId, proposalId, choice, nullifier, root, proof, relayerAddress) {
-       // proof now includes relayerAddress as public signal
-       // contract verifies it matches the signer
-   }
-   ```
-
-### Phase 4: Frontend Changes
-
-1. Update `frontend/src/lib/zkproof.ts`:
-   ```typescript
-   export async function generateVoteProof(
-       secret: string,
-       salt: string,
-       blindingFactor: string,
-       daoId: bigint,
-       proposalId: bigint,
-       voteChoice: boolean,
-       pathElements: string[],
-       pathIndices: number[],
-       relayerAddress: string,  // NEW
-   ): Promise<Proof> {
-       // Convert relayerAddress to field element
-       const relayerAddressFr = await stellarAddressToFieldElement(relayerAddress);
-       
-       // Generate proof with new signal
-       return await proveVote({
-           secret,
-           salt,
-           blindingFactor,
-           daoId,
-           proposalId,
-           voteChoice,
-           numCandidates: 2,
-           pathElements,
-           pathIndices,
-           relayerAddress: relayerAddressFr,  // NEW signal
-       });
-   }
-   ```
-
-2. Update vote submission UI:
-   - Pass relayer address when generating proofs
-   - Display confirmation: "Voting through relayer: [address]"
-
-### Phase 5: Testing & Validation
-
-1. **KAT (Known Answer Test)**:
-   - Generate reference proof with known inputs including relayer_address
-   - Verify circuit output matches expected hash
-   - Verify on-chain Poseidon (for nullifier, not relayer) still matches
-   - See `scripts/test/poseidon-kat.sh` for existing pattern
-
-2. **Acceptance tests**:
-   - Old proofs (6 signals) are rejected by new contract
-   - New proofs (7 signals) with correct relayer_address pass
-   - New proofs with wrong relayer_address fail
-   - Nullifier collision detection unaffected (still per-election)
-
-3. **Integration tests**:
-   - Vote submission through different relayers with same proof fails
-   - Vote submission with correct relayer succeeds
-   - Backward compatibility: old client proofs rejected
-
-### Phase 6: Documentation
-
-1. Update THREAT_MODEL.md:
-   - Section: "Relayer Binding (#361)"
-   - Document front-running mitigation
-   - Explain what still can't be prevented
-   - Note privacy implications (relayer is public)
-
-2. Update README.md:
-   - Mention relayer binding in voting flow
-   - Update circuit signature documentation
-
-## Security Considerations
-
-### What This Prevents
-✅ Cross-relayer proof reuse (proof bound to specific relayer)
-✅ Selective front-running via relayer switching
-✅ Proof harvesting and replay by malicious observer
-
-### What This Does NOT Prevent
-❌ Front-running within a single relayer (still possible)
-❌ Censorship (relayer can still drop votes)
-❌ Ordering attacks if coordinated with proposer
-❌ Nullifier censorship (relayer knows nullifier from proof)
-
-### Privacy Impact
-- Relayer address is now a public signal (visible on-chain)
-- Voters who desire different relayers will have different proofs
-- No new privacy leakage: relayer addresses are already known from transaction signing
-
-### Attack Surface Changes
-
-**New attack**: Faulty relayer address in circuit
-- If `relayerAddress != actual_relayer`, vote is rejected
-- Could be used for denial-of-service if frontend always sends wrong address
-- Mitigated: Frontend must provide correct relayer address or users won't get votes through
-
-**New dependency**: Relayer address encoding
-- Must correctly map Stellar address → U256 field element
-- Incorrect encoding breaks proofs
-- Same encoding used everywhere (circuit, contract, frontend)
-
-## Rollout Plan
-
-1. **Week 1**: Implement circuit changes and regenerate setup
-2. **Week 2**: Update contract and backend
-3. **Week 3**: Update frontend and tests
-4. **Week 4**: KAT and integration tests, documentation
-5. **Deployment**: New contract version, clients upgrade to new frontend
-
-## Alternatives Considered
-
-### Option A: Include relayer in nullifier
-- ❌ Would require regenerating all cached proofs if relayer changes
-- ❌ Breaks election-scoped nullifier model
-- ❌ Voter would need to re-vote with different relayer
-
-### Option B: Relayer as optional signal
-- ❌ Adds complexity (two circuit versions)
-- ❌ Some proofs bound, some not (inconsistent security)
-- ✅ Could enable gradual migration (not chosen for simplicity)
-
-### Option C: Relayer binding via signature (off-circuit)
-- ✅ No circuit changes needed
-- ❌ Doesn't bind proof to relayer at proof level
-- ❌ Relayer could strip signature and resubmit
-- ❌ Less transparent to voters
-
-### Chosen: Option A (public signal binding)
-- ✅ Simple and clean
-- ✅ Transparent to voters
-- ✅ No off-chain signature management
-- ✅ Backward compatible via version bumping
-- ❌ Requires circuit recompilation
+- `contracts/voting/src/lib.rs` — helpers, errors, storage keys, events,
+  rotation entrypoints, `*_with_relayer` entrypoints, design note.
+- `circuits/vote.circom`, `circuits/vote_template.circom` — documentation of
+  the sentinel/7th-signal removal; signal count unchanged at 6.
+- `RELAYER_BINDING_IMPLEMENTATION_STATUS.md` — what shipped vs. what did not.
+- `FEATURE_361_COMPLETION_SUMMARY.md` — signing (#361) vs. enforcement.
+- `THREAT_MODEL.md` — relayer-binding threat section.
 
 ## References
 
-- THREAT_MODEL.md §§ "Can do (malicious)" and "Relayer front-running mitigation"
-- Issue #167: Merkle second-preimage, proof malleability, field validation (foundation for this work)
-- Groth16 verification in voting contract (circuits/vote.circom, contracts/voting/src/lib.rs)
+- `THREAT_MODEL.md` §§ "Relayer front-running", "Anonymous submission".
+- `scripts/drift-guard.mjs` — circuit/contract public-signal parity check.
+- Closed #361 (relay request signing) as prior context; ZV-029.

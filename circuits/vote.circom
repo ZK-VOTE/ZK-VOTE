@@ -14,6 +14,18 @@ include "vote_template.circom";
 // Public signals: [root, nullifier, daoId, proposalId, voteChoice, numCandidates] - 6 signals
 // Commitment is computed internally from secret+salt (private)
 //
+// Relayer binding (ZV-029 / #361): there is deliberately NO 7th
+// `relayerAddress` public signal. A public signal binds nothing a Soroban
+// contract can check — `Env::auths()` is test-only and the contract cannot
+// observe who invoked it — so the old signal (fed by a zero sentinel on the
+// contract side) was purely decorative while forcing an 8-point IC vector
+// that no verification key could match. Instead the relayer is a call
+// argument to `vote_with_relayer` / `cast_votes_with_relayer` and is bound by
+// `relayer.require_auth()`, with a `RelayerAttributionEvent` recording
+// `(dao_id, proposal_id, nullifier, relayer)` at submission time. A proof
+// replayed by a different relayer is rejected because the nullifier was
+// already consumed. See RELAYER_BINDING_DESIGN.md.
+//
 // MUST stay in lockstep with `NUM_PUBLIC_SIGNALS` in
 // contracts/voting/src/lib.rs. scripts/drift-guard.mjs fails the build if the
 // two disagree, or if the checked-in verification key's IC vector is not

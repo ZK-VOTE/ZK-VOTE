@@ -3,11 +3,14 @@
  */
 import type { RegistryClient } from './registry'
 
-export const VERSION = '1.0.0'
+export const VERSION = '2.0.0'
 
 /**
  * Circuit compatibility matrix
- * SDK version N supports circuits version N and N-1
+ * SDK version N supports circuits version N and N-1.
+ *
+ * v2 is the first release with real Groth16 proving/verification and
+ * Poseidon derivation; all placeholder ("mock") implementations were removed.
  *
  * NOTE (ZV-113 / #953): this is a static, offline declaration of what this
  * SDK build *was written* to support. It is not checked against anything
@@ -16,9 +19,13 @@ export const VERSION = '1.0.0'
  * version, which is what decides whether the SDK will refuse to prove.
  */
 export const CIRCUIT_COMPATIBILITY = {
+  '2.0.0': ['1.0', '0.9'],
   '1.0.0': ['1.0', '0.9'],
   '0.9.0': ['0.9', '0.8']
 }
+
+/** v2 removed every mock; older SDK versions were placeholder-only. */
+export const MOCKS_REMOVED_IN = '2.0.0'
 
 /**
  * Check if circuit version is compatible with current SDK, per the static

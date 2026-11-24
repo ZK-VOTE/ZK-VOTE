@@ -92,7 +92,7 @@ function truncateStellarAddress(addr: string): string {
   return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
 }
 
-function hashIp(ip: string): string {
+export function hashIp(ip: string): string {
   // Deterministic pseudonym — same input → same output for correlation,
   // but the original IP cannot be recovered.
   let h = 0;
@@ -219,3 +219,6 @@ export function createLogger(defaultMeta: LogMeta = {}) {
       log("error", event, { ...defaultMeta, ...meta }),
   };
 }
+
+/** Shared logger instance used by modules that import `{ logger }` directly. */
+export const logger = createLogger();

@@ -1894,6 +1894,187 @@ Verify a finalized ordering without re-running the full VDF computation.
 
 ---
 
+## Relayer-Sponsored (Zero-Fee) Voting
+
+The relayer can pay the full Stellar/Soroban fee for a vote. The voter supplies
+**no funded transaction and pays no fee**: they sign a short-lived,
+domain-separated authorization object and POST only that object. The relayer
+builds the Soroban invocation from its own source account, wraps it in a
+fee-bump transaction whose fee source is the relayer, and submits it. Abuse
+costs are charged to a bounded token bucket keyed by
+`(daoId, voter commitment, relayer)` — never to an IP address — so a voter
+cannot get a fresh allowance simply by changing networks.
+
+### POST /pay/vote
+
+No relayer auth token is required (`csrfOriginGuard` still applies). Maximum
+body size is 16 kB.
+
+```json
+{
+  "version": 1,
+  "domain": "zkvote.vote-authorization.v1",
+  "chainId": "Standalone Network ; February 2017",
+  "daoId": 42,
+  "proposalId": 9,
+  "voter": "G...",
+  "commitment": "abab...(optional 1–64 byte hex privacy commitment)",
+  "nullifier": "cdcd...(hex, up to 32 bytes)",
+  "choice": 1,
+  "relayer": "G... (active relayer public key)",
+  "expiry": 1790000000,
+  "nonce": "client-generated-unique-value",
+  "signerPublicKey": "G... (or 0x-hex / base64 Ed25519 public key)",
+  "signature": "base64 Ed25519 detached signature"
+}
+```
+
+`expiry` is **unix seconds**; authorizations may not live longer than
+`MAX_AUTH_LIFETIME_SECONDS` (600s, plus a 30s clock-skew allowance). For
+G-address voters, `signerPublicKey` must equal `voter`; commitment-based voters
+use a dedicated one-shot signing key. The signature covers `sha256` of a
+length-prefixed, domain-separated canonical encoding of every field except
+`signature` (see `canonicalVoteAuthPayload` in
+`src/services/relayer-fee-economics.ts` and the mirrored implementation in
+`frontend/src/lib/client.ts`). Replaying the same `(signer, relayer, nonce)`
+triple is rejected.
+
+Successful response (`200`):
+
+```json
+{
+  "success": true,
+  "txHash": "fee-bump transaction hash",
+  "innerTxHash": "inner Soroban transaction hash",
+  "feeStroops": 110000,
+  "feeXlm": 0.011,
+  "dryRun": false,
+  "choice": 1,
+  "sponsorship": { "limitStroops": 50000000, "remainingStroops": 49989000, "resetSeconds": 1790083200 },
+  "rateLimit": { "limit": 30, "remaining": 29, "resetSeconds": 1790000060 }
+}
+```
+
+In `RELAYER_TEST_MODE` the envelope is fully built and hashed but not sent;
+`dryRun` is `true` and `txHash` is the locally computed hash.
+
+#### Rejection codes
+
+All failures return `{ "error": "...", "code": "...", "retryable": boolean }`.
+
+| Status | Code                     | Meaning                                                       |
+| ------ | ------------------------ | ------------------------------------------------------------- |
+| 400    | `INVALID_REQUEST`        | Malformed fee estimate / request                              |
+| 400    | `INVALID_AUTHORIZATION`  | Schema validation failed or signer key is invalid             |
+| 400    | `UNSUPPORTED_VERSION`    | Unknown authorization version                                 |
+| 400    | `DOMAIN_MISMATCH`        | Wrong domain tag or chain ID                                  |
+| 400    | `RELAYER_MISMATCH`       | Authorization names a different relayer                       |
+| 401    | `EXPIRED_AUTHORIZATION`  | Expiry passed (outside clock skew)                            |
+| 401    | `INVALID_SIGNATURE`      | Signature does not match `signerPublicKey`                    |
+| 409    | `NONCE_REPLAY`           | `(signer, relayer, nonce)` already used                        |
+| 429    | `RATE_LIMITED`           | Abuse/rate-limit token bucket exhausted                       |
+| 429    | `BUDGET_EXHAUSTED`       | Per-vote cap or per-DAO daily sponsorship cap exhausted       |
+| 503    | `RELAYER_RESERVE_LOW`    | Relayer reserve below threshold — client should degrade       |
+| 500    | `SUBMISSION_FAILED`      | RPC simulation/submission failure                             |
+
+`429` and `503` responses include `Retry-After`. `503 RELAYER_RESERVE_LOW` is
+the graceful-degradation signal: clients should fall back to the normal
+voter-funded `/vote` flow or retry later. Invalid signatures, expired
+authorizations and nonce replays also consume abuse tokens, bounding spam
+without IP-only keying.
+
+#### Response headers
+
+Every `/pay/vote` response (success or failure) carries:
+
+| Header                    | Meaning                                              |
+| ------------------------- | ---------------------------------------------------- |
+| `X-Sponsorship-Limit`     | Per-DAO daily cap in stroops                         |
+| `X-Sponsorship-Remaining` | Remaining daily cap (including in-flight holds)      |
+| `X-Sponsorship-Reset`     | Unix seconds when the daily window resets            |
+| `X-RateLimit-Limit`       | Token bucket capacity                                |
+| `X-RateLimit-Remaining`   | Tokens left for `(daoId, commitment, relayer)`        |
+| `X-RateLimit-Reset`       | Unix seconds until the bucket refills                |
+| `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` | draft-6 mirrors |
+| `X-Sponsorship-Fee-Stroops` | Relayer fee actually reserved (success only)       |
+| `Retry-After`             | Seconds to wait on retryable failures                 |
+
+Configuration (environment variables): `VOTE_NETWORK_FEE_STROOPS` (default
+`10000`), `VOTE_RESOURCE_FEE_STROOPS` (default `100000`),
+`VOTE_MAX_FEE_STROOPS` (default `500000`),
+`SPONSORSHIP_DAILY_LIMIT_STROOPS` (default `50000000` = 5 XLM),
+`SPONSORSHIP_PER_VOTE_LIMIT_STROOPS` (default `500000`),
+`SPONSORSHIP_TOKEN_CAPACITY` (default `30`),
+`SPONSORSHIP_TOKEN_REFILL_PER_MIN` (default `10`),
+`RELAYER_RESERVE_XLM` (default `25`), `RELAYER_RESERVE_MIN_XLM` (default `10`),
+`VOTE_AUTH_CHAIN_ID` (overrides `NETWORK_PASSPHRASE` as the expected chain tag),
+`SPONSORED_VOTE_FUNCTION` (contract method, default `vote_with_auth`).
+
+### GET /pay/metrics
+
+Requires the relayer auth token (same as `GET /metrics`). Returns the
+in-memory sponsorship collector snapshot:
+
+```json
+{
+  "sponsoredVotesTotal": 12,
+  "sponsoredFeeSpendStroops": 1320000,
+  "sponsoredFeeSpendXlm": 0.132,
+  "authorizationRejections": {
+    "INVALID_SIGNATURE": 2,
+    "NONCE_REPLAY": 1,
+    "BUDGET_EXHAUSTED": 1,
+    "RELAYER_RESERVE_LOW": 1
+  },
+  "budgetExhaustions": 1,
+  "nonceReplays": 1,
+  "reserveLowRejections": 1,
+  "rateLimitRejections": 0,
+  "submissionFailures": 0,
+  "feeEstimateStroopsHistogram": {
+    "count": 12,
+    "sum": 1320000,
+    "max": 110000,
+    "buckets": { "le_10000": 0, "le_50000": 0, "le_100000": 0, "le_250000": 12, "le_500000": 12 }
+  },
+  "submissionDurationMsHistogram": { "count": 12, "sum": 900, "max": 200, "buckets": {} }
+}
+```
+
+`getMetrics()` is also exported from `src/services/relayer-fee-economics.ts`
+for in-process dashboards. Rejection counters are keyed by the stable codes
+above; `sponsoredFeeSpendStroops` is incremented only after a successful
+fee-bump submission.
+
+### Frontend SDK
+
+`frontend/src/lib/client.ts` exports `authorizeVote`, `seedVoteSigner`,
+`SponsoredVoteClient` and `getSponsoredVoteClient`:
+
+```ts
+import { getSponsoredVoteClient, seedVoteSigner } from "./lib/client";
+
+const client = getSponsoredVoteClient();
+const result = await client.submit(
+  {
+    daoId: 42,
+    proposalId: 9,
+    voter: publicKey,
+    commitment,
+    nullifier,
+    choice: 1,
+    relayer: relayerPublicKey,
+    expiry: Math.floor(Date.now() / 1000) + 60,
+    nonce: crypto.randomUUID(),
+  },
+  seedVoteSigner(seed),
+);
+if (result.degraded) {
+  // 503 RELAYER_RESERVE_LOW or 429 quota: retry after result.retryAfterSeconds
+  // or fall back to the voter-funded /vote flow.
+}
+```
+
 ## Route Parameter Validation
 
 All route parameters are validated using Zod schemas before processing. Invalid parameters return `400 Bad Request` with structured error details.

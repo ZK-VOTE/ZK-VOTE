@@ -10,7 +10,17 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { config, BN254_SCALAR_FIELD } from "../config.js";
 import { log, logger } from "./logger.js";
 import { createCoverTrafficScheduler } from "./cover-traffic.js";
-import { getMetadata, setMetadata } from "./db.js";
+import { getMetadata, setMetadata, getWriteDb } from "./db.js";
+import {
+  SigningPolicy,
+  parseTierLimits,
+  parseCosigners,
+  DEFAULT_TIER_LIMITS,
+} from "./relayer-signing-policy.js";
+import {
+  SqliteKeyLifecycleStore,
+  RelayerRotationOrchestrator,
+} from "./relayer-rotation.js";
 import {
   rpcCallsTotal,
   rpcCallDuration,
@@ -896,6 +906,7 @@ export class RpcPoolManager {
     const results = this.endpoints.map((ep) => this.statusOf(ep, tip));
     for (const ep of results) {
       const labels = { dependency: "soroban_rpc", endpoint: endpointLabel(ep.url) };
+      // Host-only label keeps cardinality bounded (#749).
       rpcEndpointLatency.set({ endpoint: normalizeEndpoint(ep.url) }, ep.latencyMs / 1000);
       endpointHealthy.set(labels, ep.healthy ? 1 : 0);
       if (ep.lagLedgers !== null) endpointLedgerLag.set(labels, ep.lagLedgers);
@@ -1521,6 +1532,8 @@ export async function submitTransactionWithRecovery(
   operation: () => Promise<StellarSdk.Transaction>,
   maxRetries = 3,
   label = "transaction",
+  submitFn: (tx: StellarSdk.Transaction) => Promise<TransactionSubmissionResult> = (tx) =>
+    (server as StellarSdk.rpc.Server).sendTransaction(tx) as unknown as Promise<TransactionSubmissionResult>,
 ): Promise<TransactionSubmissionResult> {
   let attempts = 0;
   let lastError: Error | null = null;
@@ -1541,7 +1554,7 @@ export async function submitTransactionWithRecovery(
       // Submit transaction (use the original preparedTx on first attempt)
       const txToSubmit = attempts === 0 ? preparedTx : await operation();
       const sr = await callWithTimeout(
-        () => (server as StellarSdk.rpc.Server).sendTransaction(txToSubmit),
+        () => submitFn(txToSubmit),
         `send_${label}`,
       );
 
@@ -1658,4 +1671,92 @@ export async function submitVoteViaRelayerQuorum(opts: { transaction: any; simul
     .build();
   preparedTx.sign(relayerKeypair as StellarSdk.Keypair);
   return submitToRelayQuorum(preparedTx);
+}
+
+// ============================================
+// FEE-BUMP SUPPORT (RELAYER-SPONSORED VOTES)
+// ============================================
+
+/**
+ * Wrap an already-signed inner transaction in a fee-bump transaction whose fee
+ * source is the relayer. The voter supplies no funded transaction and pays no
+ * network fee: the relayer is the only fee source. `feeStroops` is the total
+ * fee the relayer is willing to spend (base fee + Soroban resource fee).
+ */
+export function buildRelayerFeeBump(
+  innerTx: StellarSdk.Transaction,
+  feeStroops: number | string,
+  options: { feeSource?: string; networkPassphrase?: string } = {},
+): StellarSdk.TransactionFeeBump {
+  const feeSource = options.feeSource ?? relayerKeypair.publicKey();
+  const fee = String(Math.max(1, Math.floor(Number(feeStroops))));
+  return StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+    feeSource,
+    fee,
+    innerTx,
+    options.networkPassphrase ?? config.networkPassphrase,
+  );
+}
+
+/**
+ * Sign a fee-bump envelope. A fee bump has a different hash from its inner
+ * transaction, so it must be signed separately; signHash works for local, KMS
+ * and HSM-backed signers alike.
+ */
+export async function signFeeBumpTransaction(feeBumpTx: StellarSdk.TransactionFeeBump): Promise<void> {
+  const hash = feeBumpTx.hash();
+  const signature = await activeSigner.signHash(hash);
+  // The signature hint must match the signer's key, not the fee source when a
+  // muxed/different account happens to be used as the inner source.
+  const raw = StellarSdk.StrKey.decodeEd25519PublicKey(activeSigner.getPublicKey());
+  feeBumpTx.signatures.push(
+    new StellarSdk.xdr.DecoratedSignature({
+      hint: raw.subarray(raw.length - 4),
+      signature: Buffer.from(signature),
+    }),
+  );
+}
+
+export interface FeeBumpSubmissionOptions {
+  label?: string;
+  /** Rebuild the fee-bump after a tx_bad_seq recovery. */
+  rebuildFeeBump?: () => Promise<StellarSdk.TransactionFeeBump> | StellarSdk.TransactionFeeBump;
+  /** Injection point used by tests and alternate submission transports. */
+  submitFn?: (tx: StellarSdk.Transaction) => Promise<TransactionSubmissionResult>;
+  /** Set when the caller already holds the sequence lock (build+submit atomicity). */
+  skipLock?: boolean;
+}
+
+/**
+ * Submit a fee-bump transaction under the sequence lock with automatic
+ * tx_bad_seq recovery. In test mode the fully built and hashed envelope is
+ * returned as a dry run — no network call is made — so endpoint policy can be
+ * exercised without an RPC node.
+ */
+export async function submitRelayerFeeBump(
+  feeBumpTx: StellarSdk.TransactionFeeBump,
+  options: FeeBumpSubmissionOptions = {},
+): Promise<TransactionSubmissionResult> {
+  const hash = feeBumpTx.hash().toString("hex");
+  if (config.testMode) {
+    return { status: "DRY_RUN", hash };
+  }
+  const submit = async () => {
+    await signFeeBumpTransaction(feeBumpTx);
+    return submitTransactionWithRecovery(
+      feeBumpTx as unknown as StellarSdk.Transaction,
+      async () => {
+        if (!options.rebuildFeeBump) {
+          throw new Error("Fee-bump sequence recovery requires rebuildFeeBump");
+        }
+        const rebuilt = await options.rebuildFeeBump();
+        await signFeeBumpTransaction(rebuilt);
+        return rebuilt as unknown as StellarSdk.Transaction;
+      },
+      3,
+      options.label ?? "fee_bump",
+      options.submitFn as ((tx: StellarSdk.Transaction) => Promise<TransactionSubmissionResult>) | undefined,
+    );
+  };
+  return options.skipLock ? submit() : withSequenceLock(submit);
 }

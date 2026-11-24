@@ -82,6 +82,22 @@ pub struct CircuitInfo {
     pub ceremony_transcript_hash: Option<BytesN<32>>,
 }
 
+/// On-disk layout of a circuit record. Kept identical to the pre-ZV-033
+/// `CircuitInfo` so entries written by an earlier registry version still
+/// decode. The ceremony transcript hash lives under its own key and is merged
+/// into `CircuitInfo` on read.
+#[contracttype]
+#[derive(Clone)]
+struct StoredCircuitInfo {
+    pub circuit_id: String,
+    pub circuit_type: CircuitType,
+    pub vk: VerificationKey,
+    pub wasm_hash: BytesN<32>,
+    pub registered_at: u64,
+    pub expiration: u64,
+    pub num_public_signals: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct DaoMigration {
@@ -144,6 +160,9 @@ pub struct VkProposal {
 #[contracttype]
 pub enum DataKey {
     Circuit(String, CircuitType),
+    /// Governance-pinned ceremony transcript hash (ZV-033). Stored separately
+    /// from `Circuit` to preserve the legacy circuit record layout.
+    CeremonyTranscriptHash(String, CircuitType),
     DaoMigration(u64),
     DaoCurrentCircuit(u64, CircuitType),
     VkProposal(u32),
@@ -160,6 +179,18 @@ pub struct CircuitRegisteredEvent {
     pub circuit_id: String,
     pub circuit_type: CircuitType,
     pub registered_at: u64,
+}
+
+/// Emitted when governance binds or clears the ceremony transcript hash for a
+/// registered circuit. A zero hash clears the binding.
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CeremonyHashUpdatedEvent {
+    #[topic]
+    pub circuit_id: String,
+    #[topic]
+    pub circuit_type: CircuitType,
+    pub ceremony_transcript_hash: BytesN<32>,
 }
 
 #[soroban_sdk::contractevent]
@@ -290,6 +321,101 @@ impl CircuitRegistry {
         }
     }
 
+    /// Read the legacy circuit layout and merge the optional ceremony hash.
+    fn load_circuit(env: &Env, key: &DataKey) -> CircuitInfo {
+        let stored: StoredCircuitInfo = env
+            .storage()
+            .persistent()
+            .get(key)
+            .unwrap_or_else(|| panic_with_error!(env, RegistryError::CircuitNotFound));
+        let ceremony_key = DataKey::CeremonyTranscriptHash(
+            stored.circuit_id.clone(),
+            stored.circuit_type.clone(),
+        );
+        let ceremony_transcript_hash: Option<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&ceremony_key)
+            .unwrap_or(None);
+        CircuitInfo {
+            circuit_id: stored.circuit_id,
+            circuit_type: stored.circuit_type,
+            vk: stored.vk,
+            wasm_hash: stored.wasm_hash,
+            registered_at: stored.registered_at,
+            expiration: stored.expiration,
+            num_public_signals: stored.num_public_signals,
+            ceremony_transcript_hash,
+        }
+    }
+
+    /// Persist using the legacy layout; the ceremony hash has its own key so
+    /// that a hash supplied at registration (or via `set_ceremony_transcript_hash`)
+    /// survives the split record and is returned by `load_circuit`.
+    fn write_circuit(env: &Env, key: &DataKey, circuit: &CircuitInfo) {
+        let stored = StoredCircuitInfo {
+            circuit_id: circuit.circuit_id.clone(),
+            circuit_type: circuit.circuit_type.clone(),
+            vk: circuit.vk.clone(),
+            wasm_hash: circuit.wasm_hash.clone(),
+            registered_at: circuit.registered_at,
+            expiration: circuit.expiration,
+            num_public_signals: circuit.num_public_signals,
+        };
+        env.storage().persistent().set(key, &stored);
+
+        let ceremony_key = DataKey::CeremonyTranscriptHash(
+            circuit.circuit_id.clone(),
+            circuit.circuit_type.clone(),
+        );
+        match &circuit.ceremony_transcript_hash {
+            Some(hash) => {
+                env.storage().persistent().set(&ceremony_key, hash);
+                Self::bump_persistent(env, &ceremony_key);
+            }
+            None => env.storage().persistent().remove(&ceremony_key),
+        }
+    }
+
+    /// Governance-only: bind a ceremony transcript hash to a registered
+    /// circuit. Clients cross-check this value against the signed artifact
+    /// manifest before using any proving key. A zero hash clears the binding.
+    pub fn set_ceremony_transcript_hash(
+        env: Env,
+        circuit_id: String,
+        circuit_type: CircuitType,
+        ceremony_transcript_hash: BytesN<32>,
+    ) {
+        Self::bump_instance(&env);
+        Self::assert_governance(&env);
+
+        let circuit_key = DataKey::Circuit(circuit_id.clone(), circuit_type.clone());
+        if !env.storage().persistent().has(&circuit_key) {
+            panic_with_error!(&env, RegistryError::CircuitNotFound);
+        }
+
+        let ceremony_key = DataKey::CeremonyTranscriptHash(
+            circuit_id.clone(),
+            circuit_type.clone(),
+        );
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if ceremony_transcript_hash == zero {
+            env.storage().persistent().remove(&ceremony_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&ceremony_key, &ceremony_transcript_hash.clone());
+            Self::bump_persistent(&env, &ceremony_key);
+        }
+
+        CeremonyHashUpdatedEvent {
+            circuit_id,
+            circuit_type,
+            ceremony_transcript_hash,
+        }
+        .publish(&env);
+    }
+
     /// Governance-only: replace the admin set used for VK upgrade approvals.
     pub fn set_admins(env: Env, admins: Vec<Address>) {
         Self::bump_instance(&env);
@@ -354,7 +480,7 @@ impl CircuitRegistry {
             ceremony_transcript_hash,
         };
 
-        env.storage().persistent().set(&key, &circuit);
+        Self::write_circuit(&env, &key, &circuit);
         Self::bump_persistent(&env, &key);
 
         // Single source of truth for VK versioning. Starts at 1 and is bumped
@@ -374,11 +500,7 @@ impl CircuitRegistry {
     pub fn get_circuit(env: Env, circuit_id: String, circuit_type: CircuitType) -> CircuitInfo {
         Self::bump_instance(&env);
         let key = DataKey::Circuit(circuit_id.clone(), circuit_type);
-        let circuit: CircuitInfo = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+        let circuit = Self::load_circuit(&env, &key);
         Self::bump_persistent(&env, &key);
         circuit
     }
@@ -403,11 +525,7 @@ impl CircuitRegistry {
     pub fn get_vk(env: Env, circuit_id: String, circuit_type: CircuitType) -> CircuitVKMap {
         Self::bump_instance(&env);
         let key = DataKey::Circuit(circuit_id.clone(), circuit_type);
-        let circuit: CircuitInfo = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+        let circuit = Self::load_circuit(&env, &key);
 
         let now = env.ledger().timestamp();
         if circuit.expiration != 0 && now > circuit.expiration {
@@ -830,16 +948,12 @@ impl CircuitRegistry {
         Self::bump_persistent(&env, &proposal_key);
 
         let circuit_key = DataKey::Circuit(proposal.circuit_id.clone(), proposal.circuit_type);
-        let mut circuit: CircuitInfo = env
-            .storage()
-            .persistent()
-            .get(&circuit_key)
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::CircuitNotFound));
+        let mut circuit = Self::load_circuit(&env, &circuit_key);
 
         circuit.vk = proposal.new_vk.clone();
         circuit.wasm_hash = proposal.new_wasm_hash;
         circuit.registered_at = now;
-        env.storage().persistent().set(&circuit_key, &circuit);
+        Self::write_circuit(&env, &circuit_key, &circuit);
         Self::bump_persistent(&env, &circuit_key);
 
         let version_key =

@@ -4,7 +4,17 @@
  */
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config.js";
-import { relayerKeypair, withPaymentSequenceLock } from "./stellar.js";
+import {
+  buildRelayerFeeBump,
+  callWithTimeout,
+  getRelayerAccount,
+  relayerKeypair,
+  server,
+  simulateWithBackoff,
+  submitRelayerFeeBump,
+  withPaymentSequenceLock,
+  withSequenceLock,
+} from "./stellar.js";
 import { relayerKeyManager } from "./relayerKeyManager.js";
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
@@ -31,7 +41,9 @@ import {
   recordTransactionFee,
   assessRelayerReserve,
   shouldThrottleOperations,
+  stroopsToXlm,
 } from "./relayer-fee-economics.js";
+import type { VoteAuthorization } from "./relayer-fee-economics.js";
 
 // ── Horizon endpoint pool (#745) ─────────────────────────────────────────
 //
@@ -640,64 +652,6 @@ export async function swapStrictSend(
     const res: any = await submitToHorizon(tx);
     return { hash: res.hash };
   });
-  const account = await (horizonServer as any).loadAccount(
-    relayerKeypair.publicKey(),
-  );
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: "10000",
-    networkPassphrase: config.networkPassphrase,
-  })
-    .addOperation(
-      StellarSdk.Operation.pathPaymentStrictSend({
-        sendAsset: sendA,
-        sendAmount: canonicalSendAmount,
-        destination,
-        destAsset: destA,
-        destMin: canonicalDestMin,
-        path: [],
-      } as any),
-    )
-    .setTimeout(30)
-    .build();
-  await relayerKeyManager.signTransaction(tx);
-
-  // SPIKE-027: Enhanced error handling for swap failures with slippage context
-  try {
-    const res: any = await (horizonServer as any).submitTransaction(tx);
-    log("info", "swap_executed", {
-      sendAsset,
-      destAsset,
-      sendAmount: canonicalSendAmount,
-      destMin: canonicalDestMin,
-      hash: res.hash,
-    });
-    return { hash: res.hash };
-  } catch (e: any) {
-    const data = e.response?.data || e.response?.body || e.message;
-    const extras = (data as any)?.extras;
-    const resultCodes = extras?.result_codes;
-
-    log("error", "swap_failed", {
-      sendAsset,
-      destAsset,
-      sendAmount: canonicalSendAmount,
-      destMin: canonicalDestMin,
-      error: JSON.stringify(data).slice(0, 1000),
-      resultCodes: resultCodes ? JSON.stringify(resultCodes) : undefined,
-    });
-
-    // Check if failure was due to slippage (path payment underfunded)
-    const isSlippageError = resultCodes?.operations?.includes("op_under_dest_min");
-    throw new Error(
-      isSlippageError
-        ? `Swap failed: slippage exceeded (received less than destMin ${destMin})`
-        : resultCodes
-          ? `Swap failed: ${JSON.stringify(resultCodes)}`
-          : typeof data === "string"
-            ? data
-            : JSON.stringify(data).slice(0, 500) || e.message
-    );
-  }
 }
 
 /**
@@ -770,4 +724,177 @@ export async function quoteStrictSend(
     log("error", "quote_failed", { error: (e as Error).message });
     throw new Error(`Quote unavailable: ${(e as Error).message}`);
   }
+}
+
+// ── Relayer-sponsored vote submission (fee-bump) ───────────────────────────
+//
+// The voter never signs a Stellar transaction and never funds an account. They
+// sign only the off-chain authorization object verified in pay.ts. The relayer
+// builds the inner Soroban invocation from its own source account, wraps it in
+// a fee-bump whose fee source is the relayer, signs both envelopes, and pays
+// for the whole submission out of its sponsorship budget.
+
+export interface SponsoredVoteSubmission {
+  /** Fee-bump transaction hash (the hash clients should track). */
+  hash: string;
+  /** Inner transaction hash, retained for Soroban diagnostics. */
+  innerHash: string;
+  feeStroops: number;
+  feeXlm: number;
+  /** True in RELAYER_TEST_MODE: envelope is built and hashed but not submitted. */
+  dryRun: boolean;
+  status: string;
+}
+
+function sponsoredVoteArgs(auth: VoteAuthorization, contractId: string): StellarSdk.xdr.Operation {
+  const contract = new StellarSdk.Contract(contractId);
+  const scBytes = (value: string): StellarSdk.xdr.ScVal =>
+    StellarSdk.xdr.ScVal.scvBytes(
+      Buffer.from(value.startsWith("0x") ? value.slice(2) : value, "hex"),
+    );
+  const scString = (value: string): StellarSdk.xdr.ScVal =>
+    StellarSdk.xdr.ScVal.scvString(value.slice(0, 256));
+  const choice =
+    typeof auth.choice === "boolean" ? (auth.choice ? 1 : 0) : auth.choice;
+
+  // Field order mirrors the vote_with_auth contract interface. Arguments are
+  // passed explicitly instead of as a single opaque blob so the contract can
+  // validate each value against its on-chain proposal state.
+  return contract.call(
+    process.env.SPONSORED_VOTE_FUNCTION || "vote_with_auth",
+    StellarSdk.nativeToScVal(BigInt(auth.daoId), { type: "u64" }),
+    StellarSdk.nativeToScVal(BigInt(auth.proposalId), { type: "u64" }),
+    StellarSdk.nativeToScVal(choice, { type: "u32" }),
+    scBytes(auth.nullifier),
+    scBytes(auth.commitment ?? ""),
+    scString(auth.voter),
+    StellarSdk.nativeToScVal(BigInt(Math.floor(auth.expiry)), { type: "i64" }),
+    scString(auth.nonce),
+    scString(auth.signerPublicKey),
+    scBytes(auth.signature),
+  );
+}
+
+/** Deterministic valid account for dry runs; test-mode relayer ids are GTEST placeholders. */
+let dryRunSourceCache: StellarSdk.Keypair | undefined;
+function dryRunSource(): string {
+  if (!dryRunSourceCache) {
+    dryRunSourceCache = StellarSdk.Keypair.fromRawEd25519Seed(
+      StellarSdk.hash(Buffer.from("zkvote:sponsored-vote-dry-run-source", "utf8")),
+    );
+  }
+  return dryRunSourceCache.publicKey();
+}
+
+/** A deterministic, valid contract id for dry runs where env ids are placeholders. */
+function dryRunContractId(): string {
+  const fromConfig = config.votingContractId;
+  if (fromConfig && StellarSdk.StrKey.isValidContract(fromConfig)) return fromConfig;
+  return StellarSdk.StrKey.encodeContract(
+    StellarSdk.hash(Buffer.from("zkvote:sponsored-vote-dry-run", "utf8")),
+  );
+}
+
+export interface SponsoredVoteOptions {
+  feeStroops: number;
+  /** For tests: override the submission transport. */
+  submitFn?: NonNullable<Parameters<typeof submitRelayerFeeBump>[1]>["submitFn"];
+}
+
+export async function submitSponsoredVote(
+  auth: VoteAuthorization,
+  options: SponsoredVoteOptions,
+): Promise<SponsoredVoteSubmission> {
+  if (!Number.isFinite(options.feeStroops) || options.feeStroops <= 0) {
+    throw new Error("A positive fee estimate is required for sponsorship");
+  }
+  const feeStroops = Math.floor(options.feeStroops);
+
+  // Build + simulate + fee-bump + submit must be atomic on the relayer's
+  // sequence: an interleaving rotation or payment would invalidate the inner
+  // transaction. The caller has already reserved budget and consumed the
+  // nonce, so releasing the lock here cannot double-spend.
+  return withSequenceLock(async () => {
+    const contractId = config.testMode ? dryRunContractId() : config.votingContractId;
+    if (!contractId || !StellarSdk.StrKey.isValidContract(contractId)) {
+      throw new Error("VOTING_CONTRACT_ID is not a valid Soroban contract id");
+    }
+    const operation = sponsoredVoteArgs(auth, contractId);
+
+    const buildInner = async (): Promise<StellarSdk.Transaction> => {
+      const account = config.testMode
+        ? new StellarSdk.Account(dryRunSource(), "1")
+        : await getRelayerAccount();
+      let tx = new StellarSdk.TransactionBuilder(account, {
+        fee: String(Math.max(100, Math.floor(feeStroops / 2))),
+        networkPassphrase: config.networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(60)
+        .build();
+
+      if (!config.testMode) {
+        const simResult = await callWithTimeout(
+          () =>
+            simulateWithBackoff(() =>
+              (server as StellarSdk.rpc.Server).simulateTransaction(tx),
+            ),
+          "simulate_sponsored_vote",
+        );
+        if (!StellarSdk.rpc.Api.isSimulationSuccess(simResult)) {
+          throw new Error("SIMULATION_FAILED:SPONSORED_VOTE_REJECTED");
+        }
+        tx = StellarSdk.rpc.assembleTransaction(tx, simResult).build();
+      }
+      // The relayer owns the inner source account; it signs the invocation,
+      // while the voter's Ed25519 authorization travels inside the arguments.
+      await relayerKeyManager.signTransaction(tx as StellarSdk.Transaction);
+      return tx;
+    };
+
+    const inner = await buildInner();
+    const buildFeeBump = (): ReturnType<typeof buildRelayerFeeBump> =>
+      buildRelayerFeeBump(inner, feeStroops, {
+        networkPassphrase: config.networkPassphrase,
+        feeSource: config.testMode ? dryRunSource() : relayerKeypair.publicKey(),
+      });
+
+    const result = await submitRelayerFeeBump(buildFeeBump(), {
+      label: "sponsored_vote",
+      skipLock: true, // already held by withSequenceLock above
+      rebuildFeeBump: async () => {
+        const rebuiltInner = await buildInner();
+        return buildRelayerFeeBump(rebuiltInner, feeStroops, {
+          networkPassphrase: config.networkPassphrase,
+          feeSource: config.testMode ? dryRunSource() : relayerKeypair.publicKey(),
+        });
+      },
+      submitFn: options.submitFn,
+    });
+
+    if (result.status === "ERROR") {
+      throw new Error(`Sponsored vote submission failed: ${result.errorResult ?? "unknown"}`);
+    }
+
+    log("info", "sponsored_vote_submitted", {
+      hash: result.hash,
+      innerHash: inner.hash().toString("hex"),
+      feeStroops,
+      feeXlm: stroopsToXlm(feeStroops),
+      daoId: auth.daoId,
+      proposalId: auth.proposalId,
+      dryRun: config.testMode,
+    });
+    if (!config.testMode) {
+      sponsorshipReserveGauge.set(getSponsorshipReserveXlm());
+    }
+    return {
+      hash: result.hash ?? inner.hash().toString("hex"),
+      innerHash: inner.hash().toString("hex"),
+      feeStroops,
+      feeXlm: stroopsToXlm(feeStroops),
+      dryRun: config.testMode,
+      status: result.status,
+    };
+  });
 }

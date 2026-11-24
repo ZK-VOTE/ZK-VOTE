@@ -6,10 +6,39 @@
  * - Surge awareness: adjusting fees based on network load and fee volatility
  * - Historical tracking: analyzing fee trends to predict future costs
  * - Fairness: distributing fees equitably across operations
+ *
+ * It also owns the policy for sponsored (zero-fee) vote submission. A voter
+ * never signs or funds a Stellar transaction: they sign a domain-separated
+ * authorization object off-chain and hand it to the relayer. This module owns the
+ * policy that decides whether the relayer is willing to pay for that vote:
+ *
+ *  - typed authorization + Ed25519 verification, expiry and nonce replay checks;
+ *  - per-DAO daily / per-vote sponsorship budgets;
+ *  - a bounded token bucket keyed by (daoId, voter commitment, relayer) rather
+ *    than by IP — abuse costs are charged to this credential so a voter can
+ *    rotate networks without escaping the limit;
+ *  - a relayer reserve gate that degrades gracefully (RELAYER_RESERVE_LOW)
+ *    instead of submitting a vote that the account cannot afford;
+ *  - an in-memory metrics collector (counters + small histograms) exposing
+ *    sponsored fee spend and rejection reasons.
+ *
+ * All sponsorship state is in-memory but behind interfaces (ReplayStore,
+ * TokenBucket quota, SponsorshipBudget snapshots) so a deployment can persist
+ * it later without changing callers.
  */
 
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  sign as ed25519Sign,
+  verify as ed25519Verify,
+  type KeyObject,
+} from "node:crypto";
+import * as StellarSdk from "@stellar/stellar-sdk";
+import { z } from "zod";
 
 // Reserve thresholds (in XLM)
 const MINIMUM_OPERATING_RESERVE = 50; // Minimum to keep operations running
@@ -64,7 +93,6 @@ export async function calculateSurgeMultiplier(): Promise<number> {
   }
 
   const avgFee = recentFees.avg_fee;
-  const maxFee = recentFees.max_fee || avgFee;
 
   // Calculate surge based on deviation from base
   const surgeRatio = avgFee / BASE_FEE_STROOPS;
@@ -512,4 +540,833 @@ async function queryLiveRelayerState(
       pendingOperations: 0,
     };
   }
+}
+
+// ── Sponsored vote policy ─────────────────────────────────────────────────
+
+// ── Stable rejection codes ────────────────────────────────────────────────
+
+export const RELAYER_REJECTION_CODES = [
+  "INVALID_REQUEST",
+  "INVALID_AUTHORIZATION",
+  "UNSUPPORTED_VERSION",
+  "DOMAIN_MISMATCH",
+  "EXPIRED_AUTHORIZATION",
+  "INVALID_SIGNATURE",
+  "RELAYER_MISMATCH",
+  "NONCE_REPLAY",
+  "RATE_LIMITED",
+  "BUDGET_EXHAUSTED",
+  "RELAYER_RESERVE_LOW",
+  "SUBMISSION_FAILED",
+] as const;
+
+export type RelayerRejectionCode = (typeof RELAYER_REJECTION_CODES)[number];
+
+export class RelayerError extends Error {
+  constructor(
+    public readonly code: RelayerRejectionCode,
+    public readonly statusCode: number,
+    message: string,
+    public readonly retryable = false,
+  ) {
+    super(message);
+    this.name = "RelayerError";
+    Error.captureStackTrace?.(this, RelayerError);
+  }
+}
+
+// ── Authorization object ──────────────────────────────────────────────────
+
+export const VOTE_AUTH_DOMAIN = "zkvote.vote-authorization.v1";
+export const VOTE_AUTH_VERSION = 1;
+/** Authorizations are short-lived: a long window would widen replay exposure. */
+export const MAX_AUTH_LIFETIME_SECONDS = 600;
+export const DEFAULT_CLOCK_SKEW_SECONDS = 30;
+const STROOPS_PER_XLM = 10_000_000;
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const hexString = z.string().regex(/^(0x)?[0-9a-fA-F]{1,128}$/);
+const numericId = z
+  .union([z.number().int().nonnegative(), z.string().regex(/^\d+$/)])
+  .transform((v) => String(v))
+  .refine((v) => BigInt(v) <= 18_446_744_073_709_551_615n, "id exceeds u64 range");
+
+export const voteAuthorizationSchema = z
+  .object({
+    version: z.number().int().nonnegative(),
+    domain: z.string().min(1).max(128),
+    chainId: z.string().min(1).max(256),
+    daoId: numericId,
+    proposalId: numericId,
+    /** Stellar G-address, or an opaque voter identifier when privacy-bound. */
+    voter: z.string().min(1).max(256),
+    /** Optional privacy commitment; used (with daoId/relayer) as the abuse key. */
+    commitment: hexString.optional(),
+    nullifier: hexString,
+    choice: z.union([
+      z.boolean(),
+      z.number().int().nonnegative().max(0xffffffff),
+    ]),
+    /** Relayer G-address that is authorized to pay the fee. */
+    relayer: z.string().min(1).max(128),
+    /** Unix seconds. */
+    expiry: z.number().int().positive(),
+    /** Caller-chosen unique value; replay is keyed by (voter, relayer, nonce). */
+    nonce: z.string().min(1).max(128),
+    /** Ed25519 public key that signed the payload (G-address, 0x-hex or base64). */
+    signerPublicKey: z.string().min(1).max(256),
+    /** Base64 Ed25519 detached signature over the canonical payload digest. */
+    signature: z.string().min(1).max(512),
+  })
+  .strict();
+
+export type VoteAuthorization = z.infer<typeof voteAuthorizationSchema>;
+export type VoteAuthorizationFields = Omit<VoteAuthorization, "signature">;
+
+export function normalizedChoice(choice: VoteAuthorization["choice"]): number {
+  return typeof choice === "boolean" ? (choice ? 1 : 0) : choice;
+}
+
+/**
+ * Length-prefixed, domain-separated canonical payload. Length prefixes make the
+ * encoding injective even when fields contain the separator, so no two distinct
+ * authorization objects can hash to the same digest.
+ */
+export function canonicalVoteAuthPayload(auth: VoteAuthorizationFields): string {
+  const field = (value: string): string =>
+    `${Buffer.byteLength(value, "utf8")}:${value}`;
+  return [
+    "zkvote-vote-auth-canonical-v1",
+    field(VOTE_AUTH_DOMAIN),
+    field(String(auth.version)),
+    field(auth.domain),
+    field(auth.chainId),
+    field(String(auth.daoId)),
+    field(String(auth.proposalId)),
+    field(auth.voter),
+    field(auth.commitment ? auth.commitment.toLowerCase() : ""),
+    field(auth.nullifier.toLowerCase()),
+    field(String(normalizedChoice(auth.choice))),
+    field(auth.relayer),
+    field(String(auth.expiry)),
+    field(auth.nonce),
+    field(auth.signerPublicKey),
+  ].join("|");
+}
+
+export function voteAuthDigest(auth: VoteAuthorizationFields): Buffer {
+  return createHash("sha256").update(canonicalVoteAuthPayload(auth)).digest();
+}
+
+/**
+ * Node's crypto typings require views backed by ArrayBuffer (not the wider
+ * ArrayBufferLike that Buffer carries). Copying into a fresh Uint8Array makes
+ * the type explicit without changing the bytes.
+ */
+function bytes(buffer: Buffer): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from(buffer);
+}
+
+// DER wrappers turn raw 32-byte Ed25519 keys into Node KeyObjects.
+// Uint8Array form avoids Buffer/ArrayBufferLike generic mismatches with the
+// repo's pinned @types/node while producing byte-identical DER.
+const ED25519_SPKI_PREFIX = Uint8Array.from(
+  Buffer.from("302a300506032b6570032100", "hex"),
+);
+const ED25519_PKCS8_PREFIX = Uint8Array.from(
+  Buffer.from("302e020100300506032b657004220420", "hex"),
+);
+
+export function decodeEd25519PublicKey(encoded: string): Buffer {
+  let raw: Buffer;
+  if (encoded.startsWith("G") && encoded.length >= 50) {
+    try {
+      raw = Buffer.from(new Uint8Array(StellarSdk.StrKey.decodeEd25519PublicKey(encoded)));
+    } catch {
+      throw new RelayerError(
+        "INVALID_AUTHORIZATION",
+        400,
+        "signerPublicKey is not a valid Ed25519 public key",
+      );
+    }
+  } else {
+    const hex = encoded.startsWith("0x") ? encoded.slice(2) : encoded;
+    if (/^[0-9a-fA-F]{64}$/.test(hex)) {
+      raw = Buffer.from(hex, "hex");
+    } else {
+      raw = Buffer.from(encoded, "base64");
+    }
+  }
+  if (raw.length !== 32) {
+    throw new RelayerError(
+      "INVALID_AUTHORIZATION",
+      400,
+      "signerPublicKey must encode 32 bytes",
+    );
+  }
+  return raw;
+}
+
+function privateKeyFrom(secret: Buffer | string | KeyObject): KeyObject {
+  if (typeof secret !== "string") {
+    if (Buffer.isBuffer(secret)) {
+      if (secret.length !== 32) {
+        throw new Error("Ed25519 seed must be 32 bytes");
+      }
+      return createPrivateKey({
+        key: Buffer.from(Uint8Array.from([...ED25519_PKCS8_PREFIX, ...bytes(secret)])),
+        format: "der",
+        type: "pkcs8",
+      });
+    }
+    return secret;
+  }
+  if (secret.startsWith("S")) {
+    const seed = Buffer.from(new Uint8Array(StellarSdk.StrKey.decodeEd25519SecretSeed(secret)));
+    return privateKeyFrom(seed);
+  }
+  return createPrivateKey(secret);
+}
+
+/** Helper used by tests and by clients that sign on the server side. */
+export function signVoteAuthorization(
+  fields: VoteAuthorizationFields,
+  secret: Buffer | string | KeyObject,
+): VoteAuthorization {
+  const draft = fields as VoteAuthorization;
+  const signature = ed25519Sign(null, bytes(voteAuthDigest(draft)), privateKeyFrom(secret));
+  return { ...draft, signature: signature.toString("base64") };
+}
+
+export function verifyVoteAuthorizationSignature(auth: VoteAuthorization): void {
+  const raw = decodeEd25519PublicKey(auth.signerPublicKey);
+  let signature: Buffer;
+  try {
+    signature = Buffer.from(auth.signature, "base64");
+  } catch {
+    throw new RelayerError("INVALID_SIGNATURE", 401, "Malformed signature");
+  }
+  const ok =
+    signature.length === 64 &&
+    ed25519Verify(
+      null,
+      bytes(voteAuthDigest(auth)),
+      createPublicKey({
+        key: Buffer.from(Uint8Array.from([...ED25519_SPKI_PREFIX, ...bytes(raw)])),
+        format: "der",
+        type: "spki",
+      }),
+      bytes(signature),
+    );
+  if (!ok) {
+    throw new RelayerError(
+      "INVALID_SIGNATURE",
+      401,
+      "Vote authorization signature does not match signerPublicKey",
+    );
+  }
+}
+
+export interface VerifyAuthorizationOptions {
+  expectedRelayer: string;
+  expectedChainId: string;
+  /** Unix seconds; injectable so tests are deterministic. */
+  nowSeconds?: number;
+  clockSkewSeconds?: number;
+}
+
+/**
+ * Full static verification. Replay/budget/reserve checks are policy decisions
+ * made by the route; this function only proves the authorization is authentic,
+ * current, and addressed to this relayer on this chain.
+ */
+export function verifyVoteAuthorization(
+  auth: VoteAuthorization,
+  options: VerifyAuthorizationOptions,
+): void {
+  if (auth.version !== VOTE_AUTH_VERSION) {
+    throw new RelayerError(
+      "UNSUPPORTED_VERSION",
+      400,
+      `Unsupported vote authorization version ${auth.version}`,
+    );
+  }
+  if (auth.domain !== VOTE_AUTH_DOMAIN) {
+    throw new RelayerError(
+      "DOMAIN_MISMATCH",
+      400,
+      "Vote authorization domain tag does not match this service",
+    );
+  }
+  if (auth.chainId !== options.expectedChainId) {
+    throw new RelayerError(
+      "DOMAIN_MISMATCH",
+      400,
+      "Vote authorization chainId does not match this network",
+    );
+  }
+  if (auth.relayer !== options.expectedRelayer) {
+    throw new RelayerError(
+      "RELAYER_MISMATCH",
+      400,
+      "Vote authorization is addressed to a different relayer",
+    );
+  }
+  const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const skew = options.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS;
+  if (auth.expiry <= now - skew) {
+    throw new RelayerError(
+      "EXPIRED_AUTHORIZATION",
+      401,
+      "Vote authorization has expired",
+    );
+  }
+  if (auth.expiry > now + MAX_AUTH_LIFETIME_SECONDS + skew) {
+    throw new RelayerError(
+      "INVALID_AUTHORIZATION",
+      400,
+      "Vote authorization expiry is too far in the future",
+    );
+  }
+  // When the voter is itself a Stellar account the signer must be that account;
+  // commitment-based voters use a dedicated one-shot signing key instead.
+  if (auth.voter.startsWith("G") && auth.voter !== auth.signerPublicKey) {
+    throw new RelayerError(
+      "INVALID_AUTHORIZATION",
+      400,
+      "voter account must equal signerPublicKey for G-address voters",
+    );
+  }
+  verifyVoteAuthorizationSignature(auth);
+}
+
+/** Replay identity: the signer (or voter), the paying relayer, and the nonce. */
+export function replayKey(auth: VoteAuthorization): string {
+  return `${auth.signerPublicKey}|${auth.relayer}|${auth.nonce}`;
+}
+
+/** Abuse/rate-limit identity: no IP address is stored or keyed on. */
+export function sponsorshipTokenKey(auth: VoteAuthorization): string {
+  return `${auth.daoId}|${auth.commitment ?? auth.voter}|${auth.relayer}`;
+}
+
+// ── Replay protection (persistable) ───────────────────────────────────────
+
+export interface ReplayStore {
+  has(key: string): boolean | Promise<boolean>;
+  put(key: string, expiresAtMs: number): void | Promise<void>;
+  delete?(key: string): void | Promise<void>;
+  /** Atomic check-and-insert; returns true when the key was newly stored. */
+  consume?(key: string, expiresAtMs: number): boolean | Promise<boolean>;
+}
+
+const MAX_REPLAY_ENTRIES = 50_000;
+
+export class InMemoryReplayStore implements ReplayStore {
+  private readonly entries = new Map<string, number>();
+
+  has(key: string): boolean {
+    const expires = this.entries.get(key);
+    if (expires === undefined) return false;
+    if (expires <= Date.now()) {
+      this.entries.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  consume(key: string, expiresAtMs: number): boolean {
+    if (this.has(key)) return false;
+    this.put(key, expiresAtMs);
+    return true;
+  }
+
+  put(key: string, expiresAtMs: number): void {
+    if (expiresAtMs <= Date.now()) return;
+    if (this.entries.size >= MAX_REPLAY_ENTRIES) {
+      for (const [k, exp] of this.entries) {
+        if (exp <= Date.now()) this.entries.delete(k);
+      }
+      // Bounded even under a sustained unique-nonce attack.
+      while (this.entries.size >= MAX_REPLAY_ENTRIES) {
+        const oldest = this.entries.keys().next();
+        if (oldest.done) break;
+        this.entries.delete(oldest.value);
+      }
+    }
+    this.entries.set(key, expiresAtMs);
+  }
+
+  delete(key: string): void {
+    this.entries.delete(key);
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+}
+
+export class ReplayGuard {
+  constructor(
+    private readonly store: ReplayStore = new InMemoryReplayStore(),
+    private readonly ttlMs = MAX_AUTH_LIFETIME_SECONDS * 1000,
+  ) {}
+
+  /** Atomically reject an already-used (voter|relayer, nonce) pair. */
+  async consume(key: string, nowMs = Date.now()): Promise<void> {
+    const expiresAtMs = nowMs + this.ttlMs;
+    if (this.store.consume) {
+      if (!(await this.store.consume(key, expiresAtMs))) {
+        throw new RelayerError("NONCE_REPLAY", 409, "Vote authorization nonce already used");
+      }
+      return;
+    }
+    if (await this.store.has(key)) {
+      throw new RelayerError("NONCE_REPLAY", 409, "Vote authorization nonce already used");
+    }
+    await this.store.put(key, expiresAtMs);
+  }
+
+  reset(): void {
+    // In-memory stores expose clear(); persistent stores are reset by their owner.
+    const store = this.store as ReplayStore & { clear?: () => void };
+    store.clear?.();
+  }
+}
+
+export const replayGuard = new ReplayGuard();
+
+// ── Token bucket (abuse costs are charged here, never to the voter) ───────
+
+export interface Quota {
+  limit: number;
+  remaining: number;
+  /** Unix seconds at which the bucket is full again. */
+  resetSeconds: number;
+}
+
+export class TokenBucket {
+  private readonly buckets = new Map<
+    string,
+    { tokens: number; lastRefillMs: number }
+  >();
+
+  constructor(
+    private readonly options: {
+      capacity?: number;
+      refillPerMinute?: number;
+      maxKeys?: number;
+      now?: () => number;
+    } = {},
+  ) {}
+
+  private get capacity(): number {
+    return this.options.capacity ?? envInt("SPONSORSHIP_TOKEN_CAPACITY", 30);
+  }
+
+  private get refillPerMinute(): number {
+    return this.options.refillPerMinute ?? envInt("SPONSORSHIP_TOKEN_REFILL_PER_MIN", 10);
+  }
+
+  private refill(key: string, nowMs: number): { tokens: number; lastRefillMs: number } {
+    let entry = this.buckets.get(key);
+    if (!entry) {
+      if (this.buckets.size >= (this.options.maxKeys ?? 10_000)) {
+        const oldest = this.buckets.keys().next();
+        if (!oldest.done) this.buckets.delete(oldest.value);
+      }
+      entry = { tokens: this.capacity, lastRefillMs: nowMs };
+      this.buckets.set(key, entry);
+    }
+    const elapsed = Math.max(0, nowMs - entry.lastRefillMs);
+    entry.tokens = Math.min(
+      this.capacity,
+      entry.tokens + (elapsed / 60_000) * this.refillPerMinute,
+    );
+    entry.lastRefillMs = nowMs;
+    return entry;
+  }
+
+  quota(key: string, nowMs = this.options.now?.() ?? Date.now()): Quota {
+    const entry = this.refill(key, nowMs);
+    const secondsToFull =
+      this.refillPerMinute > 0
+        ? Math.ceil(((this.capacity - entry.tokens) / this.refillPerMinute) * 60)
+        : 0;
+    return {
+      limit: this.capacity,
+      remaining: Math.floor(entry.tokens),
+      resetSeconds: Math.ceil((nowMs + secondsToFull * 1000) / 1000),
+    };
+  }
+
+  /** Deduct `cost` tokens or throw a typed 429 with the current quota. */
+  consume(key: string, cost = 1, nowMs = this.options.now?.() ?? Date.now()): Quota {
+    const entry = this.refill(key, nowMs);
+    if (entry.tokens < cost) {
+      throw new RelayerError(
+        "RATE_LIMITED",
+        429,
+        "Sponsorship rate limit exceeded",
+        true,
+      );
+    }
+    entry.tokens -= cost;
+    return this.quota(key, nowMs);
+  }
+
+  /** Best-effort charge for rejected/spam requests; never masks the root error. */
+  chargeAbuse(key: string, cost = 3): void {
+    try {
+      this.consume(key, cost);
+    } catch {
+      // The original rejection reason is what the caller needs to see.
+    }
+  }
+
+  reset(): void {
+    this.buckets.clear();
+  }
+}
+
+export const tokenBucket = new TokenBucket();
+
+// ── Fee estimation & per-DAO budget ───────────────────────────────────────
+
+export interface VoteFeeEstimate {
+  networkFeeStroops: number;
+  resourceFeeStroops: number;
+  totalStroops: number;
+}
+
+export function estimateVoteFee(): VoteFeeEstimate {
+  const networkFeeStroops = envInt("VOTE_NETWORK_FEE_STROOPS", 10_000);
+  const resourceFeeStroops = envInt("VOTE_RESOURCE_FEE_STROOPS", 100_000);
+  const cap = envInt("VOTE_MAX_FEE_STROOPS", 500_000);
+  const totalStroops = Math.min(cap, networkFeeStroops + resourceFeeStroops);
+  recordFeeEstimate(totalStroops);
+  return { networkFeeStroops, resourceFeeStroops, totalStroops };
+}
+
+export function stroopsToXlm(stroops: number): number {
+  return stroops / STROOPS_PER_XLM;
+}
+
+export interface SponsorshipQuota {
+  limitStroops: number;
+  remainingStroops: number;
+  /** Unix seconds at which the daily window resets. */
+  resetSeconds: number;
+}
+
+interface BudgetWindow {
+  startMs: number;
+  spentStroops: number;
+  reservedStroops: number;
+}
+
+export interface SponsorshipReservation {
+  id: string;
+  daoId: string;
+  amountStroops: number;
+}
+
+/**
+ * Per-DAO sponsorship budget with a fixed 24h (UTC-aligned) window. A
+ * reservation is held during submission and either committed (success) or
+ * released (failure), so concurrent requests cannot overspend the cap.
+ */
+export class SponsorshipBudget {
+  private readonly windows = new Map<string, BudgetWindow>();
+  private reservationCounter = 0;
+
+  constructor(private readonly windowMs = 86_400_000) {}
+
+  private windowFor(daoId: string, nowMs: number): BudgetWindow {
+    const startMs = Math.floor(nowMs / this.windowMs) * this.windowMs;
+    let window = this.windows.get(daoId);
+    if (!window || window.startMs !== startMs) {
+      window = { startMs, spentStroops: 0, reservedStroops: 0 };
+      this.windows.set(daoId, window);
+      // Keep the map bounded across many DAOs.
+      if (this.windows.size > 10_000) {
+        for (const [key, value] of this.windows) {
+          if (value.startMs !== startMs && nowMs - value.startMs >= this.windowMs) {
+            this.windows.delete(key);
+          }
+        }
+      }
+    }
+    return window;
+  }
+
+  private dailyCap(): number {
+    return envInt("SPONSORSHIP_DAILY_LIMIT_STROOPS", 50_000_000); // 5 XLM
+  }
+
+  private perVoteCap(): number {
+    return envInt("SPONSORSHIP_PER_VOTE_LIMIT_STROOPS", 500_000); // 0.05 XLM
+  }
+
+  quota(daoId: string, nowMs = Date.now()): SponsorshipQuota {
+    const window = this.windowFor(daoId, nowMs);
+    return {
+      limitStroops: this.dailyCap(),
+      remainingStroops: Math.max(
+        0,
+        this.dailyCap() - window.spentStroops - window.reservedStroops,
+      ),
+      resetSeconds: Math.ceil((window.startMs + this.windowMs) / 1000),
+    };
+  }
+
+  reserve(
+    daoId: string,
+    amountStroops: number,
+    nowMs = Date.now(),
+  ): SponsorshipReservation {
+    if (!Number.isFinite(amountStroops) || amountStroops <= 0) {
+      throw new RelayerError("INVALID_REQUEST", 400, "Invalid fee estimate");
+    }
+    if (amountStroops > this.perVoteCap()) {
+      recordRejection("BUDGET_EXHAUSTED");
+      throw new RelayerError(
+        "BUDGET_EXHAUSTED",
+        429,
+        "Estimated vote fee exceeds the per-vote sponsorship cap",
+      );
+    }
+    const window = this.windowFor(daoId, nowMs);
+    if (window.spentStroops + window.reservedStroops + amountStroops > this.dailyCap()) {
+      recordRejection("BUDGET_EXHAUSTED");
+      throw new RelayerError(
+        "BUDGET_EXHAUSTED",
+        429,
+        "DAO sponsorship budget exhausted for this window",
+        true,
+      );
+    }
+    window.reservedStroops += amountStroops;
+    return {
+      id: `${daoId}:${nowMs}:${++this.reservationCounter}`,
+      daoId,
+      amountStroops,
+    };
+  }
+
+  commit(reservation: SponsorshipReservation, nowMs = Date.now()): void {
+    const window = this.windowFor(reservation.daoId, nowMs);
+    window.reservedStroops = Math.max(
+      0,
+      window.reservedStroops - reservation.amountStroops,
+    );
+    window.spentStroops += reservation.amountStroops;
+  }
+
+  release(reservation: SponsorshipReservation, nowMs = Date.now()): void {
+    const window = this.windowFor(reservation.daoId, nowMs);
+    window.reservedStroops = Math.max(
+      0,
+      window.reservedStroops - reservation.amountStroops,
+    );
+  }
+
+  reset(): void {
+    this.windows.clear();
+  }
+}
+
+export const sponsorshipBudget = new SponsorshipBudget();
+
+// ── Reserve threshold & graceful degradation ──────────────────────────────
+
+let relayerReserveXlm = envNumber("RELAYER_RESERVE_XLM", 25);
+
+export function getRelayerReserveXlm(): number {
+  return relayerReserveXlm;
+}
+
+/** Ops/tests can feed the relayer's live balance into the gate. */
+export function setRelayerReserveXlm(xlm: number): void {
+  if (!Number.isFinite(xlm) || xlm < 0) {
+    throw new Error("Relayer reserve must be a non-negative number of XLM");
+  }
+  relayerReserveXlm = xlm;
+}
+
+/**
+ * Fail before submission when the relayer cannot cover the vote plus its
+ * safety buffer. The caller maps RELAYER_RESERVE_LOW to 503 + Retry-After, so
+ * clients can degrade to the normal (voter-funded) vote flow instead of
+ * presenting an opaque 500.
+ */
+export function assertRelayerReserve(feeStroops: number): void {
+  const threshold = envNumber("RELAYER_RESERVE_MIN_XLM", 10);
+  if (relayerReserveXlm - stroopsToXlm(feeStroops) < threshold) {
+    throw new RelayerError(
+      "RELAYER_RESERVE_LOW",
+      503,
+      `Relayer reserve below threshold (${relayerReserveXlm} XLM, need ${threshold} XLM)`,
+      true,
+    );
+  }
+}
+
+// ── In-memory metrics ─────────────────────────────────────────────────────
+
+export interface HistogramSnapshot {
+  count: number;
+  sum: number;
+  max: number;
+  buckets: Record<string, number>;
+}
+
+export interface RelayerSponsorshipMetrics {
+  sponsoredVotesTotal: number;
+  sponsoredFeeSpendStroops: number;
+  sponsoredFeeSpendXlm: number;
+  authorizationRejections: Record<RelayerRejectionCode, number>;
+  budgetExhaustions: number;
+  nonceReplays: number;
+  reserveLowRejections: number;
+  rateLimitRejections: number;
+  submissionFailures: number;
+  feeEstimateStroopsHistogram: HistogramSnapshot;
+  submissionDurationMsHistogram: HistogramSnapshot;
+}
+
+const FEE_BUCKETS = [10_000, 50_000, 100_000, 250_000, 500_000];
+const DURATION_BUCKETS = [50, 200, 1_000, 5_000, 30_000];
+
+class Histogram {
+  private count = 0;
+  private sum = 0;
+  private max = 0;
+  private readonly buckets: number[];
+
+  constructor(private readonly bounds: number[]) {
+    this.buckets = bounds.map(() => 0);
+  }
+
+  observe(value: number): void {
+    if (!Number.isFinite(value)) return;
+    this.count++;
+    this.sum += value;
+    this.max = Math.max(this.max, value);
+    this.bounds.forEach((bound, i) => {
+      if (value <= bound) this.buckets[i]++;
+    });
+  }
+
+  snapshot(): HistogramSnapshot {
+    const result: Record<string, number> = {};
+    this.bounds.forEach((bound, i) => {
+      result[`le_${bound}`] = this.buckets[i];
+    });
+    return { count: this.count, sum: this.sum, max: this.max, buckets: result };
+  }
+
+  reset(): void {
+    this.count = 0;
+    this.sum = 0;
+    this.max = 0;
+    this.buckets.fill(0);
+  }
+}
+
+const feeHistogram = new Histogram(FEE_BUCKETS);
+const durationHistogram = new Histogram(DURATION_BUCKETS);
+
+function emptyRejections(): Record<RelayerRejectionCode, number> {
+  const out = {} as Record<RelayerRejectionCode, number>;
+  for (const code of RELAYER_REJECTION_CODES) out[code] = 0;
+  return out;
+}
+
+type MetricsState = Omit<
+  RelayerSponsorshipMetrics,
+  "feeEstimateStroopsHistogram" | "submissionDurationMsHistogram"
+>;
+
+const metrics: MetricsState = {
+  sponsoredVotesTotal: 0,
+  sponsoredFeeSpendStroops: 0,
+  sponsoredFeeSpendXlm: 0,
+  authorizationRejections: emptyRejections(),
+  budgetExhaustions: 0,
+  nonceReplays: 0,
+  reserveLowRejections: 0,
+  rateLimitRejections: 0,
+  submissionFailures: 0,
+};
+
+export function recordFeeEstimate(stroops: number): void {
+  feeHistogram.observe(stroops);
+}
+
+export function recordRejection(code: RelayerRejectionCode): void {
+  if (code in metrics.authorizationRejections) {
+    metrics.authorizationRejections[code]++;
+  }
+  if (code === "BUDGET_EXHAUSTED") metrics.budgetExhaustions++;
+  if (code === "NONCE_REPLAY") metrics.nonceReplays++;
+  if (code === "RELAYER_RESERVE_LOW") metrics.reserveLowRejections++;
+  if (code === "RATE_LIMITED") metrics.rateLimitRejections++;
+}
+
+export function recordSponsoredVote(
+  feeStroops: number,
+  durationMs = 0,
+): void {
+  metrics.sponsoredVotesTotal++;
+  metrics.sponsoredFeeSpendStroops += feeStroops;
+  metrics.sponsoredFeeSpendXlm = stroopsToXlm(metrics.sponsoredFeeSpendStroops);
+  durationHistogram.observe(durationMs);
+}
+
+export function recordSubmissionFailure(): void {
+  metrics.submissionFailures++;
+}
+
+export function getMetrics(): RelayerSponsorshipMetrics {
+  return {
+    ...metrics,
+    authorizationRejections: { ...metrics.authorizationRejections },
+    feeEstimateStroopsHistogram: feeHistogram.snapshot(),
+    submissionDurationMsHistogram: durationHistogram.snapshot(),
+  };
+}
+
+/** Alias kept explicit so route code reads `getRelayerSponsorshipMetrics()`. */
+export const getRelayerSponsorshipMetrics = getMetrics;
+
+export function resetRelayerSponsorshipStateForTests(): void {
+  replayGuard.reset();
+  tokenBucket.reset();
+  sponsorshipBudget.reset();
+  feeHistogram.reset();
+  durationHistogram.reset();
+  metrics.sponsoredVotesTotal = 0;
+  metrics.sponsoredFeeSpendStroops = 0;
+  metrics.sponsoredFeeSpendXlm = 0;
+  metrics.authorizationRejections = emptyRejections();
+  metrics.budgetExhaustions = 0;
+  metrics.nonceReplays = 0;
+  metrics.reserveLowRejections = 0;
+  metrics.rateLimitRejections = 0;
+  metrics.submissionFailures = 0;
 }
