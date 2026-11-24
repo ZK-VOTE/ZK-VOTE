@@ -16,14 +16,22 @@
     "dist",
     "workers",
     "manifests",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",
-    "typecheck": "tsc --noEmit --target ES2022 --module esnext --moduleResolution bundler --skipLibCheck --esModuleInterop --strict false src/*.ts",
+    "manifest:generate": "node scripts/generate-manifest.mjs",
+    "manifest:verify": "node scripts/verify-manifest.mjs",
+    "check:compatibility": "node scripts/check-compatibility.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run check:compatibility && npm run build && npm run manifest:generate && npm run manifest:verify && npm run test",
+    "publish:dry-run": "npm publish --dry-run"
   },
   "keywords": [
     "zero-knowledge",

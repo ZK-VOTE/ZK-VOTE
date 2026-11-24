@@ -33,5 +33,8 @@ export {
   checkCircuitVersion,
   UnsupportedCircuitVersionError,
   type CircuitVersionCheck,
-  MOCKS_REMOVED_IN,
+  SEMVER_POLICY,
+  DEPRECATION_POLICY,
+  verifyChecksum,
 } from './version'
+export * from './generated/zkv1'

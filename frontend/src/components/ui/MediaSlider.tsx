@@ -5,8 +5,7 @@ import {
   Play,
   Image as ImageIcon,
 } from "lucide-react";
-
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+import { RELAYER_URL } from "../../config/env";
 
 // Helper to extract YouTube video ID
 function getYouTubeId(url: string): string | null {

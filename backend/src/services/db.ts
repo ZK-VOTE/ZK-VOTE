@@ -31,6 +31,13 @@ import {
   incrementTransactionCounter,
 } from "./walResilience.js";
 import { config } from "../config.js";
+import {
+  configureRepository,
+  getRepository,
+  isRepositoryCutoverEnabled,
+  type WriteExecutor,
+} from "./repository.js";
+import { mirrorWrite } from "./dualWrite.js";
 
 /** Optional Prometheus sink — wired from boot so db.ts stays testable without prom-client. */
 export interface DbMetricsSink {
@@ -43,6 +50,40 @@ export interface DbMetricsSink {
 
 /** Object holder avoids TDZ if metrics wires during circular ESM init. */
 const metricsState: { sink: DbMetricsSink | null } = { sink: null };
+
+// ── Repository cutover seam ────────────────────────────────────────────────
+// SQL for the hot paths is built by Kysely in repository.ts. The executor below
+// only runs the compiled, parameterized statement on the primary handle; it
+// never interpolates values. When dual-write is off, mirroring is a no-op, so
+// disabling it cannot lose data on the authoritative store.
+let repositoryConfigured = false;
+function ensureRepositoryConfigured(): void {
+  if (repositoryConfigured) return;
+  const executor: WriteExecutor = {
+    run(sql, params) {
+      const result = getWriteDb().prepare(sql).run(...(params as unknown[]));
+      return { changes: result.changes, lastInsertRowid: result.lastInsertRowid };
+    },
+    transaction<T>(fn: () => T): T {
+      return getWriteDb().transaction(fn)();
+    },
+  };
+  configureRepository({
+    db: kysely,
+    executor,
+    mirror: (sql, params) => mirrorWrite(sql, [...params]),
+    strict: config.dbDualWriteStrict,
+    cutover: config.dbWriteCutover,
+  });
+  repositoryConfigured = true;
+}
+
+/** Returns the repository when the cutover flag routes writes through it. */
+function repositoryForWrites() {
+  ensureRepositoryConfigured();
+  if (!isRepositoryCutoverEnabled()) return null;
+  return getRepository();
+}
 
 export function setDbMetricsSink(sink: DbMetricsSink | null): void {
   metricsState.sink = sink;
@@ -1383,6 +1424,50 @@ export function initDb(dbPath?: string): DatabaseType {
     CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
     CREATE INDEX IF NOT EXISTS idx_audit_log_archived ON audit_log(archived_at);
 
+    -- Persistent Webhook Delivery Subsystem (ZV-036)
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      secret TEXT NOT NULL,
+      event_types TEXT NOT NULL DEFAULT '',
+      dao_ids TEXT NOT NULL DEFAULT '',
+      active INTEGER NOT NULL DEFAULT 1,
+      rate_limit_per_minute INTEGER NOT NULL DEFAULT 60,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_active ON webhook_subscriptions(active);
+
+    CREATE TABLE IF NOT EXISTS webhook_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      event_type TEXT NOT NULL,
+      dao_id TEXT,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      processed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_outbox_queue ON webhook_outbox(status, next_attempt_at);
+    CREATE INDEX IF NOT EXISTS idx_webhook_outbox_event_id ON webhook_outbox(event_id);
+
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      outbox_id INTEGER NOT NULL,
+      subscription_id TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      status_code INTEGER,
+      response_body TEXT,
+      error TEXT,
+      duration_ms INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_outbox ON webhook_deliveries(outbox_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription ON webhook_deliveries(subscription_id, created_at);
+
     -- Core fields are immutable once written; only archived_at (set by the
     -- rotation job after export) may be updated.
     CREATE TRIGGER IF NOT EXISTS audit_log_immutable_core
@@ -1425,6 +1510,11 @@ export function initDb(dbPath?: string): DatabaseType {
       UNIQUE(dao_id, ledger, tx_hash, type)
     );
   `);
+
+  // Durable state for the factory saga, shared rate limiter, VDF ordering and
+  // circuit-registry caches. Installed here so every store can rely on the
+  // tables existing before the first request (and before migrations run).
+  ensureDurableSchema(database);
 
   const versionRow = database
     .prepare("SELECT value FROM metadata WHERE key = 'schema_version'")
@@ -2441,6 +2531,12 @@ export function recordTransactionLog(
   txHash: string,
   status: string = "PENDING",
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.recordTransactionLog(nullifierHash, txHash, status, Date.now());
+    incrementTransactionCounter();
+    return;
+  }
   const database = getWriteDb();
   database
     .prepare(
@@ -2463,6 +2559,11 @@ export function updateTransactionLogStatus(
   status: string,
   txHash?: string,
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.updateTransactionLogStatus(nullifierHash, status, txHash, Date.now());
+    return;
+  }
   const database = getWriteDb();
   if (txHash) {
     database
@@ -2536,6 +2637,12 @@ export function getVoteSubmission(
  * Insert a new pending vote submission. Returns false if nullifier already exists (idempotency race).
  */
 export function insertVoteSubmission(nullifierHash: string): boolean {
+  const repo = repositoryForWrites();
+  if (repo) {
+    const inserted = repo.insertVoteSubmission(nullifierHash, Date.now());
+    if (inserted) incrementTransactionCounter();
+    return inserted;
+  }
   const database = getWriteDb();
   const now = Date.now();
   const result = database
@@ -2555,6 +2662,11 @@ export function updateVoteSubmission(
   status: "confirmed" | "failed",
   txHash?: string,
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.updateVoteSubmission(nullifierHash, status, txHash, Date.now());
+    return;
+  }
   const database = getWriteDb();
   const now = Date.now();
   if (txHash) {
@@ -4032,6 +4144,12 @@ export function storeVoteReceipt(
   daoId: number,
   status: "confirmed" | "pending" | "failed" = "confirmed",
 ): void {
+  const repo = repositoryForWrites();
+  if (repo) {
+    repo.storeVoteReceipt(nullifier, txHash, proposalId, daoId, status, Date.now());
+    incrementTransactionCounter();
+    return;
+  }
   const database = getWriteDb();
   try {
     database

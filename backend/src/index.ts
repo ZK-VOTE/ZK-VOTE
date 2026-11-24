@@ -17,9 +17,19 @@ import express, {
 import cors from "cors";
 import helmet from "helmet";
 
-import { config, validateEnv, isValidContractId } from "./config.js";
+import {
+  config,
+  validateEnv,
+  validateStartupConfig,
+} from "./config.js";
 // Composition root (#358) — explicit construction/wiring of service deps.
-import { buildAppServices } from "./composition-root.js";
+import {
+  buildAppServices,
+  setMemoryThresholdHandler,
+} from "./composition-root.js";
+// Startup phases and declarative routes (#358 follow-up).
+import { createStartupPhases } from "./startup-phases.js";
+import { mountRoutes } from "./routes/index.js";
 import { initializeTelemetry } from "./services/tracing.js";
 import swaggerUi from "swagger-ui-express";
 import { ServiceSupervisor } from "./services/supervisor.js";
@@ -36,28 +46,7 @@ import {
 } from "./services/cluster.js";
 
 import { log, logger } from "./services/logger.js";
-import * as ipfsService from "./services/ipfs.js";
-import { initPinManager } from "./services/ipfs-pin-manager.js";
-import { getDb } from "./services/db.js";
 import {
-  startWalCheckpointing,
-  stopWalResilience,
-  startWalMonitor,
-  startPeriodicBackups,
-  performInitialCheckpoint,
-  detectAndHandleWalIssue,
-} from "./services/walResilience.js";
-import {
-  startScheduledBackups,
-  stopScheduledBackups,
-} from "./services/backup.js";
-import {
-  startMonitor as startPinMonitor,
-  stopMonitor as stopPinMonitor,
-} from "./services/ipfs-monitor.js";
-import {
-  server,
-  relayerKeypair,
   getPendingSequenceLockOps,
   waitForSequenceLockIdle,
   stopCoverTraffic,
@@ -109,18 +98,11 @@ import {
   graduatedSlowDown,
   degradationContext,
   metricsMiddleware,
+  sharedRateLimiter,
 } from "./middleware/index.js";
 
 import {
-  healthRoutes,
   initHealthRoutes,
-  analyticsRoutes,
-  votingRoutes,
-  daoRoutes,
-  ipfsRoutes,
-  commentsRoutes,
-  claimRoutes,
-  indexerRoutes,
   initIndexerRoutes,
   bridgeRoutes,
   circuitRoutes,
@@ -134,11 +116,14 @@ import {
   thresholdRoutes,
   auditRoutes,
   randomnessRoutes,
+  factoryRoutes,
   payRoutes,
   swapRoutes,
   rampRoutes,
   onboardingRoutes,
   notificationRoutes,
+  proverRoutes,
+  eventsRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
 
@@ -147,23 +132,58 @@ let stopNotificationWorker: (() => void) | null = null;
 import openApiSpec from "./openapi.js";
 
 // ============================================
-// ENVIRONMENT VALIDATION
+// STARTUP PHASES
+// ============================================
+// config -> infrastructure -> services -> routes -> workers -> ready
+// A failed phase is terminal: no later phase may be entered.
+
+const startupPhases = createStartupPhases();
+
+await startupPhases.run("config", () => {
+  validateEnv();
+  // Fail-closed production validation (throwable counterpart of validateEnv).
+  validateStartupConfig();
+  initializeTelemetry();
+});
+
+// ============================================
+// INFRASTRUCTURE PHASE — EXPRESS APP SETUP
 // ============================================
 
-validateEnv();
-initializeTelemetry();
+// CORS origins must be parsed before helmet's CSP is configured; the
+// frameAncestors directive depends on whether a wildcard origin is allowed.
+function parseCorsOrigins(value: string | string[]): string[] {
+  if (Array.isArray(value)) return value;
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
 
-// ============================================
-// COMPOSITION ROOT (#358)
-// ============================================
-// Build and wire every service's dependencies explicitly. Consumer services
-// get their deps from this container, not from module-level globals.
+const allowedCorsOrigins = parseCorsOrigins(
+  config.corsOrigins as unknown as string | string[],
+);
+const isProduction = process.env.NODE_ENV === "production";
 
-const services = buildAppServices();
+if (allowedCorsOrigins.length === 0) {
+  throw new Error("CORS_ORIGIN must specify at least one origin");
+}
 
-// ============================================
-// EXPRESS APP SETUP
-// ============================================
+if (isProduction && allowedCorsOrigins.includes("*")) {
+  throw new Error(
+    "CORS_ORIGIN must not be '*' in production; configure exact origins",
+  );
+}
+
+for (const origin of allowedCorsOrigins) {
+  if (origin !== "*" && /[*?]/.test(origin)) {
+    throw new Error(
+      "CORS_ORIGIN origins must be exact URLs, not wildcard patterns",
+    );
+  }
+}
+
+const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
 
 const app: Express = express();
 
@@ -257,19 +277,8 @@ app.use((_req, res, next) => {
   next();
 });
 
-// Prevent caching of sensitive, non-static API responses. Kept scoped to the
-// routes that return per-user or per-vote data rather than applied globally,
-// since some routes (e.g. /api-docs, /ipfs/image/:cid) are fine to cache.
-// See #140 — per-route CSP exceptions for the IPFS image endpoint are left
-// as follow-up (needs its own directive design, not a 2-3 line change).
-const noStore = (
-  _req: express.Request,
-  res: express.Response,
-  next: express.NextFunction,
-) => {
-  res.setHeader("Cache-Control", "no-store");
-  next();
-};
+// Per-route `Cache-Control: no-store` is applied by mountRoutes() in the
+// declarative route registry (see routes/index.ts).
 
 // Metrics middleware (before other middleware to capture all requests)
 app.use(metricsMiddleware);
@@ -333,6 +342,16 @@ app.use(requestLogger);
 // Graduated throttling (delays before a client is hard rate-limited)
 app.use(graduatedSlowDown);
 
+// Shared, cross-replica bucket for privileged auth/admin key endpoints (#511).
+// Keyed by signed membership token / client id with IP as a weak fallback.
+const authBucketLimiter = sharedRateLimiter("auth");
+app.use((req, res, next) => {
+  if (/^\/(api\/v[12]\/)?(auth|admin|factory)(\/|$)/.test(req.path)) {
+    return authBucketLimiter(req, res, next);
+  }
+  next();
+});
+
 // Audit middleware - must be after body parsing and requestLogger, before routes
 // Audits every mutating route (POST/PUT/PATCH/DELETE) with PII redaction, append-only
 app.use(auditMiddleware);
@@ -357,9 +376,14 @@ app.get("/csrf-token", (_req, res) => {
   res.json({ ok: true });
 });
 
+// Infrastructure setup above is complete.
+startupPhases.checkpoint("infrastructure");
+
 // ============================================
-// ROUTE INITIALIZATION
+// SERVICES PHASE — COMPOSITION ROOT (#358)
 // ============================================
+// Build and wire every service's dependencies explicitly. Consumer services
+// get their deps from this container, not from module-level globals.
 
 // Initialize routes that need dependencies
 initHealthRoutes(
@@ -390,27 +414,18 @@ app.use(noStore, adminRoutes);
 app.use(noStore, thresholdRoutes);
 app.use(auditRoutes);
 app.use(noStore, randomnessRoutes);
+app.use(noStore, factoryRoutes);
 app.use(payRoutes);
 app.use(swapRoutes);
 app.use(rampRoutes);
 app.use(onboardingRoutes);
 app.use(noStore, notificationRoutes);
+app.use(proverRoutes);
+app.use(eventsRoutes);
 
 // ============================================
-// API VERSIONING (#139)
+// ROUTES PHASE — DECLARATIVE REGISTRY
 // ============================================
-// URL-based versioning: mount the same routers under /api/v1 in addition to
-// the existing unversioned paths, so existing clients keep working while new
-// clients can opt into the explicit, cache-friendly versioned path. A
-// response header also advertises which version served the request.
-//
-// Deliberately out of scope for this pass (see PR body): deprecation/Sunset
-// headers for the unversioned routes, a version-lifecycle policy doc, and
-// updating the frontend to call /api/v1.
-app.use((_req, res, next) => {
-  res.setHeader("API-Version", "v1");
-  next();
-});
 
 const v1Router = express.Router();
 
@@ -434,6 +449,7 @@ function mountV1(): void {
   v1Router.use(noStore, thresholdRoutes);
   v1Router.use(auditRoutes);
   v1Router.use(noStore, randomnessRoutes);
+  v1Router.use(noStore, factoryRoutes);
   v1Router.use(payRoutes);
   v1Router.use(swapRoutes);
   v1Router.use(rampRoutes);
@@ -441,15 +457,14 @@ function mountV1(): void {
   v1Router.use(noStore, notificationRoutes);
 }
 
-mountV1();
-app.use("/api/v1", v1Router);
+  // The registry validates required services before mounting anything.
+  mountRoutes(app, services, services.profile, { variant: "unversioned" });
 
-// API v2 Router with explicit multi-tenant isolation (#307)
-const v2Router = express.Router();
-v2Router.use((_req, res, next) => {
-  res.setHeader("API-Version", "v2");
-  next();
-});
+  // Response header advertising the default (unversioned) API version (#139).
+  app.use((_req, res, next) => {
+    res.setHeader("API-Version", "v1");
+    next();
+  });
 
 function mountV2(): void {
   v2Router.use(metricsRoutes);
@@ -471,13 +486,21 @@ function mountV2(): void {
   v2Router.use(noStore, thresholdRoutes);
   v2Router.use(auditRoutes);
   v2Router.use(noStore, randomnessRoutes);
+  v2Router.use(noStore, factoryRoutes);
   v2Router.use(payRoutes);
   v2Router.use(swapRoutes);
   v2Router.use(rampRoutes);
 }
 
-mountV2();
-app.use("/api/v2", v2Router);
+  // API v2 Router with explicit multi-tenant isolation (#307)
+  const v2Router = express.Router();
+  v2Router.use((_req, res, next) => {
+    res.setHeader("API-Version", "v2");
+    next();
+  });
+  mountRoutes(v2Router, services, services.profile, { variant: "v2" });
+  app.use("/api/v2", v2Router);
+});
 
 // OpenAPI spec + interactive docs
 const openApiDocument = buildOpenApiDocument();
@@ -562,9 +585,7 @@ async function gracefulShutdown(reason: string): Promise<void> {
   });
 
   await supervisor.stopAll();
-  stopBackgroundServices();
-  stopAuthScheduler();
-  stopWalResilience();
+  await stopBackgroundServices();
   closeConfirmationHub();
   log("info", "shutdown_component_stopped", {
     component: "background_services",
@@ -615,93 +636,21 @@ async function startBackgroundServices(): Promise<void> {
   log("info", "starting_background_services", {
     pid: process.pid,
     isLeader: isLeaderWorker(),
+    profile: services.profile,
+    workers: services.workers.list().length,
   });
 
-  // Register background services with supervisor for crash recovery (#176)
-  registerSupervisorServices();
+  // Supervisor crash recovery (#176) wraps the same worker definitions that
+  // the composition root declared. `createWorker` makes start/stop idempotent.
+  void supervisor.startAll();
 
-  // Initialize Pinata and IPFS redundancy layer
-  if (config.ipfsEnabled && config.pinataJwt) {
-    try {
-      ipfsService.initPinata(config.pinataJwt, config.pinataGateway);
-      log("info", "pinata_initialized");
-
-      try {
-        initPinManager(config.ipfsBackupDir, config.web3StorageToken);
-        log("info", "pin_manager_initialized", {
-          backupDir: config.ipfsBackupDir,
-          hasWeb3Storage: !!config.web3StorageToken,
-        });
-
-        startPinMonitor({
-          scanIntervalMs: config.pinVerifyIntervalMs,
-          alertThreshold: config.pinAlertThreshold,
-          autoRepin: config.pinAutoRepin,
-          repinFn: ipfsService.repinCallback,
-        });
-        log("info", "pin_monitor_started", {
-          intervalMs: config.pinVerifyIntervalMs,
-          alertThreshold: config.pinAlertThreshold,
-          autoRepin: config.pinAutoRepin,
-        });
-      } catch (err) {
-        log("warn", "pin_manager_init_failed", {
-          error: (err as Error).message,
-        });
-      }
-    } catch (err) {
-      log("error", "pinata_init_failed", { error: (err as Error).message });
-    }
-  }
-
-  // Start event indexer
-  if (config.indexerEnabled) {
-    const contractIds = [config.votingContractId!, config.treeContractId!];
-    if (
-      config.daoRegistryContractId &&
-      isValidContractId(config.daoRegistryContractId)
-    ) {
-      contractIds.push(config.daoRegistryContractId);
-    }
-    if (
-      config.membershipSbtContractId &&
-      isValidContractId(config.membershipSbtContractId)
-    ) {
-      contractIds.push(config.membershipSbtContractId);
-    }
-
-    try {
-      await startIndexer(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        services.stellar.server as any,
-        contractIds,
-        config.indexerPollIntervalMs,
-      );
-      log("info", "indexer_enabled", { contracts: contractIds.length });
-    } catch (err) {
-      log("warn", "indexer_start_failed", { error: (err as Error).message });
-    }
-  }
-
-  // Start DAO sync
-  if (
-    config.daoRegistryContractId &&
-    isValidContractId(config.daoRegistryContractId)
-  ) {
+  // Cosmetic banner retained from the original DAO-sync startup path.
+  if (services.enableRelayer && config.daoRegistryContractId) {
     console.log("\nDAO Cache Endpoints:");
     console.log("  GET  /daos                - Get all DAOs (cached)");
     console.log("  GET  /daos?user=ADDRESS   - Get DAOs with membership info");
     console.log("  GET  /dao/:daoId          - Get single DAO (cached)");
     console.log("  POST /daos/sync           - Trigger DAO sync (admin)");
-    startDaoSync();
-
-    if (
-      config.membershipSbtContractId &&
-      isValidContractId(config.membershipSbtContractId)
-    ) {
-      startMembershipSync();
-      startSbtTransferWatch();
-    }
   }
 
   startTTLRenewal();
@@ -715,20 +664,10 @@ async function startBackgroundServices(): Promise<void> {
   if (!config.testMode) startRelay();
 
   try {
-    const database = getDb();
-    const dbPath = database.name;
-    performInitialCheckpoint(database);
-    detectAndHandleWalIssue(database, dbPath);
-    startWalCheckpointing(database);
-    startWalMonitor(database, dbPath);
-    startPeriodicBackups(database, dbPath);
-    // Encrypted snapshot backups (#359) — opt-in via BACKUP_ENCRYPTION_ENABLED.
-    if (config.backupEncryptionEnabled) {
-      startScheduledBackups(config.backupIntervalMs);
-    }
+    await services.workers.startAll();
   } catch (err) {
-    log("warn", "wal_resilience_start_failed", {
-      error: (err as Error).message,
+    log("error", "background_services_start_failed", {
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 
@@ -762,12 +701,14 @@ async function startBackgroundServices(): Promise<void> {
  * still writing.
  */
 async function stopBackgroundServices(): Promise<void> {
-  if (!backgroundServicesStarted) return;
+  log("info", "stopping_background_services", {
+    pid: process.pid,
+    started: backgroundServicesStarted,
+  });
   backgroundServicesStarted = false;
 
-  log("info", "stopping_background_services", { pid: process.pid });
-
-  // Stop supervised services first
+  // Stop supervised services first, then drain every worker in reverse order
+  // with a bounded timeout (WorkerRegistry handles both).
   void supervisor.stopAll();
 
   // Legacy stop calls (kept for services not yet fully migrated to supervisor)
@@ -796,80 +737,42 @@ async function stopBackgroundServices(): Promise<void> {
  * exponential backoff, and dependency-aware shutdown ordering.
  */
 function registerSupervisorServices(): void {
-  // TTL Renewal - most critical (contract storage expiry risk)
-  supervisor.register({
-    name: "ttl_renewal",
-    start: () => startTTLRenewal(),
-    stop: () => stopTTLRenewal(),
-  });
-
-  // SBT Transfer Watch
-  supervisor.register({
-    name: "sbt_transfer_watch",
-    start: () => startSbtTransferWatch(),
-    stop: () => stopSbtTransferWatch(),
-  });
-
-  // Indexer - critical for frontend data freshness
-  supervisor.register({
-    name: "indexer",
-    start: async () => {
-      if (!config.indexerEnabled) return;
-      const contractIds = [config.votingContractId!, config.treeContractId!];
-      if (
-        config.daoRegistryContractId &&
-        isValidContractId(config.daoRegistryContractId)
-      ) {
-        contractIds.push(config.daoRegistryContractId);
-      }
-      if (
-        config.membershipSbtContractId &&
-        isValidContractId(config.membershipSbtContractId)
-      ) {
-        contractIds.push(config.membershipSbtContractId);
-      }
-      await startIndexer(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        server as any,
-        contractIds,
-        config.indexerPollIntervalMs,
-      );
+  // Supervisor service name -> composition-root worker name. The supervisor
+  // delegates start/stop to the same idempotent worker instances that the
+  // registry drains, so crash recovery and graceful shutdown cannot diverge.
+  const supervised: ReadonlyArray<{
+    service: Parameters<typeof supervisor.register>[0]["name"];
+    worker: string;
+    dependencies?: Parameters<typeof supervisor.register>[0]["dependencies"];
+  }> = [
+    { service: "ttl_renewal", worker: "ttl-renewal" },
+    { service: "sbt_transfer_watch", worker: "sbt-transfer-watch" },
+    { service: "indexer", worker: "indexer" },
+    { service: "dao_sync", worker: "dao-sync" },
+    {
+      service: "membership_sync",
+      worker: "membership-sync",
+      dependencies: ["dao_sync"],
     },
-    stop: () => stopIndexer(),
-  });
+  ];
 
-  // DAO Sync
-  supervisor.register({
-    name: "dao_sync",
-    start: () => {
-      if (
-        config.daoRegistryContractId &&
-        isValidContractId(config.daoRegistryContractId)
-      ) {
-        startDaoSync();
-      }
-    },
-    stop: () => stopDaoSync(),
-  });
-
-  // Membership Sync - depends on DAO Sync being active
-  supervisor.register({
-    name: "membership_sync",
-    start: () => {
-      if (
-        config.membershipSbtContractId &&
-        isValidContractId(config.membershipSbtContractId)
-      ) {
-        startMembershipSync();
-      }
-    },
-    stop: () => stopMembershipSync(),
-    dependencies: ["dao_sync"],
-  });
-
-  // Fire-and-forget: startAll resolves failures internally
-  void supervisor.startAll();
+  for (const entry of supervised) {
+    const worker = services.workers.get(entry.worker);
+    if (!worker) continue;
+    supervisor.register({
+      name: entry.service,
+      start: () => worker.start(),
+      stop: () => worker.stop(),
+      enabled: worker.enabled,
+      ...(entry.dependencies ? { dependencies: entry.dependencies } : {}),
+    });
+  }
 }
+
+// Workers are wired (not started) by the composition root during the services
+// phase; registering them with the supervisor is the workers phase.
+registerSupervisorServices();
+startupPhases.checkpoint("workers");
 
 // ============================================
 // SERVER STARTUP & CLUSTER CONTROLLER
@@ -883,6 +786,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const PORT = config.port;
 
     httpServer = app.listen(PORT, async () => {
+      if (!startupPhases.isReady) startupPhases.checkpoint("ready");
+
       logger.info("server_started", {
         port: PORT,
         pid: process.pid,
@@ -891,6 +796,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         network: config.networkPassphrase,
         rpcUrl: config.rpcUrl,
         relayer: services.stellar.relayerKeypair.publicKey(),
+        startupProfile: services.profile,
+        startupDurationMs: startupPhases.report().totalDurationMs,
       });
 
       console.log(`\nZKVote Relayer running on http://localhost:${PORT}`);
@@ -993,4 +900,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
 }
 
-export { app };
+export {
+  app,
+  // Startup observability / independently testable lifecycle hooks. Existing
+  // `app` export is preserved; everything else is additive.
+  services,
+  startupPhases,
+  startBackgroundServices,
+  stopBackgroundServices,
+  gracefulShutdown,
+};

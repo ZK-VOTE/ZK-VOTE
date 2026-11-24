@@ -24,6 +24,8 @@
     "test:coverage": "vitest run --coverage",
     "type-check": "tsc --noEmit",
     "drift:check": "node ../scripts/drift-guard.mjs",
+    "drift:fix": "node ../scripts/drift-guard.mjs --fix",
+    "protocol:check": "node ../scripts/generate-bindings.mjs --check",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "e2e": "playwright test",

@@ -151,10 +151,18 @@ Attacker creates 1000 DAOs to squat names or spam search.
 
 ### Backend API
 
-- `POST /factory/create` - Start DAO creation saga
-- `GET /factory/status/:ticket_id` - Check progress
-- `POST /factory/resume/:ticket_id` - Resume after failure
-- `DELETE /factory/cancel/:ticket_id` - Cancel and compensate
+- `POST /factory/create` - Start DAO creation saga (optional `idempotencyKey`)
+- `GET /factory/status/:ticketId` - Check progress (persisted state)
+- `POST /factory/resume/:ticketId` - Resume from the last committed step
+- `POST /factory/cancel/:ticketId` - Operator-only (master key): cancel and compensate
+- `GET /factory/plan/:ticketId` - Operator-only: inspect the compensation plan
+
+State is persisted in `factory_sagas`, `factory_saga_steps` and
+`factory_saga_events` (see `backend/src/services/durable-schema.ts`). Each step
+has a stable idempotency key derived from `(ticketId, step, name)` so a replay
+never redeploys a contract. Deployment waits use real transaction-status polling
+through `waitForTransaction()`; there are no simulated sleeps. The job scheduler
+recovers in-flight sagas after a restart.
 
 ### Factory Orchestrator
 
@@ -220,4 +228,8 @@ CREATE INDEX idx_factory_status ON factory_sagas(status);
 
 ## Current Status
 
-Planning complete. Saga orchestrator and wizard pending implementation.
+Saga orchestrator implemented with durable SQLite state, per-step idempotency,
+compensation plans, audit events, operator retry/cancel API, metrics and
+restart recovery via the job scheduler. The frontend wizard remains planned.
+On-chain factory wiring is behind `FACTORY_CONTRACT_ID` (ZV-008); without it the
+production adapter fails closed instead of fabricating deployment IDs.

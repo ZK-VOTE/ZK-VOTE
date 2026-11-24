@@ -1023,6 +1023,65 @@ export const rate_limit_store_size = new Gauge({
   registers: [register],
 });
 
+// ── Durable state-machine metrics ────────────────────────────────────────────
+// Labels are restricted to bounded, code-defined values so they pass the
+// cardinality guard. Per-object detail goes to `metric_drilldown` logs instead.
+
+export const factorySagasTotal = new Counter({
+  name: "zkvote_factory_sagas_total",
+  help: "DAO factory sagas created",
+  labelNames: ["result"] as const,
+  registers: [register],
+});
+
+export const factorySagaStepsTotal = new Counter({
+  name: "zkvote_factory_saga_steps_total",
+  help: "Factory saga step outcomes, including idempotent replays",
+  labelNames: ["operation", "result"] as const,
+  registers: [register],
+});
+
+export const factoryCompensationsTotal = new Counter({
+  name: "zkvote_factory_compensations_total",
+  help: "Compensation actions executed or failed",
+  labelNames: ["result", "reason"] as const,
+  registers: [register],
+});
+
+export const sharedRateLimitDecisionsTotal = new Counter({
+  name: "zkvote_shared_rate_limit_decisions_total",
+  help: "Decisions made by the shared atomic token-bucket limiter",
+  labelNames: ["type", "result"] as const,
+  registers: [register],
+});
+
+export const quotaOverridesReloadedTotal = new Counter({
+  name: "zkvote_quota_overrides_reloaded_total",
+  help: "Live quota overrides reloaded from admin config into the limiter",
+  registers: [register],
+});
+
+export const randomnessOperationsTotal = new Counter({
+  name: "zkvote_randomness_operations_total",
+  help: "Randomness seed/contribute/finalize/verify outcomes",
+  labelNames: ["operation", "result"] as const,
+  registers: [register],
+});
+
+export const circuitRegistryOperationsTotal = new Counter({
+  name: "zkvote_circuit_registry_operations_total",
+  help: "On-chain circuit registry reads/writes and fail-closed rejections",
+  labelNames: ["operation", "result"] as const,
+  registers: [register],
+});
+
+export const durableRecoveriesTotal = new Counter({
+  name: "zkvote_durable_recoveries_total",
+  help: "Durable jobs resumed after a restart or stale heartbeat",
+  labelNames: ["operation", "result"] as const,
+  registers: [register],
+});
+
 export const session_store_size = new Gauge({
   name: "zkvote_session_store_size",
   help: "Current number of active authenticated relay sessions stored in memory or db",
@@ -1439,6 +1498,38 @@ export interface CardinalityAuditResult {
     labels?: string[];
   }>;
 }
+
+// ============================================
+// WEBHOOK DELIVERY SUBSYSTEM METRICS (ZV-036)
+// ============================================
+
+export const webhookQueueDepth = new Gauge({
+  name: "zkvote_webhook_queue_depth",
+  help: "Current number of pending events in webhook outbox queue",
+  registers: [register],
+});
+
+export const webhookAttemptsTotal = new Counter({
+  name: "zkvote_webhook_attempts_total",
+  help: "Total webhook delivery attempts",
+  labelNames: ["status", "event_type"] as const,
+  registers: [register],
+});
+
+export const webhookDeadLetterTotal = new Counter({
+  name: "zkvote_webhook_dead_letter_total",
+  help: "Total webhook events moved to dead-letter queue",
+  labelNames: ["event_type"] as const,
+  registers: [register],
+});
+
+export const webhookDeliveryDuration = new Histogram({
+  name: "zkvote_webhook_delivery_duration_seconds",
+  help: "Webhook delivery HTTP request duration in seconds",
+  labelNames: ["status"] as const,
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+});
 
 /**
  * Audits the registry against cardinality governance rules: no prohibited

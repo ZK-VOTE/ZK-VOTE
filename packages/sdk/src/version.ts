@@ -150,3 +150,28 @@ export async function checkCircuitVersion(
     usedFallback: false,
   })
 }
+
+/**
+ * Semver and circuit lifecycle policy specification (ZV-033)
+ */
+export const SEMVER_POLICY = {
+  MAJOR: 'Breaking API changes or dropping circuit version N-1 compatibility',
+  MINOR: 'Backwards-compatible features or adding support for new circuit version N+1',
+  PATCH: 'Backwards-compatible bug fixes and internal performance optimizations',
+} as const
+
+export const DEPRECATION_POLICY = {
+  SUPPORTED_WINDOW: 'Current circuit version (N) and immediately prior version (N-1)',
+  DEPRECATION_WARNING_WINDOW: 'N-1 circuit fallback with warning notification',
+  UNSUPPORTED_ACTION: 'Refuse proof generation with UnsupportedCircuitVersionError',
+  DEPRECATION_CYCLE_DAYS: 90,
+} as const
+
+/**
+ * Validates whether a given tarball hex checksum matches the expected manifest hash.
+ */
+export function verifyChecksum(actualHex: string, expectedHex: string): boolean {
+  if (!actualHex || !expectedHex) return false
+  return actualHex.toLowerCase().trim() === expectedHex.toLowerCase().trim()
+}
+

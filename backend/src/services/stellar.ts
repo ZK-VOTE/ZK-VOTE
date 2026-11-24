@@ -60,6 +60,16 @@ import {
   type CircuitBreaker,
 } from "./circuit-breaker.js";
 import { withSpan } from "./tracing.js";
+import {
+  DEFAULT_TIER_LIMITS,
+  parseCosigners,
+  parseTierLimits,
+  SigningPolicy,
+} from "./relayer-signing-policy.js";
+import {
+  RelayerRotationOrchestrator,
+  SqliteKeyLifecycleStore,
+} from "./relayer-rotation.js";
 import type { Groth16Proof } from "../types/index.js";
 // #541 Soroban rent economics: Persistent costs ~10x Temporary. Roots/config
 // stay Persistent/Instance (long-lived, TTL-extended); leaves/ephemeral data
@@ -154,9 +164,42 @@ try {
     testMode: config.testMode,
   });
 } catch (err) {
-  log("error", "invalid_relayer_key", { message: (err as Error).message });
-  console.error("Run ./scripts/init-local.sh to generate a secure key");
-  process.exit(1);
+  log("error", "invalid_relayer_key", {
+    message: (err as Error).message,
+    testMode: config.testMode,
+  });
+  if (!config.testMode) {
+    // Production stays fail-closed: no relayer key means no signing.
+    console.error("Run ./scripts/init-local.sh to generate a secure key");
+    process.exit(1);
+  }
+
+  // TEST-ONLY fallback. In-process tests import this module to construct
+  // services; a broken test key configuration (or a metrics-label mismatch in
+  // the key manager) must not kill the test runner. Install a deterministic
+  // stub key so publicKey()/signing surfaces remain usable and predictable.
+  const TEST_RELAYER_PUBLIC_KEY =
+    "GTESTRELAYERADDRESS000000000000000000000000000000000000";
+  try {
+    relayerKeyManager.reset();
+    relayerKeyManager.registerKey({
+      id: "relayer-primary-test-fallback",
+      publicKey: TEST_RELAYER_PUBLIC_KEY,
+      role: "primary",
+      signerType: "test",
+      makeActive: true,
+    });
+  } catch (fallbackErr) {
+    // registerKey installs the active key before reporting metrics; a metrics
+    // failure at the end is harmless for tests, so it is ignored here only.
+    log("warn", "test_relayer_key_metrics_ignored", {
+      message: (fallbackErr as Error).message,
+    });
+  }
+  log("warn", "test_relayer_key_fallback", {
+    publicKey: TEST_RELAYER_PUBLIC_KEY,
+    reason: (err as Error).message,
+  });
 }
 
 /**

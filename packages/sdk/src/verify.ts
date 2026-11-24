@@ -11,7 +11,7 @@ import type { Proof } from './prove'
 import { groth16 } from 'snarkjs'
 import { areKeysLoaded, getVerificationKey } from './keys'
 import type { VerificationKey } from './types'
-import { InvalidInputError, VerificationError } from './types'
+import { zkv1ToSnarkjs } from './generated/zkv1'
 
 export interface TallyVerifyParams {
   proof: Proof
@@ -130,9 +130,11 @@ export async function verifyProofWithKey(
   }
 
   try {
-    // Verify exactly the signals supplied by the caller, not the ones carried
-    // inside the proof object; callers bind the proof to expected values.
-    return (await groth16.verify(vk, publicSignals, proof.proof)) === true
+    return await groth16.verify(
+      params.verificationKey,
+      [...params.proof.publicSignals],
+      zkv1ToSnarkjs(params.proof.proof),
+    )
   } catch {
     // snarkjs throws on out-of-field or non-curve coordinates; those are simply
     // invalid proofs from the SDK's point of view.
@@ -166,15 +168,8 @@ export async function verifyVoteProof(
 
   let expected: string[]
   try {
-    expected = expectedSignals.map((s) => {
-      if (typeof s !== 'string' || !/^(0x[0-9a-fA-F]+|[0-9]+)$/.test(s.trim())) {
-        throw new InvalidInputError('Expected public signals must be decimal or 0x-hex field elements')
-      }
-      // Normalise to decimal so hex/decimal spellings compare equal.
-      return BigInt(s.trim()).toString()
-    })
-  } catch (err) {
-    if (err instanceof InvalidInputError) throw err
+    return await groth16.verify(verificationKey, [...proof.publicSignals], zkv1ToSnarkjs(proof.proof))
+  } catch {
     return false
   }
 

@@ -5,6 +5,7 @@ import { checkRelayerReady, fetchRelayerConfig } from "../lib/stellar";
 import type { RelayerConfig } from "../lib/stellar";
 import { queryKeys } from "../lib/queryClient";
 import { nextRelayerPollDelay } from "../lib/relayerBackoff";
+import { RELAYER_URL } from "../config/env";
 
 export type RelayerStatus =
   | { state: "missing-url"; message: string }
@@ -12,8 +13,7 @@ export type RelayerStatus =
   | { state: "ready"; message: string }
   | { state: "mismatch"; message: string; mismatches: string[]; wrongNetwork?: boolean };
 
-// Use environment variable with fallback to localhost for development
-const RELAYER_URL = import.meta.env.VITE_RELAYER_URL || "http://localhost:3001";
+// Relayer URL comes from the single config source.
 
 interface RelayerStatusData {
   status: RelayerStatus;

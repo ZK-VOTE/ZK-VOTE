@@ -135,16 +135,32 @@ jobs:
         run: npm run type-check
       - name: CSP origin-policy parity
         run: npm run csp:check
+      - name: Protocol bindings are reproducible
+        # Generated bindings are checked in. Regenerating them from the single
+        # manifest must produce no diff; otherwise CI fails with a hint to run
+        # `npm run protocol:generate` (or `npm run drift:fix`).
+        working-directory: .
+        run: |
+          npm run protocol:generate
+          if ! git diff --exit-code -- frontend/src/generated/zkv1.ts backend/src/generated/zkv1.ts packages/sdk/src/generated/zkv1.ts contracts/zkvote-groth16/src/generated.rs; then
+            echo "::error::Generated protocol bindings are stale. Run 'npm run protocol:generate' and commit the result."
+            exit 1
+          fi
       - name: Drift guard
-        # ZK_VOTE_ALLOW_MISSING_VKEY=1: the vote proving/verification key is
-        # produced by the MPC trusted setup, not by CI, and is deliberately not
-        # committed (see frontend/public/circuits/README.md). Every OTHER public
-        # signal check still applies and still fails the build — including the
-        # circuit/contract/frontend count agreement and the IC-length check on
-        # any key that is present.
+        # The vote proving/verification key is produced by the MPC trusted setup,
+        # not by CI, and is deliberately not committed. The guard warns about its
+        # absence but still enforces signal order/count across circuit, contract,
+        # frontend and generated bindings. Pipelines that produce the key set
+        # ZK_VOTE_REQUIRE_VKEY=1 to make its absence fatal.
         env:
           ZK_VOTE_ALLOW_MISSING_VKEY: "1"
         run: npm run drift:check
+      - name: Drift guard self-tests
+        working-directory: .
+        run: npm run test:drift
+      - name: Upgrade/migration chaos drill
+        working-directory: .
+        run: npm run test:upgrade-drill
       - name: Lint (includes JSDoc validation)
         run: npm run lint
       - name: Format check
@@ -393,3 +409,33 @@ jobs:
           path: |
             frontend/public/circuits/
           retention-days: 7
+
+  sdk:
+    name: SDK Package & Compatibility
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+          cache-dependency-path: packages/sdk/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify circuit compatibility matrix
+        run: |
+          npm run check:compatibility
+      - name: Build SDK
+        run: npm run build
+      - name: Generate and verify artifact checksum manifest
+        run: |
+          npm run manifest:generate
+          npm run manifest:verify
+      - name: Run SDK tests
+        run: npm test
+      - name: Dry-run publish
+        run: npm run publish:dry-run
+

@@ -22,40 +22,49 @@ const config = require("./config.json");
 /**
  * Fetch latest Bitcoin block hash or hash at specific height as entropy
  */
-async function fetchBitcoinBlockHash(blockHeight) {
+async function fetchBitcoinBlockHash(blockHeight, allowSystemEntropy = false) {
   try {
     if (blockHeight) {
-      const resp = await axios.get(`https://blockchain.info/block-height/${blockHeight}?format=json`);
+      const resp = await axios.get(`https://blockchain.info/block-height/${blockHeight}?format=json`, { timeout: 10000 });
       if (resp.data && resp.data.blocks && resp.data.blocks[0]) {
         return resp.data.blocks[0].hash;
       }
     } else {
-      const resp = await axios.get("https://blockchain.info/q/latesthash");
+      const resp = await axios.get("https://blockchain.info/q/latesthash", { timeout: 10000 });
       if (resp.data) {
         return resp.data.trim();
       }
     }
   } catch (err) {
-    console.warn(`[Beacon] Could not reach blockchain.info (${err.message}), falling back to drand/urandom.`);
+    console.warn(`[Beacon] Could not reach blockchain.info (${err.message}), trying drand fallback...`);
   }
 
-  // Fallback to drand or urandom
+  // Fallback to drand
   try {
-    const drandResp = await axios.get("https://api.drand.sh/public/latest");
+    const drandResp = await axios.get("https://api.drand.sh/public/latest", { timeout: 10000 });
     if (drandResp.data && drandResp.data.randomness) {
       return drandResp.data.randomness;
     }
   } catch (err) {
-    console.warn(`[Beacon] Could not reach drand (${err.message}), using system entropy.`);
+    console.warn(`[Beacon] Could not reach drand (${err.message}).`);
   }
 
-  return crypto.randomBytes(32).toString("hex");
+  if (allowSystemEntropy) {
+    console.warn("[Beacon] Explicit fallback to system entropy (--allow-system-entropy active).");
+    return crypto.randomBytes(32).toString("hex");
+  }
+
+  throw new Error(
+    "External beacon entropy sources unavailable (blockchain.info and drand unreachable). " +
+    "A public verifiable beacon is required for production finalization. " +
+    "For local testing only, supply an explicit beacon hash or pass --allow-system-entropy."
+  );
 }
 
 /**
  * Apply random beacon to the final contribution zkey
  */
-async function applyBeacon(transcriptDir, customBeaconHash, numIterations = 10) {
+async function applyBeacon(transcriptDir, customBeaconHash, numIterations = 10, allowSystemEntropy = false) {
   const stateFile = path.join(transcriptDir, "coordinator-state.json");
   let state = {};
   if (fs.existsSync(stateFile)) {
@@ -73,7 +82,7 @@ async function applyBeacon(transcriptDir, customBeaconHash, numIterations = 10) 
   let beaconHash = customBeaconHash;
   if (!beaconHash) {
     console.log("Fetching external random beacon...");
-    beaconHash = await fetchBitcoinBlockHash(config.bitcoinBeaconBlock);
+    beaconHash = await fetchBitcoinBlockHash(config.bitcoinBeaconBlock, allowSystemEntropy);
   }
 
   console.log(`Applying random beacon:`);
@@ -99,7 +108,9 @@ async function applyBeacon(transcriptDir, customBeaconHash, numIterations = 10) 
   state.finalZkeyHash = finalFileHash;
   state.completedAt = Date.now();
 
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  const tempStateFile = `${stateFile}.tmp`;
+  fs.writeFileSync(tempStateFile, JSON.stringify(state, null, 2));
+  fs.renameSync(tempStateFile, stateFile);
 
   console.log("✓ Random beacon successfully applied!");
   console.log(`  Final zkey SHA-256: ${finalFileHash}`);
@@ -116,12 +127,14 @@ program
   .option("--dir <path>", "Transcript directory", "./transcript")
   .option("--beacon <hash>", "Custom beacon hash (e.g. BTC block hash)")
   .option("--iter <number>", "Number of iterations (exponent)", 10)
+  .option("--allow-system-entropy", "Explicitly allow local entropy fallback if external sources fail")
   .action(async (options) => {
     try {
       await applyBeacon(
         path.resolve(options.dir),
         options.beacon,
-        parseInt(options.iter, 10)
+        parseInt(options.iter, 10),
+        Boolean(options.allowSystemEntropy)
       );
     } catch (err) {
       console.error("✗ Failed to apply random beacon:", err.message);

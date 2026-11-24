@@ -35,6 +35,44 @@ services:
     depends_on: [backend]
     networks: [observability]
 
+  prover:
+    build:
+      context: ./backend
+    profiles: ["cpu"]
+    environment:
+      - PROVER_MODE=worker
+      - PROVER_CONCURRENCY=4
+      - PROVER_QUEUE_LIMIT=100
+      - PROVER_TIMEOUT_MS=60000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [observability]
+    restart: unless-stopped
+
+  prover-gpu:
+    build:
+      context: ./backend
+    profiles: ["gpu"]
+    environment:
+      - PROVER_MODE=worker
+      - PROVER_ACCELERATION=cuda
+      - PROVER_CONCURRENCY=8
+      - PROVER_QUEUE_LIMIT=200
+      - PROVER_TIMEOUT_MS=30000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [observability]
+    restart: unless-stopped
+
 networks:
   observability:
     driver: bridge

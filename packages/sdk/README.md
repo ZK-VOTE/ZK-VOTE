@@ -271,6 +271,56 @@ try {
 - Circuit compatibility is enforced
 - Secrets must be 32 bytes and properly generated
 
+## Circuit Compatibility & Semver Policy
+
+SDK versioning strictly follows Semantic Versioning (SemVer) with an enforced circuit compatibility window:
+
+- **Major (X.0.0)**: Breaking API changes, or dropping compatibility for circuit version $N-1$.
+- **Minor (1.X.0)**: Backwards-compatible features or adding support for new circuit version $N+1$.
+- **Patch (1.0.X)**: Non-breaking bug fixes, performance optimizations, or documentation.
+
+### Deprecation Policy
+The SDK supports a rolling $N$ and $N-1$ circuit window relative to the active CircuitRegistry:
+- Active version $N$: Fully supported without warnings.
+- Fallback version $N-1$: Supported with a deprecation warning (`usedFallback: true`) advising an upgrade.
+- Version $N-2$ or older: Proof generation is strictly blocked (`UnsupportedCircuitVersionError`). Circuit deprecations require at least a 90-day grace period.
+
+## Supply Chain Security & Provenance
+
+Every official release of `@zkvote/sdk` is published with cryptographically verifiable npm provenance using GitHub Actions OIDC and Sigstore Cosign:
+
+1. **Verify Provenance Statement**:
+   ```bash
+   npm audit signatures
+   ```
+2. **Verify Tarball & File Checksums**:
+   Checksums for all artifacts are committed to `manifests/manifest.json` and `manifests/checksums.sha256`. Consumers can independently verify tarball and compiled distribution files:
+   ```bash
+   sha256sum -c manifests/checksums.sha256
+   ```
+
+## Rollback & Republish Procedure
+
+If a release artifact is found to be defective or fails circuit verification:
+
+1. **Immediate Staging Verification**:
+   All release tags (`v*` or `@zkvote/sdk@*`) trigger CI dry-run publication and circuit matrix checks in staging before targeting the production npm registry.
+2. **Within 72 Hours (npm Policy)**:
+   If an unpublishable defect is discovered within 72 hours of publication and no dependent packages have adopted it:
+   ```bash
+   npm unpublish @zkvote/sdk@<version>
+   ```
+3. **Deprecation (Standard Production Procedure)**:
+   Per npm registry immutability guidelines, if more than 72 hours have elapsed or downstream consumers exist:
+   ```bash
+   npm deprecate @zkvote/sdk@<version> "Critical issue found. Please upgrade immediately to @zkvote/sdk@<fixed-version>"
+   ```
+4. **Emergency Patch & Republish**:
+   - Create fix branch off the release tag.
+   - Increment semver patch in `packages/sdk/package.json` and `packages/sdk/src/version.ts`.
+   - Re-run `npm run manifest:generate` and `npm run check:compatibility`.
+   - Push new tag (e.g., `v1.0.1`) to trigger automated provenance-signed publishing pipeline.
+
 ## License
 
 MIT

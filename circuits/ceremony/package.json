@@ -19,6 +19,7 @@
   "dependencies": {
     "snarkjs": "0.7.5",
     "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
     "bitcoin-core": "^4.0.0",
     "chalk": "^5.3.0",
     "axios": "^1.6.0",
