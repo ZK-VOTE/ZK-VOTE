@@ -1,9 +1,8 @@
 import { useState, useEffect } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { X, Clock, Loader2, Trash2 } from "lucide-react";
 import { Button } from "./ui/Button";
 import { useMounted } from "../hooks/useMounted";
+import SafeMarkdown from "./SafeMarkdown";
 import {
   type CommentWithContent,
   type CommentMetadata,
@@ -119,12 +118,12 @@ export default function RevisionHistory({
         {/* Content */}
         <div className="flex-1 overflow-hidden flex flex-col sm:flex-row">
           {/* Revision list */}
-          <div className="w-full sm:w-48 border-b sm:border-b-0 sm:border-r border-border overflow-x-auto sm:overflow-y-auto shrink-0 flex sm:flex-col">
+          <div className="w-full sm:w-48 border-b sm:border-b-0 sm:border-e border-border overflow-x-auto sm:overflow-y-auto shrink-0 flex sm:flex-col">
             {revisions.map((revision, index) => (
               <button
                 key={revision.cid || `deleted-${index}`}
                 onClick={() => setSelectedIndex(index)}
-                className={`flex-1 sm:flex-none px-4 py-3 min-h-[48px] text-left border-r sm:border-r-0 border-b-0 sm:border-b border-border hover:bg-muted/50 transition-colors shrink-0 ${
+                className={`flex-1 sm:flex-none px-4 py-3 min-h-[48px] text-start border-e sm:border-e-0 border-b-0 sm:border-b border-border hover:bg-muted/50 transition-colors shrink-0 ${
                   selectedIndex === index ? "bg-muted font-medium" : ""
                 }`}
               >
@@ -203,11 +202,7 @@ export default function RevisionHistory({
                     </span>
                   )}
                 </div>
-                <div className="prose prose-sm dark:prose-invert max-w-none">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {selectedRevision.content.body}
-                  </ReactMarkdown>
-                </div>
+                <SafeMarkdown source={selectedRevision.content.body} />
               </div>
             ) : (
               <p className="text-muted-foreground text-sm">

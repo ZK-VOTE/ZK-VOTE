@@ -223,6 +223,14 @@ pub struct CommentDeletedEvent {
     pub proposal_id: u64,
     pub comment_id: u64,
     pub deleted_by: u32,
+    /// SHA-256 hash of the deletion reason string (admin deletions only).
+    ///
+    /// For user self-deletions this is all-zeros.  For admin deletions the
+    /// admin must supply a reason; the hash is committed on-chain so the
+    /// reason can be verified later without leaking it at deletion time.
+    /// Off-chain tooling should publish the pre-image to a transparency log
+    /// once moderation review is complete (see `docs/moderation-policy.md`).
+    pub reason_hash: soroban_sdk::BytesN<32>,
 }
 
 #[soroban_sdk::contractevent]
@@ -989,6 +997,7 @@ impl Comments {
             proposal_id,
             comment_id,
             deleted_by: DELETED_BY_USER,
+            reason_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         }
         .publish(&env);
     }
@@ -1072,21 +1081,37 @@ impl Comments {
             proposal_id,
             comment_id,
             deleted_by: DELETED_BY_USER,
+            reason_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         }
         .publish(&env);
     }
 
-    /// Admin delete any comment
+    /// Admin delete any comment.
+    ///
+    /// `reason_hash` must be the SHA-256 hash of the human-readable deletion
+    /// reason.  The hash is committed on-chain in the `CommentDeletedEvent` so
+    /// that moderator actions are auditable without revealing the reason at the
+    /// time of deletion (the pre-image is published to the transparency log
+    /// after the moderation window closes — see `docs/moderation-policy.md`).
+    /// Passing an all-zeros hash is rejected to enforce that admins always
+    /// supply a reason.
     pub fn admin_delete_comment(
         env: Env,
         dao_id: u64,
         proposal_id: u64,
         comment_id: u64,
         admin: Address,
+        reason_hash: soroban_sdk::BytesN<32>,
     ) {
         Self::bump_instance(&env);
         admin.require_auth();
         Self::assert_admin(&env, dao_id, &admin);
+
+        // Reject an all-zeros reason hash: admins must supply a real reason.
+        let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        if reason_hash == zero_hash {
+            panic_with_error!(&env, CommentsError::InvalidInput);
+        }
 
         let key = DataKey::Comment(dao_id, proposal_id, comment_id);
         let mut comment: CommentInfo = env
@@ -1111,6 +1136,7 @@ impl Comments {
             proposal_id,
             comment_id,
             deleted_by: DELETED_BY_ADMIN,
+            reason_hash,
         }
         .publish(&env);
     }
@@ -1937,8 +1963,15 @@ mod test {
         let comment_id =
             comments_client.add_comment(&dao_id, &proposal_id, &content_cid, &None, &member);
 
-        // Admin deletes member's comment
-        comments_client.admin_delete_comment(&dao_id, &proposal_id, &comment_id, &admin);
+        // Admin deletes member's comment (supply a non-zero reason hash)
+        let reason_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+        comments_client.admin_delete_comment(
+            &dao_id,
+            &proposal_id,
+            &comment_id,
+            &admin,
+            &reason_hash,
+        );
 
         let comment = comments_client.get_comment(&dao_id, &proposal_id, &comment_id);
         assert!(comment.deleted);
@@ -2108,7 +2141,14 @@ mod test {
             comments_client.add_comment(&dao_id, &proposal_id, &content_cid, &None, &member);
 
         // Non-admin tries to admin-delete
-        comments_client.admin_delete_comment(&dao_id, &proposal_id, &comment_id, &non_admin);
+        let reason_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+        comments_client.admin_delete_comment(
+            &dao_id,
+            &proposal_id,
+            &comment_id,
+            &non_admin,
+            &reason_hash,
+        );
     }
 
     // ========================================================================

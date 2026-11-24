@@ -672,7 +672,7 @@ export default function DAOInfoPanel({
                       Object.keys(event.data).length > 0 &&
                       !hasChanges && (
                         <p className="text-xs text-muted-foreground truncate">
-                          {formatEventData(event.data)}
+                          <bdi dir="auto">{formatEventData(event.data)}</bdi>
                         </p>
                       )}
                     {hasChanges && event.data.changes && (
@@ -687,7 +687,7 @@ export default function DAOInfoPanel({
                       </button>
                     )}
                   </div>
-                  <div className="text-xs text-muted-foreground text-right">
+                  <div className="text-xs text-muted-foreground text-end">
                     <p>
                       Ledger{" "}
                       {typeof event.ledger === "number" && !isNaN(event.ledger)

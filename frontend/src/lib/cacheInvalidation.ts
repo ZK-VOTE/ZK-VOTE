@@ -262,26 +262,109 @@ export async function clearAllQueryCaches(): Promise<InvalidationResult> {
 }
 
 /**
+ * Invalidate claim-related queries
+ * Use after: Claim submission, status changes
+ * Addresses ZV-125: Cache invalidation consistency
+ */
+export async function invalidateClaimQueries(
+  daoId: number,
+  proposalId?: number,
+): Promise<InvalidationResult> {
+  const keys: QueryKey[] = [];
+
+  if (proposalId !== undefined) {
+    // Invalidate specific claim status queries for this proposal
+    await queryClient.invalidateQueries({
+      predicate: (query) =>
+        Array.isArray(query.queryKey) &&
+        query.queryKey[0] === "claim" &&
+        query.queryKey[1] === "status" &&
+        query.queryKey[2] === daoId &&
+        query.queryKey[3] === proposalId,
+    });
+  } else {
+    // Invalidate all claim queries for this DAO
+    await queryClient.invalidateQueries({
+      predicate: (query) =>
+        Array.isArray(query.queryKey) &&
+        query.queryKey[0] === "claim" &&
+        query.queryKey[2] === daoId,
+    });
+  }
+
+  // Invalidate treasury
+  await queryClient.invalidateQueries({
+    queryKey: queryKeys.claim.treasury(daoId),
+  });
+  keys.push(queryKeys.claim.treasury(daoId));
+
+  if (import.meta.env.DEV) {
+    console.log(
+      `[Cache] Invalidated ${keys.length} claim-related queries`,
+      keys,
+    );
+  }
+
+  return {
+    keys,
+    count: keys.length,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
  * Invalidation after successful vote submission
  * Cascades through all related data
+ * Enhanced for ZV-125: Now invalidates claim queries too
  */
 export async function invalidateAfterVote(
   daoId: number,
   proposalId: number,
 ): Promise<InvalidationResult> {
   const proposalResult = await invalidateProposalQueries(daoId, proposalId);
+  const claimResult = await invalidateClaimQueries(daoId, proposalId);
+  
   await queryClient.invalidateQueries({
     queryKey: queryKeys.dao.info(daoId),
   });
   const daoKey = queryKeys.dao.info(daoId);
-  const totalCount = proposalResult.count + 1;
+  const totalCount = proposalResult.count + claimResult.count + 1;
 
   if (import.meta.env.DEV) {
     console.log(`[Cache] Post-vote invalidation: ${totalCount} queries`);
   }
 
   return {
-    keys: [...proposalResult.keys, daoKey],
+    keys: [...proposalResult.keys, ...claimResult.keys, daoKey],
+    count: totalCount,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Invalidation after successful claim submission
+ * New for ZV-125: Handles claim-specific cache invalidation
+ */
+export async function invalidateAfterClaim(
+  daoId: number,
+  proposalId: number,
+): Promise<InvalidationResult> {
+  const claimResult = await invalidateClaimQueries(daoId, proposalId);
+  
+  // Also invalidate proposal details (treasury may have changed)
+  await queryClient.invalidateQueries({
+    queryKey: queryKeys.proposals.detail(daoId, proposalId),
+  });
+  const proposalKey = queryKeys.proposals.detail(daoId, proposalId);
+  
+  const totalCount = claimResult.count + 1;
+
+  if (import.meta.env.DEV) {
+    console.log(`[Cache] Post-claim invalidation: ${totalCount} queries`);
+  }
+
+  return {
+    keys: [...claimResult.keys, proposalKey],
     count: totalCount,
     timestamp: new Date().toISOString(),
   };
@@ -385,7 +468,9 @@ export function useInvalidationHelpers() {
     invalidateMembershipQueries,
     invalidateCommentQueries,
     invalidateRelayerQueries,
+    invalidateClaimQueries,
     invalidateAfterVote,
+    invalidateAfterClaim,
     invalidateAfterDaoCreation,
     clearAllQueryCaches,
     debugQueryCache,

@@ -4,7 +4,7 @@
  */
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config.js";
-import { relayerKeypair, withSequenceLock } from "./stellar.js";
+import { relayerKeypair, withPaymentSequenceLock } from "./stellar.js";
 import { relayerKeyManager } from "./relayerKeyManager.js";
 import { log } from "./logger.js";
 import { getDb } from "./db.js";
@@ -26,6 +26,12 @@ import {
   horizonStroopsToSorobanAmount,
   parseStroops,
 } from "../utils/stellarAmount.js";
+import {
+  estimateFee,
+  recordTransactionFee,
+  assessRelayerReserve,
+  shouldThrottleOperations,
+} from "./relayer-fee-economics.js";
 
 // ── Horizon endpoint pool (#745) ─────────────────────────────────────────
 //
@@ -321,7 +327,7 @@ export async function ensureRelayerTrustline(
     throw new Error(`${assetCode} relayer trustline is awaiting issuer authorization`);
   }
 
-  await withSequenceLock(async () => {
+  await withPaymentSequenceLock(async () => {
     const account = await loadAccount(relayer, "consistent_read");
     const tx = new StellarSdk.TransactionBuilder(account, {
       fee: "10000",
@@ -390,7 +396,7 @@ export async function sendPayment(op: PaymentOp): Promise<{ hash: string }> {
   }
   // Build + sign + submit hold the sequence lock so a concurrent payment or a
   // key rotation cannot interleave on the relayer's sequence number.
-  return withSequenceLock(async () => {
+  return withPaymentSequenceLock(async () => {
     const account = await loadAccount(relayerKeypair.publicKey(), "consistent_read");
     const tx = new StellarSdk.TransactionBuilder(account, {
       fee: "10000",
@@ -514,11 +520,31 @@ export async function sendBatch(
     throw err;
   }
 
+  // SPIKE-760: Reserve defense + surge-aware fee estimation
+  const relayerAccount = await loadAccount(relayerKeypair.publicKey(), "consistent_read");
+  const relayerBalance = parseFloat(
+    relayerAccount.balances.find((b: any) => b.asset_type === "native")?.balance || "0",
+  );
+
+  const reserveStatus = await assessRelayerReserve(
+    relayerBalance,
+    sponsorshipReserveXlm,
+    0.1,
+  );
+
+  const feeEstimate = await estimateFee(ops.length, relayerBalance, muxedCount);
+
+  if (await shouldThrottleOperations(reserveStatus, feeEstimate)) {
+    throw new Error(
+      `Batch rejected: ${reserveStatus.status} reserve (${relayerBalance.toFixed(2)} XLM) + ${feeEstimate.networkStatus} network. Try again with fewer ops or higher batch size for better fees.`,
+    );
+  }
+
   // The whole batch build + sign + submit holds the sequence lock.
-  return withSequenceLock(async () => {
+  return withPaymentSequenceLock(async () => {
     const account = await loadAccount(relayerKeypair.publicKey(), "consistent_read");
     const builder = new StellarSdk.TransactionBuilder(account, {
-      fee: (10000 * ops.length).toString(),
+      fee: feeEstimate.recommendedForOps.toString(),
       networkPassphrase: config.networkPassphrase,
     });
     for (const op of ops) {
@@ -534,60 +560,25 @@ export async function sendBatch(
     const tx = builder.setTimeout(30).build();
     await relayerKeyManager.signTransaction(tx);
     const res: any = await submitToHorizon(tx);
-    log("info", "batch_sent", { ops: ops.length, hash: res.hash });
+    log("info", "batch_sent", {
+      ops: ops.length,
+      hash: res.hash,
+      feePerOp: feeEstimate.baseFee,
+      surgeMultiplier: feeEstimate.surgeMultiplier,
+      reserveStatus: reserveStatus.status,
+    });
+
+    // Record fee for historical tracking
+    await recordTransactionFee(
+      res.hash,
+      feeEstimate.baseFee,
+      ops.length,
+      feeEstimate.recommendedForOps,
+    );
+
     if (muxedCount > 0) noteSponsorshipCreated(muxedCount);
     return { hash: res.hash, ops: ops.length };
   });
-  const account = await (horizonServer as any).loadAccount(
-    relayerKeypair.publicKey(),
-  );
-  const builder = new StellarSdk.TransactionBuilder(account, {
-    fee: (10000 * ops.length).toString(),
-    networkPassphrase: config.networkPassphrase,
-  });
-  for (const op of ops) {
-    const asset = getAsset(op.asset);
-    builder.addOperation(
-      StellarSdk.Operation.payment({
-        destination: op.destination,
-        asset,
-        amount: canonicalizeStellarAmount(op.amount),
-      }),
-    );
-  }
-  const tx = builder.setTimeout(30).build();
-  await relayerKeyManager.signTransaction(tx);
-
-  // SPIKE-027: Enhanced error context for batch failures
-  try {
-    const res: any = await (horizonServer as any).submitTransaction(tx);
-    log("info", "batch_sent", { ops: ops.length, hash: res.hash });
-    if (muxedCount > 0) {
-      noteSponsorshipCreated(muxedCount);
-      const { sponsorshipReserveXlm: gauge } = await import("./metrics.js");
-      gauge.set(getSponsorshipReserveXlm());
-    }
-    return { hash: res.hash, ops: ops.length };
-  } catch (e: any) {
-    const data = e.response?.data || e.response?.body || e.message;
-    const extras = (data as any)?.extras;
-    const resultCodes = extras?.result_codes;
-
-    log("error", "batch_payment_failed", {
-      batchSize: ops.length,
-      error: JSON.stringify(data).slice(0, 1000),
-      resultCodes: resultCodes ? JSON.stringify(resultCodes) : undefined,
-    });
-
-    // Provide actionable error message with operation-level detail when available
-    throw new Error(
-      resultCodes
-        ? `Batch payment failed: ${JSON.stringify(resultCodes)}`
-        : typeof data === "string"
-          ? data
-          : JSON.stringify(data).slice(0, 500) || e.message
-    );
-  }
 }
 
 /**
@@ -627,7 +618,7 @@ export async function swapStrictSend(
       await assertDestinationTrustline(destination, destAsset);
     }
   }
-  return withSequenceLock(async () => {
+  return withPaymentSequenceLock(async () => {
     const account = await loadAccount(relayerKeypair.publicKey(), "consistent_read");
     const tx = new StellarSdk.TransactionBuilder(account, {
       fee: "10000",

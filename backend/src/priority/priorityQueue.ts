@@ -30,6 +30,8 @@ interface PriorityQueueOptions {
   settings?: Readonly<Record<PriorityTier, TierSettings>>;
   starvationThresholdMs?: number;
   onStarvation?: (event: PriorityStarvationEvent) => void;
+  /** Called after each drain pass with the current depth of every tier. */
+  onDepthChange?: (snapshot: QueueDepthSnapshot[]) => void;
 }
 
 export class RequestTimeoutError extends Error {
@@ -47,22 +49,28 @@ export class RequestTimeoutError extends Error {
 export class PriorityQueue {
   private readonly queues: Record<PriorityTier, QueueItem<unknown>[]> = {
     [PriorityTier.CRITICAL]: [],
+    [PriorityTier.HIGH]: [],
+    [PriorityTier.NORMAL]: [],
     [PriorityTier.LOW]: [],
   };
 
   private readonly inFlight: Record<PriorityTier, number> = {
     [PriorityTier.CRITICAL]: 0,
+    [PriorityTier.HIGH]: 0,
+    [PriorityTier.NORMAL]: 0,
     [PriorityTier.LOW]: 0,
   };
 
   private readonly settings: Readonly<Record<PriorityTier, TierSettings>>;
   private readonly starvationThresholdMs: number;
   private readonly onStarvation?: (event: PriorityStarvationEvent) => void;
+  private readonly onDepthChange?: (snapshot: QueueDepthSnapshot[]) => void;
 
   constructor(options: PriorityQueueOptions = {}) {
     this.settings = options.settings ?? TIER_SETTINGS;
     this.starvationThresholdMs = options.starvationThresholdMs ?? 1_000;
     this.onStarvation = options.onStarvation;
+    this.onDepthChange = options.onDepthChange;
   }
 
   enqueue<T>(
@@ -110,6 +118,8 @@ export class PriorityQueue {
           });
       }
     }
+
+    this.onDepthChange?.(this.getQueueDepths());
   }
 
   getQueueDepths(): QueueDepthSnapshot[] {

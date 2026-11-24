@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./IGroth16Verifier.sol";
+
 /**
  * @title ZKVote Bridge Contract
  * @notice Verifies Groth16 proofs for cross-chain voting from Ethereum
@@ -74,6 +76,15 @@ contract Bridge {
     /// @notice Admin who can propose verifier changes and transfer admin
     address public admin;
 
+    /// @notice Address pending acceptance of the admin role (#650 two-step transfer)
+    address public pendingAdmin;
+
+    /// @notice Address authorized to post SBT/vote roots (in addition to admin)
+    address public rootUpdater;
+
+    /// @notice Vote tally roots per DAO+proposal (posted by rootUpdater)
+    mapping(uint256 => mapping(uint256 => uint256)) public voteRoots; // daoId => proposalId => voteRoot
+
     /// @notice Minimum confirmation depth before a posted SBT root is accepted.
     uint256 public finalityDepth;
 
@@ -105,6 +116,8 @@ contract Bridge {
     error TimelockNotElapsed();
     error NoPendingVerifier();
     error ChainIdMismatch();
+    error VoteRootNotSet();
+    error VoteRootMismatch();
 
     // ============================================
     // CONSTRUCTOR
@@ -119,6 +132,7 @@ contract Bridge {
         verifier = _verifier;
         sbtContractAddr = _sbtContractAddr;
         admin = msg.sender;
+        rootUpdater = msg.sender;
         finalityDepth = 0;
         chainId = block.chainid;
     }
@@ -182,8 +196,7 @@ contract Bridge {
     }
 
     /**
-     * @notice Transfer admin role
-     * @param newAdmin Address of the new admin
+     * @notice Post a new vote tally root for a DAO proposal
      */
     function updateVoteRoot(
         uint256 daoId,
@@ -196,6 +209,9 @@ contract Bridge {
         emit VoteRootUpdated(daoId, proposalId, voteRoot, block.number);
     }
 
+    /**
+     * @notice Set the address authorized to post SBT/vote roots
+     */
     function setRootUpdater(address newRootUpdater) external {
         if (msg.sender != admin) revert OnlyAdmin();
         if (newRootUpdater == address(0)) revert InvalidAddress();
@@ -205,6 +221,7 @@ contract Bridge {
 
     /**
      * @notice Start two-step admin transfer (#650)
+     * @param newAdmin Address of the new admin
      */
     function transferAdmin(address newAdmin) external {
         if (msg.sender != admin) revert OnlyAdmin();
@@ -255,6 +272,13 @@ contract Bridge {
 
         if (sbtRoots[daoId] == 0) revert SbtRootNotSet();
         if (sbtRoot != sbtRoots[daoId]) revert SbtRootNotSet();
+
+        // Vote root must be anchored to a value previously posted by the root
+        // updater; otherwise an attacker could submit a proof against an
+        // arbitrary, unanchored vote tree.
+        uint256 anchoredVoteRoot = voteRoots[daoId][proposalId];
+        if (anchoredVoteRoot == 0) revert VoteRootNotSet();
+        if (voteRoot != anchoredVoteRoot) revert VoteRootMismatch();
 
         // Enforce confirmation depth to prevent replaying against unfinalized roots.
         if (block.number < sbtRootBlock[daoId] + finalityDepth) {
@@ -327,14 +351,13 @@ contract Bridge {
         uint256[2] memory c,
         uint256[9] memory publicSignals
     ) internal view returns (bool) {
+        // abi.encodeCall type-checks this call against IGroth16Verifier at
+        // compile time, so the verifier interface (and its 9 public signals,
+        // matching bridge.circom) cannot drift from what Bridge sends (#887).
+        // A low-level staticcall keeps the check fail-closed: a reverting or
+        // malformed verifier yields "invalid", never a revert path.
         (bool success, bytes memory result) = verifier.staticcall(
-            abi.encodeWithSignature(
-                "verifyProof(uint256[2],uint256[2][2],uint256[2],uint256[9])",
-                a,
-                b,
-                c,
-                publicSignals
-            )
+            abi.encodeCall(IGroth16Verifier.verifyProof, (a, b, c, publicSignals))
         );
 
         if (!success || result.length < 32) return false;

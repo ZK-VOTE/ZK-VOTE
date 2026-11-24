@@ -44,6 +44,11 @@ pub enum RegistryError {
     VkProposalInvalidQuorum = 15,
     VkProposalAlreadyCancelled = 16,
     NotAdmin = 17,
+    /// #726: Circuit registration rejected because no ceremony transcript hash
+    /// was provided. Every new circuit artifact must be backed by an auditable
+    /// trusted-setup transcript whose SHA-256 hash is recorded on-chain so
+    /// downstream verifiers can trace the VK to the ceremony.
+    MissingCeremonyProvenance = 18,
 }
 
 #[contracttype]
@@ -64,6 +69,17 @@ pub struct CircuitInfo {
     pub registered_at: u64,
     pub expiration: u64,
     pub num_public_signals: u32,
+    /// #726 — SHA-256 hash of the MPC trusted-setup ceremony transcript that
+    /// produced the parameters embedded in `vk`. Computed by
+    /// `circuits/ceremony/verify-ceremony.js` and stored here so any party can
+    /// independently verify that the on-chain VK matches the published
+    /// transcript without re-running the full ceremony.
+    ///
+    /// `None` is rejected by `register_circuit` for new registrations; it is
+    /// kept optional in the storage type only to preserve backward
+    /// compatibility with circuit records written by earlier versions of this
+    /// contract that pre-date this field.
+    pub ceremony_transcript_hash: Option<BytesN<32>>,
 }
 
 #[contracttype]
@@ -284,9 +300,20 @@ impl CircuitRegistry {
         wasm_hash: BytesN<32>,
         expiration: u64,
         num_public_signals: u32,
+        // #726: SHA-256 hash of the MPC ceremony transcript (output of
+        // `circuits/ceremony/verify-ceremony.js`). Required for all new
+        // circuit registrations; absent provenance is rejected so that
+        // downstream verifiers can always trace any on-chain VK back to
+        // its trusted-setup ceremony.
+        ceremony_transcript_hash: Option<BytesN<32>>,
     ) {
         Self::bump_instance(&env);
         Self::assert_governance(&env);
+
+        // #726: reject registration without ceremony provenance.
+        if ceremony_transcript_hash.is_none() {
+            panic_with_error!(&env, RegistryError::MissingCeremonyProvenance);
+        }
 
         let key = DataKey::Circuit(circuit_id.clone(), circuit_type);
         if env.storage().persistent().has(&key) {
@@ -301,6 +328,7 @@ impl CircuitRegistry {
             registered_at: env.ledger().timestamp(),
             expiration,
             num_public_signals,
+            ceremony_transcript_hash,
         };
 
         env.storage().persistent().set(&key, &circuit);

@@ -121,6 +121,29 @@ const TEMPORARY_TTL_THRESHOLD: u32 = 51_840; // ~3 days
                                              // in Temporary storage at all.)
 const TEMPORARY_TTL_EXTEND_BASE: u32 = 259_200;
 
+// ── Storage TTL and rent enforcement (ZV-032 / #881) ───────────────────────
+pub const DEFAULT_TTL_BUDGET_PER_PERIOD: u32 = 10_000;
+pub const DEFAULT_TTL_PERIOD_LEDGERS: u32 = 17_280; // ~24h at 5s/ledger
+pub const MIN_TTL_BUMP_COST: u32 = 10;
+
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum TtlPriority {
+    Critical = 0, // Governance & Active Voting State
+    Standard = 1, // Settled proposals, checkpoints, tallies
+    Low = 2,      // Archival & auxiliary state
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlExtensionBudget {
+    pub max_budget: u32,
+    pub consumed_budget: u32,
+    pub period_start_ledger: u32,
+    pub period_length_ledgers: u32,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum VotingError {
@@ -256,18 +279,41 @@ pub enum VotingError {
     InvalidRelayerAddress = 92,
     /// Verification key has not been attested by an MPC ceremony transcript
     VkNotAttested = 93,
+
+    // ── Encrypted-tally path (vote-choice privacy) ─────────────────────────
+    /// Proposal is not configured for encrypted tallying
+    EncryptedTallyNotConfigured = 94,
+    /// Encrypted-vote verification key has not been registered for this DAO
+    EncryptedVkNotSet = 95,
+    /// Encrypted tally has already been finalized
+    EncryptedTallyAlreadyFinalized = 96,
+    /// The proposal is still open or has no deadline
+    EncryptedTallyNotReady = 97,
+    /// Ciphertext point is malformed or not on Baby Jubjub
+    InvalidCiphertext = 98,
+    /// Proof was built for a different registry epoch
+    EpochMismatch = 99,
+    /// Epoch is older than the grace window allows
+    EpochStale = 107,
+    /// Fewer than `threshold` ceremony authorities approved the tally
+    InsufficientCeremonyApprovals = 108,
+    /// An approver is not a configured ceremony authority
+    InvalidCeremonyAuthority = 109,
+
+    // ── Bridge + weighted-balance path (#648) ──────────────────────────────
+    // Placed after 109 to avoid colliding with the encrypted-tally range (94–109).
     /// Caller is not the configured bridge contract (#648)
-    NotBridge = 94,
+    NotBridge = 110,
     /// Bridge contract address has not been configured (#648)
-    BridgeContractNotSet = 95,
+    BridgeContractNotSet = 111,
     /// The weighted ballot's `balanceCommitment` is malformed (zero, or
     /// outside the field)
-    InvalidBalanceCommitment = 96,
+    InvalidBalanceCommitment = 112,
     /// The weighted ballot's `balanceCommitment` is well-formed but the DAO
     /// never pinned it via `set_weighted_balance_commitment`. Without this
     /// check a prover picks the commitment — and therefore the vote weight —
     /// freely, since it is a *public* input of `weighted_vote.circom`.
-    UnknownBalanceCommitment = 97,
+    UnknownBalanceCommitment = 113,
 
     // ── Coarse categories (100–106) ────────────────────────────────────────
     // An anonymous submission collapses to one of these so a relayer cannot
@@ -296,6 +342,46 @@ pub enum VotingError {
     RandomnessCommitClosed = 78,
     RandomnessRevealClosed = 79,
     RandomnessAlreadyCommitted = 80,
+
+    // ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────
+    /// `set_proposal_semantics` is one-shot: a tuple has already been pinned
+    /// for this proposal.
+    SemanticsAlreadyPinned = 114,
+    /// No (semanticsId, semanticsVersion) tuple has been pinned for this
+    /// proposal yet, so there is nothing a universal tally proof can be
+    /// checked against.
+    SemanticsNotPinned = 115,
+    /// The submitted proof's declared (semanticsId, semanticsVersion) does
+    /// not match the tuple pinned for this proposal - rejects a tally
+    /// proven under the wrong proof family before any Groth16 verification
+    /// is attempted (#699).
+    SemanticsMismatch = 116,
+    /// No verification key is registered for this
+    /// (dao_id, semanticsId, semanticsVersion) tuple.
+    SemanticsVkNotSet = 117,
+    /// `semanticsId` is not one of the known universal-tally semantics
+    /// (yes/no, quadratic, weighted).
+    UnknownSemanticsId = 118,
+
+    // ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────
+    /// `tiers` is zero or sets a bit outside the known halt-tier bitmask.
+    InvalidHaltTier = 119,
+    /// Halt-quorum threshold is zero or exceeds the number of configured signers.
+    InvalidHaltQuorum = 120,
+    /// Caller is not one of the configured halt-quorum signers.
+    NotHaltQuorumSigner = 121,
+    /// No halt is currently active (nothing to ratify/resume).
+    HaltNotActive = 122,
+    /// This signer has already approved the pending ratification/resume.
+    DuplicateHaltApproval = 123,
+    /// A fast (unratified) halt may only be stood down by the guardian who
+    /// activated it, not by an arbitrary quorum signer.
+    NotHaltActivator = 124,
+    // ── Storage TTL and rent enforcement (ZV-032 / #881) ───────────────────
+    /// TTL extension budget for this DAO is exhausted or insufficient for this priority.
+    TtlBudgetExceeded = 125,
+    /// Invalid TTL priority level supplied.
+    InvalidTtlPriority = 126,
 }
 
 impl VotingError {
@@ -419,6 +505,16 @@ pub const MAX_VOTE_BATCH: u32 = zkvote_groth16::batch::MAX_BATCH_SIZE;
 ///
 /// IC (inner commitment) vector length for Groth16 VK = num_public_inputs + 1
 const NUM_PUBLIC_SIGNALS: u32 = 6;
+/// Encrypted-vote circuit public signals:
+/// [root, nullifier, daoId, proposalId, numCandidates, epoch,
+///  publicKeyX, publicKeyY, c1X, c1Y, cYesX, cYesY, cNoX, cNoY, relayerAddress]
+const ENCRYPTED_NUM_PUBLIC_SIGNALS: u32 = 15;
+const ENCRYPTED_CIRCUIT_IC_LEN: u32 = ENCRYPTED_NUM_PUBLIC_SIGNALS + 1;
+/// Grace period during which a proof built at epoch N-1 is still accepted after
+/// an epoch rotation. Keeps honest in-flight voters alive without reopening the
+/// stale-revocation hole indefinitely.
+pub const EPOCH_GRACE_SECS: u64 = 300;
+// IC (inner commitment) vector length for Groth16 VK = num_public_inputs + 1
 const VOTE_CIRCUIT_IC_LEN: u32 = NUM_PUBLIC_SIGNALS + 1;
 
 /// Smallest `numCandidates` the vote circuit can be satisfied with. Votes are
@@ -430,7 +526,49 @@ const MIN_SATISFIABLE_NUM_CANDIDATES: u32 = 2;
 const TALLY_NUM_PUBLIC_SIGNALS: u32 = 6;
 /// IC vector length for the tally Groth16 VK = TALLY_NUM_PUBLIC_SIGNALS + 1
 const TALLY_CIRCUIT_IC_LEN: u32 = TALLY_NUM_PUBLIC_SIGNALS + 1;
+
+// ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────────
+// Additive to the plain yes/no tally above (`submit_recursive_tally`,
+// `verify_tally_proof`), which this does not touch or replace. Mirrors
+// circuits/tally_universal.circom.
+/// Known semantics ids. There is deliberately no "generic"/unknown id that
+/// verifies - `universal_tally_ic_len` rejects anything else.
+pub const SEMANTICS_YES_NO: u32 = 0;
+pub const SEMANTICS_QUADRATIC: u32 = 1;
+pub const SEMANTICS_WEIGHTED: u32 = 2;
+/// Signals shared by every universal-tally semantics:
+/// [dao_id, proposal_id, semanticsId, semanticsVersion, num_votes].
+const UNIVERSAL_TALLY_BASE_SIGNALS: u32 = 5;
+/// Yes/no adds [yesVotes, noVotes] plus the trailing nullifier accumulator.
+const UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS: u32 = UNIVERSAL_TALLY_BASE_SIGNALS + 2 + 1;
+/// Quadratic and weighted each add one output signal plus the nullifier accumulator.
+const UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS: u32 = UNIVERSAL_TALLY_BASE_SIGNALS + 1 + 1;
+const UNIVERSAL_TALLY_WEIGHTED_NUM_SIGNALS: u32 = UNIVERSAL_TALLY_BASE_SIGNALS + 1 + 1;
+const UNIVERSAL_TALLY_YES_NO_IC_LEN: u32 = UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS + 1;
+const UNIVERSAL_TALLY_QUADRATIC_IC_LEN: u32 = UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS + 1;
+const UNIVERSAL_TALLY_WEIGHTED_IC_LEN: u32 = UNIVERSAL_TALLY_WEIGHTED_NUM_SIGNALS + 1;
 pub const MAX_PAUSE_DURATION: u64 = 72 * 60 * 60;
+
+// ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────────
+// Additive alongside the plain `pause`/`unpause` above (single guardian,
+// contract-wide, 72h auto-expiry), which are untouched. Separates "which
+// operations are blocked" into independently settable tiers, and
+// distinguishes a fast single-signer activation (short, mandatory expiry)
+// from a quorum-ratified one (durable until a quorum resumes it).
+pub const HALT_TIER_VOTE_SUBMISSION: u32 = 0x1;
+pub const HALT_TIER_TALLY_FINALIZATION: u32 = 0x2;
+/// No treasury-execution entrypoint exists in this contract today; other
+/// contracts (e.g. a future rewards/treasury contract) can cross-call
+/// `is_tier_halted(HALT_TIER_TREASURY_EXECUTION)` before paying out. See
+/// "Still needed" in docs/ops/runbooks/panic-plus-surge.md.
+pub const HALT_TIER_TREASURY_EXECUTION: u32 = 0x4;
+const ALL_HALT_TIERS: u32 =
+    HALT_TIER_VOTE_SUBMISSION | HALT_TIER_TALLY_FINALIZATION | HALT_TIER_TREASURY_EXECUTION;
+/// A fast (unratified) halt is a stopgap, not a resolution: it expires far
+/// sooner than the legacy pause's 72h so an un-ratified emergency action
+/// can never quietly become permanent.
+pub const FAST_HALT_MAX_DURATION: u64 = 24 * 60 * 60;
+
 pub const RANDOMNESS_COMMIT_WINDOW: u64 = 3_600;
 pub const RANDOMNESS_REVEAL_WINDOW: u64 = 3_600;
 const MIN_RANDOMNESS_PARTICIPANTS: u32 = 2;
@@ -590,6 +728,20 @@ pub enum DataKey {
     SybilWeightCap(u64, u64), // (dao_id, proposal_id)
     /// Running weighted tally for a proposal.
     WeightedTally(u64, u64), // (dao_id, proposal_id)
+
+    // ── Encrypted-tally path (vote-choice privacy) ─────────────────────────
+    /// Verification key for `vote_encrypted.circom` (15 public signals).
+    EncryptedVk(u64), // dao_id -> VerificationKey
+    EncryptedVkVersion(u64), // dao_id -> u32
+    /// Per-proposal encryption configuration + ceremony authorities.
+    EncryptedConfig(u64, u64), // (dao_id, proposal_id) -> EncryptedTallyConfig
+    /// One encrypted ballot, keyed by election-scoped nullifier.
+    EncryptedBallot(u64, u64, U256), // (dao_id, proposal_id, nullifier) -> EncryptedBallot
+    EncryptedBallotCount(u64, u64), // (dao_id, proposal_id) -> u64
+    /// Finalized decrypted aggregate.
+    EncryptedTally(u64, u64), // (dao_id, proposal_id) -> EncryptedTallyResult
+
+    // ── Bridge + weighted-balance path (#648) ──────────────────────────────
     /// Authorized Soroban bridge contract that may call record_bridged_vote (#648).
     BridgeContract,
     /// Verification key for the token-balance weighted vote circuit
@@ -605,6 +757,34 @@ pub enum DataKey {
     /// ever issued — it is a *public input*, so a prover picks it. Pinning it
     /// on-chain is what closes the "commit to any balance you like" hole.
     WeightedBalanceCommitment(u64, U256), // (dao_id, commitment)
+
+    // ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────
+    /// Proposal-level pinned (semanticsId, semanticsVersion) tuple. Set once
+    /// via `set_proposal_semantics` while the proposal is still in
+    /// `Registration`. Appended at the end so existing storage
+    /// discriminants stay stable.
+    ProposalSemantics(u64, u64), // (dao_id, proposal_id) -> TallySemantics
+    /// Verification key for the universal tally circuit family, one per
+    /// (dao_id, semanticsId, semanticsVersion) - "VK pinned per semantics
+    /// version".
+    SemanticsVk(u64, u32, u32), // (dao_id, semantics_id, semantics_version) -> VerificationKey
+    /// Finalized universal tally result, additive to `RecursiveTally`.
+    UniversalTally(u64, u64), // (dao_id, proposal_id) -> UniversalTallyInfo
+
+    // ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────
+    /// Current halt, if any. Contract-wide, same scope as the legacy
+    /// `Paused` flag (not per-DAO).
+    HaltState,
+    /// Configured halt-quorum signers.
+    HaltQuorumSigners,
+    /// Configured halt-quorum threshold (M-of-N over `HaltQuorumSigners`).
+    HaltQuorumThreshold,
+    /// Signers who have approved ratifying the current pending halt.
+    HaltRatificationApprovals,
+    /// Signers who have approved resuming the current ratified halt.
+    HaltResumeApprovals,
+    /// Per-DAO TTL extension budget and consumption tracker (#881).
+    TtlBudget(u64), // dao_id -> TtlExtensionBudget
 }
 
 /// A single quadratic-voting ballot as stored on-chain.
@@ -631,6 +811,36 @@ pub struct RecursiveTallyInfo {
     pub finalized_at: u64,
 }
 
+/// A proposal-level (semanticsId, semanticsVersion) tuple, pinned once
+/// before voting starts (ZV-112 / #952, #699). A universal tally proof
+/// whose own declared tuple does not equal this is rejected without a
+/// Groth16 verification attempt - see
+/// [`Voting::set_proposal_semantics`]/[`Voting::submit_universal_tally`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TallySemantics {
+    pub semantics_id: u32,
+    pub semantics_version: u32,
+}
+
+/// Finalized universal tally result. Additive alongside
+/// [`RecursiveTallyInfo`] (yes/no only, unversioned) - it does not replace
+/// it. Only the fields relevant to `semantics_id` are meaningful; the rest
+/// are zero (enforced by [`Voting::submit_universal_tally`]).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UniversalTallyInfo {
+    pub semantics_id: u32,
+    pub semantics_version: u32,
+    pub num_votes: u64,
+    pub yes_votes: u64,
+    pub no_votes: u64,
+    pub total_credits_spent: u64,
+    pub weighted_total: u64,
+    pub final_nullifier_acc: U256,
+    pub finalized_at: u64,
+}
+
 // ── Sybil-resistance layer (#301) ──────────────────────────────────────────
 
 /// Weighted tally alongside the plain head-count.
@@ -646,6 +856,120 @@ pub struct WeightedTally {
     pub no_weight: u64,
     pub yes_ballots: u64,
     pub no_ballots: u64,
+}
+
+// ── Encrypted tally (vote-choice privacy) ─────────────────────────────────
+
+/// Inputs for `create_encrypted_proposal`. Grouped to keep the exported
+/// function under Soroban's practical argument limit.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateEncryptedProposalParams {
+    pub title: String,
+    pub content_cid: String,
+    pub end_time: u64,
+    pub vote_mode: VoteMode,
+    /// Baby Jubjub election public key (x, y).
+    pub public_key_x: U256,
+    pub public_key_y: U256,
+    /// Ceremony threshold, e.g. 2 for a 2-of-3 ceremony.
+    pub threshold: u32,
+    /// Exactly `total_authorities` addresses, each able to approve a tally.
+    pub authorities: Vec<Address>,
+    /// Registry epoch the election's membership root is pinned to.
+    pub epoch: u32,
+}
+
+/// Per-proposal configuration for the encrypted-tally path.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedTallyConfig {
+    pub public_key_x: U256,
+    pub public_key_y: U256,
+    pub threshold: u32,
+    pub total_authorities: u32,
+    /// Concrete ceremony authority set. Every approval must be a member.
+    pub authorities: Vec<Address>,
+    pub epoch: u32,
+    pub vk_hash: BytesN<32>,
+    pub vk_version: u32,
+    pub finalized: bool,
+}
+
+/// One encrypted ballot. `c1`, `cYes` and `cNo` are 64-byte big-endian
+/// Baby Jubjub points; no plaintext choice is stored.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedBallot {
+    pub nullifier: U256,
+    pub c1: BytesN<64>,
+    pub c_yes: BytesN<64>,
+    pub c_no: BytesN<64>,
+    pub epoch: u32,
+}
+
+/// Finalized, threshold-decrypted aggregate. The aggregate ciphertexts remain
+/// on-chain for independent verification of the ceremony transcript.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedTallyResult {
+    pub yes_votes: u64,
+    pub no_votes: u64,
+    pub aggregate_c1: BytesN<64>,
+    pub aggregate_c_yes: BytesN<64>,
+    pub aggregate_c_no: BytesN<64>,
+    pub ballot_count: u64,
+    pub epoch: u32,
+    pub finalized_at: u64,
+}
+
+/// Inputs for `finalize_encrypted_tally`, grouped for the same reason.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalizeEncryptedTallyParams {
+    pub yes_votes: u64,
+    pub no_votes: u64,
+    pub aggregate_c1: BytesN<64>,
+    pub aggregate_c_yes: BytesN<64>,
+    pub aggregate_c_no: BytesN<64>,
+    pub epoch: u32,
+    /// At least `threshold` distinct ceremony authorities; each must authorize.
+    pub approvers: Vec<Address>,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedVoteEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub nullifier: U256,
+    pub c1: BytesN<64>,
+    pub c_yes: BytesN<64>,
+    pub c_no: BytesN<64>,
+    pub epoch: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedTallyFinalizedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub proposal_id: u64,
+    pub yes_votes: u64,
+    pub no_votes: u64,
+    pub ballot_count: u64,
+    pub epoch: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptedVKSetEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub version: u32,
 }
 
 // ── VDF-gated commit–reveal (#302) ─────────────────────────────────────────
@@ -853,6 +1177,25 @@ pub struct ProposalInfo {
     pub vote_mode: VoteMode, // Fixed or Trailing voting
     pub earliest_root_index: u32, // For Trailing mode: earliest valid root index
     pub snapshot_ledger: u32, // Ledger sequence at creation for balance snapshot
+    /// #736 — Membership Merkle root pinned at proposal creation time.
+    ///
+    /// This is the eligibility snapshot: only commitments that existed in the
+    /// tree at or before this root are considered eligible voters for this
+    /// proposal, regardless of when the proof is submitted. The ZK circuit
+    /// must include this root as a public signal so the contract can verify
+    /// the prover used the correct snapshot and not a later, attacker-inflated
+    /// root (flash-membership attack).
+    ///
+    /// Proofs submitted against a different membership root are rejected even
+    /// if that root is otherwise valid for the DAO — it is not the root that
+    /// was in effect when this proposal was created.
+    pub eligibility_snapshot_root: U256,
+    /// Ledger timestamp at which a `VoteMode::Trailing` proposal's tally was
+    /// frozen by `close_proposal`. `None` until closed, and for
+    /// `VoteMode::Fixed` proposals always. All result consumers (rewards,
+    /// randomness, upgrades) must treat the tally as immutable once this is
+    /// set, since a Trailing-mode root can otherwise keep moving.
+    pub trailing_finalized_at: Option<u64>,
 }
 
 // Typed Events
@@ -989,6 +1332,48 @@ pub struct RandomnessCommittedEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractUnpausedEvent {
     pub guardian: Address,
+}
+
+/// Tiered emergency halt state (ZV-114 / #954). `tiers` is a bitmask of
+/// [`HALT_TIER_VOTE_SUBMISSION`] / [`HALT_TIER_TALLY_FINALIZATION`] /
+/// [`HALT_TIER_TREASURY_EXECUTION`]. While `!ratified`, the halt is a fast
+/// single-signer activation and expires automatically at `expires_at`
+/// ([`FAST_HALT_MAX_DURATION`] after `activated_at`) unless a quorum
+/// ratifies it first via `ratify_halt`, at which point it is durable until
+/// a quorum calls `resume_halt`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltInfo {
+    pub tiers: u32,
+    pub activated_at: u64,
+    pub expires_at: u64,
+    pub ratified: bool,
+    pub activated_by: Address,
+    pub reason: String,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltActivatedEvent {
+    pub tiers: u32,
+    pub activated_by: Address,
+    pub expires_at: u64,
+    pub reason: String,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltRatifiedEvent {
+    pub tiers: u32,
+    pub approvals: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HaltResumedEvent {
+    pub tiers: u32,
+    pub resumed_by: Address,
+    pub via_quorum: bool,
 }
 
 #[soroban_sdk::contractevent]
@@ -1174,6 +1559,37 @@ pub struct ElectionStatusChangedEvent {
     pub updated_at: u64,
 }
 
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlExtensionRejectedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub priority: u32,
+    pub requested_cost: u32,
+    pub consumed_budget: u32,
+    pub max_budget: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlExtensionAppliedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub priority: u32,
+    pub cost: u32,
+    pub consumed_budget: u32,
+    pub remaining_budget: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TtlBudgetConfiguredEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub max_budget: u32,
+    pub period_length_ledgers: u32,
+}
+
 #[contract]
 pub struct Voting;
 
@@ -1197,6 +1613,218 @@ impl Voting {
             TEMPORARY_TTL_THRESHOLD,
             TEMPORARY_TTL_EXTEND_BASE,
         );
+    }
+
+    fn consume_dao_ttl_budget(
+        env: &Env,
+        dao_id: u64,
+        priority: TtlPriority,
+        cost: u32,
+    ) -> bool {
+        let effective_cost = cost.max(MIN_TTL_BUMP_COST);
+        let key = DataKey::TtlBudget(dao_id);
+        let current_ledger = env.ledger().sequence();
+
+        let mut budget = if let Some(b) = env.storage().persistent().get::<_, TtlExtensionBudget>(&key) {
+            b
+        } else {
+            TtlExtensionBudget {
+                max_budget: DEFAULT_TTL_BUDGET_PER_PERIOD,
+                consumed_budget: 0,
+                period_start_ledger: current_ledger,
+                period_length_ledgers: DEFAULT_TTL_PERIOD_LEDGERS,
+            }
+        };
+
+        let period_len = if budget.period_length_ledgers == 0 {
+            DEFAULT_TTL_PERIOD_LEDGERS
+        } else {
+            budget.period_length_ledgers
+        };
+
+        if current_ledger >= budget.period_start_ledger.saturating_add(period_len) {
+            budget.period_start_ledger = current_ledger;
+            budget.consumed_budget = 0;
+        }
+
+        // Priority evaluation against remaining budget
+        let allowed = match priority {
+            TtlPriority::Low => {
+                let limit = budget.max_budget / 2;
+                budget.consumed_budget.saturating_add(effective_cost) <= limit
+            }
+            TtlPriority::Standard => {
+                let limit = (budget.max_budget * 85) / 100;
+                budget.consumed_budget.saturating_add(effective_cost) <= limit
+            }
+            TtlPriority::Critical => {
+                budget.consumed_budget.saturating_add(effective_cost) <= budget.max_budget
+            }
+        };
+
+        if !allowed {
+            TtlExtensionRejectedEvent {
+                dao_id,
+                priority: priority as u32,
+                requested_cost: effective_cost,
+                consumed_budget: budget.consumed_budget,
+                max_budget: budget.max_budget,
+            }
+            .publish(env);
+            return false;
+        }
+
+        budget.consumed_budget = budget.consumed_budget.saturating_add(effective_cost);
+        env.storage().persistent().set(&key, &budget);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+
+        TtlExtensionAppliedEvent {
+            dao_id,
+            priority: priority as u32,
+            cost: effective_cost,
+            consumed_budget: budget.consumed_budget,
+            remaining_budget: budget.max_budget.saturating_sub(budget.consumed_budget),
+        }
+        .publish(env);
+
+        true
+    }
+
+    fn bump_dao_persistent<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+        env: &Env,
+        dao_id: u64,
+        priority: TtlPriority,
+        key: &K,
+    ) -> bool {
+        if Self::consume_dao_ttl_budget(env, dao_id, priority, MIN_TTL_BUMP_COST) {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_ttl_budget(env: Env, dao_id: u64) -> TtlExtensionBudget {
+        Self::bump_instance(&env);
+        let key = DataKey::TtlBudget(dao_id);
+        let current_ledger = env.ledger().sequence();
+        if let Some(mut budget) = env.storage().persistent().get::<_, TtlExtensionBudget>(&key) {
+            let period_len = if budget.period_length_ledgers == 0 {
+                DEFAULT_TTL_PERIOD_LEDGERS
+            } else {
+                budget.period_length_ledgers
+            };
+            if current_ledger >= budget.period_start_ledger.saturating_add(period_len) {
+                budget.period_start_ledger = current_ledger;
+                budget.consumed_budget = 0;
+            }
+            budget
+        } else {
+            TtlExtensionBudget {
+                max_budget: DEFAULT_TTL_BUDGET_PER_PERIOD,
+                consumed_budget: 0,
+                period_start_ledger: current_ledger,
+                period_length_ledgers: DEFAULT_TTL_PERIOD_LEDGERS,
+            }
+        }
+    }
+
+    pub fn set_ttl_budget(
+        env: Env,
+        dao_id: u64,
+        max_budget: u32,
+        period_length_ledgers: u32,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+        let guardian: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Guardian)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::NotGuardian));
+        if caller != guardian {
+            panic_with_error!(&env, VotingError::Unauthorized);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let period_len = if period_length_ledgers == 0 {
+            DEFAULT_TTL_PERIOD_LEDGERS
+        } else {
+            period_length_ledgers
+        };
+        let budget = TtlExtensionBudget {
+            max_budget,
+            consumed_budget: 0,
+            period_start_ledger: current_ledger,
+            period_length_ledgers: period_len,
+        };
+        let key = DataKey::TtlBudget(dao_id);
+        env.storage().persistent().set(&key, &budget);
+        Self::bump_persistent(&env, &key);
+
+        TtlBudgetConfiguredEvent {
+            dao_id,
+            max_budget,
+            period_length_ledgers: period_len,
+        }
+        .publish(&env);
+    }
+
+    pub fn extend_dao_entry_ttl(
+        env: Env,
+        dao_id: u64,
+        priority: u32,
+        key_type: u32,
+        id: u64,
+    ) -> bool {
+        Self::bump_instance(&env);
+        let prio = match priority {
+            0 => TtlPriority::Critical,
+            1 => TtlPriority::Standard,
+            2 => TtlPriority::Low,
+            _ => panic_with_error!(&env, VotingError::InvalidTtlPriority),
+        };
+
+        match key_type {
+            0 => {
+                let k = DataKey::Proposal(dao_id, id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            1 => {
+                let k = DataKey::VotingKey(dao_id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            2 => {
+                let k = DataKey::ElectionConfig(dao_id, id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            3 => {
+                let k = DataKey::BalanceSnapshot(dao_id, id);
+                if env.storage().persistent().has(&k) {
+                    Self::bump_dao_persistent(&env, dao_id, prio, &k)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Give a nullifier record a TTL that outlives the election it belongs to.
@@ -1239,9 +1867,17 @@ impl Voting {
                 .min(PERSISTENT_TTL_EXTEND)
         };
         let ttl_extend = ttl_extend.max(NULLIFIER_GRACE_LEDGERS);
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, ttl_extend);
+        let allowed = Self::consume_dao_ttl_budget(
+            env,
+            dao_id,
+            TtlPriority::Critical,
+            MIN_TTL_BUMP_COST,
+        );
+        if allowed {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, ttl_extend);
+        }
     }
 
     /// Whether this election's nullifier has already been spent.
@@ -1524,6 +2160,277 @@ impl Voting {
         paused && env.ledger().timestamp() < paused_at.saturating_add(MAX_PAUSE_DURATION)
     }
 
+    // ── Tiered emergency halt (ZV-114 / #954) ───────────────────────────────
+    //
+    // Additive alongside pause/unpause above, which this does not touch:
+    // those remain a simple contract-wide guardian kill switch. This adds
+    // a halt model scoped to named tiers (vote submission, tally
+    // finalization, treasury execution - the last with no entrypoint of
+    // its own here yet, exposed for other contracts to consult), with a
+    // fast single-signer activation path (mandatory expiry, no quorum
+    // needed) and a quorum-ratified path (durable, requires a quorum to
+    // resume). See docs/ops/runbooks/panic-plus-surge.md for the drill.
+
+    /// Configure the halt quorum (admin/guardian only). Replaces any
+    /// existing configuration; does not touch an in-progress
+    /// ratification/resume (those read the signer list fresh on each
+    /// call, so changing it mid-flight changes who the remaining
+    /// approvals must come from - document this operationally rather than
+    /// trying to "freeze" a vote in progress).
+    pub fn set_halt_quorum(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        guardian: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        guardian.require_auth();
+        Self::require_guardian(&env, &guardian);
+
+        if threshold == 0 || threshold > signers.len() as u32 {
+            return Err(VotingError::InvalidHaltQuorum);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltQuorumSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltQuorumThreshold, &threshold);
+        Ok(())
+    }
+
+    /// Fast single-signer halt activation (guardian only). Expires
+    /// automatically after [`FAST_HALT_MAX_DURATION`] unless ratified by
+    /// quorum first via `ratify_halt` - "temporary halts expire
+    /// automatically if not ratified".
+    pub fn activate_halt(
+        env: Env,
+        tiers: u32,
+        reason: String,
+        guardian: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        guardian.require_auth();
+        Self::require_guardian(&env, &guardian);
+
+        if tiers == 0 || tiers & !ALL_HALT_TIERS != 0 {
+            return Err(VotingError::InvalidHaltTier);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(FAST_HALT_MAX_DURATION);
+        let info = HaltInfo {
+            tiers,
+            activated_at: now,
+            expires_at,
+            ratified: false,
+            activated_by: guardian.clone(),
+            reason: reason.clone(),
+        };
+        env.storage().instance().set(&DataKey::HaltState, &info);
+        env.storage().instance().set(
+            &DataKey::HaltRatificationApprovals,
+            &Vec::<Address>::new(&env),
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltResumeApprovals, &Vec::<Address>::new(&env));
+
+        HaltActivatedEvent {
+            tiers,
+            activated_by: guardian,
+            expires_at,
+            reason,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Add `signer`'s approval toward ratifying the current pending halt.
+    /// Once the configured threshold is met, the halt becomes durable
+    /// (its expiry no longer applies) until a quorum resumes it. Returns
+    /// whether the halt is now ratified.
+    pub fn ratify_halt(env: Env, signer: Address) -> Result<bool, VotingError> {
+        Self::bump_instance(&env);
+        signer.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumSigners)
+            .unwrap_or(Vec::new(&env));
+        if !signers.contains(&signer) {
+            return Err(VotingError::NotHaltQuorumSigner);
+        }
+
+        let mut info: HaltInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltState)
+            .ok_or(VotingError::HaltNotActive)?;
+        if info.ratified {
+            return Ok(true);
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltRatificationApprovals)
+            .unwrap_or(Vec::new(&env));
+        if approvals.contains(&signer) {
+            return Err(VotingError::DuplicateHaltApproval);
+        }
+        approvals.push_back(signer);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumThreshold)
+            .unwrap_or(u32::MAX);
+        let ratified_now = approvals.len() as u32 >= threshold;
+
+        if ratified_now {
+            info.ratified = true;
+            env.storage().instance().set(&DataKey::HaltState, &info);
+            HaltRatifiedEvent {
+                tiers: info.tiers,
+                approvals: approvals.len() as u32,
+            }
+            .publish(&env);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::HaltRatificationApprovals, &approvals);
+        Ok(ratified_now)
+    }
+
+    /// Stand down the current halt. A fast (unratified) halt may only be
+    /// resumed by the guardian who activated it - the "distinct quorum
+    /// path" for activation already lets anyone with the guardian key act
+    /// alone, so letting any other solo caller resume it would add no new
+    /// protection. A ratified halt always requires its own quorum, so a
+    /// single compromised guardian can never undo what a quorum deliberately
+    /// ratified. Returns whether the halt was actually cleared.
+    pub fn resume_halt(env: Env, caller: Address) -> Result<bool, VotingError> {
+        Self::bump_instance(&env);
+        caller.require_auth();
+
+        let info: HaltInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltState)
+            .ok_or(VotingError::HaltNotActive)?;
+
+        if !info.ratified {
+            if caller != info.activated_by {
+                return Err(VotingError::NotHaltActivator);
+            }
+            Self::clear_halt(&env);
+            HaltResumedEvent {
+                tiers: info.tiers,
+                resumed_by: caller,
+                via_quorum: false,
+            }
+            .publish(&env);
+            return Ok(true);
+        }
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumSigners)
+            .unwrap_or(Vec::new(&env));
+        if !signers.contains(&caller) {
+            return Err(VotingError::NotHaltQuorumSigner);
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltResumeApprovals)
+            .unwrap_or(Vec::new(&env));
+        if approvals.contains(&caller) {
+            return Err(VotingError::DuplicateHaltApproval);
+        }
+        approvals.push_back(caller.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::HaltQuorumThreshold)
+            .unwrap_or(u32::MAX);
+        let resumed = approvals.len() as u32 >= threshold;
+
+        if resumed {
+            Self::clear_halt(&env);
+            HaltResumedEvent {
+                tiers: info.tiers,
+                resumed_by: caller,
+                via_quorum: true,
+            }
+            .publish(&env);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::HaltResumeApprovals, &approvals);
+        }
+        Ok(resumed)
+    }
+
+    fn clear_halt(env: &Env) {
+        env.storage().instance().remove(&DataKey::HaltState);
+        env.storage()
+            .instance()
+            .remove(&DataKey::HaltRatificationApprovals);
+        env.storage()
+            .instance()
+            .remove(&DataKey::HaltResumeApprovals);
+    }
+
+    /// Whether `tier` is currently halted: active, covers `tier`, and
+    /// either ratified or not yet past its fast-activation expiry. A
+    /// fast halt past its expiry is treated as resumed without needing an
+    /// explicit transaction, same as the legacy pause's auto-expiry.
+    fn tier_is_halted(env: &Env, tier: u32) -> bool {
+        let info: Option<HaltInfo> = env.storage().instance().get(&DataKey::HaltState);
+        match info {
+            None => false,
+            Some(info) => {
+                if info.tiers & tier == 0 {
+                    return false;
+                }
+                info.ratified || env.ledger().timestamp() < info.expires_at
+            }
+        }
+    }
+
+    /// Panics with [`VotingError::ContractPaused`] if `tier` is halted.
+    /// Reuses `ContractPaused` rather than a new error so existing
+    /// clients that already handle that error (from `require_not_paused`)
+    /// handle this too without a taxonomy change.
+    fn require_tier_not_halted(env: &Env, tier: u32) {
+        if Self::tier_is_halted(env, tier) {
+            panic_with_error!(env, VotingError::ContractPaused);
+        }
+    }
+
+    /// Public status check for `tier` - lets other contracts (e.g. a
+    /// future treasury contract gating [`HALT_TIER_TREASURY_EXECUTION`])
+    /// cross-call this instead of needing their own halt state.
+    pub fn is_tier_halted(env: Env, tier: u32) -> bool {
+        Self::bump_instance(&env);
+        Self::tier_is_halted(&env, tier)
+    }
+
+    /// Fetch the current halt, if any (regardless of whether it has
+    /// expired - callers that need the live gate should use
+    /// `is_tier_halted` instead).
+    pub fn get_halt_status(env: Env) -> Option<HaltInfo> {
+        Self::bump_instance(&env);
+        env.storage().instance().get(&DataKey::HaltState)
+    }
+
     /// Validate that a U256 value is within the BN254 scalar field (< r).
     /// Panics with a coarse-mapped [`VotingError::SignalNotInField`] under
     /// [`PathContext::Anonymous`].
@@ -1650,6 +2557,64 @@ impl Voting {
     }
 
     /// Set verification key with explicit MPC transcript hash attestation
+    /// Register the verification key for the encrypted-vote circuit
+    /// (`vote_encrypted.circom`, 15 public signals). Admin only.
+    ///
+    /// Kept separate from `set_vk` because the public-signal vector is longer
+    /// than the legacy circuit and must not be usable to verify a plaintext
+    /// vote.
+    pub fn set_encrypted_vk(env: Env, dao_id: u64, vk: VerificationKey, admin: Address) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+
+        if vk.ic.len() != ENCRYPTED_CIRCUIT_IC_LEN {
+            panic_with_error!(&env, VotingError::VkIcLengthMismatch);
+        }
+        if vk.ic.len() > MAX_IC_LENGTH {
+            panic_with_error!(&env, VotingError::VkIcTooLarge);
+        }
+
+        let current_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedVkVersion(dao_id))
+            .unwrap_or(0);
+        let new_version = current_version + 1;
+
+        let vk_key = DataKey::EncryptedVk(dao_id);
+        env.storage().persistent().set(&vk_key, &vk);
+        Self::bump_persistent(&env, &vk_key);
+
+        let version_key = DataKey::EncryptedVkVersion(dao_id);
+        env.storage().persistent().set(&version_key, &new_version);
+        Self::bump_persistent(&env, &version_key);
+
+        EncryptedVKSetEvent {
+            dao_id,
+            version: new_version,
+        }
+        .publish(&env);
+    }
+
+    pub fn encrypted_vk_version(env: Env, dao_id: u64) -> u32 {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::EncryptedVkVersion(dao_id))
+            .unwrap_or(0)
+    }
+
+    pub fn get_encrypted_vk(env: Env, dao_id: u64) -> VerificationKey {
+        Self::bump_instance(&env);
+        let key = DataKey::EncryptedVk(dao_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::EncryptedVkNotSet))
+    }
+
     pub fn set_vk_with_transcript(
         env: Env,
         dao_id: u64,
@@ -1768,6 +2733,7 @@ impl Voting {
     ) -> Result<(), VotingError> {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_TALLY_FINALIZATION);
 
         let total_votes = yes_votes
             .checked_add(no_votes)
@@ -1991,6 +2957,301 @@ impl Voting {
             return Err(VotingError::TallyProofInvalid);
         }
         Ok(())
+    }
+
+    // ── Universal tally-semantics verification (ZV-112 / #952, #699) ───────
+    //
+    // Additive alongside submit_recursive_tally/verify_tally_proof above,
+    // which these do not touch or replace. See
+    // docs/spikes/698-701-protocol-boundary-findings.md (#699) for the
+    // design recommendation this implements: pin a proposal-level
+    // (semanticsId, semanticsVersion) tuple before voting starts and
+    // reject any ballot/tally whose proof circuit/version does not match.
+
+    /// Expected Groth16 VK `ic` length for a given semantics id, or
+    /// [`VotingError::UnknownSemanticsId`] if `semantics_id` is not one of
+    /// [`SEMANTICS_YES_NO`] / [`SEMANTICS_QUADRATIC`] / [`SEMANTICS_WEIGHTED`].
+    fn universal_tally_ic_len(semantics_id: u32) -> Result<u32, VotingError> {
+        match semantics_id {
+            SEMANTICS_YES_NO => Ok(UNIVERSAL_TALLY_YES_NO_IC_LEN),
+            SEMANTICS_QUADRATIC => Ok(UNIVERSAL_TALLY_QUADRATIC_IC_LEN),
+            SEMANTICS_WEIGHTED => Ok(UNIVERSAL_TALLY_WEIGHTED_IC_LEN),
+            _ => Err(VotingError::UnknownSemanticsId),
+        }
+    }
+
+    /// Pin the (semanticsId, semanticsVersion) tuple a proposal's universal
+    /// tally must be proven under (admin only). One-shot
+    /// ([`VotingError::SemanticsAlreadyPinned`] on a second call) and only
+    /// while the proposal is still in [`ProposalState::Registration`] -
+    /// pinning after voting has started would let an admin retroactively
+    /// pick which semantics a tally is checked against.
+    pub fn set_proposal_semantics(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        semantics_id: u32,
+        semantics_version: u32,
+        admin: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+
+        Self::universal_tally_ic_len(semantics_id)?;
+
+        let key = DataKey::Proposal(dao_id, proposal_id);
+        let proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(VotingError::VotingClosed)?;
+        Self::bump_persistent(&env, &key);
+        if proposal.state != ProposalState::Registration {
+            return Err(VotingError::VotingClosed);
+        }
+
+        let semantics_key = DataKey::ProposalSemantics(dao_id, proposal_id);
+        if env.storage().persistent().has(&semantics_key) {
+            return Err(VotingError::SemanticsAlreadyPinned);
+        }
+
+        let semantics = TallySemantics {
+            semantics_id,
+            semantics_version,
+        };
+        env.storage().persistent().set(&semantics_key, &semantics);
+        Self::bump_persistent(&env, &semantics_key);
+        Ok(())
+    }
+
+    /// Fetch the (semanticsId, semanticsVersion) tuple pinned for a proposal, if any.
+    pub fn get_proposal_semantics(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<TallySemantics> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProposalSemantics(dao_id, proposal_id))
+    }
+
+    /// Register the verification key for the universal tally circuit at a
+    /// specific (semanticsId, semanticsVersion) (admin only). Each tuple
+    /// gets its own VK slot - this is what "VK pinned per semantics
+    /// version" means in practice: a proof built for one semantics/version
+    /// has no VK to verify against under any other tuple, so there is no
+    /// way to reuse one semantics' proof to satisfy another's tally.
+    pub fn set_semantics_vk(
+        env: Env,
+        dao_id: u64,
+        semantics_id: u32,
+        semantics_version: u32,
+        vk: VerificationKey,
+        admin: Address,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, dao_id, &admin);
+
+        let expected_ic_len = Self::universal_tally_ic_len(semantics_id)?;
+        if vk.ic.len() != expected_ic_len {
+            return Err(VotingError::VkIcLengthMismatch);
+        }
+
+        let key = DataKey::SemanticsVk(dao_id, semantics_id, semantics_version);
+        env.storage().persistent().set(&key, &vk);
+        Self::bump_persistent(&env, &key);
+        Ok(())
+    }
+
+    /// Submit a universal-tally proof (ZV-112). Checks the proof's declared
+    /// (semanticsId, semanticsVersion) against the proposal's pinned tuple
+    /// *before* attempting Groth16 verification, so a tally proven under
+    /// the wrong proof family is rejected with
+    /// [`VotingError::SemanticsMismatch`] rather than a generic invalid-proof
+    /// result - this is the "reject a tally over mixed proof families
+    /// without a compatible tuple" behavior from the acceptance criteria.
+    ///
+    /// Only the output fields relevant to `semantics_id` may be non-zero;
+    /// this is checked explicitly rather than left to the Groth16 pairing
+    /// check alone; the bound nullifier accumulator check is identical to
+    /// `verify_tally_proof_data`.
+    pub fn submit_universal_tally(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        semantics_id: u32,
+        semantics_version: u32,
+        num_votes: u64,
+        yes_votes: u64,
+        no_votes: u64,
+        total_credits_spent: u64,
+        weighted_total: u64,
+        final_nullifier_acc: U256,
+        proof: Proof,
+    ) -> Result<(), VotingError> {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_TALLY_FINALIZATION);
+
+        let semantics_key = DataKey::ProposalSemantics(dao_id, proposal_id);
+        let pinned: TallySemantics = env
+            .storage()
+            .persistent()
+            .get(&semantics_key)
+            .ok_or(VotingError::SemanticsNotPinned)?;
+        Self::bump_persistent(&env, &semantics_key);
+
+        if pinned.semantics_id != semantics_id || pinned.semantics_version != semantics_version {
+            return Err(VotingError::SemanticsMismatch);
+        }
+
+        match semantics_id {
+            SEMANTICS_YES_NO => {
+                if total_credits_spent != 0 || weighted_total != 0 {
+                    return Err(VotingError::SemanticsMismatch);
+                }
+                let total = yes_votes
+                    .checked_add(no_votes)
+                    .ok_or(VotingError::TallyOverflow)?;
+                if total != num_votes {
+                    return Err(VotingError::RecursiveProofInvalid);
+                }
+            }
+            SEMANTICS_QUADRATIC => {
+                if yes_votes != 0 || no_votes != 0 || weighted_total != 0 {
+                    return Err(VotingError::SemanticsMismatch);
+                }
+            }
+            SEMANTICS_WEIGHTED => {
+                if yes_votes != 0 || no_votes != 0 || total_credits_spent != 0 {
+                    return Err(VotingError::SemanticsMismatch);
+                }
+            }
+            _ => return Err(VotingError::UnknownSemanticsId),
+        }
+
+        let vk_key = DataKey::SemanticsVk(dao_id, semantics_id, semantics_version);
+        let vk: VerificationKey = env
+            .storage()
+            .persistent()
+            .get(&vk_key)
+            .ok_or(VotingError::SemanticsVkNotSet)?;
+        Self::bump_persistent(&env, &vk_key);
+
+        let expected_ic_len = Self::universal_tally_ic_len(semantics_id)?;
+        if vk.ic.len() != expected_ic_len {
+            return Err(VotingError::VkIcLengthMismatch);
+        }
+
+        Self::assert_in_field(&env, PathContext::Admin, &final_nullifier_acc);
+
+        let acc_key = DataKey::NullifierAccumulator(dao_id, proposal_id);
+        let expected_acc: U256 = match env.storage().persistent().get(&acc_key) {
+            Some(acc) => {
+                Self::bump_persistent(&env, &acc_key);
+                acc
+            }
+            None => U256::from_u32(&env, 0),
+        };
+        if expected_acc != final_nullifier_acc {
+            return Err(VotingError::TallyProofInvalid);
+        }
+
+        let dao_signal = U256::from_u128(&env, dao_id as u128);
+        let proposal_signal = U256::from_u128(&env, proposal_id as u128);
+        let semantics_id_signal = U256::from_u128(&env, semantics_id as u128);
+        let semantics_version_signal = U256::from_u128(&env, semantics_version as u128);
+        let num_votes_signal = U256::from_u128(&env, num_votes as u128);
+
+        let mut pub_signals = soroban_sdk::vec![
+            &env,
+            dao_signal,
+            proposal_signal,
+            semantics_id_signal,
+            semantics_version_signal,
+            num_votes_signal,
+        ];
+        match semantics_id {
+            SEMANTICS_YES_NO => {
+                pub_signals.push_back(U256::from_u128(&env, yes_votes as u128));
+                pub_signals.push_back(U256::from_u128(&env, no_votes as u128));
+            }
+            SEMANTICS_QUADRATIC => {
+                pub_signals.push_back(U256::from_u128(&env, total_credits_spent as u128));
+            }
+            SEMANTICS_WEIGHTED => {
+                pub_signals.push_back(U256::from_u128(&env, weighted_total as u128));
+            }
+            _ => return Err(VotingError::UnknownSemanticsId),
+        }
+        pub_signals.push_back(final_nullifier_acc.clone());
+
+        if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
+            return Err(VotingError::TallyProofInvalid);
+        }
+
+        let key = DataKey::Proposal(dao_id, proposal_id);
+        let mut proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(VotingError::VotingClosed)?;
+        if proposal.state != ProposalState::Active {
+            return Err(VotingError::VotingClosed);
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.end_time {
+            return Err(VotingError::VotingClosed);
+        }
+        proposal.state = ProposalState::Closed;
+        // Only yes/no feeds the legacy yes_votes/no_votes fields that
+        // existing outcome logic reads; QV/weighted results live solely in
+        // UniversalTallyInfo until those read paths are migrated (#699
+        // "still needed": on-chain tally integration beyond storage).
+        if semantics_id == SEMANTICS_YES_NO {
+            proposal.yes_votes = proposal
+                .yes_votes
+                .checked_add(yes_votes)
+                .ok_or(VotingError::TallyOverflow)?;
+            proposal.no_votes = proposal
+                .no_votes
+                .checked_add(no_votes)
+                .ok_or(VotingError::TallyOverflow)?;
+        }
+        env.storage().persistent().set(&key, &proposal);
+        Self::bump_persistent(&env, &key);
+
+        let info = UniversalTallyInfo {
+            semantics_id,
+            semantics_version,
+            num_votes,
+            yes_votes,
+            no_votes,
+            total_credits_spent,
+            weighted_total,
+            final_nullifier_acc,
+            finalized_at: now,
+        };
+        let tally_key = DataKey::UniversalTally(dao_id, proposal_id);
+        env.storage().persistent().set(&tally_key, &info);
+        Self::bump_persistent(&env, &tally_key);
+
+        Ok(())
+    }
+
+    /// Fetch the finalized universal tally for a proposal, if any.
+    pub fn get_universal_tally(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<UniversalTallyInfo> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UniversalTally(dao_id, proposal_id))
     }
 
     /// Internal helper to fetch a BN254 VK by version or fail with a clear error
@@ -2373,6 +3634,13 @@ impl Voting {
 
         let proposal_id = Self::next_proposal_id(&env, dao_id);
 
+        // #736: pin the eligibility snapshot root — this is the membership
+        // Merkle root at proposal-creation time. Votes submitted later must
+        // prove membership against THIS root, not whatever root is current at
+        // vote time. That prevents flash-membership attacks (mint → register →
+        // vote → burn within a single election window).
+        let eligibility_snapshot_root = eligible_root.clone();
+
         let proposal = ProposalInfo {
             id: proposal_id,
             dao_id,
@@ -2390,6 +3658,8 @@ impl Voting {
             vote_mode,
             earliest_root_index,
             snapshot_ledger,
+            eligibility_snapshot_root,
+            trailing_finalized_at: None,
         };
 
         let key = DataKey::Proposal(dao_id, proposal_id);
@@ -2459,6 +3729,565 @@ impl Voting {
         env.crypto().sha256(&data).into()
     }
 
+    // ── Encrypted-tally path ───────────────────────────────────────────────
+
+    fn tree_epoch(env: &Env, tree: &Address, dao_id: u64) -> u32 {
+        env.invoke_contract(
+            tree,
+            &Symbol::new(env, "current_epoch"),
+            soroban_sdk::vec![env, dao_id.into_val(env)],
+        )
+    }
+
+    fn tree_epoch_root(env: &Env, tree: &Address, dao_id: u64, epoch: u32) -> U256 {
+        env.invoke_contract(
+            tree,
+            &Symbol::new(env, "epoch_root"),
+            soroban_sdk::vec![env, dao_id.into_val(env), epoch.into_val(env)],
+        )
+    }
+
+    fn tree_epoch_advanced_at(env: &Env, tree: &Address, dao_id: u64, epoch: u32) -> u64 {
+        env.invoke_contract(
+            tree,
+            &Symbol::new(env, "epoch_advanced_at"),
+            soroban_sdk::vec![env, dao_id.into_val(env), epoch.into_val(env)],
+        )
+    }
+
+    /// Split a 64-byte Baby Jubjub point into its big-endian x/y coordinates.
+    fn point_bytes_to_u256(env: &Env, point: &BytesN<64>) -> (U256, U256) {
+        let bytes = point.to_array();
+        let x = U256::from_be_bytes(env, &Bytes::from_slice(env, &bytes[..32]));
+        let y = U256::from_be_bytes(env, &Bytes::from_slice(env, &bytes[32..]));
+        Self::assert_in_field(env, PathContext::Anonymous, &x);
+        Self::assert_in_field(env, PathContext::Anonymous, &y);
+        (x, y)
+    }
+
+    /// Create an encrypted-tally proposal pinned to a registry epoch.
+    ///
+    /// Unlike `create_proposal`, this path snapshots the encrypted-circuit VK
+    /// and stores the election public key + 2-of-3 ceremony authorities. No
+    /// plaintext `voteChoice` is ever accepted for this proposal.
+    pub fn create_encrypted_proposal(
+        env: Env,
+        dao_id: u64,
+        creator: Address,
+        params: CreateEncryptedProposalParams,
+    ) -> u64 {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        if params.title.len() > MAX_TITLE_LEN {
+            panic_with_error!(&env, VotingError::TitleTooLong);
+        }
+        if params.content_cid.len() > MAX_CID_LEN {
+            panic_with_error!(&env, VotingError::InvalidContentCid);
+        }
+        if params.threshold == 0
+            || params.threshold > params.authorities.len()
+            || params.authorities.len() > 32
+        {
+            panic_with_error!(&env, VotingError::InvalidInput);
+        }
+        let now = env.ledger().timestamp();
+        if params.end_time != 0 && params.end_time <= now {
+            panic_with_error!(&env, VotingError::EndTimeInvalid);
+        }
+
+        // Snapshot the encrypted-vote VK and refuse to create an election that
+        // could never verify a ballot.
+        let vk_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedVkVersion(dao_id))
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::EncryptedVkNotSet));
+        let vk: VerificationKey = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedVk(dao_id))
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::EncryptedVkNotSet));
+        let vk_hash = Self::hash_vk(&env, &vk);
+
+        // Membership / proposal-permission checks mirror create_proposal.
+        let tree_contract: Address = Self::tree_contract(env.clone());
+        let sbt_contract: Address = env.invoke_contract(
+            &tree_contract,
+            &symbol_short!("sbt_contr"),
+            soroban_sdk::vec![&env],
+        );
+        let registry: Address = env.invoke_contract(
+            &sbt_contract,
+            &symbol_short!("registry"),
+            soroban_sdk::vec![&env],
+        );
+        let has_sbt: bool = env.invoke_contract(
+            &sbt_contract,
+            &symbol_short!("has"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env), creator.clone().into_val(&env)],
+        );
+        if !has_sbt {
+            panic_with_error!(&env, VotingError::NotDaoMember);
+        }
+        let members_can_propose: bool = env.invoke_contract(
+            &registry,
+            &Symbol::new(&env, "members_can_propose"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env)],
+        );
+        if !members_can_propose {
+            let dao_admin: Address = env.invoke_contract(
+                &registry,
+                &symbol_short!("get_admin"),
+                soroban_sdk::vec![&env, dao_id.into_val(&env)],
+            );
+            if creator != dao_admin {
+                panic_with_error!(&env, VotingError::OnlyAdminCanPropose);
+            }
+        }
+
+        let current_epoch = Self::tree_epoch(&env, &tree_contract, dao_id);
+        let epoch = if params.epoch == 0 {
+            current_epoch
+        } else {
+            params.epoch
+        };
+        if epoch != current_epoch {
+            panic_with_error!(&env, VotingError::EpochMismatch);
+        }
+        let eligible_root = Self::tree_epoch_root(&env, &tree_contract, dao_id, epoch);
+        let earliest_root_index: u32 = env.invoke_contract(
+            &tree_contract,
+            &symbol_short!("curr_idx"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env)],
+        );
+
+        let proposal_id = Self::next_proposal_id(&env, dao_id);
+        // #736: pin the eligibility snapshot root, same as the other
+        // proposal constructors - votes must prove membership against
+        // this root, not whatever root is current at vote time.
+        let eligibility_snapshot_root = eligible_root.clone();
+        let proposal = ProposalInfo {
+            id: proposal_id,
+            dao_id,
+            title: params.title.clone(),
+            content_cid: params.content_cid.clone(),
+            yes_votes: 0,
+            no_votes: 0,
+            end_time: params.end_time,
+            created_by: creator.clone(),
+            created_at: now,
+            state: ProposalState::Active,
+            vk_hash: vk_hash.clone(),
+            vk_version,
+            eligible_root,
+            vote_mode: params.vote_mode,
+            earliest_root_index,
+            snapshot_ledger: env.ledger().sequence(),
+            eligibility_snapshot_root,
+            trailing_finalized_at: None,
+        };
+        let key = DataKey::Proposal(dao_id, proposal_id);
+        env.storage().persistent().set(&key, &proposal);
+        Self::bump_persistent(&env, &key);
+
+        let curve_key = DataKey::ProposalCurve(dao_id, proposal_id);
+        env.storage().persistent().set(&curve_key, &CurveId::Bn254);
+        Self::bump_persistent(&env, &curve_key);
+
+        let end_time_key = DataKey::ProposalEndTime(dao_id, proposal_id);
+        env.storage()
+            .persistent()
+            .set(&end_time_key, &params.end_time);
+        Self::bump_persistent(&env, &end_time_key);
+
+        let config = EncryptedTallyConfig {
+            public_key_x: params.public_key_x,
+            public_key_y: params.public_key_y,
+            threshold: params.threshold,
+            total_authorities: params.authorities.len(),
+            authorities: params.authorities.clone(),
+            epoch,
+            vk_hash,
+            vk_version,
+            finalized: false,
+        };
+        let config_key = DataKey::EncryptedConfig(dao_id, proposal_id);
+        env.storage().persistent().set(&config_key, &config);
+        Self::bump_persistent(&env, &config_key);
+
+        // Encrypted tallies are yes/no only; the circuit enforces the same
+        // bound, and the contract pins it so a second proposal cannot disagree.
+        let election_config = ElectionConfig {
+            snapshot_ledger: env.ledger().sequence(),
+            min_balance: 0,
+            twab_window: 0,
+            candidate_seed: None,
+            num_candidates: 2,
+            vdf_output: None,
+            vdf_delay: 0,
+            max_revotes: 0,
+            merkle_root_set_at: None,
+            commitment_window: 0,
+            merkle_depth: 0,
+        };
+        let election_key = DataKey::ElectionConfig(dao_id, proposal_id);
+        env.storage()
+            .persistent()
+            .set(&election_key, &election_config);
+        Self::bump_persistent(&env, &election_key);
+
+        ProposalEvent {
+            dao_id,
+            proposal_id,
+            title: params.title,
+            content_cid: params.content_cid,
+            creator,
+        }
+        .publish(&env);
+
+        proposal_id
+    }
+
+    /// Submit an encrypted ballot.
+    ///
+    /// Public signals are reconstructed from storage and the submitted
+    /// ciphertext bytes; the plaintext choice never appears in the calldata,
+    /// the event, or storage.
+    pub fn vote_encrypted(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        nullifier: U256,
+        root: U256,
+        epoch: u32,
+        c1: BytesN<64>,
+        c_yes: BytesN<64>,
+        c_no: BytesN<64>,
+        proof: Proof,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
+        let ctx = PathContext::Anonymous;
+        Self::set_reentrancy_lock(&env);
+
+        Self::assert_in_field(&env, ctx, &nullifier);
+        Self::assert_in_field(&env, ctx, &root);
+        if nullifier == U256::from_u32(&env, 0) {
+            panic_coarse(&env, ctx, VotingError::InvalidNullifier);
+        }
+
+        let null_key = storage::nullifier_used_key(dao_id, proposal_id, nullifier.clone());
+        if env.storage().temporary().has(&null_key) || env.storage().persistent().has(&null_key) {
+            panic_coarse(&env, ctx, VotingError::NullifierUsed);
+        }
+
+        let prop_key = DataKey::Proposal(dao_id, proposal_id);
+        let mut proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&prop_key)
+            .expect("proposal not found");
+        let now = env.ledger().timestamp();
+        if proposal.state != ProposalState::Active {
+            panic_coarse(&env, ctx, VotingError::VotingClosed);
+        }
+        if proposal.end_time != 0 && now > proposal.end_time {
+            panic_coarse(&env, ctx, VotingError::VotingClosed);
+        }
+
+        let config_key = DataKey::EncryptedConfig(dao_id, proposal_id);
+        let config: EncryptedTallyConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .unwrap_or_else(|| panic_coarse(&env, ctx, VotingError::EncryptedTallyNotConfigured));
+        if config.finalized {
+            panic_coarse(&env, ctx, VotingError::EncryptedTallyAlreadyFinalized);
+        }
+
+        env.storage().temporary().set(&null_key, &true);
+        Self::bump_nullifier_ttl(&env, &null_key, dao_id, proposal_id);
+
+        Self::assert_root_eligible(&env, ctx, dao_id, &proposal, &root);
+
+        // Epoch pinning: the proof must be built against an epoch root that is
+        // current (or within the grace window) and the supplied Merkle root
+        // must be exactly that epoch's checkpoint. This is what prevents a
+        // revoked member from replaying a pre-revocation proof.
+        let tree_contract = Self::tree_contract(env.clone());
+        let current_epoch = Self::tree_epoch(&env, &tree_contract, dao_id);
+        if epoch > current_epoch {
+            panic_coarse(&env, ctx, VotingError::EpochMismatch);
+        }
+        if epoch < current_epoch {
+            let advanced_at =
+                Self::tree_epoch_advanced_at(&env, &tree_contract, dao_id, current_epoch);
+            if now > advanced_at.saturating_add(EPOCH_GRACE_SECS) {
+                panic_coarse(&env, ctx, VotingError::EpochStale);
+            }
+        }
+        let epoch_root = Self::tree_epoch_root(&env, &tree_contract, dao_id, epoch);
+        if epoch_root != root {
+            panic_coarse(&env, ctx, VotingError::EpochMismatch);
+        }
+        if epoch_root != proposal.eligible_root && proposal.vote_mode == VoteMode::Fixed {
+            // Fixed elections still accept their snapshot root only while it is
+            // the pinned epoch root; after rotation the grace window applies.
+            if epoch != current_epoch {
+                panic_coarse(&env, ctx, VotingError::EpochMismatch);
+            }
+        }
+
+        let vk_key = DataKey::EncryptedVk(dao_id);
+        let vk: VerificationKey = env
+            .storage()
+            .persistent()
+            .get(&vk_key)
+            .unwrap_or_else(|| panic_coarse(&env, ctx, VotingError::EncryptedVkNotSet));
+        if Self::hash_vk(&env, &vk) != config.vk_hash {
+            panic_coarse(&env, ctx, VotingError::VkChanged);
+        }
+
+        let (c1x, c1y) = Self::point_bytes_to_u256(&env, &c1);
+        let (cyx, cyy) = Self::point_bytes_to_u256(&env, &c_yes);
+        let (cnx, cny) = Self::point_bytes_to_u256(&env, &c_no);
+        if (c1x == U256::from_u32(&env, 0) && c1y == U256::from_u32(&env, 1))
+            || (cyx == U256::from_u32(&env, 0) && cyy == U256::from_u32(&env, 1))
+            || (cnx == U256::from_u32(&env, 0) && cny == U256::from_u32(&env, 1))
+        {
+            panic_coarse(&env, ctx, VotingError::InvalidCiphertext);
+        }
+
+        let num_candidates: u32 = env
+            .storage()
+            .persistent()
+            .get::<_, ElectionConfig>(&DataKey::ElectionConfig(dao_id, proposal_id))
+            .map(|c| c.num_candidates)
+            .unwrap_or(2);
+        if num_candidates == 0 || num_candidates > 2 {
+            panic_coarse(&env, ctx, VotingError::InvalidCandidateIndex);
+        }
+
+        let pub_signals = soroban_sdk::vec![
+            &env,
+            root.clone(),
+            nullifier.clone(),
+            U256::from_u128(&env, dao_id as u128),
+            U256::from_u128(&env, proposal_id as u128),
+            U256::from_u32(&env, num_candidates),
+            U256::from_u32(&env, epoch),
+            config.public_key_x.clone(),
+            config.public_key_y.clone(),
+            c1x,
+            c1y,
+            cyx,
+            cyy,
+            cnx,
+            cny,
+            U256::from_u32(&env, 0), // relayerAddress sentinel; see circuit docs
+        ];
+
+        if !Self::verify_groth16(&env, &vk, &proof, &pub_signals) {
+            panic_coarse(&env, ctx, VotingError::InvalidProof);
+        }
+
+        Self::accumulate_nullifier(&env, dao_id, proposal_id, &nullifier);
+
+        let ballot = EncryptedBallot {
+            nullifier: nullifier.clone(),
+            c1: c1.clone(),
+            c_yes: c_yes.clone(),
+            c_no: c_no.clone(),
+            epoch,
+        };
+        let ballot_key = DataKey::EncryptedBallot(dao_id, proposal_id, nullifier.clone());
+        env.storage().persistent().set(&ballot_key, &ballot);
+        Self::bump_persistent(&env, &ballot_key);
+
+        let count_key = DataKey::EncryptedBallotCount(dao_id, proposal_id);
+        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let next_count = count
+            .checked_add(1)
+            .unwrap_or_else(|| panic_coarse(&env, ctx, VotingError::TallyOverflow));
+        env.storage().persistent().set(&count_key, &next_count);
+        Self::bump_persistent(&env, &count_key);
+
+        // Vote counts stay zero until the ceremony finalizes. Observers see
+        // ciphertext, not a choice.
+        env.storage().persistent().set(&prop_key, &proposal);
+        Self::bump_persistent(&env, &prop_key);
+
+        Self::clear_reentrancy_lock(&env);
+
+        EncryptedVoteEvent {
+            dao_id,
+            proposal_id,
+            nullifier,
+            c1,
+            c_yes,
+            c_no,
+            epoch,
+        }
+        .publish(&env);
+    }
+
+    /// Finalize the aggregate after the proposal closes.
+    ///
+    /// The 2-of-3 (or t-of-n) ceremony authorities each authorize the exact
+    /// aggregate and tally. The contract does not perform Baby Jubjub addition
+    /// itself: the aggregate ciphertext is committed on-chain so anyone can
+    /// recompute it from `EncryptedVoteEvent`s and check the decrypted totals
+    /// against the ceremony transcript.
+    pub fn finalize_encrypted_tally(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        params: FinalizeEncryptedTallyParams,
+    ) {
+        Self::bump_instance(&env);
+        Self::require_not_paused(&env);
+
+        let prop_key = DataKey::Proposal(dao_id, proposal_id);
+        let mut proposal: ProposalInfo = env
+            .storage()
+            .persistent()
+            .get(&prop_key)
+            .expect("proposal not found");
+        let now = env.ledger().timestamp();
+        if proposal.end_time == 0 || now <= proposal.end_time {
+            panic_with_error!(&env, VotingError::EncryptedTallyNotReady);
+        }
+        if proposal.state != ProposalState::Active && proposal.state != ProposalState::Closed {
+            panic_with_error!(&env, VotingError::InvalidState);
+        }
+
+        let config_key = DataKey::EncryptedConfig(dao_id, proposal_id);
+        let mut config: EncryptedTallyConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .unwrap_or_else(|| panic_with_error!(&env, VotingError::EncryptedTallyNotConfigured));
+        if config.finalized {
+            panic_with_error!(&env, VotingError::EncryptedTallyAlreadyFinalized);
+        }
+        if params.epoch != config.epoch {
+            panic_with_error!(&env, VotingError::EpochMismatch);
+        }
+
+        // Approvals: distinct, configured, and each must authorize this tx.
+        if params.approvers.len() < config.threshold {
+            panic_with_error!(&env, VotingError::InsufficientCeremonyApprovals);
+        }
+        let mut seen: Vec<Address> = Vec::new(&env);
+        for i in 0..params.approvers.len() {
+            let approver = params.approvers.get(i).unwrap();
+            if seen.contains(approver.clone()) {
+                panic_with_error!(&env, VotingError::InvalidCeremonyAuthority);
+            }
+            if !config.authorities.contains(approver.clone()) {
+                panic_with_error!(&env, VotingError::InvalidCeremonyAuthority);
+            }
+            approver.require_auth();
+            seen.push_back(approver);
+        }
+
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EncryptedBallotCount(dao_id, proposal_id))
+            .unwrap_or(0);
+        if count == 0 {
+            panic_with_error!(&env, VotingError::TallyProofMissing);
+        }
+        if params.yes_votes.saturating_add(params.no_votes) > count {
+            panic_with_error!(&env, VotingError::TallyOverflow);
+        }
+
+        // Validate the aggregate points are in the field.
+        let _ = Self::point_bytes_to_u256(&env, &params.aggregate_c1);
+        let _ = Self::point_bytes_to_u256(&env, &params.aggregate_c_yes);
+        let _ = Self::point_bytes_to_u256(&env, &params.aggregate_c_no);
+
+        proposal.yes_votes = params.yes_votes;
+        proposal.no_votes = params.no_votes;
+        proposal.state = ProposalState::Closed;
+        env.storage().persistent().set(&prop_key, &proposal);
+        Self::bump_persistent(&env, &prop_key);
+
+        config.finalized = true;
+        env.storage().persistent().set(&config_key, &config);
+        Self::bump_persistent(&env, &config_key);
+
+        let result = EncryptedTallyResult {
+            yes_votes: params.yes_votes,
+            no_votes: params.no_votes,
+            aggregate_c1: params.aggregate_c1,
+            aggregate_c_yes: params.aggregate_c_yes,
+            aggregate_c_no: params.aggregate_c_no,
+            ballot_count: count,
+            epoch: config.epoch,
+            finalized_at: now,
+        };
+        let tally_key = DataKey::EncryptedTally(dao_id, proposal_id);
+        env.storage().persistent().set(&tally_key, &result);
+        Self::bump_persistent(&env, &tally_key);
+
+        EncryptedTallyFinalizedEvent {
+            dao_id,
+            proposal_id,
+            yes_votes: params.yes_votes,
+            no_votes: params.no_votes,
+            ballot_count: count,
+            epoch: config.epoch,
+        }
+        .publish(&env);
+    }
+
+    pub fn get_encrypted_config(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<EncryptedTallyConfig> {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::EncryptedConfig(dao_id, proposal_id))
+    }
+
+    pub fn get_encrypted_ballot(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+        nullifier: U256,
+    ) -> Option<EncryptedBallot> {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::EncryptedBallot(dao_id, proposal_id, nullifier))
+    }
+
+    pub fn encrypted_ballot_count(env: Env, dao_id: u64, proposal_id: u64) -> u64 {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::EncryptedBallotCount(dao_id, proposal_id))
+            .unwrap_or(0)
+    }
+
+    pub fn get_encrypted_tally(
+        env: Env,
+        dao_id: u64,
+        proposal_id: u64,
+    ) -> Option<EncryptedTallyResult> {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::EncryptedTally(dao_id, proposal_id))
+    }
+
     // ── Reentrancy Guard ────────────────────────────────────────────────────
     //
     // REENTRANCY MODEL:
@@ -2526,6 +4355,7 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
 
         let ctx = PathContext::Anonymous;
 
@@ -2975,6 +4805,16 @@ impl Voting {
             panic_with_error!(&env, VotingError::VotingClosed);
         }
         if root != proposal.eligible_root {
+            panic_with_error!(&env, VotingError::RootMismatch);
+        }
+
+        // #736: flash-membership guard — the proof must be bound to the
+        // eligibility snapshot root pinned at proposal-creation time. A voter
+        // who registered after the snapshot cannot manufacture a valid proof
+        // for this root, and a flash-membership attacker who registered,
+        // voted, and then burned/transferred the SBT is identifiable because
+        // their commitment was not in the tree when this snapshot was taken.
+        if root != proposal.eligibility_snapshot_root {
             panic_with_error!(&env, VotingError::RootMismatch);
         }
 
@@ -3454,6 +5294,7 @@ impl Voting {
         let ctx = PathContext::Anonymous;
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
         Self::set_reentrancy_lock(&env);
 
         let count = votes.len();
@@ -3735,7 +5576,13 @@ impl Voting {
             .persistent()
             .get(&key)
             .expect("proposal not found");
-        Self::bump_persistent(&env, &key);
+        let is_active = proposal.end_time == 0 || env.ledger().timestamp() <= proposal.end_time;
+        let prio = if is_active {
+            TtlPriority::Critical
+        } else {
+            TtlPriority::Standard
+        };
+        Self::bump_dao_persistent(&env, dao_id, prio, &key);
         proposal
     }
 
@@ -3952,6 +5799,12 @@ impl Voting {
         }
         if proposal.state != ProposalState::Closed {
             proposal.state = ProposalState::Closed;
+            // Freeze Trailing-mode results: record the ledger timestamp at which
+            // the tally became final.  All result consumers (rewards, randomness,
+            // upgrades) must treat the tally as immutable once this is set.
+            if proposal.vote_mode == VoteMode::Trailing {
+                proposal.trailing_finalized_at = Some(env.ledger().timestamp());
+            }
             env.storage().persistent().set(&key, &proposal);
             Self::bump_persistent(&env, &key);
             ProposalClosedEvent {
@@ -4360,6 +6213,7 @@ impl Voting {
     ) {
         Self::bump_instance(&env);
         Self::require_not_paused(&env);
+        Self::require_tier_not_halted(&env, HALT_TIER_VOTE_SUBMISSION);
         Self::assert_in_field(&env, PathContext::Anonymous, &nullifier);
         Self::assert_in_field(&env, PathContext::Anonymous, &root);
 
@@ -5341,7 +7195,15 @@ impl Voting {
         Self::bump_persistent(&env, &delay_key);
 
         // Derive and store the VDF input from election parameters
-        let block_hash = BytesN::from_array(&env, &[0u8; 32]); // Placeholder — in production use ledger hash
+        // Derive per-ledger entropy from sequence + timestamp so the VDF
+        // input is unpredictable before close but deterministically verifiable
+        // by anyone who knows the ledger header.
+        let seq: u32 = env.ledger().sequence();
+        let ts: u64  = env.ledger().timestamp();
+        let mut entropy_buf = [0u8; 12];
+        entropy_buf[..4].copy_from_slice(&seq.to_be_bytes());
+        entropy_buf[4..12].copy_from_slice(&ts.to_be_bytes());
+        let block_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &entropy_buf)).into();
         let admin_xdr = admin.to_xdr(&env);
         let admin_seed: BytesN<32> = env.crypto().sha256(&admin_xdr).into();
         let vdf_input = vdf::derive_vdf_input(&env, dao_id, proposal_id, &block_hash, &admin_seed);

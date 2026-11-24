@@ -1,0 +1,59 @@
+# Priority-queue starvation alerts (ZV-110).
+#
+# `zkvote_priority_starvation_total{priority,route}` increments whenever a
+# queued request waits at least `starvationThresholdMs` (default 1s) before
+# starting (backend/src/priority/priorityQueue.ts). Each tier has its own
+# worker pool, so starvation in one tier means that tier's own reserved
+# concurrency is saturated — it is never caused by a lower tier's traffic,
+# only by too much same-tier or higher-priority work.
+#
+# docs/PRIORITY_MODEL.md documents this alert; see
+# backend/src/priority/priorityConfig.ts for the tier definitions
+# (CRITICAL: vote, HIGH: admin/dispute, NORMAL: pay/swap/ramp, LOW: comment).
+
+groups:
+  - name: zkvote-priority-queue
+    rules:
+      - alert: ZKVotePriorityStarvation
+        expr: sum by (priority, route) (increase(zkvote_priority_starvation_total{priority="CRITICAL"}[5m])) > 0
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: "Vote traffic ({{ $labels.route }}) is waiting on the CRITICAL priority queue"
+          description: >
+            A vote request waited past the starvation threshold even though
+            votes have their own reserved worker pool. This means CRITICAL
+            concurrency itself is saturated by vote volume, not by comments,
+            payments, or admin traffic. Runbook: check
+            zkvote_priority_queue_depth{tier="CRITICAL"}; if sustained, raise
+            TIER_SETTINGS[CRITICAL].concurrency rather than any other tier's.
+
+      - alert: ZKVoteAdminDisputePriorityStarvation
+        expr: sum by (priority, route) (increase(zkvote_priority_starvation_total{priority="HIGH"}[5m])) > 0
+        labels:
+          severity: critical
+          service: zkvote-relayer
+        annotations:
+          summary: "Admin/dispute traffic ({{ $labels.route }}) is waiting on the HIGH priority queue"
+          description: >
+            An admin intervention or dispute-intake request waited past the
+            starvation threshold. HIGH has its own reserved pool separate
+            from NORMAL (payments) and LOW (comments), so this means an
+            incident responder may currently be blocked. Runbook: check
+            zkvote_priority_queue_depth{tier="HIGH"} for backlog; this is an
+            incident-response path, treat as high urgency.
+
+      - alert: ZKVotePaymentPriorityStarvation
+        expr: sum by (priority, route) (increase(zkvote_priority_starvation_total{priority="NORMAL"}[10m])) > 20
+        for: 5m
+        labels:
+          severity: warning
+          service: zkvote-relayer
+        annotations:
+          summary: "Payment traffic ({{ $labels.route }}) is backing up in the NORMAL priority queue"
+          description: >
+            A burst of pay/swap/ramp requests is exceeding NORMAL's reserved
+            concurrency. This is expected to self-resolve as the tier drains
+            (it cannot occupy HIGH or CRITICAL workers); sustained growth
+            means the burst is outpacing TIER_SETTINGS[NORMAL].concurrency.

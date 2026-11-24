@@ -1,0 +1,91 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://zk-vote/release-manifest.schema.json",
+  "title": "ZK-VOTE Release Train Manifest",
+  "description": "Describes released versions, their component versions, compatibility requirements, breaking changes, and valid upgrade paths.",
+  "type": "object",
+  "required": ["schemaVersion", "releases", "upgradeMatrix"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": {
+      "type": "string",
+      "description": "Version of this manifest schema; bump when the shape changes"
+    },
+    "releases": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/Release" }
+    },
+    "upgradeMatrix": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/UpgradePath" }
+    }
+  },
+  "definitions": {
+    "Release": {
+      "type": "object",
+      "required": ["version", "status", "components", "compatibility", "breakingChanges", "migrations"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "releasedAt": { "type": ["string", "null"], "format": "date-time" },
+        "status": { "type": "string", "enum": ["stable", "prerelease", "deprecated", "eol"] },
+        "components": {
+          "type": "object",
+          "required": ["backend", "frontend", "contracts"],
+          "properties": {
+            "backend":   { "type": "string" },
+            "frontend":  { "type": "string" },
+            "contracts": { "type": "string" }
+          }
+        },
+        "compatibility": {
+          "type": "object",
+          "required": ["stellarNetwork", "sorobanRpcMinVersion", "nodeMinVersion", "postgresMinVersion"],
+          "properties": {
+            "stellarNetwork":       { "type": "array", "items": { "type": "string" } },
+            "sorobanRpcMinVersion": { "type": "string" },
+            "nodeMinVersion":       { "type": "string" },
+            "postgresMinVersion":   { "type": "string" }
+          }
+        },
+        "breakingChanges": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/BreakingChange" }
+        },
+        "migrations": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/Migration" }
+        }
+      }
+    },
+    "BreakingChange": {
+      "type": "object",
+      "required": ["area", "description", "migrationType"],
+      "properties": {
+        "area":          { "type": "string" },
+        "description":   { "type": "string" },
+        "migrationType": { "type": "string", "enum": ["additive", "breaking", "removal"] }
+      }
+    },
+    "Migration": {
+      "type": "object",
+      "required": ["id", "description", "required"],
+      "properties": {
+        "id":          { "type": "string" },
+        "description": { "type": "string" },
+        "required":    { "type": "boolean" }
+      }
+    },
+    "UpgradePath": {
+      "type": "object",
+      "required": ["from", "to", "supported"],
+      "properties": {
+        "from":      { "type": "string" },
+        "to":        { "type": "string" },
+        "supported": { "type": "boolean" },
+        "notes":     { "type": "string" }
+      }
+    }
+  }
+}

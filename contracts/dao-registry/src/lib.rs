@@ -38,6 +38,22 @@ const PERSISTENT_TTL_EXTEND: u32 = 6_312_000; // ~365 days — protocol maxEntry
 /// paginate by advancing `start`.
 pub const SWEEP_MAX_DAOS: u32 = 50;
 
+/// Durable receipt for an idempotent DAO creation.
+///
+/// The backend provisioner can safely retry `create_dao_idempotent` after a
+/// crash: the key is the idempotency token, and the receipt records the DAO it
+/// produced. Later bootstrap steps still need their own idempotency (the
+/// backend saga records checkpoints), but a retried registry step can never
+/// create a duplicate DAO.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DaoCreationReceipt {
+    pub dao_id: u64,
+    pub idempotency_key: BytesN<32>,
+    pub creator: Address,
+    pub created_at: u64,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum RegistryError {
@@ -61,13 +77,128 @@ pub enum RegistryError {
     DuplicateSigner = 17,
     InvalidThreshold = 18,
     SignerNotFound = 19,
+    // Issue #734 — name squatting / front-running mitigations
+    /// A commit-reveal reservation for this name already exists and has not
+    /// yet expired. The caller must wait for it to expire or be the same
+    /// address that committed.
+    NameAlreadyReserved = 20,
+    /// The provided reveal does not match the on-chain commitment hash.
+    CommitRevealMismatch = 21,
+    /// The reservation has expired; the caller must commit again.
+    ReservationExpired = 22,
+    /// The reservation window has not passed; reveal is too early.
+    RevealTooEarly = 23,
+    /// Storage footprint quota exceeded for this DAO.
+    StorageQuotaExceeded = 24,
+    /// Unauthorized storage update or footprint alteration.
+    UnauthorizedStorageUpdate = 25,
+    /// Invalid storage category supplied.
+    InvalidStorageCategory = 26,
 }
 
 // Size limit to prevent DoS attacks
 const MAX_DAO_NAME_LEN: u32 = 24; // Max DAO name length (24 chars)
 const MAX_METADATA_CID_LEN: u32 = 64; // Max IPFS CID length
+
+// ── Storage-rent DoS mitigations (SPIKE-052 / issue #732) ────────────────────
+//
+// Soroban storage rent is billed per-entry at ledger close. Without per-DAO
+// footprint accounting an attacker can create many DAOs and grow tree/proposal
+// state cheaply, externalizing rent costs to the network.
+//
+// Policy (v1):
+//   MAX_PROPOSALS_PER_DAO  — caps the maximum number of concurrent open
+//     proposals per DAO; limits voting-contract state growth.
+//   MAX_MEMBERS_PER_DAO    — soft cap on SBT mints / tree leaves per DAO
+//     before the DAO admin must explicitly raise the limit (prevents depth-18
+//     tree exhaustion attacks on small DAOs).
+//   MAX_COMMENTS_PER_PROPOSAL — limits comment-contract entries per proposal.
+//
+// These constants are readable by sibling contracts (voting, comments,
+// membership-tree) via a future cross-contract call so the policy is
+// authoritative here. They are conservative defaults; a governance action on
+// the registry contract can raise them for a specific DAO.
+//
+// Reverse-griefing note: a cap on DAO state can be used by an attacker to
+// pin a victim DAO at its quota and freeze legitimate growth. Mitigation:
+// only the DAO admin may raise per-DAO caps (via `set_dao_quota`), and
+// the protocol-global defaults are set high enough to not affect real DAOs.
+pub const MAX_PROPOSALS_PER_DAO: u32 = 1_000;
+pub const MAX_MEMBERS_PER_DAO: u32 = 100_000; // 2^18 = 262_144 is the tree hard limit
+pub const MAX_COMMENTS_PER_PROPOSAL: u32 = 500;
+pub const DEFAULT_MAX_ENTRIES_PER_DAO: u32 = 105_000;
+pub const DEFAULT_MAX_BYTES_PER_DAO: u64 = 50_000_000; // 50 MB
 const MIN_UPGRADE_DELAY: u64 = 24 * 60 * 60;
 const MAX_UPGRADE_PAYLOAD_LEN: u32 = 4096;
+
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum StorageCategory {
+    Governance = 0,
+    Voting = 1,
+    Membership = 2,
+    Auxiliary = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageFootprint {
+    pub total_entries: u32,
+    pub total_bytes: u64,
+    pub governance_entries: u32,
+    pub governance_bytes: u64,
+    pub voting_entries: u32,
+    pub voting_bytes: u64,
+    pub membership_entries: u32,
+    pub membership_bytes: u64,
+    pub auxiliary_entries: u32,
+    pub auxiliary_bytes: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageQuota {
+    pub max_entries: u32,
+    pub max_bytes: u64,
+}
+
+// ── Commit-reveal name reservation (SPIKE-055 / issue #734) ──────────────────
+//
+// DAOs are identified by a numeric `dao_id` (squatting-proof). Names are
+// non-unique labels on top of that numeric identity. To mitigate creation
+// front-running (a watcher races to register the same name with a higher
+// ledger-sequence fee), we provide an optional commit-reveal flow:
+//
+//   1. Caller hashes: commitment = SHA-256(name || nonce || caller_address)
+//      and calls `commit_name(commitment, caller)`.
+//   2. After REVEAL_MIN_WAIT_LEDGERS ledgers, caller calls `create_dao` with
+//      the same name + nonce. The contract verifies the commitment and clears
+//      the reservation.
+//
+// The reservation expires after RESERVATION_TTL_LEDGERS so a failed reveal
+// doesn't permanently block a name.
+//
+// Commit-reveal is OPTIONAL — callers that don't care about front-running can
+// skip it and call `create_dao` directly. The numeric dao_id is always the
+// canonical identity regardless of the name label.
+/// Minimum ledgers between commit and reveal (~5 minutes at 5s/ledger).
+pub const REVEAL_MIN_WAIT_LEDGERS: u32 = 60;
+/// Reservation TTL in ledgers (~1 hour).
+pub const RESERVATION_TTL_LEDGERS: u32 = 720;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct NameReservation {
+    /// Address that committed (only this address may reveal).
+    pub reserver: Address,
+    /// SHA-256(name || nonce || reserver) — stored as 32-byte hash.
+    pub commitment: BytesN<32>,
+    /// Ledger sequence when the commitment was made.
+    pub committed_at: u32,
+    /// Ledger sequence when this reservation expires.
+    pub expires_at: u32,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -241,6 +372,15 @@ pub struct DaoCreateEvent {
 
 #[soroban_sdk::contractevent]
 #[derive(Clone, Debug, PartialEq)]
+pub struct DaoCreatedIdempotentEvent {
+    #[topic]
+    pub idempotency_key: BytesN<32>,
+    pub dao_id: u64,
+    pub created: bool,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CircuitUpgradeProposedEvent {
     #[topic]
     pub dao_id: u64,
@@ -309,6 +449,25 @@ pub struct ContractUpgraded {
     pub to: u32,
 }
 
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageFootprintUpdatedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub category: u32,
+    pub total_entries: u32,
+    pub total_bytes: u64,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DaoQuotaUpdatedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub max_entries: u32,
+    pub max_bytes: u64,
+}
+
 #[contract]
 pub struct DaoRegistry;
 
@@ -351,6 +510,14 @@ impl DaoRegistry {
         };
 
         let key = Self::member_role_key(dao_id, &member);
+        let exists = env.storage().persistent().has(&key);
+        Self::charge_storage_footprint(
+            &env,
+            dao_id,
+            StorageCategory::Membership,
+            64,
+            if exists { Some(64) } else { None },
+        );
         let member_role = MemberRole {
             member: member.clone(),
             role: role_enum,
@@ -396,6 +563,7 @@ impl DaoRegistry {
         let key = Self::member_role_key(dao_id, &member);
         if env.storage().persistent().has(&key) {
             env.storage().persistent().remove(&key);
+            Self::release_storage_footprint(&env, dao_id, StorageCategory::Membership, 64);
 
             RoleRevokedEvent { dao_id, member }.publish(&env);
         }
@@ -441,6 +609,14 @@ impl DaoRegistry {
         };
 
         let key = Self::multisig_config_key(dao_id);
+        let exists = env.storage().persistent().has(&key);
+        Self::charge_storage_footprint(
+            &env,
+            dao_id,
+            StorageCategory::Governance,
+            160,
+            if exists { Some(160) } else { None },
+        );
         env.storage().persistent().set(&key, &config);
         Self::bump_persistent(&env, &key);
 
@@ -524,6 +700,7 @@ impl DaoRegistry {
         };
 
         let proposal_key = Self::multisig_proposal_key(dao_id, proposal_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 512, None);
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_persistent(&env, &proposal_key);
 
@@ -588,6 +765,7 @@ impl DaoRegistry {
         }
 
         proposal.signatures.push_back(signer.clone());
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 512, Some(512));
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_persistent(&env, &proposal_key);
 
@@ -664,6 +842,7 @@ impl DaoRegistry {
 
         // Mark as executed
         proposal.executed = true;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 512, Some(512));
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_persistent(&env, &proposal_key);
 
@@ -717,6 +896,7 @@ impl DaoRegistry {
         };
 
         let key = Self::dao_key(dao_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, None);
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
 
@@ -728,6 +908,82 @@ impl DaoRegistry {
         .publish(&env);
 
         dao_id
+    }
+
+    /// Idempotent DAO creation used by the bootstrap saga.
+    ///
+    /// Retrying with the same 32-byte key returns the original DAO id with
+    /// `created == false` instead of minting a duplicate DAO. The receipt is
+    /// durable for the life of the contract and lets the backend prove which
+    /// step actually committed after a crash.
+    pub fn create_dao_idempotent(
+        env: Env,
+        idempotency_key: BytesN<32>,
+        name: String,
+        creator: Address,
+        membership_open: bool,
+        members_can_propose: bool,
+        metadata_cid: Option<String>,
+    ) -> (u64, bool) {
+        Self::bump_instance(&env);
+
+        let key = (symbol_short!("idem"), idempotency_key.clone());
+        if let Some(dao_id) = env.storage().persistent().get::<_, u64>(&key) {
+            Self::bump_persistent(&env, &key);
+            DaoCreatedIdempotentEvent {
+                idempotency_key,
+                dao_id,
+                created: false,
+            }
+            .publish(&env);
+            return (dao_id, false);
+        }
+
+        let dao_id = Self::create_dao(
+            env.clone(),
+            name,
+            creator.clone(),
+            membership_open,
+            members_can_propose,
+            metadata_cid,
+        );
+
+        env.storage().persistent().set(&key, &dao_id);
+        Self::bump_persistent(&env, &key);
+
+        let receipt = DaoCreationReceipt {
+            dao_id,
+            idempotency_key: idempotency_key.clone(),
+            creator,
+            created_at: env.ledger().timestamp(),
+        };
+        let receipt_key = (symbol_short!("receipt"), dao_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Auxiliary, 80, None);
+        env.storage().persistent().set(&receipt_key, &receipt);
+        Self::bump_persistent(&env, &receipt_key);
+
+        DaoCreatedIdempotentEvent {
+            idempotency_key,
+            dao_id,
+            created: true,
+        }
+        .publish(&env);
+
+        (dao_id, true)
+    }
+
+    /// Resolve an idempotency key to the DAO it created, if any.
+    pub fn get_dao_by_idempotency_key(env: Env, idempotency_key: BytesN<32>) -> Option<u64> {
+        Self::bump_instance(&env);
+        let key = (symbol_short!("idem"), idempotency_key);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Read the durable creation receipt for a DAO.
+    pub fn get_creation_receipt(env: Env, dao_id: u64) -> Option<DaoCreationReceipt> {
+        Self::bump_instance(&env);
+        let key = (symbol_short!("receipt"), dao_id);
+        env.storage().persistent().get(&key)
     }
 
     /// Get DAO info
@@ -770,6 +1026,7 @@ impl DaoRegistry {
 
         let old_admin = info.admin.clone();
         info.admin = new_admin.clone();
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, Some(256));
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
 
@@ -863,6 +1120,7 @@ impl DaoRegistry {
         }
 
         info.members_can_propose = members_can_propose;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, Some(256));
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
     }
@@ -887,6 +1145,7 @@ impl DaoRegistry {
         }
 
         info.membership_open = membership_open;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, Some(256));
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
     }
@@ -914,6 +1173,7 @@ impl DaoRegistry {
         }
 
         info.name = name;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, Some(256));
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
     }
@@ -945,6 +1205,7 @@ impl DaoRegistry {
         }
 
         info.metadata_cid = metadata_cid;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, Some(256));
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
     }
@@ -1004,6 +1265,7 @@ impl DaoRegistry {
         };
 
         let key = Self::dao_key(dao_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, None);
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
 
@@ -1092,6 +1354,7 @@ impl DaoRegistry {
         };
 
         let key = Self::dao_key(dao_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, None);
         env.storage().persistent().set(&key, &info);
         Self::bump_persistent(&env, &key);
 
@@ -1201,12 +1464,294 @@ impl DaoRegistry {
         (symbol_short!("upgrade"), dao_id, proposal_id)
     }
 
+    fn footprint_key(dao_id: u64) -> (Symbol, u64) {
+        (symbol_short!("ftprint"), dao_id)
+    }
+
+    fn quota_key(dao_id: u64) -> (Symbol, u64) {
+        (symbol_short!("quota"), dao_id)
+    }
+
+    pub fn get_storage_footprint(env: Env, dao_id: u64) -> StorageFootprint {
+        Self::bump_instance(&env);
+        let key = Self::footprint_key(dao_id);
+        env.storage().persistent().get(&key).unwrap_or(StorageFootprint {
+            total_entries: 0,
+            total_bytes: 0,
+            governance_entries: 0,
+            governance_bytes: 0,
+            voting_entries: 0,
+            voting_bytes: 0,
+            membership_entries: 0,
+            membership_bytes: 0,
+            auxiliary_entries: 0,
+            auxiliary_bytes: 0,
+        })
+    }
+
+    pub fn get_dao_quota(env: Env, dao_id: u64) -> StorageQuota {
+        Self::bump_instance(&env);
+        let key = Self::quota_key(dao_id);
+        env.storage().persistent().get(&key).unwrap_or(StorageQuota {
+            max_entries: DEFAULT_MAX_ENTRIES_PER_DAO,
+            max_bytes: DEFAULT_MAX_BYTES_PER_DAO,
+        })
+    }
+
+    pub fn set_dao_quota(
+        env: Env,
+        dao_id: u64,
+        max_entries: u32,
+        max_bytes: u64,
+        admin: Address,
+    ) {
+        Self::bump_instance(&env);
+        admin.require_auth();
+        Self::require_dao_admin(&env, dao_id, &admin);
+
+        let current = Self::get_storage_footprint(env.clone(), dao_id);
+        if max_entries < current.total_entries || max_bytes < current.total_bytes {
+            panic_with_error!(&env, RegistryError::StorageQuotaExceeded);
+        }
+
+        let quota = StorageQuota {
+            max_entries,
+            max_bytes,
+        };
+        let key = Self::quota_key(dao_id);
+        env.storage().persistent().set(&key, &quota);
+        Self::bump_persistent(&env, &key);
+
+        DaoQuotaUpdatedEvent {
+            dao_id,
+            max_entries,
+            max_bytes,
+        }
+        .publish(&env);
+    }
+
+    pub fn record_external_storage_usage(
+        env: Env,
+        dao_id: u64,
+        category: u32,
+        delta_entries: i32,
+        delta_bytes: i64,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+        Self::require_dao_admin(&env, dao_id, &caller);
+
+        let cat = match category {
+            0 => StorageCategory::Governance,
+            1 => StorageCategory::Voting,
+            2 => StorageCategory::Membership,
+            3 => StorageCategory::Auxiliary,
+            _ => panic_with_error!(&env, RegistryError::InvalidStorageCategory),
+        };
+
+        let quota = Self::get_dao_quota(env.clone(), dao_id);
+        let mut fp = Self::get_storage_footprint(env.clone(), dao_id);
+
+        let new_total_entries = (fp.total_entries as i64 + delta_entries as i64) as u32;
+        let new_total_bytes = if delta_bytes >= 0 {
+            fp.total_bytes.saturating_add(delta_bytes as u64)
+        } else {
+            fp.total_bytes.saturating_sub((-delta_bytes) as u64)
+        };
+
+        if new_total_entries > quota.max_entries || new_total_bytes > quota.max_bytes {
+            panic_with_error!(&env, RegistryError::StorageQuotaExceeded);
+        }
+
+        fp.total_entries = new_total_entries;
+        fp.total_bytes = new_total_bytes;
+
+        match cat {
+            StorageCategory::Governance => {
+                fp.governance_entries = (fp.governance_entries as i64 + delta_entries as i64) as u32;
+                fp.governance_bytes = if delta_bytes >= 0 {
+                    fp.governance_bytes.saturating_add(delta_bytes as u64)
+                } else {
+                    fp.governance_bytes.saturating_sub((-delta_bytes) as u64)
+                };
+            }
+            StorageCategory::Voting => {
+                fp.voting_entries = (fp.voting_entries as i64 + delta_entries as i64) as u32;
+                fp.voting_bytes = if delta_bytes >= 0 {
+                    fp.voting_bytes.saturating_add(delta_bytes as u64)
+                } else {
+                    fp.voting_bytes.saturating_sub((-delta_bytes) as u64)
+                };
+            }
+            StorageCategory::Membership => {
+                fp.membership_entries = (fp.membership_entries as i64 + delta_entries as i64) as u32;
+                fp.membership_bytes = if delta_bytes >= 0 {
+                    fp.membership_bytes.saturating_add(delta_bytes as u64)
+                } else {
+                    fp.membership_bytes.saturating_sub((-delta_bytes) as u64)
+                };
+            }
+            StorageCategory::Auxiliary => {
+                fp.auxiliary_entries = (fp.auxiliary_entries as i64 + delta_entries as i64) as u32;
+                fp.auxiliary_bytes = if delta_bytes >= 0 {
+                    fp.auxiliary_bytes.saturating_add(delta_bytes as u64)
+                } else {
+                    fp.auxiliary_bytes.saturating_sub((-delta_bytes) as u64)
+                };
+            }
+        }
+
+        let key = Self::footprint_key(dao_id);
+        env.storage().persistent().set(&key, &fp);
+        Self::bump_persistent(&env, &key);
+
+        StorageFootprintUpdatedEvent {
+            dao_id,
+            category,
+            total_entries: fp.total_entries,
+            total_bytes: fp.total_bytes,
+        }
+        .publish(&env);
+    }
+
+    fn charge_storage_footprint(
+        env: &Env,
+        dao_id: u64,
+        category: StorageCategory,
+        new_bytes: u64,
+        old_bytes: Option<u64>,
+    ) {
+        let quota = Self::get_dao_quota(env.clone(), dao_id);
+        let mut fp = Self::get_storage_footprint(env.clone(), dao_id);
+
+        let (entries_delta, bytes_delta) = match old_bytes {
+            Some(old_b) => {
+                let delta = if new_bytes >= old_b {
+                    (new_bytes - old_b) as i64
+                } else {
+                    -((old_b - new_bytes) as i64)
+                };
+                (0i32, delta)
+            }
+            None => (1i32, new_bytes as i64),
+        };
+
+        let new_total_entries = (fp.total_entries as i64 + entries_delta as i64) as u32;
+        let new_total_bytes = if bytes_delta >= 0 {
+            fp.total_bytes.saturating_add(bytes_delta as u64)
+        } else {
+            fp.total_bytes.saturating_sub((-bytes_delta) as u64)
+        };
+
+        if new_total_entries > quota.max_entries || new_total_bytes > quota.max_bytes {
+            panic_with_error!(env, RegistryError::StorageQuotaExceeded);
+        }
+
+        fp.total_entries = new_total_entries;
+        fp.total_bytes = new_total_bytes;
+
+        match category {
+            StorageCategory::Governance => {
+                fp.governance_entries = (fp.governance_entries as i64 + entries_delta as i64) as u32;
+                fp.governance_bytes = if bytes_delta >= 0 {
+                    fp.governance_bytes.saturating_add(bytes_delta as u64)
+                } else {
+                    fp.governance_bytes.saturating_sub((-bytes_delta) as u64)
+                };
+            }
+            StorageCategory::Voting => {
+                fp.voting_entries = (fp.voting_entries as i64 + entries_delta as i64) as u32;
+                fp.voting_bytes = if bytes_delta >= 0 {
+                    fp.voting_bytes.saturating_add(bytes_delta as u64)
+                } else {
+                    fp.voting_bytes.saturating_sub((-bytes_delta) as u64)
+                };
+            }
+            StorageCategory::Membership => {
+                fp.membership_entries = (fp.membership_entries as i64 + entries_delta as i64) as u32;
+                fp.membership_bytes = if bytes_delta >= 0 {
+                    fp.membership_bytes.saturating_add(bytes_delta as u64)
+                } else {
+                    fp.membership_bytes.saturating_sub((-bytes_delta) as u64)
+                };
+            }
+            StorageCategory::Auxiliary => {
+                fp.auxiliary_entries = (fp.auxiliary_entries as i64 + entries_delta as i64) as u32;
+                fp.auxiliary_bytes = if bytes_delta >= 0 {
+                    fp.auxiliary_bytes.saturating_add(bytes_delta as u64)
+                } else {
+                    fp.auxiliary_bytes.saturating_sub((-bytes_delta) as u64)
+                };
+            }
+        }
+
+        let key = Self::footprint_key(dao_id);
+        env.storage().persistent().set(&key, &fp);
+        Self::bump_persistent(env, &key);
+
+        StorageFootprintUpdatedEvent {
+            dao_id,
+            category: category as u32,
+            total_entries: fp.total_entries,
+            total_bytes: fp.total_bytes,
+        }
+        .publish(env);
+    }
+
+    fn release_storage_footprint(
+        env: &Env,
+        dao_id: u64,
+        category: StorageCategory,
+        released_bytes: u64,
+    ) {
+        let mut fp = Self::get_storage_footprint(env.clone(), dao_id);
+        fp.total_entries = fp.total_entries.saturating_sub(1);
+        fp.total_bytes = fp.total_bytes.saturating_sub(released_bytes);
+
+        match category {
+            StorageCategory::Governance => {
+                fp.governance_entries = fp.governance_entries.saturating_sub(1);
+                fp.governance_bytes = fp.governance_bytes.saturating_sub(released_bytes);
+            }
+            StorageCategory::Voting => {
+                fp.voting_entries = fp.voting_entries.saturating_sub(1);
+                fp.voting_bytes = fp.voting_bytes.saturating_sub(released_bytes);
+            }
+            StorageCategory::Membership => {
+                fp.membership_entries = fp.membership_entries.saturating_sub(1);
+                fp.membership_bytes = fp.membership_bytes.saturating_sub(released_bytes);
+            }
+            StorageCategory::Auxiliary => {
+                fp.auxiliary_entries = fp.auxiliary_entries.saturating_sub(1);
+                fp.auxiliary_bytes = fp.auxiliary_bytes.saturating_sub(released_bytes);
+            }
+        }
+
+        let key = Self::footprint_key(dao_id);
+        env.storage().persistent().set(&key, &fp);
+        Self::bump_persistent(env, &key);
+
+        StorageFootprintUpdatedEvent {
+            dao_id,
+            category: category as u32,
+            total_entries: fp.total_entries,
+            total_bytes: fp.total_bytes,
+        }
+        .publish(env);
+    }
+
     fn next_upgrade_proposal_id(env: &Env) -> u64 {
         let key = symbol_short!("c_upg_cnt");
         let count: u64 = env.storage().instance().get(&key).unwrap_or(0);
         let new_id = count + 1;
         env.storage().instance().set(&key, &new_id);
         new_id
+    }
+
+    /// Storage key for a name reservation commitment (issue #734).
+    fn name_reservation_key(commitment: &BytesN<32>) -> (Symbol, BytesN<32>) {
+        (symbol_short!("nm_rsv"), commitment.clone())
     }
 
     fn next_multisig_proposal_id(env: &Env) -> u64 {
@@ -1279,6 +1824,7 @@ impl DaoRegistry {
         };
 
         let key = Self::contract_upgrade_key(dao_id, proposal_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 1024, None);
         env.storage().persistent().set(&key, &proposal);
         Self::bump_persistent(&env, &key);
 
@@ -1338,6 +1884,7 @@ impl DaoRegistry {
         );
 
         proposal.executed = true;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 1024, Some(1024));
         env.storage().persistent().set(&key, &proposal);
         Self::bump_persistent(&env, &key);
 
@@ -1380,6 +1927,7 @@ impl DaoRegistry {
         );
 
         proposal.rolled_back = true;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 1024, Some(1024));
         env.storage().persistent().set(&key, &proposal);
         Self::bump_persistent(&env, &key);
 
@@ -1449,6 +1997,7 @@ impl DaoRegistry {
         };
 
         let proposal_key = Self::circuit_upgrade_key(dao_id, proposal_id);
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, None);
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_persistent(&env, &proposal_key);
 
@@ -1491,6 +2040,7 @@ impl DaoRegistry {
         }
 
         proposal.approved = true;
+        Self::charge_storage_footprint(&env, dao_id, StorageCategory::Governance, 256, Some(256));
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_persistent(&env, &proposal_key);
 
@@ -1499,6 +2049,58 @@ impl DaoRegistry {
             proposal_id,
         }
         .publish(&env);
+    }
+
+    // ── Commit-reveal name reservation (SPIKE-055 / issue #734) ─────────────
+    //
+    // Optional front-running mitigation for `create_dao`. The caller hashes
+    //   commitment = SHA-256(name || nonce || caller_address)
+    // off-chain and stores only the hash. After REVEAL_MIN_WAIT_LEDGERS ledgers
+    // the caller can prove ownership of the name by supplying the preimage in
+    // `create_dao`. The DAO's canonical identity is always the numeric `dao_id`
+    // assigned at creation; names are non-unique labels on that identity.
+
+    /// Store a name reservation commitment. Only the `reserver` address may
+    /// later reveal it. The same commitment hash may not be re-committed while
+    /// an unexpired reservation exists.
+    pub fn commit_name(env: Env, commitment: BytesN<32>, reserver: Address) {
+        Self::bump_instance(&env);
+        reserver.require_auth();
+
+        let key = Self::name_reservation_key(&commitment);
+        let now_ledger = env.ledger().sequence();
+
+        // If a reservation already exists and has not expired, reject.
+        if let Some(existing) = env.storage().temporary().get::<_, NameReservation>(&key) {
+            if existing.expires_at >= now_ledger {
+                panic_with_error!(&env, RegistryError::NameAlreadyReserved);
+            }
+        }
+
+        let reservation = NameReservation {
+            reserver,
+            commitment: commitment.clone(),
+            committed_at: now_ledger,
+            expires_at: now_ledger + RESERVATION_TTL_LEDGERS,
+        };
+        env.storage().temporary().set(&key, &reservation);
+        // Extend TTL so the entry survives until expiry.
+        env.storage().temporary().extend_ttl(
+            &key,
+            RESERVATION_TTL_LEDGERS,
+            RESERVATION_TTL_LEDGERS,
+        );
+    }
+
+    /// Read back a name reservation (for frontend UX / availability checks).
+    pub fn get_name_reservation(env: Env, commitment: BytesN<32>) -> Option<NameReservation> {
+        Self::bump_instance(&env);
+        let key = Self::name_reservation_key(&commitment);
+        let now_ledger = env.ledger().sequence();
+        env.storage()
+            .temporary()
+            .get(&key)
+            .filter(|r: &NameReservation| r.expires_at >= now_ledger)
     }
 
     pub fn get_circuit_upgrade_proposal(

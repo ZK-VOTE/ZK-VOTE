@@ -1,73 +1,74 @@
 // DAO metadata types and utilities for profile/branding management
+// ZV-127: Now uses versioned schema with migration support
 
 import { relayerFetch } from "./api";
 import { safeClone } from "./safeMerge";
+import {
+  type DaoMetadataV2,
+  validateAndMigrateMetadata,
+  validateMetadataWithDetails,
+  type ValidationResult,
+  CURRENT_SCHEMA_VERSION,
+} from "../../../shared/dao-metadata-schema.js";
 
 /**
- * DAO metadata stored on IPFS.
+ * DAO metadata stored on IPFS (Current Version).
  * Referenced by CID in the on-chain DaoInfo.metadata_cid field.
+ * 
+ * Note: This now uses the shared versioned schema (V2).
+ * Legacy V1 metadata is automatically migrated on fetch.
  */
-export interface DAOMetadata {
+export type DAOMetadata = DaoMetadataV2;
+
+// Legacy V1 interface for backwards compatibility
+export interface DAOMetadataLegacy {
   version: 1;
-  description: string; // Markdown, max 1000 chars
-  coverImageCid?: string; // IPFS CID for cover photo
-  profileImageCid?: string; // IPFS CID for profile photo
-  themeColor?: string; // Per-DAO accent color, strict 6-digit hex e.g. "#3b82f6"
+  description: string;
+  coverImageCid?: string;
+  profileImageCid?: string;
+  themeColor?: string;
   links?: {
     website?: string;
-    twitter?: string; // x.com handle or URL
-    linkedin?: string; // LinkedIn URL
-    github?: string; // GitHub org/user URL
+    twitter?: string;
+    linkedin?: string;
+    github?: string;
   };
-  updatedAt: string; // ISO 8601 timestamp
+  updatedAt: string;
 }
 
-export const MAX_DESCRIPTION_LENGTH = 1000;
-export const MAX_NAME_LENGTH = 24;
+export const MAX_DESCRIPTION_LENGTH = 5000; // Updated for V2
+export const MAX_NAME_LENGTH = 100; // Updated for V2 (on-chain limit is 24)
 
 /**
  * Validate a DAO metadata object
+ * ZV-127: Now uses comprehensive validation with migration support
  */
 export function validateDAOMetadata(metadata: Partial<DAOMetadata>): string[] {
-  const errors: string[] = [];
+  const result = validateMetadataWithDetails(metadata);
+  return result.errors || [];
+}
 
-  if (
-    metadata.description &&
-    metadata.description.length > MAX_DESCRIPTION_LENGTH
-  ) {
-    errors.push(`Description exceeds ${MAX_DESCRIPTION_LENGTH} characters`);
-  }
-
-  if (metadata.themeColor && !isValidHexColor(metadata.themeColor)) {
-    errors.push("Theme color must be a 6-digit hex color, e.g. #3b82f6");
-  }
-
-  if (metadata.links) {
-    if (metadata.links.website && !isValidUrl(metadata.links.website)) {
-      errors.push("Invalid website URL");
-    }
-    if (metadata.links.twitter && !isValidTwitter(metadata.links.twitter)) {
-      errors.push("Invalid Twitter/X handle or URL");
-    }
-    if (metadata.links.linkedin && !isValidLinkedIn(metadata.links.linkedin)) {
-      errors.push("Invalid LinkedIn URL");
-    }
-    if (metadata.links.github && !isValidGitHub(metadata.links.github)) {
-      errors.push("Invalid GitHub URL");
-    }
-  }
-
-  return errors;
+/**
+ * Get detailed validation result including warnings
+ * ZV-127: Returns full validation context for UI display
+ */
+export function validateDAOMetadataDetailed(
+  metadata: Partial<DAOMetadata>,
+): ValidationResult {
+  return validateMetadataWithDetails(metadata);
 }
 
 /**
  * Upload DAO metadata to IPFS
+ * ZV-127: Now enforces V2 schema before upload
  */
 export async function uploadDAOMetadata(
-  metadata: Omit<DAOMetadata, "version" | "updatedAt">,
+  metadata: Partial<DAOMetadata>,
 ): Promise<{ cid: string }> {
   const fullMetadata: DAOMetadata = {
-    version: 1,
+    version: CURRENT_SCHEMA_VERSION,
+    name: metadata.name || "",
+    description: metadata.description || "",
     ...metadata,
     updatedAt: new Date().toISOString(),
   };
@@ -93,6 +94,7 @@ export async function uploadDAOMetadata(
 
 /**
  * Fetch DAO metadata from IPFS
+ * ZV-127: Automatically migrates legacy V1 metadata to V2
  */
 export async function fetchDAOMetadata(
   cid: string,
@@ -101,16 +103,15 @@ export async function fetchDAOMetadata(
     const response = await relayerFetch(`/ipfs/${cid}`);
     if (!response.ok) return null;
     const data = await response.json();
-    // Validate it's actually DAO metadata and sanitize prototype pollution keys
-    if (
-      data &&
-      typeof data === "object" &&
-      data.version === 1 &&
-      typeof data.description === "string"
-    ) {
-      return safeClone(data) as DAOMetadata;
+    
+    // Validate and migrate to current version
+    try {
+      const migrated = validateAndMigrateMetadata(data);
+      return safeClone(migrated) as DAOMetadata;
+    } catch (validationError) {
+      console.warn("Failed to validate/migrate DAO metadata:", validationError);
+      return null;
     }
-    return null;
   } catch {
     return null;
   }

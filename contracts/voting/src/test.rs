@@ -297,12 +297,6 @@ mod mock_transcript_registry {
                 .set(&DataKey::Attestation(transcript_hash, vk_hash), &attested);
         }
 
-        pub fn set_attest_all(env: Env, attest_all: bool) {
-            env.storage()
-                .persistent()
-                .set(&DataKey::AttestAll(attest_all), &attest_all);
-        }
-
         pub fn is_vk_attested(env: Env, vk_hash: BytesN<32>) -> bool {
             if let Some(explicit) = env
                 .storage()
@@ -3094,6 +3088,310 @@ fn test_non_guardian_cannot_pause() {
     VotingClient::new(&env, &voting_id).pause(&Address::generate(&env));
 }
 
+// ── Tiered emergency halt tests (ZV-114 / #954) ─────────────────────────────
+
+/// Set up a DAO with one member, a VK, and a proposal ready to vote on.
+/// Returns (env, client, guardian, member, proposal_id, nullifier, proof).
+fn setup_halt_vote_env() -> (
+    Env,
+    VotingClient<'static>,
+    Address,
+    Address,
+    u64,
+    U256,
+    Proof,
+) {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+
+    sbt_client.set_member(&1u64, &member, &true);
+    let root = U256::from_u32(&env, 12345);
+    tree_client.set_root(&1u64, &root);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let now = env.ledger().timestamp();
+    // Long enough to outlive a FAST_HALT_MAX_DURATION time jump in the
+    // expiry/ratification tests below, so those are actually exercising
+    // the halt gate rather than incidentally hitting VotingClosed.
+    let proposal_id = client.create_proposal(
+        &1u64,
+        &String::from_str(&env, "Halt Test"),
+        &String::from_str(&env, ""),
+        &(now + FAST_HALT_MAX_DURATION * 3),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    let guardian = client.guardian();
+    let nullifier = U256::from_u32(&env, 424242);
+    let proof = create_dummy_proof(&env);
+    (env, client, guardian, member, proposal_id, nullifier, proof)
+}
+
+#[test]
+fn test_activate_halt_blocks_vote_submission_tier_only() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "suspected exploit"),
+        &guardian,
+    );
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+    // A different, unhalted tier must remain unaffected.
+    assert!(!client.is_tier_halted(&HALT_TIER_TALLY_FINALIZATION));
+
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    let res = client.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_fast_halt_expires_automatically_if_not_ratified() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "temporary"),
+        &guardian,
+    );
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + FAST_HALT_MAX_DURATION);
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    // And voting actually works again - the gate, not just the getter, sees the expiry.
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+}
+
+#[test]
+fn test_fast_halt_resumed_early_by_its_activator() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "false alarm"),
+        &guardian,
+    );
+    let resumed = client.resume_halt(&guardian);
+    assert!(resumed);
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+}
+
+#[test]
+fn test_fast_halt_cannot_be_resumed_by_a_non_activator() {
+    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) = setup_halt_vote_env();
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "x"),
+        &guardian,
+    );
+
+    let someone_else = Address::generate(&env);
+    let res = client.try_resume_halt(&someone_else);
+    assert!(res.is_err());
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+}
+
+#[test]
+fn test_ratified_halt_survives_fast_expiry_and_requires_quorum_to_resume() {
+    let (env, client, guardian, _member, proposal_id, nullifier, proof) = setup_halt_vote_env();
+
+    let signer_a = Address::generate(&env);
+    let signer_b = Address::generate(&env);
+    let signer_c = Address::generate(&env);
+    client.set_halt_quorum(
+        &soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+        &2u32,
+        &guardian,
+    );
+
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "under investigation"),
+        &guardian,
+    );
+
+    // One approval is not enough to ratify.
+    assert!(!client.ratify_halt(&signer_a));
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    // A second, distinct signer's approval ratifies it.
+    assert!(client.ratify_halt(&signer_b));
+
+    // Ratified: survives past what would have been the fast-halt expiry.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + FAST_HALT_MAX_DURATION + 1);
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    let proposal = client.get_proposal(&1u64, &proposal_id);
+    let res = client.try_vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+    assert!(res.is_err());
+
+    // The original activator alone cannot resume a ratified halt.
+    let res = client.try_resume_halt(&guardian);
+    assert!(res.is_err());
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    // Quorum resume: one approval isn't enough either.
+    assert!(!client.resume_halt(&signer_a));
+    assert!(client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+    assert!(client.resume_halt(&signer_c));
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+
+    client.vote(
+        &1u64,
+        &proposal_id,
+        &true,
+        &nullifier,
+        &proposal.eligible_root,
+        &proof,
+    );
+}
+
+#[test]
+fn test_halt_ratification_rejects_duplicate_and_unknown_signer() {
+    let (env, client, guardian, _member, _proposal_id, _nullifier, _proof) = setup_halt_vote_env();
+    let signer_a = Address::generate(&env);
+    let signer_b = Address::generate(&env);
+    client.set_halt_quorum(
+        &soroban_sdk::vec![&env, signer_a.clone(), signer_b.clone()],
+        &2u32,
+        &guardian,
+    );
+    client.activate_halt(
+        &HALT_TIER_VOTE_SUBMISSION,
+        &String::from_str(&env, "x"),
+        &guardian,
+    );
+
+    assert!(!client.ratify_halt(&signer_a));
+    let dup = client.try_ratify_halt(&signer_a);
+    assert!(dup.is_err());
+
+    let unknown = Address::generate(&env);
+    let res = client.try_ratify_halt(&unknown);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_invalid_halt_tier_and_quorum_rejected() {
+    let (env, client, guardian, ..) = setup_halt_vote_env();
+
+    // Zero tiers / a bit outside the known mask.
+    assert!(client
+        .try_activate_halt(&0u32, &String::from_str(&env, "x"), &guardian)
+        .is_err());
+    assert!(client
+        .try_activate_halt(&0x8u32, &String::from_str(&env, "x"), &guardian)
+        .is_err());
+
+    // Threshold above signer count.
+    let signer_a = Address::generate(&env);
+    assert!(client
+        .try_set_halt_quorum(&soroban_sdk::vec![&env, signer_a], &2u32, &guardian)
+        .is_err());
+}
+
+#[test]
+fn test_treasury_execution_tier_has_no_gated_entrypoint_but_is_queryable() {
+    let (env, client, guardian, ..) = setup_halt_vote_env();
+    assert!(!client.is_tier_halted(&HALT_TIER_TREASURY_EXECUTION));
+    client.activate_halt(
+        &HALT_TIER_TREASURY_EXECUTION,
+        &String::from_str(&env, "pending review"),
+        &guardian,
+    );
+    assert!(client.is_tier_halted(&HALT_TIER_TREASURY_EXECUTION));
+    // Other tiers remain independently unaffected.
+    assert!(!client.is_tier_halted(&HALT_TIER_VOTE_SUBMISSION));
+}
+
+#[test]
+fn test_tally_finalization_tier_blocks_submit_recursive_tally() {
+    let (env, voting_id, tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let tree_client = mock_tree::MockTreeClient::new(&env, &tree_id);
+    tree_client.set_root(&1u64, &U256::from_u32(&env, 12345));
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    client.set_recursive_vk(&dao_id, &Bytes::from_slice(&env, &[1, 2, 3, 4]), &admin);
+    client.set_tally_vk(&dao_id, &create_dummy_vk(&env), &admin);
+
+    let end_time = env.ledger().timestamp() + 3600;
+    let prop_id = client.create_proposal(
+        &dao_id,
+        &String::from_str(&env, "Tally Halt Test"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &end_time,
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    let guardian = client.guardian();
+    client.activate_halt(
+        &HALT_TIER_TALLY_FINALIZATION,
+        &String::from_str(&env, "tally dispute"),
+        &guardian,
+    );
+
+    let proof = create_dummy_proof(&env);
+    let res = client.try_submit_recursive_tally(
+        &dao_id,
+        &prop_id,
+        &1000u64,
+        &650u64,
+        &350u64,
+        &U256::from_u32(&env, 0),
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
 // ── Candidate index bounds tests ────────────────────────────────────────────
 
 #[test]
@@ -3480,6 +3778,227 @@ fn test_recursive_tally_submission() {
     assert_eq!(prop_info.yes_votes, 650);
     assert_eq!(prop_info.no_votes, 350);
     assert_eq!(prop_info.state, ProposalState::Closed);
+}
+
+// ============================================================================
+// Universal tally-semantics verification (ZV-112 / Issue #952, #699)
+// ============================================================================
+
+/// Create a `Registration`-state proposal, pin `semantics_id`/`semantics_version`
+/// on it, register a matching dummy VK, then activate it. Returns
+/// (env, client, admin, dao_id, proposal_id).
+fn setup_universal_tally_proposal(
+    semantics_id: u32,
+    semantics_version: u32,
+    num_public_signals: u32,
+) -> (Env, VotingClient<'static>, Address, u64, u64) {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    let now = env.ledger().timestamp();
+    let proposal_id = client.create_proposal_in_registration(
+        &dao_id,
+        &String::from_str(&env, "Universal Tally Test Proposal"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+
+    client.set_proposal_semantics(
+        &dao_id,
+        &proposal_id,
+        &semantics_id,
+        &semantics_version,
+        &admin,
+    );
+    client.set_semantics_vk(
+        &dao_id,
+        &semantics_id,
+        &semantics_version,
+        &create_dummy_tally_vk(&env, num_public_signals),
+        &admin,
+    );
+    client.activate_proposal(&dao_id, &proposal_id, &admin);
+
+    (env, client, admin, dao_id, proposal_id)
+}
+
+#[test]
+fn test_universal_tally_yes_no_submission() {
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    client.submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &10u64,
+        &6u64,
+        &4u64,
+        &0u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+
+    let tally = client.get_universal_tally(&dao_id, &proposal_id).unwrap();
+    assert_eq!(tally.semantics_id, SEMANTICS_YES_NO);
+    assert_eq!(tally.yes_votes, 6);
+    assert_eq!(tally.no_votes, 4);
+
+    let prop_info = client.get_proposal(&dao_id, &proposal_id);
+    assert_eq!(prop_info.yes_votes, 6);
+    assert_eq!(prop_info.no_votes, 4);
+    assert_eq!(prop_info.state, ProposalState::Closed);
+}
+
+#[test]
+fn test_universal_tally_quadratic_submission() {
+    let (env, client, _admin, dao_id, proposal_id) = setup_universal_tally_proposal(
+        SEMANTICS_QUADRATIC,
+        1,
+        UNIVERSAL_TALLY_QUADRATIC_NUM_SIGNALS,
+    );
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    client.submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_QUADRATIC,
+        &1u32,
+        &3u64,
+        &0u64,
+        &0u64,
+        &14u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+
+    let tally = client.get_universal_tally(&dao_id, &proposal_id).unwrap();
+    assert_eq!(tally.semantics_id, SEMANTICS_QUADRATIC);
+    assert_eq!(tally.total_credits_spent, 14);
+
+    // QV results do not feed the legacy yes/no fields.
+    let prop_info = client.get_proposal(&dao_id, &proposal_id);
+    assert_eq!(prop_info.yes_votes, 0);
+    assert_eq!(prop_info.no_votes, 0);
+}
+
+#[test]
+fn test_universal_tally_rejects_mismatched_semantics() {
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+
+    // Proof declares QV even though the proposal is pinned to yes/no.
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_QUADRATIC,
+        &1u32,
+        &3u64,
+        &0u64,
+        &0u64,
+        &14u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_universal_tally_rejects_cross_semantics_output_leakage() {
+    // Pinned + declared tuple both say yes/no, but the caller also smuggles
+    // in a non-zero QV output - must be rejected even though the tuple matches.
+    let (env, client, _admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &10u64,
+        &6u64,
+        &4u64,
+        &999u64, // non-zero totalCreditsSpent under a yes/no tuple
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_set_proposal_semantics_is_one_shot() {
+    let (_env, client, admin, dao_id, proposal_id) =
+        setup_universal_tally_proposal(SEMANTICS_YES_NO, 1, UNIVERSAL_TALLY_YES_NO_NUM_SIGNALS);
+
+    // Proposal was already activated by the fixture, so even a repeat call
+    // with the same tuple is now also rejected for being past Registration;
+    // this just confirms pinning is not silently idempotent either way.
+    let res =
+        client.try_set_proposal_semantics(&dao_id, &proposal_id, &SEMANTICS_YES_NO, &1u32, &admin);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_submit_universal_tally_without_pinned_semantics_fails() {
+    let (env, voting_id, _tree_id, sbt_id, registry_id, member) = setup_env_with_registry();
+    let client = VotingClient::new(&env, &voting_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    sbt_client.set_member(&1u64, &member, &true);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let admin = Address::generate(&env);
+    registry_client.set_admin(&1u64, &admin);
+    client.set_vk(&1u64, &create_dummy_vk(&env), &admin);
+
+    let dao_id = 1u64;
+    let now = env.ledger().timestamp();
+    let proposal_id = client.create_proposal_in_registration(
+        &dao_id,
+        &String::from_str(&env, "No Semantics Pinned"),
+        &String::from_str(&env, "ipfs://QmTest"),
+        &(now + 3600),
+        &member,
+        &VoteMode::Fixed,
+    );
+    client.activate_proposal(&dao_id, &proposal_id, &admin);
+
+    let proof = create_dummy_proof(&env);
+    let nullifier_acc = U256::from_u32(&env, 0);
+    let res = client.try_submit_universal_tally(
+        &dao_id,
+        &proposal_id,
+        &SEMANTICS_YES_NO,
+        &1u32,
+        &1u64,
+        &1u64,
+        &0u64,
+        &0u64,
+        &0u64,
+        &nullifier_acc,
+        &proof,
+    );
+    assert!(res.is_err());
 }
 
 // ============================================================================
@@ -5107,7 +5626,7 @@ fn test_effective_num_candidates_is_always_satisfiable() {
     assert_eq!(voting.get_effective_num_candidates(&1, &proposal_id), 2);
 
     // A configured value is passed through unchanged.
-    voting.set_election_config(&1, &proposal_id, &0, &0, &7);
+    voting.set_election_config(&1, &proposal_id, &0, &0, &7, &admin);
     assert_eq!(voting.get_num_candidates(&1, &proposal_id), 7);
     assert_eq!(voting.get_effective_num_candidates(&1, &proposal_id), 7);
 }

@@ -10,6 +10,11 @@
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import type { Database as DatabaseType } from "better-sqlite3";
+import {
+  verifyExclusionGroth16,
+  ExclusionDepthError,
+  type SnarkjsProof,
+} from "./exclusion-verifier.js";
 
 let _deps: { getDb?: () => DatabaseType; log?: (...args: any[]) => void } | null = null;
 export function initExclusionProof(deps: { getDb: () => DatabaseType; log: (...args: any[]) => void }) {
@@ -78,18 +83,81 @@ export interface RevocationStatus {
   commitment: string;
 }
 
+/**
+ * Maximum index addressable by the 18-level membership tree used by the
+ * current voting circuits (2^18 leaves). Larger deployments require an
+ * explicitly versioned exclusion circuit, verification key and tree depth.
+ * This is an input-safety limit, NOT a measured proving-performance threshold.
+ */
+export const MAX_EXCLUSION_REGISTRY_LEAVES = 1 << 18;
+
 export async function verifyExclusionProof(
   proof: ExclusionProof,
   _treeContractId: string,
+  /** Merkle depth for the exclusion circuit; 0 means the default depth (18). */
+  circuitDepth = 0,
 ): Promise<{ valid: boolean; reason?: string }> {
   try {
-    const { commitment, daoId, historicalRoot, currentRoot } =
+    const { commitment, daoId, leafIndex, historicalRoot, currentRoot } =
       proof.publicInputs;
+
+    // Reject unsupported or malformed indices before DB work or proof
+    // dispatch. Never silently wrap, round or truncate a JS number.
+    if (
+      !Number.isSafeInteger(leafIndex) ||
+      leafIndex < 0 ||
+      leafIndex >= MAX_EXCLUSION_REGISTRY_LEAVES
+    ) {
+      return {
+        valid: false,
+        reason:
+          "Exclusion leaf index is outside the supported 18-level registry " +
+          "(0..262143); use a versioned larger-depth circuit and verifier.",
+      };
+    }
 
     deps().log("info", "exclusion_proof_verification_started", {
       commitment: commitment.slice(0, 10),
       daoId: Number(daoId),
+      circuitDepth,
     });
+
+    // ── Groth16 cryptographic verification ───────────────────────────────
+    // This is the gate that was previously missing. A forged exclusion proof
+    // must be rejected here before any DB work is done (ZV-051 / #899).
+    // ExclusionDepthError is a typed error — callers should return 422 to
+    // signal a misconfigured election, not 400 (bad proof) or 500.
+    const snarkjsProof: SnarkjsProof = {
+      pi_a: proof.pi_a,
+      pi_b: proof.pi_b,
+      pi_c: proof.pi_c,
+      protocol: proof.protocol,
+      curve: proof.curve,
+    };
+    try {
+      const cryptoResult = await verifyExclusionGroth16(
+        snarkjsProof,
+        { historicalRoot, currentRoot, daoId, leafIndex, commitment },
+        circuitDepth,
+      );
+      if (!cryptoResult.valid) {
+        deps().log("warn", "exclusion_proof_crypto_rejected", {
+          commitment: commitment.slice(0, 10),
+          reason: cryptoResult.reason,
+        });
+        return cryptoResult;
+      }
+    } catch (err) {
+      if (err instanceof ExclusionDepthError) {
+        deps().log("warn", "exclusion_proof_depth_mismatch", {
+          requestedDepth: err.requestedDepth,
+          supportedDepths: err.supportedDepths,
+        });
+        return { valid: false, reason: err.message };
+      }
+      throw err;
+    }
+    // ─────────────────────────────────────────────────────────────────────
 
     // 1. Verify historical proof (was in the tree at some point)
     if (!historicalRoot || historicalRoot.length === 0) {
@@ -232,6 +300,140 @@ export async function recordRevocation(
       error: (err as Error).message,
     });
   }
+}
+
+/** One atomic (epoch, root, witness) bundle served to a prover. */
+export interface EpochWitnessBundle {
+  daoId: number;
+  epoch: number;
+  root: string;
+  advancedAt: number;
+  commitment: string;
+  pathElements: string[];
+  pathIndices: number[];
+  fetchedAtLedger: number;
+}
+
+/**
+ * Minimal chain surface used to build an epoch witness. Injected so the
+ * TOCTOU-safe read can be unit-tested and so the relayer can point at either
+ * Soroban RPC or a cache.
+ */
+export interface EpochWitnessSource {
+  getLatestLedger(): Promise<number>;
+  getEpochInfo(daoId: number): Promise<{
+    epoch: number;
+    root: string;
+    advancedAt: number;
+  }>;
+  getMerklePath(params: {
+    daoId: number;
+    commitment: string;
+    root: string;
+  }): Promise<{ pathElements: string[]; pathIndices: number[] }>;
+}
+
+export class EpochWitnessChangedError extends Error {
+  constructor(message = "membership root changed while building witness") {
+    super(message);
+    this.name = "EpochWitnessChangedError";
+  }
+}
+
+/**
+ * Fetch (epoch, root, witness) atomically with respect to epoch rotation.
+ *
+ * A naive "read root -> read witness -> submit" sequence has a TOCTOU window:
+ * the registry can advance between the witness read and submission, letting a
+ * revoked member submit a proof anchored at the old epoch. We:
+ *   - read epoch/root before and after generating the path,
+ *   - require the same epoch, root and ledger snapshot,
+ *   - retry a bounded number of times.
+ *
+ * The voting contract repeats the epoch/root check on-chain; this is the
+ * off-chain half of the invariant.
+ */
+export async function fetchAtomicEpochWitness(
+  source: EpochWitnessSource,
+  params: {
+    daoId: number;
+    commitment: string;
+    /** Pin a specific epoch; defaults to the current one. */
+    epoch?: number;
+    maxAttempts?: number;
+  },
+): Promise<EpochWitnessBundle> {
+  const attempts = params.maxAttempts ?? 3;
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const ledgerBefore = await source.getLatestLedger();
+      const before = await source.getEpochInfo(params.daoId);
+      if (params.epoch != null && before.epoch !== params.epoch) {
+        throw new EpochWitnessChangedError(
+          `requested epoch ${params.epoch}, registry is at ${before.epoch}`,
+        );
+      }
+
+      const path = await source.getMerklePath({
+        daoId: params.daoId,
+        commitment: params.commitment,
+        root: before.root,
+      });
+
+      const ledgerAfter = await source.getLatestLedger();
+      const after = await source.getEpochInfo(params.daoId);
+      if (
+        before.epoch !== after.epoch ||
+        before.root !== after.root ||
+        ledgerBefore !== ledgerAfter
+      ) {
+        throw new EpochWitnessChangedError();
+      }
+
+      deps().log("info", "epoch_witness_served", {
+        daoId: params.daoId,
+        epoch: after.epoch,
+        root: after.root.slice(0, 12),
+        ledger: ledgerAfter,
+      });
+
+      return {
+        daoId: params.daoId,
+        epoch: after.epoch,
+        root: after.root,
+        advancedAt: after.advancedAt,
+        commitment: params.commitment,
+        pathElements: path.pathElements,
+        pathIndices: path.pathIndices,
+        fetchedAtLedger: ledgerAfter,
+      };
+    } catch (err) {
+      lastError = err as Error;
+      if (!(err instanceof EpochWitnessChangedError)) throw err;
+    }
+  }
+
+  throw (
+    lastError ?? new EpochWitnessChangedError("could not obtain a stable epoch witness")
+  );
+}
+
+/**
+ * True when a witness is still acceptable under the on-chain grace window.
+ * Mirrors `EPOCH_GRACE_SECS` in `contracts/voting/src/lib.rs`.
+ */
+export function isEpochWithinGrace(
+  bundle: Pick<EpochWitnessBundle, "epoch" | "advancedAt">,
+  currentEpoch: number,
+  currentEpochAdvancedAt: number,
+  nowSeconds: number,
+  graceSeconds = 300,
+): boolean {
+  if (bundle.epoch === currentEpoch) return true;
+  if (bundle.epoch > currentEpoch) return false;
+  return nowSeconds <= currentEpochAdvancedAt + graceSeconds;
 }
 
 export async function recordReinstatement(

@@ -66,6 +66,17 @@ export function useSubmissionQueue(): SubmissionQueueHookResult {
     return unsubscribe;
   }, []);
 
+  // ZV-132: reconcile another tab's queue update using causal revisions.
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === "zkvote_submission_queue_v1") {
+        submissionQueue.syncFromStorage();
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
+
   // Track browser online/offline events
   useEffect(() => {
     const handleOnline = () => {

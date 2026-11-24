@@ -173,6 +173,14 @@ const DEGRADED_SOURCE_IMPACT: Record<string, Omit<DegradedSourceImpact, "service
     critical: true,
     message: "Payments and swaps may be delayed or temporarily unavailable.",
   },
+  dao_sync: {
+    critical: false,
+    message: "DAO directory data is cached and may be stale. An empty list does not confirm there are no DAOs.",
+  },
+  indexer: {
+    critical: false,
+    message: "Blockchain indexing is delayed; listings and activity may be stale until synchronization recovers.",
+  },
   swap_quotes: {
     critical: false,
     message: "Swap prices come from a backup source and may differ at execution.",

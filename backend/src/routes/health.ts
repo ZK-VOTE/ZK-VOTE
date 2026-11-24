@@ -38,13 +38,14 @@ import {
   getCachedDaoCount,
 } from "../services/db.js";
 import { getBackupStatus } from "../services/backup.js";
+import { isMalwareScannerReady } from "../services/malwareScanner.js";
 import { getLogMetrics } from "../middleware/logging.js";
 import { getWalHealth } from "../services/walResilience.js";
 
 import { checkRotationHealth, getSecretBackend } from "../services/secrets/index.js";
 import { relayerKeyManager } from "../services/relayerKeyManager.js";
 
-import { rpcPoolManager, sequenceManager } from "../services/stellar.js";
+import { rpcPoolManager, sequenceManager, getSequenceContentionMetrics } from "../services/stellar.js";
 import { getAllCircuitBreakerMetrics } from "../services/circuit-breaker.js";
 import { getEndpointPoolStatuses } from "../services/endpoint-pool.js";
 import { getMemorySnapshot } from "../services/memory-monitor.js";
@@ -232,6 +233,7 @@ router.get("/health", async (req: Request, res: Response) => {
       base.treeContract = config.treeContractId;
       base.vkVersion = config.staticVkVersion;
       base.rateLimits = getRateLimitMetrics();
+      base.sequenceContention = getSequenceContentionMetrics();
       base.membershipVerification = getMembershipVerificationMetrics();
     }
   }
@@ -278,15 +280,17 @@ router.get("/readyz", async (req: Request, res: Response) => {
 
     const isRpcOk = rpcStatus.ok;
     const isDbOk = dbHealth.available !== false;
+    const malwareScannerOk = await isMalwareScannerReady();
 
-    const overallStatus = isRpcOk && isDbOk ? "ready" : "not_ready";
-    const httpStatus = isRpcOk && isDbOk ? 200 : 503;
+    const overallStatus = isRpcOk && isDbOk && malwareScannerOk ? "ready" : "not_ready";
+    const httpStatus = isRpcOk && isDbOk && malwareScannerOk ? 200 : 503;
 
     const base: Record<string, unknown> = {
       status: overallStatus,
       dependencies: {
         rpc: isRpcOk ? "ok" : "unavailable",
         db: isDbOk ? "ok" : "unavailable",
+        malwareScanner: malwareScannerOk ? "ok" : "unavailable",
       },
     };
 
@@ -330,14 +334,16 @@ router.get("/ready", async (req: Request, res: Response) => {
 
     const isRpcOk = rpcStatus.ok;
     const isDbOk = dbHealth.available !== false;
+    const malwareScannerOk = await isMalwareScannerReady();
 
-    const overallStatus = isRpcOk && isDbOk ? "ready" : "degraded";
-    const httpStatus = isRpcOk && isDbOk ? 200 : 503;
+    const overallStatus = isRpcOk && isDbOk && malwareScannerOk ? "ready" : "degraded";
+    const httpStatus = isRpcOk && isDbOk && malwareScannerOk ? 200 : 503;
 
     const base: Record<string, unknown> = {
       status: overallStatus,
       rpc: rpcStatus,
       db: dbHealth,
+      malwareScanner: malwareScannerOk ? "ok" : "unavailable",
     };
 
     if (config.healthExposeDetails) {
@@ -379,6 +385,28 @@ router.get("/services", async (req: Request, res: Response) => {
   } catch (err) {
     log("error", "supervisor_status_failed", { error: (err as Error).message });
     res.status(500).json({ error: "Failed to get supervisor status" });
+  }
+});
+
+/**
+ * GET /lifecycle
+ * Lifecycle dashboard: compact per-worker state with summary counts (#924).
+ * Admin-gated like /services.
+ */
+router.get("/lifecycle", async (req: Request, res: Response) => {
+  if (config.healthExposeDetails) {
+    const token = extractAuthToken(req);
+    if (!safeTokenMatch(token, config.relayerAuthToken)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
+  try {
+    const supervisor = getSupervisor();
+    res.json(supervisor.getLifecycleDashboard());
+  } catch (err) {
+    log("error", "lifecycle_dashboard_failed", { error: (err as Error).message });
+    res.status(500).json({ error: "Failed to get lifecycle dashboard" });
   }
 });
 

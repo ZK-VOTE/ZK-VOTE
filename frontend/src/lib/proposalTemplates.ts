@@ -1,24 +1,16 @@
 /**
- * Proposal templates (issue #383)
- *
- * Reusable starting configs for CreateProposalForm — picking one prefills
- * the title/body scaffold, vote mode, and deadline, which the DAO member
- * can still edit before submitting. This deliberately only covers the two
- * vote modes CreateProposalForm actually supports as a per-proposal
- * `voteMode` — "fixed" and "trailing" (see VoteModeSelector).
- *
- * Quadratic voting (QV) is NOT included here even though the original
- * issue mentions it: in this codebase QV is a budget-allocation mechanism
- * spread across a DAO's whole proposal set (see backend/src/routes/quadratic.ts),
- * not a per-proposal creation-time mode. There's no "QV proposal" for a
- * template to prefill — a member allocates quadratic voice credits across
- * proposals that already exist, so a QV template doesn't map onto this form.
+ * ZV-128 — Versioned, localized proposal-template registry.
+ * Source of truth: shared/proposal-template-registry.json. The generated
+ * frontend/backend snapshots are compared in CI to prevent schema drift.
  */
+import registry from "./proposal-template-registry.json";
 
 export type ProposalVoteMode = "fixed" | "trailing";
+export type TemplateLocale = "en" | "ar";
 
 export interface ProposalTemplate {
   id: string;
+  version: number;
   name: string;
   description: string;
   titlePlaceholder: string;
@@ -27,51 +19,60 @@ export interface ProposalTemplate {
   deadlineSeconds: number;
 }
 
-const DAY = 24 * 60 * 60;
+type RegistryTemplate = (typeof registry.templates)[number];
 
-export const PROPOSAL_TEMPLATES: ProposalTemplate[] = [
-  {
-    id: "quick-poll",
-    name: "Quick Poll",
-    description: "Fixed 3-day window for a simple yes/no decision.",
-    titlePlaceholder: "Should we ...?",
-    bodyScaffold: "## Question\n\n## Context\n\n## Options\n",
-    voteMode: "fixed",
-    deadlineSeconds: 3 * DAY,
-  },
-  {
-    id: "standard-proposal",
-    name: "Standard Proposal",
-    description: "Fixed 7-day window for a typical governance decision.",
-    titlePlaceholder: "Proposal: ...",
-    bodyScaffold:
-      "## Summary\n\n## Motivation\n\n## Specification\n\n## Rationale\n",
-    voteMode: "fixed",
-    deadlineSeconds: 7 * DAY,
-  },
-  {
-    id: "extended-discussion",
-    name: "Extended Discussion",
-    description:
-      "Trailing deadline that extends while votes keep coming in — for proposals needing more debate time.",
-    titlePlaceholder: "Discussion: ...",
-    bodyScaffold: "## Summary\n\n## Background\n\n## Open Questions\n",
-    voteMode: "trailing",
-    deadlineSeconds: 7 * DAY,
-  },
-  {
-    id: "treasury-spend",
-    name: "Treasury Spend",
-    description:
-      "Trailing 14-day window for higher-stakes financial decisions.",
-    titlePlaceholder: "Treasury Spend: ...",
-    bodyScaffold:
-      "## Requested Amount\n\n## Purpose\n\n## Recipient\n\n## Justification\n",
-    voteMode: "trailing",
-    deadlineSeconds: 14 * DAY,
-  },
-];
+function localizeTemplate(source: RegistryTemplate, locale: TemplateLocale): ProposalTemplate {
+  return {
+    id: source.id,
+    version: source.version,
+    name: source.name[locale],
+    description: source.description[locale],
+    titlePlaceholder: source.titlePlaceholder[locale],
+    bodyScaffold: source.bodyScaffold[locale],
+    voteMode: source.voteMode as ProposalVoteMode,
+    deadlineSeconds: source.deadlineSeconds,
+  };
+}
 
-export function getProposalTemplate(id: string): ProposalTemplate | undefined {
-  return PROPOSAL_TEMPLATES.find((t) => t.id === id);
+export function getLocalizedProposalTemplates(locale: TemplateLocale = "en"): ProposalTemplate[] {
+  return registry.templates.map((entry) => localizeTemplate(entry, locale));
+}
+
+export const PROPOSAL_TEMPLATES: ProposalTemplate[] = getLocalizedProposalTemplates("en");
+
+export function getProposalTemplate(id: string, locale: TemplateLocale = "en"): ProposalTemplate | undefined {
+  const source = registry.templates.find((entry) => entry.id === id);
+  return source ? localizeTemplate(source, locale) : undefined;
+}
+
+/**
+ * Mirror the backend's on-chain 100-UTF8-byte title bound and IPFS metadata
+ * body/video URL constraints. Users can edit template defaults, but invalid
+ * changes are rejected BEFORE uploading to IPFS.
+ */
+export function validateProposalTemplateDraft(draft: {
+  title: string;
+  body: string;
+  videoUrl?: string;
+  voteMode: string;
+  deadlineSeconds: number;
+}): Record<string, string> {
+  const errors: Record<string, string> = {};
+  const title = draft.title.normalize("NFC");
+  const bytes = new TextEncoder().encode(title).length;
+  if (!title.trim() || bytes > 100 ||
+      /[\u200B-\u200D\uFEFF\u0000-\u001F\u007F-\u009F]/.test(title)) {
+    errors.title = "Title must be 1–100 UTF-8 bytes without hidden/control characters.";
+  }
+  if (draft.body.length > 100000) errors.body = "Description must be 100,000 characters or less.";
+  if (draft.videoUrl && !/^https?:\/\/(www\.)?(youtube\.com|youtu\.be|vimeo\.com)\/.+$/i.test(draft.videoUrl)) {
+    errors.videoUrl = "Use a valid HTTPS or HTTP YouTube/Vimeo link.";
+  }
+  if (draft.voteMode !== "fixed" && draft.voteMode !== "trailing") {
+    errors.voteMode = "Select a supported voting mode.";
+  }
+  if (!Number.isFinite(draft.deadlineSeconds) || draft.deadlineSeconds <= 0) {
+    errors.deadlineSeconds = "Choose a positive deadline.";
+  }
+  return errors;
 }

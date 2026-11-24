@@ -10,6 +10,7 @@ import { NETWORK_CONFIG, CONTRACTS } from "../config/contracts";
 import { relayerFetch } from "./api";
 import {
   generateVoteProof,
+  generateEncryptedVoteProof,
   generateWeightedVoteProof,
   generateBridgeProof,
   formatProofForSoroban,
@@ -18,10 +19,17 @@ import {
   detectVKMismatch,
   validateWeight,
   type VoteProofInput,
+  type EncryptedVoteProofInput,
   type WeightedVoteProofInput,
   type BridgeProofInput,
   type GeneratedProof,
 } from "./zkproof";
+import {
+  encryptBallot,
+  pointToHex,
+  randomScalar,
+  type Point,
+} from "./elgamal";
 import {
   getZKCredentials,
   generateDeterministicZKCredentials,
@@ -35,6 +43,7 @@ import {
   processOfflineQueue,
 } from "./offlineQueue";
 import { checkContractDrift } from "./driftGuard";
+import { withMaskedTiming } from "./proofTiming";
 
 export interface ContractClients {
   daoRegistry: DaoRegistryClient;
@@ -329,6 +338,159 @@ export class ZkVoteClient {
       }
       throw e;
     }
+  }
+
+  /**
+   * Encrypted-ballot voting path (`vote_encrypted.circom`).
+   *
+   * The choice is encrypted client-side under the election's Baby Jubjub key;
+   * only ciphertext is sent to the relayer. Totals stay hidden until the 2-of-3
+   * ceremony finalizes after `end_time`.
+   */
+  async orchestrateEncryptedVote(params: {
+    daoId: number;
+    proposalId: number;
+    choice: boolean;
+    kit: {
+      signMessage: (msg: string) => Promise<{ signedMessage: string }>;
+      signTransaction: (tx: string) => Promise<string>;
+    } | null;
+    voteMode: "Fixed" | "Trailing";
+    eligibleRoot: bigint;
+    /** Election public key registered in `EncryptedTallyConfig`. */
+    encryptionPublicKey: Point;
+    /** Registry epoch the proposal was created at. */
+    epoch: number;
+    wasmPath?: string;
+    zkeyPath?: string;
+  }): Promise<{ txHash: string; ciphertext: { c1: string; cYes: string; cNo: string } }> {
+    if (!this.publicKey) throw new Error("publicKey required for voting");
+
+    await checkContractDrift().catch(() => {});
+
+    let secret: string;
+    let salt: string;
+    let blindingFactor: string;
+    let leafIndex: number;
+    const cached = getZKCredentials(params.daoId, this.publicKey);
+    if (!cached) {
+      if (!params.kit) throw new Error("No voting credentials — register first");
+      const creds = await generateDeterministicZKCredentials(
+        params.kit as never,
+        params.daoId,
+      );
+      const leafRes = await this.membershipTree.get_leaf_index({
+        dao_id: BigInt(params.daoId),
+        commitment: BigInt(creds.commitment),
+      });
+      leafIndex = Number((leafRes as unknown as { result: bigint }).result);
+      secret = creds.secret;
+      salt = creds.salt;
+      blindingFactor =
+        (creds as unknown as { blindingFactor: string }).blindingFactor ?? "0";
+      storeZKCredentials(params.daoId, this.publicKey, creds, leafIndex);
+    } else {
+      secret = cached.secret;
+      salt = cached.salt;
+      blindingFactor =
+        (cached as unknown as { blindingFactor: string }).blindingFactor ?? "0";
+      leafIndex = cached.leafIndex;
+    }
+
+    let root: bigint;
+    if (params.voteMode === "Fixed") {
+      root = params.eligibleRoot;
+    } else {
+      const cur = await this.membershipTree.current_root({
+        dao_id: BigInt(params.daoId),
+      });
+      root = (cur as unknown as { result: bigint }).result;
+    }
+
+    const merkleRes = await this.membershipTree.get_merkle_path({
+      dao_id: BigInt(params.daoId),
+      leaf_index: leafIndex,
+    });
+    const raw = (merkleRes as unknown as { result: [bigint[], number[]] })
+      .result;
+    const pathElements = raw[0].map((e: bigint) => e.toString());
+    const pathIndices = raw[1].map((i: number) => Number(i));
+
+    const nullifier = await calculateNullifier(
+      secret,
+      params.daoId.toString(),
+      params.proposalId.toString(),
+    );
+
+    const ballot = await encryptBallot(
+      params.encryptionPublicKey,
+      params.choice,
+      randomScalar(),
+    );
+    const proofInput: EncryptedVoteProofInput = {
+      root: root.toString(),
+      nullifier,
+      daoId: params.daoId.toString(),
+      proposalId: params.proposalId.toString(),
+      numCandidates: "2",
+      epoch: params.epoch.toString(),
+      publicKey: [
+        params.encryptionPublicKey.x.toString(),
+        params.encryptionPublicKey.y.toString(),
+      ],
+      c1: [ballot.c1.x.toString(), ballot.c1.y.toString()],
+      cYes: [ballot.cYes.x.toString(), ballot.cYes.y.toString()],
+      cNo: [ballot.cNo.x.toString(), ballot.cNo.y.toString()],
+      relayerAddress: "0",
+      voteChoice: params.choice ? "1" : "0",
+      secret,
+      salt,
+      blindingFactor,
+      randomness: ballot.randomness.toString(),
+      pathElements,
+      pathIndices,
+    };
+
+    const { proof } = await generateEncryptedVoteProof(
+      proofInput,
+      params.wasmPath ?? "/circuits/vote_encrypted.wasm",
+      params.zkeyPath ?? "/circuits/vote_encrypted_final.zkey",
+    );
+    const { proof_a, proof_b, proof_c } = formatProofForSoroban(proof);
+    const toHexBE = (v: string | bigint): string => {
+      const bi = typeof v === "string" ? BigInt(v) : v;
+      return bi.toString(16).padStart(64, "0");
+    };
+
+    const ciphertext = {
+      c1: pointToHex(ballot.c1),
+      cYes: pointToHex(ballot.cYes),
+      cNo: pointToHex(ballot.cNo),
+    };
+
+    const res = await withMaskedTiming(async () =>
+      relayerFetch("/vote-encrypted", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          daoId: params.daoId,
+          proposalId: params.proposalId,
+          nullifier: toHexBE(nullifier),
+          root: toHexBE(root),
+          epoch: params.epoch,
+          c1: ciphertext.c1,
+          cYes: ciphertext.cYes,
+          cNo: ciphertext.cNo,
+          proof: { a: proof_a, b: proof_b, c: proof_c },
+        }),
+      }),
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "unknown" }));
+      throw new Error(err.error || "Encrypted vote submission failed");
+    }
+    const data = await res.json();
+    return { txHash: data.txHash, ciphertext };
   }
 
   async orchestrateWeightedVote(params: {

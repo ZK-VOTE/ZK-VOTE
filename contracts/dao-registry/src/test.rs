@@ -750,3 +750,38 @@ fn test_execute_multisig_proposal() {
     let proposal = client.get_multisig_proposal(&dao_id, &proposal_id);
     assert!(proposal.unwrap().executed);
 }
+
+#[test]
+fn test_create_dao_idempotent_replays_same_dao() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DaoRegistry, ());
+    let client = DaoRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let key = BytesN::from_array(&env, &[9u8; 32]);
+    let name = String::from_str(&env, "Idempotent DAO");
+
+    let (dao_id, created) = client.create_dao_idempotent(&key, &name, &admin, &true, &true, &None);
+    assert_eq!(dao_id, 1);
+    assert!(created);
+    assert_eq!(client.dao_count(), 1);
+    assert_eq!(client.get_dao_by_idempotency_key(&key), Some(1));
+
+    let (replayed_id, replayed_created) = client.create_dao_idempotent(
+        &key,
+        &String::from_str(&env, "Different Name"),
+        &admin,
+        &false,
+        &false,
+        &None,
+    );
+    assert_eq!(replayed_id, 1);
+    assert!(!replayed_created);
+    assert_eq!(client.dao_count(), 1, "retry must not create a duplicate");
+
+    let receipt = client.get_creation_receipt(&1u64).unwrap();
+    assert_eq!(receipt.dao_id, 1);
+    assert_eq!(receipt.idempotency_key, key);
+    assert_eq!(receipt.creator, admin);
+}

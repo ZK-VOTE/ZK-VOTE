@@ -91,6 +91,16 @@ pub enum TreeError {
     PqCommitmentExists = 21,
     /// Poseidon field symbol is not a supported field
     InvalidField = 22,
+    /// Registration is already pending commit-reveal for this member
+    CommitmentPending = 23,
+    /// No pending commit-reveal registration for this member
+    CommitmentNotPending = 24,
+    /// Reveal attempted before the one-ledger commit delay elapsed
+    CommitmentRevealTooEarly = 25,
+    /// Revealed commitment/salt does not match the committed hash
+    CommitmentHashMismatch = 26,
+    /// Epoch is in the future or was never checkpointed
+    UnknownEpoch = 27,
 }
 
 #[contracttype]
@@ -119,6 +129,31 @@ pub enum DataKey {
     Sha3NextRootIdx(u64),     // dao_id -> next PQ root index counter
     Sha3RootIndex(u64, U256), // (dao_id, pq_root) -> root index
     PqCommitment(U256),       // C_PQ -> (dao_id, proposal_id, member)
+
+    // --- Commit-reveal membership registration (anti-front-running) ---
+    PendingRegistration(u64, Address), // (dao_id, member) -> PendingRegistration
+    CommitmentSaltHash(u64, BytesN<32>), // (dao_id, hash) -> true (replay guard)
+
+    // --- Epoch checkpointing (revocation-epoch pinning) ---
+    Epoch(u64),                // dao_id -> current epoch (u32)
+    EpochRoot(u64, u32),       // (dao_id, epoch) -> U256 root
+    EpochAdvancedAt(u64, u32), // (dao_id, epoch) -> ledger timestamp
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingRegistration {
+    pub commitment_hash: BytesN<32>,
+    pub committed_at_ledger: u32,
+    pub committed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpochInfo {
+    pub epoch: u32,
+    pub root: U256,
+    pub advanced_at: u64,
 }
 
 // Typed Events
@@ -200,6 +235,38 @@ pub struct RootEvictedEvent {
     pub dao_id: u64,
     pub evicted_root: U256,
     pub roots_len_after: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentCommittedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub member: Address,
+    pub commitment_hash: BytesN<32>,
+    pub committed_at_ledger: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitmentRevealedEvent {
+    #[topic]
+    pub dao_id: u64,
+    #[topic]
+    pub member: Address,
+    pub commitment: U256,
+    pub index: u32,
+}
+
+#[soroban_sdk::contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpochAdvancedEvent {
+    #[topic]
+    pub dao_id: u64,
+    pub epoch: u32,
+    pub root: U256,
+    pub advanced_at: u64,
 }
 
 #[contract]
@@ -453,6 +520,10 @@ impl MembershipTree {
         env.storage().persistent().set(&root_idx_key, &0u32);
         Self::bump_persistent(&env, &root_idx_key);
 
+        // Epoch 0 is the empty-tree checkpoint. Voting contracts pin proofs to
+        // an epoch root, so the genesis epoch must be a real entry.
+        Self::init_epoch_zero(&env, dao_id, empty_root.clone());
+
         TreeInitEvent {
             dao_id,
             depth,
@@ -528,6 +599,10 @@ impl MembershipTree {
         env.storage().persistent().set(&root_idx_key, &0u32);
         Self::bump_persistent(&env, &root_idx_key);
 
+        // Epoch 0 is the empty-tree checkpoint. Voting contracts pin proofs to
+        // an epoch root, so the genesis epoch must be a real entry.
+        Self::init_epoch_zero(&env, dao_id, empty_root.clone());
+
         TreeInitEvent {
             dao_id,
             depth,
@@ -535,6 +610,25 @@ impl MembershipTree {
             root_index: 0,
         }
         .publish(&env);
+    }
+
+    /// A tree starts at epoch 0 with its empty root checkpointed. The first
+    /// `advance_epoch` moves to epoch 1; consumers can therefore treat epoch 0
+    /// as a real, pinned root rather than an "unset" sentinel.
+    fn init_epoch_zero(env: &Env, dao_id: u64, root: U256) {
+        let epoch_key = DataKey::Epoch(dao_id);
+        env.storage().persistent().set(&epoch_key, &0u32);
+        Self::bump_persistent(env, &epoch_key);
+
+        let root_key = DataKey::EpochRoot(dao_id, 0u32);
+        env.storage().persistent().set(&root_key, &root);
+        Self::bump_persistent(env, &root_key);
+
+        let at_key = DataKey::EpochAdvancedAt(dao_id, 0u32);
+        env.storage()
+            .persistent()
+            .set(&at_key, &env.ledger().timestamp());
+        Self::bump_persistent(env, &at_key);
     }
 
     fn reserve_commitment(env: &Env, dao_id: u64, commitment: &U256) {
@@ -663,8 +757,24 @@ impl MembershipTree {
 
     /// Register a commitment with explicit caller (requires SBT membership)
     pub fn register_with_caller(env: Env, dao_id: u64, commitment: U256, caller: Address) {
+        Self::register_with_caller_internal(env, dao_id, commitment, caller, true);
+    }
+
+    /// Shared registration body. `require_auth = false` is used by
+    /// `reveal_registration`, which has already authorized the caller in the
+    /// outer frame (re-requiring auth in the same frame traps with
+    /// Error(Auth, ExistingValue) on Soroban).
+    fn register_with_caller_internal(
+        env: Env,
+        dao_id: u64,
+        commitment: U256,
+        caller: Address,
+        require_auth: bool,
+    ) {
         Self::bump_instance(&env);
-        caller.require_auth();
+        if require_auth {
+            caller.require_auth();
+        }
 
         // Verify caller has SBT for this DAO
         let sbt_contract: Address = Self::sbt_contract(&env);
@@ -856,6 +966,275 @@ impl MembershipTree {
         .publish(&env);
 
         Self::record_registration(&env, dao_id, &member);
+    }
+
+    // ============================================
+    // COMMIT-REVEAL REGISTRATION (anti-front-running)
+    // ============================================
+
+    /// Hash a commitment for the commit phase: SHA256(commitment || salt).
+    ///
+    /// The commitment itself is Poseidon(secret, salt), which is not hiding
+    /// enough on its own when the salt is low-entropy or reused. Committing to
+    /// the *salted hash* means a mempool observer cannot front-run the
+    /// commitment before the reveal ledger.
+    pub fn hash_registration(env: Env, commitment: U256, salt: BytesN<32>) -> BytesN<32> {
+        Self::bump_instance(&env);
+        let mut input = Bytes::new(&env);
+        input.append(&commitment.to_be_bytes());
+        input.append(&Bytes::from_array(&env, &salt.to_array()));
+        env.crypto().sha256(&input).into()
+    }
+
+    /// Phase 1: commit to a salted registration hash.
+    ///
+    /// The tree does not change yet, so front-running the reveal cannot claim
+    /// the commitment: the attacker would need the preimage (commitment+ salt).
+    pub fn commit_registration(
+        env: Env,
+        dao_id: u64,
+        commitment_hash: BytesN<32>,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+
+        // SBT membership and tree initialization are checked now so an
+        // uneligible member cannot occupy a pending slot.
+        let sbt_contract: Address = Self::sbt_contract(&env);
+        let has_sbt: bool = env.invoke_contract(
+            &sbt_contract,
+            &symbol_short!("has"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env), caller.clone().into_val(&env)],
+        );
+        if !has_sbt {
+            panic_with_error!(&env, TreeError::NoSbt);
+        }
+
+        let depth_key = DataKey::TreeDepth(dao_id);
+        if !env.storage().persistent().has(&depth_key) {
+            panic_with_error!(&env, TreeError::TreeNotInitialized);
+        }
+
+        let pending_key = DataKey::PendingRegistration(dao_id, caller.clone());
+        if env.storage().persistent().has(&pending_key) {
+            panic_with_error!(&env, TreeError::CommitmentPending);
+        }
+
+        let replay_key = DataKey::CommitmentSaltHash(dao_id, commitment_hash.clone());
+        if env.storage().persistent().has(&replay_key) {
+            panic_with_error!(&env, TreeError::CommitmentAlreadyUsed);
+        }
+
+        let pending = PendingRegistration {
+            commitment_hash: commitment_hash.clone(),
+            committed_at_ledger: env.ledger().sequence(),
+            committed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&pending_key, &pending);
+        Self::bump_persistent(&env, &pending_key);
+
+        env.storage().persistent().set(&replay_key, &true);
+        Self::bump_persistent(&env, &replay_key);
+
+        CommitmentCommittedEvent {
+            dao_id,
+            member: caller,
+            commitment_hash,
+            committed_at_ledger: env.ledger().sequence(),
+        }
+        .publish(&env);
+    }
+
+    /// Phase 2: reveal the commitment and salt after at least one ledger.
+    ///
+    /// Re-uses the normal registration path, so SBT checks, duplicate guards,
+    /// cooldown, tree insertion and root history all behave identically to
+    /// `register_with_caller`.
+    pub fn reveal_registration(
+        env: Env,
+        dao_id: u64,
+        commitment: U256,
+        salt: BytesN<32>,
+        caller: Address,
+    ) {
+        Self::bump_instance(&env);
+        caller.require_auth();
+
+        let pending_key = DataKey::PendingRegistration(dao_id, caller.clone());
+        let pending: PendingRegistration = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::CommitmentNotPending));
+
+        if env.ledger().sequence() <= pending.committed_at_ledger {
+            panic_with_error!(&env, TreeError::CommitmentRevealTooEarly);
+        }
+
+        let expected = Self::hash_registration(env.clone(), commitment.clone(), salt);
+        if expected != pending.commitment_hash {
+            panic_with_error!(&env, TreeError::CommitmentHashMismatch);
+        }
+
+        // Consume the pending slot before the external SBT call below.
+        env.storage().persistent().remove(&pending_key);
+        let replay_key = DataKey::CommitmentSaltHash(dao_id, pending.commitment_hash.clone());
+        env.storage().persistent().remove(&replay_key);
+
+        // Existing registration path performs SBT verification, cooldown,
+        // duplicate-commitment checks and Merkle insertion.
+        Self::register_with_caller_internal(
+            env.clone(),
+            dao_id,
+            commitment.clone(),
+            caller.clone(),
+            false,
+        );
+
+        let index: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LeafIndex(dao_id, commitment.clone()))
+            .unwrap_or(0);
+
+        CommitmentRevealedEvent {
+            dao_id,
+            member: caller,
+            commitment,
+            index,
+        }
+        .publish(&env);
+    }
+
+    /// Read the pending commit for a member, if any.
+    pub fn pending_registration(
+        env: Env,
+        dao_id: u64,
+        member: Address,
+    ) -> Option<PendingRegistration> {
+        Self::bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingRegistration(dao_id, member))
+    }
+
+    // ============================================
+    // EPOCH CHECKPOINTING (revocation-epoch pinning)
+    // ============================================
+
+    /// Advance the registry epoch, checkpointing the current root.
+    ///
+    /// Only the DAO admin can advance. Votes built against an older epoch are
+    /// rejected by `voting` once the grace window elapses (see
+    /// `EPOCH_GRACE_SECS` there), closing the "revoked member votes with a
+    /// stale proof" hole.
+    pub fn advance_epoch(env: Env, dao_id: u64, admin: Address) -> u32 {
+        Self::bump_instance(&env);
+        admin.require_auth();
+
+        let sbt_contract: Address = Self::sbt_contract(&env);
+        let registry: Address = env.invoke_contract(
+            &sbt_contract,
+            &symbol_short!("registry"),
+            soroban_sdk::vec![&env],
+        );
+        let dao_admin: Address = env.invoke_contract(
+            &registry,
+            &symbol_short!("get_admin"),
+            soroban_sdk::vec![&env, dao_id.into_val(&env)],
+        );
+        if dao_admin != admin {
+            panic_with_error!(&env, TreeError::NotAdmin);
+        }
+
+        let current: u32 = Self::current_epoch(env.clone(), dao_id);
+        let next = current
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::InvalidDepth));
+
+        let root = Self::current_root(env.clone(), dao_id);
+        let at_key = DataKey::EpochAdvancedAt(dao_id, next);
+        env.storage()
+            .persistent()
+            .set(&at_key, &env.ledger().timestamp());
+        Self::bump_persistent(&env, &at_key);
+
+        let root_key = DataKey::EpochRoot(dao_id, next);
+        env.storage().persistent().set(&root_key, &root);
+        Self::bump_persistent(&env, &root_key);
+
+        let epoch_key = DataKey::Epoch(dao_id);
+        env.storage().persistent().set(&epoch_key, &next);
+        Self::bump_persistent(&env, &epoch_key);
+
+        EpochAdvancedEvent {
+            dao_id,
+            epoch: next,
+            root,
+            advanced_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        next
+    }
+
+    pub fn current_epoch(env: Env, dao_id: u64) -> u32 {
+        Self::bump_instance(&env);
+        Self::current_epoch_internal(&env, dao_id)
+    }
+
+    fn current_epoch_internal(env: &Env, dao_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Epoch(dao_id))
+            .unwrap_or(0)
+    }
+
+    /// Root checkpointed for `epoch`. Panics if the epoch was never advanced.
+    pub fn epoch_root(env: Env, dao_id: u64, epoch: u32) -> U256 {
+        Self::bump_instance(&env);
+        let key = DataKey::EpochRoot(dao_id, epoch);
+        let root: U256 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::UnknownEpoch));
+        Self::bump_persistent(&env, &key);
+        root
+    }
+
+    /// Ledger timestamp when `epoch` was checkpointed.
+    pub fn epoch_advanced_at(env: Env, dao_id: u64, epoch: u32) -> u64 {
+        Self::bump_instance(&env);
+        let key = DataKey::EpochAdvancedAt(dao_id, epoch);
+        let at: u64 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TreeError::UnknownEpoch));
+        Self::bump_persistent(&env, &key);
+        at
+    }
+
+    pub fn get_epoch_info(env: Env, dao_id: u64) -> EpochInfo {
+        Self::bump_instance(&env);
+        let epoch = Self::current_epoch_internal(&env, dao_id);
+        EpochInfo {
+            epoch,
+            root: Self::epoch_root(env.clone(), dao_id, epoch),
+            advanced_at: Self::epoch_advanced_at(env, dao_id, epoch),
+        }
+    }
+
+    pub fn epoch_root_ok(env: Env, dao_id: u64, epoch: u32, root: U256) -> bool {
+        Self::bump_instance(&env);
+        let key = DataKey::EpochRoot(dao_id, epoch);
+        env.storage()
+            .persistent()
+            .get::<_, U256>(&key)
+            .map(|stored| stored == root)
+            .unwrap_or(false)
     }
 
     /// Get current root for a DAO

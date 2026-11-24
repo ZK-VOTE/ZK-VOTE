@@ -12,6 +12,8 @@ import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { ALLOWED_IMAGE_MIMES, BN254_MODULUS } from "../config.js";
 import { BN254_FQ_MODULUS } from "../types/index.js";
+import { detectConfusableMixedScript } from "../utils/confusables.js";
+import proposalTemplateRegistry from "./proposal-template-registry.json" with { type: "json" };
 
 // The payment schemas below call .openapi() at module load. openapi.ts also
 // extends zod, but ESM evaluates this module first whenever something imports
@@ -430,7 +432,11 @@ export const daoNameSchema = z
       return byteLen >= 1 && byteLen <= 24 && val.length <= 24;
     },
     { message: "DAO name must be 1-24 characters (max 24 UTF-8 bytes) without control or zero-width characters" },
-  );
+  )
+  .refine((val) => !detectConfusableMixedScript(val).confusable, {
+    message:
+      "DAO name mixes Latin letters with visually-identical characters from another script",
+  });
 
 /**
  * Proposal title schema matching on-chain MAX_TITLE_LEN = 100 bytes and Unicode NFC normalization.
@@ -858,6 +864,22 @@ export type NotifyEventRequest = z.infer<typeof notifyEventSchema>;
 
 export const proposalMetadataSchema = z
   .object({
+    // ZV-128: preserve template provenance and reject stale/unknown versions.
+    template: z.object({
+      id: z.string().min(1),
+      version: z.number().int().positive(),
+    }).superRefine((template, ctx) => {
+      const known = proposalTemplateRegistry.templates.some(
+        (record) => record.id === template.id && record.version === template.version,
+      );
+      if (!known) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Unknown or unsupported proposal template version",
+          path: ["version"],
+        });
+      }
+    }).optional(),
     version: z.literal(1, {
       errorMap: () => ({ message: "version must be 1" }),
     }),
@@ -1019,6 +1041,50 @@ export const bridgeVoteSchema = z.object({
 });
 
 export type BridgeVoteRequest = z.infer<typeof bridgeVoteSchema>;
+
+// ============================================
+// SATELLITE TREASURY ESCROW SCHEMAS (ZV-107)
+// ============================================
+
+const evmAddress = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address");
+const evmTxHash = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "Invalid transaction hash");
+/** uint256 lock id / Soroban message nonce / wei amount, as a decimal string. */
+const uint256Decimal = z.string().regex(/^[0-9]{1,78}$/, "Must be a decimal uint256");
+
+export const escrowLockRecordSchema = z.object({
+  lockId: uint256Decimal,
+  daoId: z.number().int().positive(),
+  proposalId: z.number().int().positive(),
+  depositor: evmAddress,
+  recipient: evmAddress,
+  amount: uint256Decimal,
+  lockTxHash: evmTxHash,
+});
+
+export const escrowResolutionSchema = z.object({
+  sorobanNonce: uint256Decimal,
+  resolutionTxHash: evmTxHash,
+});
+
+export const escrowRefundSchema = z.object({
+  resolutionTxHash: evmTxHash,
+});
+
+// ============================================
+// ONBOARDING FUNNEL SCHEMA (ZV-108)
+// ============================================
+
+export const onboardingFunnelStepSchema = z.object({
+  step: z.enum([
+    "registration_started",
+    "explore_readonly_selected",
+    "secret_created",
+    "backup_viewed",
+    "backup_verification_started",
+    "backup_verification_passed",
+    "registration_completed",
+  ]),
+});
 
 // ============================================
 // CIRCUIT PARAMETER SCHEMA
@@ -1342,6 +1408,17 @@ export const adminRelayerRotateSchema = z.object({
   actor: z.string().min(1).max(100).optional(),
 });
 
+// Abuse-detection enforcement review queue (ZV-111)
+export const adminAbuseHoldsQuerySchema = z.object({
+  tenantId: z.string().min(1).max(64).optional(),
+  status: z.enum(["held", "pending_release", "released", "escalated"]).optional(),
+});
+
+export const adminAbuseHoldReviewSchema = z.object({
+  reviewerId: z.string().min(1).max(100),
+  reason: z.string().min(1).max(500),
+});
+
 // Relayer key lifecycle (#746)
 const operatorId = z.string().min(1).max(100);
 // `${cosignerId}.${expiresAtMs}.${hmacHex}` — see issueActionApproval.
@@ -1483,3 +1560,119 @@ export const swapSubmitRequestSchema = z
     }),
   })
   .openapi("SwapSubmitRequest");
+
+// ============================================
+// SAFE DOMAIN FORMS — SPIKE-132 / #923
+//
+// Shared validators for every boundary that accepts Stellar addresses,
+// amounts, contract IDs, asset codes and memos.  These are the canonical
+// source of truth for field-level error messages; frontend validators mirror
+// them via the shared `stellarAmount` / `stellar-address` helpers.
+//
+// Rules:
+//  • Amounts: reject scientific notation, Unicode digits, leading zeros,
+//    sub-stroop precision, zero/negative values, and i64 overflow (> MAX_STROOPS).
+//  • Addresses: reject wrong-network addresses (G.../M... for mainnet;
+//    Unicode confusables handled by detectConfusableMixedScript).
+//  • Contract IDs: C... Soroban contract addresses.
+//  • Asset codes: 1-12 alphanumeric chars (Stellar alphanum4 / alphanum12).
+//  • Memos: text memos ≤ 28 bytes; hash memos as 64 hex chars.
+//  • All string fields: trimmed before validation; empty strings rejected.
+// ============================================
+
+const MAX_STELLAR_STROOPS_STR = "922337203685.4775807"; // i64::MAX / 1e7
+
+/** Rejects scientific notation, Unicode digits, overflow, zero, and sub-stroop precision. */
+export const safeAmountSchema = z
+  .string()
+  .trim()
+  .min(1, "Amount is required")
+  .refine((v) => !/[eE]/.test(v), { message: "Scientific notation is not allowed" })
+  .refine((v) => /^[0-9]+(\.[0-9]+)?$/.test(v), {
+    message: "Amount must be a plain decimal number (e.g. 10.5000000)",
+  })
+  .refine(
+    (v) => {
+      const parts = v.split(".");
+      return !parts[1] || parts[1].length <= 7;
+    },
+    { message: "Amount must have at most 7 decimal places (stroop precision)" },
+  )
+  .refine((v) => parseFloat(v) > 0, { message: "Amount must be greater than zero" })
+  .refine(
+    (v) => {
+      // Guard against i64 overflow using string comparison on the integer part.
+      const whole = v.split(".")[0];
+      const max = MAX_STELLAR_STROOPS_STR.split(".")[0];
+      if (whole.length > max.length) return false;
+      if (whole.length === max.length) return whole <= max;
+      return true;
+    },
+    { message: "Amount exceeds the Stellar i64 maximum" },
+  )
+  .openapi({ example: "10.0000000", description: "Stellar amount (max 7 decimal places)" });
+
+/** Accepts G... (base) and M... (muxed) Stellar addresses. */
+export const safeAddressSchema = z
+  .string()
+  .trim()
+  .min(1, "Address is required")
+  .refine(
+    (v) => /^G[A-Z2-7]{55}$/.test(v) || /^M[A-Z2-7]{68}$/.test(v),
+    {
+      message:
+        "Invalid Stellar address. Must be a G... account (56 chars) or M... muxed account (69 chars) using base32 characters only",
+    },
+  )
+  .refine(
+    (v) => !detectConfusableMixedScript(v),
+    { message: "Address contains confusable or mixed-script characters" },
+  )
+  .openapi({
+    example: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    description: "Stellar G... or M... address",
+  });
+
+/** Accepts Soroban C... contract IDs. */
+export const safeContractIdSchema = z
+  .string()
+  .trim()
+  .min(1, "Contract ID is required")
+  .regex(/^C[A-Z2-7]{55}$/, "Invalid Soroban contract ID (must be C... 56 chars, base32)")
+  .openapi({ example: "CCJZ5DGALEBFA4L3H5L67YXYGEJ5KLQ4AIOC7FEPH7CFAWTTF6NGA3Z", description: "Soroban contract ID" });
+
+/** Stellar asset code: 1-4 chars (alphanum4) or 5-12 chars (alphanum12). */
+export const safeAssetCodeSchema = z
+  .string()
+  .trim()
+  .min(1, "Asset code is required")
+  .max(12, "Asset code must be 12 characters or fewer")
+  .regex(/^[A-Za-z0-9]+$/, "Asset code must be alphanumeric (A-Z, 0-9)")
+  .openapi({ example: "USDC", description: "Stellar asset code (alphanum4 or alphanum12)" });
+
+/** Stellar text memo: UTF-8, max 28 bytes. */
+export const safeMemoTextSchema = z
+  .string()
+  .max(28, "Memo text must be 28 bytes or fewer")
+  .openapi({ example: "invoice-42", description: "Stellar text memo (max 28 bytes)" });
+
+/** Stellar hash memo: 64 hex characters. */
+export const safeMemoHashSchema = z
+  .string()
+  .regex(/^[0-9a-fA-F]{64}$/, "Memo hash must be 64 hex characters")
+  .openapi({ description: "Stellar hash memo (64 hex chars)" });
+
+/**
+ * Combined safe payment form schema used by SwapPanel, DepositWithdraw,
+ * DaoMultisigManagement and VoterRegistration.
+ *
+ * Validates all fields at the boundary before any transaction is constructed.
+ */
+export const safePaymentFormSchema = z.object({
+  destination: safeAddressSchema,
+  amount: safeAmountSchema,
+  asset: safeAssetCodeSchema,
+  memo: safeMemoTextSchema.optional(),
+});
+
+export type SafePaymentForm = z.infer<typeof safePaymentFormSchema>;

@@ -8,6 +8,7 @@ import { Badge } from "./ui/Badge";
 import { Button } from "./ui/Button";
 import { Card, CardContent } from "./ui/Card";
 import VoteModal from "./VoteModal";
+import { BidiSafe } from "../lib/bidiSafe";
 import {
   Clock,
   CheckCircle,
@@ -240,7 +241,7 @@ export default function ProposalCard({
                     )}
                   </div>
                   <h3 className="text-base font-semibold leading-normal">
-                    {proposal.title}
+                    <BidiSafe>{proposal.title}</BidiSafe>
                   </h3>
 
                   {/* Legacy content (non-CID) */}
@@ -299,7 +300,7 @@ export default function ProposalCard({
                     variant="outline"
                     size="sm"
                   >
-                    <Eye className="w-4 h-4 mr-1.5" />
+                    <Eye className="w-4 h-4 me-1.5" />
                     View
                   </Button>
                   {hasMembership && !proposal.hasVoted && (
@@ -318,7 +319,7 @@ export default function ProposalCard({
                     >
                       {!isRegistered ? (
                         <>
-                          <AlertCircle className="w-4 h-4 mr-1.5" />
+                          <AlertCircle className="w-4 h-4 me-1.5" />
                           Register
                         </>
                       ) : isPastDeadline ? (
@@ -327,7 +328,7 @@ export default function ProposalCard({
                         "Pending..."
                       ) : (
                         <>
-                          <Vote className="w-4 h-4 mr-1.5" />
+                          <Vote className="w-4 h-4 me-1.5" />
                           Vote
                         </>
                       )}

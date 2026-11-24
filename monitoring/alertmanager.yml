@@ -1,0 +1,131 @@
+# Alertmanager Configuration — ZV-084
+#
+# Routing: severity label drives channel selection
+#   critical  → PagerDuty (immediate on-call page) + Slack #incidents
+#   warning   → Slack #alerts
+#   info      → Slack #monitoring
+#
+# Grouping:    alerts for the same service+alertname are grouped with a 30 s
+#              wait and then a 5 min group_interval to avoid alert storms.
+# Inhibition:  a critical alert for a service suppresses warning alerts for
+#              the same service (avoids noise while the team is already paged).
+# Silencing:   maintenance windows can be applied via the Alertmanager UI or API.
+
+global:
+  resolve_timeout: 5m
+  slack_api_url: "${SLACK_WEBHOOK_URL}"   # set in deployment environment
+
+# ── Templates ────────────────────────────────────────────────────────────────
+templates:
+  - "/etc/alertmanager/templates/*.tmpl"
+
+# ── Routing tree ─────────────────────────────────────────────────────────────
+route:
+  receiver: slack-monitoring          # catch-all
+  group_by: ["alertname", "service"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # Critical alerts → PagerDuty + Slack #incidents
+    - matchers:
+        - severity = "critical"
+      receiver: critical-oncall
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 1h
+      continue: true                  # also send to Slack
+
+    - matchers:
+        - severity = "critical"
+      receiver: slack-incidents
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 1h
+
+    # Warning alerts → Slack #alerts
+    - matchers:
+        - severity = "warning"
+      receiver: slack-alerts
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 2h
+
+    # Info / heartbeat alerts → Slack #monitoring
+    - matchers:
+        - severity = "info"
+      receiver: slack-monitoring
+
+# ── Inhibition rules ─────────────────────────────────────────────────────────
+inhibit_rules:
+  # A critical alert for a service suppresses warning-level alerts for the
+  # same service so on-call engineers are not spammed while they triage.
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ["service"]
+
+  # Database unavailable inhibits indexer-stalled (derived symptom).
+  - source_matchers:
+      - alertname = "ZKVoteRelayerDatabaseUnavailable"
+    target_matchers:
+      - alertname = "ZKVoteRelayerIndexerStalled"
+    equal: ["service"]
+
+# ── Receivers ────────────────────────────────────────────────────────────────
+receivers:
+  - name: slack-monitoring
+    slack_configs:
+      - channel: "#monitoring"
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Service:* {{ .Labels.service }}
+          *Severity:* {{ .Labels.severity }}
+          *Description:* {{ .Annotations.description }}
+          {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+          {{ end }}
+
+  - name: slack-alerts
+    slack_configs:
+      - channel: "#alerts"
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.service }})'
+        text: >-
+          {{ range .Alerts }}
+          *Summary:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          {{ if .Annotations.runbook_url }}:notebook: *Runbook:* <{{ .Annotations.runbook_url }}|View runbook>{{ end }}
+          {{ end }}
+
+  - name: slack-incidents
+    slack_configs:
+      - channel: "#incidents"
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+        title: ':rotating_light: [CRITICAL] {{ .CommonLabels.alertname }} — {{ .CommonLabels.service }}'
+        text: >-
+          {{ range .Alerts }}
+          *Summary:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          {{ if .Annotations.runbook_url }}:notebook: *Runbook:* <{{ .Annotations.runbook_url }}|View runbook>{{ end }}
+          *Labels:* {{ range .Labels.SortedPairs }} `{{ .Name }}={{ .Value }}`{{ end }}
+          {{ end }}
+
+  - name: critical-oncall
+    pagerduty_configs:
+      - routing_key: "${PAGERDUTY_INTEGRATION_KEY}"
+        severity: '{{ .CommonLabels.severity }}'
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          service: '{{ .CommonLabels.service }}'
+          alertname: '{{ .CommonLabels.alertname }}'
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+        links:
+          - href: '{{ .CommonAnnotations.runbook_url }}'
+            text: Runbook

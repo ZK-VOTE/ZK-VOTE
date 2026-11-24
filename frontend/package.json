@@ -3,8 +3,14 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-    "scripts": {
+  "engines": {
+    "node": "24.x",
+    "npm": "10.x"
+  },
+  "scripts": {
     "sync:circuits": "node scripts/sync-circuits.mjs",
+    "csp:generate": "node scripts/sync-csp.mjs",
+    "csp:check": "node scripts/sync-csp.mjs --check",
     "predev": "npm run sync:circuits",
     "dev": "vite",
     "prebuild": "npm run sync:circuits",

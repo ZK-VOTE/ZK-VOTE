@@ -614,6 +614,120 @@ fn test_registration_cooldown_is_per_member_and_per_dao() {
     assert_eq!(next_index, 2);
 }
 
+// ── Commit-reveal registration (anti-front-running) ────────────────────────
+
+fn setup_tree_with_member() -> (Env, Address, Address, Address, Address, Address) {
+    let (env, tree_id, sbt_id, registry_id, admin) = setup_env();
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let member = Address::generate(&env);
+
+    registry_client.set_admin(&1u64, &admin);
+    tree_client.init_tree(&1u64, &5u32, &Symbol::new(&env, "BN254"), &admin);
+    sbt_client.set_member(&1u64, &member, &true);
+    (env, tree_id, sbt_id, registry_id, admin, member)
+}
+
+#[test]
+fn test_commit_reveal_registration_hides_then_inserts() {
+    use soroban_sdk::testutils::Ledger as _;
+    let (env, tree_id, _sbt_id, _registry_id, _admin, member) = setup_tree_with_member();
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+
+    let commitment = U256::from_u32(&env, 424242);
+    let salt = BytesN::from_array(&env, &[7u8; 32]);
+    let commit_hash = tree_client.hash_registration(&commitment, &salt);
+
+    tree_client.commit_registration(&1u64, &commit_hash, &member);
+    let pending = tree_client.pending_registration(&1u64, &member).unwrap();
+    assert_eq!(pending.commitment_hash, commit_hash);
+    // The tree is untouched until reveal.
+    let (_, next_index, _) = tree_client.get_tree_info(&1u64);
+    assert_eq!(next_index, 0);
+
+    env.ledger().with_mut(|li| li.sequence_number += 1);
+    tree_client.reveal_registration(&1u64, &commitment, &salt, &member);
+
+    let (_, next_index_after, _) = tree_client.get_tree_info(&1u64);
+    assert_eq!(next_index_after, 1);
+    assert_eq!(tree_client.get_leaf_index(&1u64, &commitment), 0);
+    assert!(tree_client.pending_registration(&1u64, &member).is_none());
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_commit_reveal_same_ledger_fails() {
+    let (env, tree_id, _sbt_id, _registry_id, _admin, member) = setup_tree_with_member();
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    let commitment = U256::from_u32(&env, 777);
+    let salt = BytesN::from_array(&env, &[9u8; 32]);
+    let commit_hash = tree_client.hash_registration(&commitment, &salt);
+    tree_client.commit_registration(&1u64, &commit_hash, &member);
+    tree_client.reveal_registration(&1u64, &commitment, &salt, &member);
+}
+
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_commit_reveal_wrong_salt_fails() {
+    use soroban_sdk::testutils::Ledger as _;
+    let (env, tree_id, _sbt_id, _registry_id, _admin, member) = setup_tree_with_member();
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    let commitment = U256::from_u32(&env, 888);
+    let salt = BytesN::from_array(&env, &[1u8; 32]);
+    let wrong_salt = BytesN::from_array(&env, &[2u8; 32]);
+    let commit_hash = tree_client.hash_registration(&commitment, &salt);
+    tree_client.commit_registration(&1u64, &commit_hash, &member);
+    env.ledger().with_mut(|li| li.sequence_number += 1);
+    tree_client.reveal_registration(&1u64, &commitment, &wrong_salt, &member);
+}
+
+// ── Epoch checkpointing (stale-revocation pinning) ─────────────────────────
+
+#[test]
+fn test_epoch_zero_is_the_initial_root() {
+    let (env, tree_id, _sbt_id, _registry_id, _admin) = setup_env();
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &_registry_id);
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    registry_client.set_admin(&1u64, &_admin);
+    tree_client.init_tree(&1u64, &5u32, &Symbol::new(&env, "BN254"), &_admin);
+
+    assert_eq!(tree_client.current_epoch(&1u64), 0);
+    assert_eq!(
+        tree_client.epoch_root(&1u64, &0u32),
+        tree_client.current_root(&1u64)
+    );
+    assert!(tree_client.epoch_root_ok(&1u64, &0u32, &tree_client.current_root(&1u64)));
+}
+
+#[test]
+fn test_advance_epoch_checkpoints_each_root() {
+    let (env, tree_id, sbt_id, registry_id, admin) = setup_env();
+    let tree_client = MembershipTreeClient::new(&env, &tree_id);
+    let sbt_client = mock_sbt::MockSbtClient::new(&env, &sbt_id);
+    let registry_client = mock_registry::MockRegistryClient::new(&env, &registry_id);
+    let member = Address::generate(&env);
+
+    registry_client.set_admin(&1u64, &admin);
+    tree_client.init_tree(&1u64, &5u32, &Symbol::new(&env, "BN254"), &admin);
+    sbt_client.set_member(&1u64, &member, &true);
+
+    let epoch0_root = tree_client.current_root(&1u64);
+    assert_eq!(tree_client.advance_epoch(&1u64, &admin), 1);
+    assert_eq!(tree_client.epoch_root(&1u64, &1u32), epoch0_root);
+
+    tree_client.register_with_caller(&1u64, &U256::from_u32(&env, 555), &member);
+    let epoch1_root = tree_client.current_root(&1u64);
+    assert_ne!(epoch1_root, epoch0_root);
+    assert_eq!(tree_client.advance_epoch(&1u64, &admin), 2);
+    assert_eq!(tree_client.epoch_root(&1u64, &2u32), epoch1_root);
+
+    // Old epoch roots are immutable checkpoints.
+    assert_eq!(tree_client.epoch_root(&1u64, &1u32), epoch0_root);
+    assert!(!tree_client.epoch_root_ok(&1u64, &2u32, &epoch0_root));
+    assert!(tree_client.epoch_root_ok(&1u64, &2u32, &epoch1_root));
+}
+
 // ---------------------------------------------------------------------------
 // Regression: the update path must keep the cached left-sibling subtrees
 // (`FilledSubtrees`) in sync with the recomputed path.

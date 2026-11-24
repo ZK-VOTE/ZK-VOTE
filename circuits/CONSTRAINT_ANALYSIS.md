@@ -361,3 +361,95 @@ The ZK-VOTE circuits (`vote.circom` and `merkle_tree.circom`) have been analyzed
 2. Add negative test cases to test suite
 3. Document all constraint rationale in code comments
 4. Consider formal verification for production
+
+---
+
+## Bridge Circuit Analysis (bridge.circom) — SPIKE-041
+
+### Overview
+
+`bridge.circom` instantiates `BridgeVote(levels)` at a default depth of 20 levels. Each proof
+verifies two independent Merkle inclusion paths (voting tree + SBT state tree), one identity
+commitment, one nullifier, and one SBT leaf hash.
+
+### Constraint Count Estimate at Production Parameters
+
+| Component | Per-instance cost | Count | Subtotal |
+|---|---|---|---|
+| Poseidon(3) — commitment | ~220 | 1 | 220 |
+| Poseidon(4) — nullifier | ~260 | 1 | 260 |
+| Poseidon(4) — SBT leaf | ~260 | 1 | 260 |
+| MerkleTreeInclusionProof(20) — voting | ~4,440 | 1 | 4,440 |
+| MerkleTreeInclusionProof(20) — SBT | ~4,440 | 1 | 4,440 |
+| Binary checks (voteChoice + pathIndices×40) | 1 each | 41 | 41 |
+| Root equality constraints | 1 each | 2 | 2 |
+| **Total (20-level, 2-tree)** | | | **~9,663** |
+
+At 20 levels the circuit fits comfortably within a 2^14 powers-of-tau ceremony (max 16,384
+constraints). Proving time on a browser WebWorker is estimated at 3–6 seconds (comparable to
+the vote circuit). The current `compile_bridge.sh` uses a `pot15` ceremony (2^15 = 32,768
+capacity), which is appropriate.
+
+### Constraint Depth Sensitivity
+
+The bridge constraint count scales linearly with tree depth. Each additional level adds
+approximately 442 constraints (2 Merkle trees × ~221 constraints/level). At depth 24 the total
+reaches ~13,400, still within the pot15 ceremony. Depth 25+ requires a pot16 ceremony.
+
+| Levels | Estimated constraints | Ceremony needed |
+|---|---|---|
+| 16 | ~7,200 | pot14 |
+| 18 | ~8,500 | pot14 |
+| 20 | ~9,663 | pot15 ✓ current |
+| 22 | ~10,800 | pot15 |
+| 24 | ~13,400 | pot15 |
+| 26 | ~15,000 | pot14 ⚠ near limit |
+
+### Under-Constrained Signal Audit
+
+| Signal | Constrained? | Notes |
+|---|---|---|
+| `commitment` | ✅ | `<==` from Poseidon(3); used as voting leaf |
+| `nullifier` | ✅ | `<==` from Poseidon(4); public output equality enforced |
+| `sbtLeafHash` | ✅ | `<==` from Poseidon(4); used as SBT tree leaf |
+| `voteChoice` | ✅ | `voteChoice * (voteChoice - 1) === 0` binary check present |
+| `votingPathIndices[i]` | ✅ | Binary check delegated to MerkleTreeInclusionProof |
+| `sbtPathIndices[i]` | ✅ | Binary check delegated to MerkleTreeInclusionProof |
+| `voteRoot` | ✅ | Public input; equality constrained to computed root |
+| `sbtRoot` | ✅ | Public input; equality constrained to computed root |
+| `chainId` | ✅ | Included in nullifier preimage; domain-separates cross-chain reuse (#649) |
+| `memberAddr` | ✅ | Included in commitment preimage; binds SBT path to identity |
+
+**Security Status**: SECURE. No under-constrained signals identified.
+
+### Proving-Key / Browser Budget
+
+- Estimated zkey size at pot15, 20 levels: ~3.5 MB (within the 10 MB browser budget from SPIKE-015).
+- WebWorker proving time: 3–6 s on modern hardware; satisfies the <10 s UX target from SPIKE-029.
+- Server-side prover (Node.js / Rust native): <1 s.
+
+### compile_bridge.sh — Registry Pin Verification
+
+`compile_bridge.sh` does not currently compare the compiled `bridge.r1cs` checksum against
+`circuit-registry` pins. The following check should be added after the trusted setup step:
+
+```bash
+# Verify compiled circuit matches registry pin (cf. SPIKE-008)
+EXPECTED=$(grep "bridge" ../circuits/checksums.sha256 | awk '{print $1}')
+ACTUAL=$(sha256sum ${BUILD_DIR}/${CIRCUIT_NAME}.r1cs | awk '{print $1}')
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  echo "ERROR: bridge.r1cs checksum mismatch (expected $EXPECTED, got $ACTUAL)" >&2
+  exit 1
+fi
+```
+
+### Action Items (SPIKE-041 resolution)
+
+- [x] Document constraint count vs depth curve (this section)
+- [x] Confirm pot15 ceremony is sufficient at depth 20
+- [x] Audit all bridge signals for under-constraint vulnerabilities
+- [x] Estimate browser proving budget compatibility
+- [ ] Add `compile_bridge.sh` registry-pin verification step
+- [ ] Add bridge circuit to `analyze-constraints.sh` sweep
+- [ ] Add integration test: generate witness → prove → verify at depth 20
+- [ ] Add negative test: reused nullifier on different chainId must fail

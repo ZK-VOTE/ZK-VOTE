@@ -1,33 +1,117 @@
 {
-  "nav.browse": "Explorar DAOs",
-  "nav.publicVotes": "Votos Públicos",
-  "nav.docs": "Documentación",
-  "nav.connectWallet": "Conectar Billetera",
-  "nav.connecting": "Conectando...",
-  "nav.disconnect": "Desconectar",
-  "vote.button": "Votar Ahora",
-  "vote.cast": "Emitir Voto Anónimo",
-  "vote.yes": "Votar Sí",
-  "vote.no": "Votar No",
-  "vote.submitting": "Enviando Voto...",
-  "vote.generating": "Generando Prueba...",
-  "vote.success": "¡Voto Enviado!",
-  "common.loading": "Cargando...",
-  "common.error": "Error",
-  "common.close": "Cerrar",
-  "common.save": "Guardar",
-  "common.cancel": "Cancelar",
-  "language.select": "Seleccionar Idioma",
-  "home.hero.title": "Votación privada para",
-  "home.hero.subtitle": "organizaciones descentralizadas",
-  "home.hero.description": "Votación con pruebas de conocimiento cero en Stellar. Emite tu voto de forma privada manteniendo total verificabilidad mediante SNARKs Groth16.",
-  "home.hero.startVoting": "Comenzar a votar",
-  "home.hero.documentation": "Documentación",
-  "home.techStack": "Construido en Stellar con primitivas criptográficas de vanguardia",
-  "dao.member_one": "miembro",
-  "dao.member_other": "miembros",
-  "dao.vote_one": "voto",
-  "dao.vote_other": "votos",
-  "dao.proposal_one": "propuesta",
-  "dao.proposal_other": "propuestas"
+  "nav": {
+    "home": "Inicio",
+    "vote": "Votar",
+    "dao": "DAO",
+    "about": "Acerca de"
+  },
+  "vote": {
+    "title": "Emite tu voto",
+    "submit": "Enviar voto",
+    "submitting": "Enviando…",
+    "success": "Voto enviado correctamente",
+    "error": "Error al enviar el voto"
+  },
+  "common": {
+    "loading": "Cargando…",
+    "error": "Se ha producido un error",
+    "retry": "Reintentar",
+    "cancel": "Cancelar",
+    "confirm": "Confirmar",
+    "close": "Cerrar"
+  },
+  "home": {
+    "hero": {
+      "title": "Gobernanza privada y verificable",
+      "subtitle": "Votación de conocimiento cero para DAOs"
+    }
+  },
+  "dao": {
+    "title": "Gobernanza DAO",
+    "proposals": "Propuestas",
+    "members": "Miembros"
+  },
+  "governance": {
+    "quorum": {
+      "label": "Quórum",
+      "met": "Quórum alcanzado",
+      "not_met": "Quórum no alcanzado",
+      "required": "Requerido: {{count}} votos",
+      "current": "Actual: {{count}} votos",
+      "percentage": "{{percent}}% del quórum requerido",
+      "reaching_in": "Se espera alcanzar el quórum en {{duration}}"
+    },
+    "freshness": {
+      "label": "Actualidad del recuento",
+      "live": "En directo",
+      "stale": "Desactualizado — última actualización {{ago}}",
+      "as_of": "A fecha de {{timestamp}}",
+      "updating": "Actualizando recuento…",
+      "staleness_warning": "El recuento no se ha actualizado en {{duration}}. Los resultados pueden no reflejar los votos recientes."
+    },
+    "dispute": {
+      "status": {
+        "label": "Estado de la disputa",
+        "none": "Sin disputas",
+        "open": "Disputa abierta",
+        "under_review": "En revisión",
+        "resolved": "Resuelta",
+        "rejected": "Disputa rechazada",
+        "escalated": "Escalada",
+        "filed_at": "Presentada {{timestamp}}",
+        "resolved_at": "Resuelta {{timestamp}}",
+        "reason": "Motivo: {{reason}}"
+      }
+    },
+    "proposal": {
+      "status": {
+        "pending": "Pendiente",
+        "active": "Activa",
+        "passed": "Aprobada",
+        "failed": "Rechazada",
+        "cancelled": "Cancelada",
+        "executed": "Ejecutada"
+      },
+      "voting_ends": "Votación finaliza {{timestamp}}",
+      "voting_ended": "Votación finalizada {{timestamp}}",
+      "time_remaining": "{{duration}} restante"
+    }
+  },
+  "proof": {
+    "phase": {
+      "label": "Fase de prueba",
+      "generating": "Generando prueba…",
+      "generated": "Prueba generada",
+      "submitting": "Enviando prueba…",
+      "verifying": "Verificando prueba…",
+      "verified": "Prueba verificada",
+      "failed": "Prueba fallida",
+      "retrying": "Reintentando generación de prueba…",
+      "hint": {
+        "generating": "Esto puede tardar unos segundos. No cierres esta página.",
+        "submitting": "Enviando tu prueba a la red.",
+        "verifying": "La red está confirmando tu voto.",
+        "verified": "Tu voto ha quedado registrado en la cadena.",
+        "failed": "La generación de prueba ha fallado. Tu voto no fue enviado."
+      }
+    }
+  },
+  "error": {
+    "unknown": "Se ha producido un error inesperado.",
+    "network": "Error de red. Comprueba tu conexión.",
+    "rate_limit": "Demasiadas solicitudes. Espera antes de reintentar.",
+    "proof_generation_failed": "La generación de prueba ha fallado. Inténtalo de nuevo.",
+    "proof_verification_failed": "La verificación de prueba ha fallado en la cadena.",
+    "nullifier_already_used": "Este voto ya ha sido emitido desde esta identidad.",
+    "proposal_not_found": "Propuesta no encontrada.",
+    "proposal_expired": "Esta propuesta ha cerrado.",
+    "proposal_not_active": "La votación no está abierta actualmente para esta propuesta.",
+    "quorum_check_failed": "No se pudo obtener el estado del quórum.",
+    "tally_unavailable": "Los datos del recuento no están disponibles actualmente.",
+    "wallet_not_connected": "Conecta tu cartera para votar.",
+    "wallet_wrong_network": "Cambia a la red correcta.",
+    "insufficient_voting_power": "Poder de voto insuficiente para esta propuesta.",
+    "dao_contract_error": "El contrato DAO devolvió un error: {{message}}",
+    "session_expired": "Tu sesión ha expirado. Vuelve a conectar tu cartera."
+  }
 }

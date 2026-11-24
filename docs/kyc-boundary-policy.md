@@ -178,3 +178,47 @@ This policy enables compliance without over-collection:
 - `backend/src/routes/ramp.ts` - API endpoints with access control
 - `frontend/src/components/DepositWithdraw.tsx` - User-facing KYC flow
 - SPIKE-146 (Issue #797) - Original spike specification
+
+## ZV-142 — Anchor boundary inventory and operator obligations
+
+The parser is an allowlist boundary, not a best-effort sanitizer. Accepted
+top-level fields are status, transaction_status, message, error, interactiveUrl,
+interactiveOrigin, type, url, and interactive_url. URL variants are retained
+only long enough to validate the configured HTTPS anchor origin; minimized
+state contains only validated interactive URL/origin, status, coarse reason
+code, and timestamp. Every other field is rejected in all environments.
+New SEP response shapes must be reviewed and added as redacted golden fixtures
+before any allowlist change.
+
+Golden fixtures live in backend/tests/fixtures/anchor-responses.json. They
+cover supported SEP status shapes and representative identity, document,
+nested customer, provider-metadata, and tracking-identifier fields. Tests
+assert that each unknown field is rejected. Never add real customer payloads
+to fixtures.
+
+### User disclosure
+
+The deposit/withdraw ramp tells users that the anchor receives their wallet
+address, asset, amount, and information submitted in its own verification
+flow. It distinguishes the anchor's KYC view from voting: the anchor does not
+receive a vote choice or ZK voting proof. Stellar wallet addresses and
+transfers remain public ledger data; do not describe the payment rail as
+anonymous.
+
+### Operator obligations and retention
+
+- Configure only approved anchor mirrors and keep the HTTPS interactive-origin
+  allowlist current. Do not fail over a KYC session to a different operator.
+- Do not enable raw request/response body logging, analytics capture, tracing
+  attributes, error-reporting payload capture, or support exports for anchor
+  responses or interactive URLs.
+- Boundary logs may record counts and coarse minimized status only. Never log
+  response field names, identity values, anchor transaction IDs, interactive
+  URLs, or provider tracking identifiers.
+- Persist only minimized status/reason state and apply ZV-063 retention:
+  completed 90 days, pending 30 days, failed/incomplete 7 days. Purge expired
+  records and backups under the same retention obligations.
+- The anchor remains an independent KYC operator responsible for its own
+  identity-document handling, notices, legal basis, security, and retention.
+  ZK-VOTE operators remain responsible for minimizing ingested data and
+  explaining public-ledger visibility of wallet transfers.

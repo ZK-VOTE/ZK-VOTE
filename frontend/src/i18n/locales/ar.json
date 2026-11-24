@@ -1,45 +1,125 @@
 {
-  "nav.browse": "تصفح المنظمات",
-  "nav.publicVotes": "الأصوات العامة",
-  "nav.docs": "الوثائق",
-  "nav.connectWallet": "ربط المحفظة",
-  "nav.connecting": "جاري الاتصال...",
-  "nav.disconnect": "قطع الاتصال",
-  "vote.button": "صوت الآن",
-  "vote.cast": "تصويت مجهول الهوية",
-  "vote.yes": "تصويت بنعم",
-  "vote.no": "تصويت بلا",
-  "vote.submitting": "جاري تقديم الصوت...",
-  "vote.generating": "جاري إنشاء الإثبات...",
-  "vote.success": "تم تقديم الصوت بنجاح!",
-  "common.loading": "جاري التحميل...",
-  "common.error": "خطأ",
-  "common.close": "إغلاق",
-  "common.save": "حفظ",
-  "common.cancel": "إلغاء",
-  "language.select": "اختر اللغة",
-  "home.hero.title": "تصويت خاص لـ",
-  "home.hero.subtitle": "المنظمات اللامركزية",
-  "home.hero.description": "التصويت بإثبات المعرفة الصفرية على Stellar. صوّت بشكل خاص مع الحفاظ على التحقق الكامل من خلال SNARKs Groth16.",
-  "home.hero.startVoting": "ابدأ التصويت",
-  "home.hero.documentation": "التوثيق",
-  "home.techStack": "مبني على Stellar باستخدام بدائل تشفير متطورة",
-  "dao.member_zero": "أعضاء",
-  "dao.member_one": "عضو",
-  "dao.member_two": "عضوان",
-  "dao.member_few": "أعضاء",
-  "dao.member_many": "عضو",
-  "dao.member_other": "أعضاء",
-  "dao.vote_zero": "أصوات",
-  "dao.vote_one": "صوت",
-  "dao.vote_two": "صوتان",
-  "dao.vote_few": "أصوات",
-  "dao.vote_many": "صوت",
-  "dao.vote_other": "أصوات",
-  "dao.proposal_zero": "مقترحات",
-  "dao.proposal_one": "مقترح",
-  "dao.proposal_two": "مقترحان",
-  "dao.proposal_few": "مقترحات",
-  "dao.proposal_many": "مقترح",
-  "dao.proposal_other": "مقترحات"
+  "nav": {
+    "home": "الرئيسية",
+    "vote": "التصويت",
+    "dao": "الحوكمة",
+    "about": "حول"
+  },
+  "vote": {
+    "title": "أدلِ بصوتك",
+    "submit": "إرسال الصوت",
+    "submitting": "جارٍ الإرسال…",
+    "success": "تم إرسال الصوت بنجاح",
+    "error": "فشل إرسال الصوت"
+  },
+  "common": {
+    "loading": "جارٍ التحميل…",
+    "error": "حدث خطأ",
+    "retry": "إعادة المحاولة",
+    "cancel": "إلغاء",
+    "confirm": "تأكيد",
+    "close": "إغلاق"
+  },
+  "home": {
+    "hero": {
+      "title": "حوكمة خاصة وقابلة للتحقق",
+      "subtitle": "تصويت بمعرفة صفرية للمنظمات اللامركزية"
+    }
+  },
+  "dao": {
+    "title": "حوكمة المنظمة اللامركزية",
+    "proposals": "المقترحات",
+    "members": "الأعضاء"
+  },
+  "governance": {
+    "quorum": {
+      "label": "النصاب القانوني",
+      "met": "اكتمل النصاب",
+      "not_met": "لم يكتمل النصاب",
+      "required": "المطلوب: {{count}} صوت",
+      "required_plural": {
+        "zero": "المطلوب: صفر أصوات",
+        "one": "المطلوب: صوت واحد",
+        "two": "المطلوب: صوتان",
+        "few": "المطلوب: {{count}} أصوات",
+        "many": "المطلوب: {{count}} صوتاً",
+        "other": "المطلوب: {{count}} صوت"
+      },
+      "current": "الحالي: {{count}} صوت",
+      "percentage": "{{percent}}% من النصاب المطلوب",
+      "reaching_in": "يُتوقع اكتمال النصاب خلال {{duration}}"
+    },
+    "freshness": {
+      "label": "حداثة الفرز",
+      "live": "مباشر",
+      "stale": "قديم — آخر تحديث {{ago}}",
+      "as_of": "بتاريخ {{timestamp}}",
+      "updating": "جارٍ تحديث الفرز…",
+      "staleness_warning": "لم يتم تحديث الفرز منذ {{duration}}. قد لا تعكس النتائج الأصوات الأخيرة."
+    },
+    "dispute": {
+      "status": {
+        "label": "حالة الاعتراض",
+        "none": "لا توجد اعتراضات",
+        "open": "اعتراض مفتوح",
+        "under_review": "قيد المراجعة",
+        "resolved": "تم الحل",
+        "rejected": "تم رفض الاعتراض",
+        "escalated": "تم التصعيد",
+        "filed_at": "تم التقديم {{timestamp}}",
+        "resolved_at": "تم الحل {{timestamp}}",
+        "reason": "السبب: {{reason}}"
+      }
+    },
+    "proposal": {
+      "status": {
+        "pending": "معلّق",
+        "active": "نشط",
+        "passed": "تم القبول",
+        "failed": "لم يُقبل",
+        "cancelled": "ملغى",
+        "executed": "منفّذ"
+      },
+      "voting_ends": "ينتهي التصويت {{timestamp}}",
+      "voting_ended": "انتهى التصويت {{timestamp}}",
+      "time_remaining": "{{duration}} متبقٍّ"
+    }
+  },
+  "proof": {
+    "phase": {
+      "label": "مرحلة الإثبات",
+      "generating": "جارٍ إنشاء الإثبات…",
+      "generated": "تم إنشاء الإثبات",
+      "submitting": "جارٍ إرسال الإثبات…",
+      "verifying": "جارٍ التحقق من الإثبات…",
+      "verified": "تم التحقق من الإثبات",
+      "failed": "فشل الإثبات",
+      "retrying": "جارٍ إعادة إنشاء الإثبات…",
+      "hint": {
+        "generating": "قد يستغرق هذا بضع ثوانٍ. لا تغلق هذه الصفحة.",
+        "submitting": "جارٍ إرسال الإثبات إلى الشبكة.",
+        "verifying": "الشبكة تتأكد من صوتك.",
+        "verified": "تم تسجيل صوتك على السلسلة.",
+        "failed": "فشل إنشاء الإثبات. لم يتم إرسال صوتك."
+      }
+    }
+  },
+  "error": {
+    "unknown": "حدث خطأ غير متوقع.",
+    "network": "خطأ في الشبكة. يرجى التحقق من الاتصال.",
+    "rate_limit": "طلبات كثيرة جداً. يرجى الانتظار قبل إعادة المحاولة.",
+    "proof_generation_failed": "فشل إنشاء الإثبات. يرجى المحاولة مجدداً.",
+    "proof_verification_failed": "فشل التحقق من الإثبات على السلسلة.",
+    "nullifier_already_used": "تم الإدلاء بهذا الصوت بالفعل من هذه الهوية.",
+    "proposal_not_found": "المقترح غير موجود.",
+    "proposal_expired": "انتهى هذا المقترح.",
+    "proposal_not_active": "التصويت غير مفتوح حالياً لهذا المقترح.",
+    "quorum_check_failed": "تعذّر استرجاع حالة النصاب.",
+    "tally_unavailable": "بيانات الفرز غير متاحة حالياً.",
+    "wallet_not_connected": "يرجى توصيل محفظتك للتصويت.",
+    "wallet_wrong_network": "يرجى التبديل إلى الشبكة الصحيحة.",
+    "insufficient_voting_power": "قوة تصويتية غير كافية لهذا المقترح.",
+    "dao_contract_error": "أعاد عقد الحوكمة خطأً: {{message}}",
+    "session_expired": "انتهت صلاحية الجلسة. يرجى إعادة توصيل المحفظة."
+  }
 }

@@ -78,6 +78,32 @@ const MAX_BACKOFF_MS = 60_000;
 const BACKOFF_MULTIPLIER = 2;
 
 // ============================================
+// LIFECYCLE DASHBOARD TYPES (#924)
+// ============================================
+
+/** Health summary exposed via the lifecycle dashboard endpoint. */
+export interface LifecycleDashboard {
+  uptime: number;
+  isShuttingDown: boolean;
+  services: Array<{
+    name: ServiceName;
+    state: ServiceHealth["state"];
+    consecutiveFailures: number;
+    lastError: string | null;
+    startedAt: string | null;
+    lastSuccessfulRun: string | null;
+    dependencies: ServiceName[];
+  }>;
+  summary: {
+    total: number;
+    running: number;
+    failed: number;
+    restarting: number;
+    stopped: number;
+  };
+}
+
+// ============================================
 // SERVICE SUPERVISOR CLASS
 // ============================================
 
@@ -461,6 +487,37 @@ export class ServiceSupervisor {
    */
   getAbortSignal(serviceName: ServiceName): AbortSignal | undefined {
     return this.abortControllers.get(serviceName)?.signal;
+  }
+
+  /**
+   * Lifecycle dashboard for the /health/lifecycle endpoint (#924).
+   *
+   * Returns a compact, structured view of every registered worker: state,
+   * failure counts, dependency list, and aggregate summary counts.
+   */
+  getLifecycleDashboard(): LifecycleDashboard {
+    const services = Array.from(this.health.values());
+    const summary = {
+      total: services.length,
+      running: services.filter((s) => s.state === "running").length,
+      failed: services.filter((s) => s.state === "failed").length,
+      restarting: services.filter((s) => s.state === "restarting").length,
+      stopped: services.filter((s) => s.state === "stopped").length,
+    };
+    return {
+      uptime: process.uptime(),
+      isShuttingDown: this.shuttingDown,
+      services: services.map((s) => ({
+        name: s.name,
+        state: s.state,
+        consecutiveFailures: s.consecutiveFailures,
+        lastError: s.lastError,
+        startedAt: s.startedAt,
+        lastSuccessfulRun: s.lastSuccessfulRun,
+        dependencies: s.dependencies,
+      })),
+      summary,
+    };
   }
 
   /**

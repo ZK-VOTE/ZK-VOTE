@@ -4,6 +4,7 @@ import { relayerFetch } from "../lib/api";
 import { isAllowedMessageOrigin } from "../lib/messageOrigin";
 import {
   canonicalizeStellarAmount,
+  formatStroops,
   horizonStroopsToSorobanAmount,
   parseStroops,
 } from "../lib/stellarAmount";
@@ -19,11 +20,13 @@ export default function SwapPanel() {
   const [to, setTo] = useState<Asset>("USDC");
   const [amount, setAmount] = useState("10");
   const [quote, setQuote] = useState<string | null>(null);
+  const [quoteToken, setQuoteToken] = useState<string | null>(null);
+  const [quoteMin, setQuoteMin] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   // A quote belongs to the session it was taken in: drop it when the wallet
   // switches account or network, and block a swap until re-quoted (#750).
   const { blockReason } = useSessionBoundForm([from, to, amount, quote]);
-  useOnWalletSessionChange(() => setQuote(null));
+  useOnWalletSessionChange(() => { setQuote(null); setQuoteToken(null); setQuoteMin(null); });
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -63,6 +66,8 @@ export default function SwapPanel() {
   }, []);
 
   const getQuote = async () => {
+    setQuoteToken(null);
+    setQuoteMin(null);
     setLoading(true);
     try {
       if (from === to) throw new Error("Choose two different assets");
@@ -101,6 +106,9 @@ export default function SwapPanel() {
           throw new Error("Soroswap quote contract is not pinned or does not match");
         }
       }
+      if (!j.executable || !j.quoteToken) throw new Error("No executable Horizon quote available");
+      setQuoteToken(j.quoteToken);
+      setQuoteMin((destinationStroops * 99n / 100n).toString());
       setQuote(`${exactDestination} ${to}`);
     } catch (e: any) {
       setQuote(`Quote unavailable${e.message ? `: ${e.message}` : ""}`);
@@ -116,6 +124,7 @@ export default function SwapPanel() {
       alert(`${sessionBlock} Get a new quote first.`);
       return;
     }
+    if (!quoteToken || !quoteMin) { alert("Get a fresh executable quote first."); return; }
     setLoading(true);
     try {
       if (from === to) throw new Error("Choose two different assets");
@@ -123,7 +132,7 @@ export default function SwapPanel() {
       const res = await relayerFetch(`/swap/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from, to, amount: canonicalAmount }),
+        body: JSON.stringify({ from, to, amount: canonicalAmount, quoteToken, destMin: formatStroops(BigInt(quoteMin)) }),
       });
       const text = await res.text();
       let j: any = {};
@@ -134,6 +143,9 @@ export default function SwapPanel() {
       }
       if (!res.ok)
         throw new Error(j.error || `HTTP ${res.status}: ${text.slice(0, 200)}`);
+      setQuoteToken(null);
+      setQuoteMin(null);
+      setQuote(null);
       alert(j.hash ? `Swap submitted: ${j.hash}` : JSON.stringify(j));
     } catch (e: any) {
       alert(e.message);

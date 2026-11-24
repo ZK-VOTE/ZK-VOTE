@@ -28,6 +28,7 @@ import {
 } from "./services/stellar.js";
 import type { StellarContext } from "./services/interfaces.js";
 import { initCircuitRegistry } from "./services/circuit-registry.js";
+import { initHaltStatus } from "./services/haltStatus.js";
 import { initAntiSpam } from "./services/anti-spam.js";
 import { initTtlService } from "./services/ttl.js";
 import { initSbtGuard } from "./services/sbt-guard.js";
@@ -35,6 +36,8 @@ import { initExclusionProof } from "./services/exclusion-proof.js";
 import { initTtlChecker } from "./services/ttl-checker.js";
 import { initSyncService } from "./services/sync.js";
 import { initBridgeRelay } from "./services/bridge.js";
+import { createEvmRpc } from "./services/bridge-evm.js";
+import { initOnboardingFunnel } from "./services/onboardingFunnel.js";
 import * as indexer from "./services/indexer.js";
 import { kysely } from "./services/kysely.js";
 import * as dbService from "./services/db.js";
@@ -90,9 +93,24 @@ export function buildAppServices(): AppServices {
     logger,
   });
 
+  // Tiered emergency halt status (ZV-114 / #954): read-only, same DI
+  // convention as circuit-registry above.
+  initHaltStatus({
+    server,
+    relayerKeypair,
+    callWithTimeout,
+    votingContractId: config.votingContractId,
+    networkPassphrase: config.networkPassphrase,
+    logger,
+  });
+
   // Wire the anti-spam service with explicit dependencies (#358): the write
   // DB handle, the Kysely query builder and the structured logger.
   initAntiSpam({ getDb: dbService.getWriteDb, kysely, logger });
+
+  // Wire the onboarding funnel metrics service (ZV-108) with the shared
+  // Kysely query builder.
+  initOnboardingFunnel({ kysely });
 
   // Wire the TTL renewal service with explicit dependencies (#358): the RPC
   // surface, config flags, contract IDs, persistence, TTL introspection,
@@ -184,6 +202,18 @@ export function buildAppServices(): AppServices {
     withSequenceLock,
     u256ToScVal,
     log: logger.log.bind(logger),
+    // EVM side of the relayer (#887): only when Bridge.sol is configured.
+    evm:
+      config.bridgeEvm.rpcUrl && config.bridgeEvm.contractAddress
+        ? {
+            rpc: createEvmRpc(config.bridgeEvm.rpcUrl),
+            contractAddress: config.bridgeEvm.contractAddress,
+            confirmations: config.bridgeEvm.confirmations,
+            startBlock: config.bridgeEvm.startBlock,
+            maxBlockRange: config.bridgeEvm.maxBlockRange,
+            maxAttempts: config.bridgeEvm.relayMaxAttempts,
+          }
+        : undefined,
   });
 
   // Wire the SBT transfer-watch service with explicit dependencies (#358):

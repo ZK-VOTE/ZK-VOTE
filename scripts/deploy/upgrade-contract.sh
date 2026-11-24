@@ -73,6 +73,43 @@ invoke_registry() {
     --
 }
 
+# ── Election blackout preflight (ZV-059) ─────────────────────────────────────
+# Query the backend for active elections and refuse to proceed if the current
+# time falls within any closing-window blackout.  Set BLACKOUT_OVERRIDE_TOKEN
+# to a valid override token to bypass the check with an audit trail.
+check_blackout() {
+  local api_base="${BACKEND_API_BASE:-http://localhost:3000}"
+  local override_token="${BLACKOUT_OVERRIDE_TOKEN:-}"
+  local response http_code
+
+  # Attempt to reach the backend blackout endpoint.  If the backend is
+  # unreachable we warn but do NOT block — a cold-start deploy without a
+  # running backend should still be possible.
+  if ! response=$(curl -sf --max-time 10 \
+      -H "X-Blackout-Override: ${override_token}" \
+      "${api_base}/admin/blackout-status" 2>/dev/null); then
+    echo "[blackout-check] WARNING: could not reach ${api_base}/admin/blackout-status — skipping check" >&2
+    return 0
+  fi
+
+  local in_blackout
+  in_blackout=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('inBlackout', False))" 2>/dev/null || echo "false")
+
+  if [ "$in_blackout" = "True" ] || [ "$in_blackout" = "true" ]; then
+    if [ -n "$override_token" ]; then
+      echo "[blackout-check] WARNING: proceeding with override token during blackout" >&2
+    else
+      echo "[blackout-check] ERROR: deploy blocked — active election blackout in effect." >&2
+      echo "  Set BLACKOUT_OVERRIDE_TOKEN to a valid override token to bypass." >&2
+      echo "  Response: $response" >&2
+      exit 1
+    fi
+  else
+    echo "[blackout-check] OK: no active blackout" >&2
+  fi
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
 case "$mode" in
   propose)
     if [ -z "$REGISTRY_ID" ] || [ -z "$DAO_ID" ] || [ -z "$TARGET_CONTRACT" ] || \
@@ -81,6 +118,7 @@ case "$mode" in
       usage
       exit 1
     fi
+    check_blackout
     now="$(date +%s)"
     ETA="${ETA:-$((now + MIN_DELAY_SECONDS))}"
     EXPIRES_AT="${EXPIRES_AT:-$((ETA + MIN_DELAY_SECONDS))}"
@@ -102,6 +140,7 @@ case "$mode" in
       usage
       exit 1
     fi
+    check_blackout
     invoke_registry execute_contract_upgrade \
       --dao_id "$DAO_ID" \
       --proposal_id "$PROPOSAL_ID" \
@@ -112,6 +151,7 @@ case "$mode" in
       usage
       exit 1
     fi
+    check_blackout
     invoke_registry rollback_contract_upgrade \
       --dao_id "$DAO_ID" \
       --proposal_id "$PROPOSAL_ID" \

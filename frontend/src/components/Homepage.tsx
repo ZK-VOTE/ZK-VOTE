@@ -47,7 +47,7 @@ export function Homepage() {
               onClick={() => navigate("/docs/")}
               className="w-full sm:w-auto min-h-[48px] px-8 text-base"
             >
-              {t("home.hero.documentation")} <span className="ml-2">→</span>
+              {t("home.hero.documentation")} <span className="ms-2">→</span>
             </Button>
           </div>
         </div>
@@ -462,55 +462,55 @@ export function Homepage() {
                   <div className="w-3 h-3 rounded-full bg-zinc-400"></div>
                   <div className="flex-1 h-12 rounded-lg border border-border/50 bg-background/50 flex items-center px-4">
                     <span className="text-sm font-mono">DAORegistry</span>
-                    <span className="ml-auto text-xs text-muted-foreground">
+                    <span className="ms-auto text-xs text-muted-foreground">
                       create_dao()
                     </span>
                   </div>
                 </div>
-                <div className="flex items-center gap-4 pl-6">
+                <div className="flex items-center gap-4 ps-6">
                   <div className="w-px h-8 bg-border"></div>
                 </div>
                 <div className="flex items-center gap-4">
                   <div className="w-3 h-3 rounded-full bg-blue-500"></div>
                   <div className="flex-1 h-12 rounded-lg border border-border/50 bg-background/50 flex items-center px-4">
                     <span className="text-sm font-mono">MembershipSBT</span>
-                    <span className="ml-auto text-xs text-muted-foreground">
+                    <span className="ms-auto text-xs text-muted-foreground">
                       mint()
                     </span>
                   </div>
                 </div>
-                <div className="flex items-center gap-4 pl-6">
+                <div className="flex items-center gap-4 ps-6">
                   <div className="w-px h-8 bg-border"></div>
                 </div>
                 <div className="flex items-center gap-4">
                   <div className="w-3 h-3 rounded-full bg-green-500"></div>
                   <div className="flex-1 h-12 rounded-lg border border-border/50 bg-background/50 flex items-center px-4">
                     <span className="text-sm font-mono">MembershipTree</span>
-                    <span className="ml-auto text-xs text-muted-foreground">
+                    <span className="ms-auto text-xs text-muted-foreground">
                       register()
                     </span>
                   </div>
                 </div>
-                <div className="flex items-center gap-4 pl-6">
+                <div className="flex items-center gap-4 ps-6">
                   <div className="w-px h-8 bg-border"></div>
                 </div>
                 <div className="flex items-center gap-4">
                   <div className="w-3 h-3 rounded-full bg-orange-500"></div>
                   <div className="flex-1 h-12 rounded-lg border border-border/50 bg-background/50 flex items-center px-4">
                     <span className="text-sm font-mono">Voting</span>
-                    <span className="ml-auto text-xs text-muted-foreground">
+                    <span className="ms-auto text-xs text-muted-foreground">
                       vote(proof)
                     </span>
                   </div>
                 </div>
-                <div className="flex items-center gap-4 pl-6">
+                <div className="flex items-center gap-4 ps-6">
                   <div className="w-px h-8 bg-border"></div>
                 </div>
                 <div className="flex items-center gap-4">
                   <div className="w-3 h-3 rounded-full bg-purple-500"></div>
                   <div className="flex-1 h-12 rounded-lg border border-border/50 bg-background/50 flex items-center px-4">
                     <span className="text-sm font-mono">Comments</span>
-                    <span className="ml-auto text-xs text-muted-foreground">
+                    <span className="ms-auto text-xs text-muted-foreground">
                       add_comment()
                     </span>
                   </div>

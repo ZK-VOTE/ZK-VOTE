@@ -11,7 +11,8 @@
  */
 
 import { DEPLOY_VERSION, CONTRACTS, NETWORK_CONFIG } from "../config/contracts";
-import { safeJsonParse } from "./safeMerge";
+import { safeJsonParse, mergeVersioned } from "./safeMerge";
+import type { VersionedValue, VersionedResolution } from "./safeMerge";
 
 // Storage key for tracking the current deployment version
 const VERSION_KEY = "zkvote_deploy_version";
@@ -102,4 +103,23 @@ export function setCached<T>(key: string, value: T): void {
  */
 export function removeCached(key: string): void {
   localStorage.removeItem(key);
+}
+
+/**
+ * ZV-132: causal cache writes for endpoints that expose sequence numbers.
+ * Stale refetches are not persisted; equal-clock divergent writes surface a
+ * typed conflict. Legacy getCached/setCached remain for unversioned settings.
+ */
+export function mergeVersionedCached<T>(
+  key: string,
+  incoming: VersionedValue<T>,
+): VersionedResolution<T> {
+  const current = getCached<VersionedValue<T>>(key);
+  if (!current) {
+    setCached(key, incoming);
+    return { kind: "accepted", current: incoming };
+  }
+  const decision = mergeVersioned(current, incoming);
+  if (decision.kind === "accepted") setCached(key, decision.current);
+  return decision;
 }

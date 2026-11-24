@@ -12,7 +12,7 @@ export function RelayerStatus({ status, errors }: Props) {
     <div className="text-sm text-red-500">
       {status && status !== "ready" && <div>Relayer status: {status}</div>}
       {errors.length > 0 && (
-        <ul className="list-disc ml-4">
+        <ul className="list-disc ms-4">
           {errors.map((err, idx) => (
             <li key={idx}>{err}</li>
           ))}

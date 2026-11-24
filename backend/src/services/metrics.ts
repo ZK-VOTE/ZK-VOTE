@@ -349,6 +349,79 @@ export const votesProcessed = new Counter({
   registers: [register],
 });
 
+// Imported by routes/voting.ts, routes/pay.ts and routes/health.ts but
+// missing from this file, which broke importing those routers (and
+// therefore backend/src/index.ts) entirely - found while adding the
+// ZV-113 compatibility-matrix route test, unrelated to voting/payment
+// instrumentation itself.
+export const proofVerificationDuration = new Histogram({
+  name: "zkvote_proof_verification_duration_seconds",
+  help: "Time to verify a submitted vote proof, in seconds",
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+  registers: [register],
+});
+
+export const proofValidationErrors = new Counter({
+  name: "zkvote_proof_validation_errors_total",
+  help: "Total vote proof validation errors, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const proofSubmissionsTotal = new Counter({
+  name: "zkvote_proof_submissions_total",
+  help: "Total vote proof submissions, by outcome",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const relayAttemptsTotal = new Counter({
+  name: "zkvote_relay_attempts_total",
+  help: "Total relayer submission attempts for vote proofs",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const relayDuration = new Histogram({
+  name: "zkvote_relay_duration_seconds",
+  help: "Time to relay a vote proof to the chain, in seconds",
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+export const relayErrors = new Counter({
+  name: "zkvote_relay_errors_total",
+  help: "Total relayer submission errors, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const relayQueueDepth = new Gauge({
+  name: "zkvote_relay_queue_depth",
+  help: "Current depth of the vote-relay submission queue",
+  registers: [register],
+});
+
+export const rootFetchFailuresTotal = new Counter({
+  name: "zkvote_root_fetch_failures_total",
+  help: "Total failures fetching a DAO's current Merkle root, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const paymentOpsPerMinute = new Histogram({
+  name: "zkvote_payment_ops_per_minute",
+  help: "Number of payment ops submitted per /pay/batch request",
+  buckets: [1, 2, 5, 10, 20, 50, 100],
+  registers: [register],
+});
+
+export const healthEndpointStatus = new Gauge({
+  name: "zkvote_health_endpoint_status",
+  help: "HTTP status code most recently returned by the /health endpoint",
+  registers: [register],
+});
+
 export const commentsSubmitted = new Counter({
   name: "zkvote_comments_submitted_total",
   help: "Total comments submitted",
@@ -773,6 +846,22 @@ export const relayerSigningRefusedTotal = new Counter({
   registers: [register],
 });
 
+// Notification delivery (ZV-037 / #886). `channel` is email | webpush;
+// `result` is sent | retry | gone | skipped. No destination or token is a label.
+export const notificationDeliveriesTotal = new Counter({
+  name: "zkvote_notification_deliveries_total",
+  help: "Notification delivery attempts by channel and result",
+  labelNames: ["channel", "result"] as const,
+  registers: [register],
+});
+
+export const notificationDeadLetterTotal = new Counter({
+  name: "zkvote_notification_dead_letter_total",
+  help: "Notifications moved to the dead-letter queue after exhausting retries",
+  labelNames: ["channel"] as const,
+  registers: [register],
+});
+
 export const relayerSigningTierTotal = new Counter({
   name: "zkvote_relayer_signing_tier_total",
   help: "Relayer signatures by signing tier",
@@ -1013,6 +1102,20 @@ export const priorityStarvationTotal = new Counter({
   registers: [register],
 });
 
+export const priorityQueueDepth = new Gauge({
+  name: "zkvote_priority_queue_depth",
+  help: "Current number of requests waiting in a priority tier's queue (not yet running)",
+  labelNames: ["tier"] as const,
+  registers: [register],
+});
+
+export const priorityQueueInFlight = new Gauge({
+  name: "zkvote_priority_queue_in_flight",
+  help: "Current number of requests running in a priority tier's reserved worker pool",
+  labelNames: ["tier"] as const,
+  registers: [register],
+});
+
 // ============================================
 // BACKUP FORWARD-SECRECY METRICS (#600)
 // ============================================
@@ -1034,6 +1137,46 @@ export const backupRestoreDrillTotal = new Counter({
   name: "zkvote_backup_restore_drill_total",
   help: "Total encrypted restore drills run (verify/decrypt round-trip)",
   labelNames: ["status"] as const,
+  registers: [register],
+});
+
+// Imported by backupCrypto.ts but missing from this file, which broke
+// every import of that module (and therefore anything that transitively
+// imports it, including backend/src/index.ts) - found while adding the
+// ZV-113 compatibility-matrix route test, unrelated to backup/crypto work
+// itself.
+export const backupTamperDetected = new Counter({
+  name: "zkvote_backup_tamper_detected_total",
+  help: "Total backup restores that detected tampering (AEAD auth-tag failure or size mismatch)",
+  labelNames: ["keyId"] as const,
+  registers: [register],
+});
+
+export const backupRestoreSuccess = new Counter({
+  name: "zkvote_backup_restore_success_total",
+  help: "Total backup restores that completed successfully",
+  labelNames: ["keyId"] as const,
+  registers: [register],
+});
+
+export const backupRestoreFailed = new Counter({
+  name: "zkvote_backup_restore_failed_total",
+  help: "Total backup restores that failed, by reason",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+export const backupEncryptionDuration = new Histogram({
+  name: "zkvote_backup_encryption_duration_seconds",
+  help: "Time to encrypt a backup payload, in seconds",
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30],
+  registers: [register],
+});
+
+export const backupDecryptionDuration = new Histogram({
+  name: "zkvote_backup_decryption_duration_seconds",
+  help: "Time to decrypt a backup payload, in seconds",
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30],
   registers: [register],
 });
 
@@ -1088,6 +1231,13 @@ export const paymentDestinationFanout = new Histogram({
   registers: [register],
 });
 
+export const paymentHoldsTotal = new Counter({
+  name: "zkvote_payment_holds_total",
+  help: "Graduated enforcement actions (hold/block) taken on flagged payments, by pattern and action (ZV-111)",
+  labelNames: ["pattern", "action"] as const,
+  registers: [register],
+});
+
 // ============================================
 // KYC BOUNDARY METRICS (SPIKE-146 / #797)
 // ============================================
@@ -1131,6 +1281,200 @@ export const outboxLagGauge = new Gauge({
   labelNames: ["channel"] as const,
   registers: [register],
 });
+
+// ============================================
+// STORAGE FOOTPRINT & RENT METRICS (ZV-032 / #881)
+// Bounded cardinality: labels are bounded by category, priority, reason, status
+// ============================================
+
+export const storageEntriesUsage = new Gauge({
+  name: "zkvote_storage_entries_usage",
+  help: "Current persistent storage entries by category and usage level",
+  labelNames: ["category", "status"] as const,
+  registers: [register],
+});
+
+export const storageBytesUsage = new Gauge({
+  name: "zkvote_storage_bytes_usage",
+  help: "Current persistent storage byte usage by category",
+  labelNames: ["category"] as const,
+  registers: [register],
+});
+
+export const storageLimitsConfigured = new Gauge({
+  name: "zkvote_storage_limits_configured",
+  help: "Aggregated configured storage entry and byte caps",
+  labelNames: ["type"] as const, // "entries" | "bytes"
+  registers: [register],
+});
+
+export const storageQuotaRejectionsTotal = new Counter({
+  name: "zkvote_storage_quota_rejections_total",
+  help: "Total writes rejected due to per-DAO storage footprint limits",
+  labelNames: ["category", "reason"] as const,
+  registers: [register],
+});
+
+// TTL Budget Metrics
+export const ttlBudgetConsumptionTotal = new Counter({
+  name: "zkvote_ttl_budget_consumption_total",
+  help: "Total TTL-extension budget units consumed",
+  labelNames: ["priority"] as const,
+  registers: [register],
+});
+
+export const ttlExtensionRejectionsTotal = new Counter({
+  name: "zkvote_ttl_extension_rejections_total",
+  help: "Total TTL extensions rejected due to budget exhaustion or priority rules",
+  labelNames: ["priority", "reason"] as const,
+  registers: [register],
+});
+
+export const ttlBudgetExhaustionWarnings = new Counter({
+  name: "zkvote_ttl_budget_exhaustion_warnings_total",
+  help: "Warnings triggered when a DAO approaches TTL budget exhaustion",
+  labelNames: ["priority"] as const,
+  registers: [register],
+});
+
+// Archival & Commitment Metrics
+export const archivalOperationsTotal = new Counter({
+  name: "zkvote_archival_operations_total",
+  help: "Total archival lifecycle operations (archive, restore, recommit)",
+  labelNames: ["operation", "status"] as const,
+  registers: [register],
+});
+
+export const archivalVerificationFailuresTotal = new Counter({
+  name: "zkvote_archival_verification_failures_total",
+  help: "Total cryptographic commitment verification failures during cold-state restoration",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+// ============================================
+// STORAGE RENT & TTL ALERTING (ZV-032 / ZV-044)
+// ============================================
+
+const recentAlerts = new Map<string, number>();
+const ALERT_DEDUPLICATION_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function shouldSuppressAlert(alertKey: string): boolean {
+  const now = Date.now();
+  const lastEmitted = recentAlerts.get(alertKey);
+  if (lastEmitted && now - lastEmitted < ALERT_DEDUPLICATION_WINDOW_MS) {
+    return true;
+  }
+  recentAlerts.set(alertKey, now);
+  return false;
+}
+
+export interface StorageAlertPayload {
+  alertType:
+    | "footprint_limit_warning"
+    | "footprint_limit_exceeded"
+    | "ttl_budget_warning"
+    | "ttl_budget_exhausted"
+    | "archival_failure"
+    | "verification_failure";
+  level: "warn" | "error";
+  daoId?: number;
+  details: Record<string, unknown>;
+}
+
+/**
+ * Dispatch or log rent and storage alerts. Integrates with ZV-044 alerting if
+ * configured, or surfaces structured logger alerts with deduplication.
+ */
+export function dispatchRentAlert(payload: StorageAlertPayload): void {
+  const alertKey = `${payload.alertType}:${payload.daoId ?? "global"}:${JSON.stringify(payload.details)}`;
+  if (shouldSuppressAlert(alertKey)) {
+    return;
+  }
+
+  // Check if ZV-044 global alert dispatcher exists
+  const globalAlertManager = (globalThis as any).__ZV044_ALERT_MANAGER__;
+  if (globalAlertManager && typeof globalAlertManager.dispatch === "function") {
+    try {
+      globalAlertManager.dispatch({
+        service: "storage_rent_enforcement",
+        type: payload.alertType,
+        level: payload.level,
+        daoId: payload.daoId,
+        details: payload.details,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    } catch (_) {
+      // Fallback to structured logging on dispatcher error
+    }
+  }
+
+  // Structured logging (redaction-safe)
+  console.warn(
+    JSON.stringify({
+      level: payload.level,
+      event: `alert_${payload.alertType}`,
+      daoId: payload.daoId,
+      details: payload.details,
+      timestamp: new Date().toISOString(),
+      integration: "zv044_fallback_logged",
+    }),
+  );
+}
+
+export function checkStorageFootprintAlert(
+  daoId: number,
+  currentEntries: number,
+  maxEntries: number,
+  currentBytes: number,
+  maxBytes: number,
+): void {
+  const entryRatio = maxEntries > 0 ? currentEntries / maxEntries : 0;
+  const byteRatio = maxBytes > 0 ? currentBytes / maxBytes : 0;
+
+  if (entryRatio >= 1.0 || byteRatio >= 1.0) {
+    dispatchRentAlert({
+      alertType: "footprint_limit_exceeded",
+      level: "error",
+      daoId,
+      details: { currentEntries, maxEntries, currentBytes, maxBytes, entryRatio, byteRatio },
+    });
+  } else if (entryRatio >= 0.85 || byteRatio >= 0.85) {
+    dispatchRentAlert({
+      alertType: "footprint_limit_warning",
+      level: "warn",
+      daoId,
+      details: { currentEntries, maxEntries, currentBytes, maxBytes, entryRatio, byteRatio },
+    });
+  }
+}
+
+export function checkTtlBudgetAlert(
+  daoId: number,
+  consumedBudget: number,
+  maxBudget: number,
+  priority: string,
+): void {
+  const ratio = maxBudget > 0 ? consumedBudget / maxBudget : 0;
+  if (ratio >= 1.0) {
+    ttlBudgetExhaustionWarnings.inc({ priority });
+    dispatchRentAlert({
+      alertType: "ttl_budget_exhausted",
+      level: "error",
+      daoId,
+      details: { consumedBudget, maxBudget, priority, ratio },
+    });
+  } else if (ratio >= 0.8) {
+    ttlBudgetExhaustionWarnings.inc({ priority });
+    dispatchRentAlert({
+      alertType: "ttl_budget_warning",
+      level: "warn",
+      daoId,
+      details: { consumedBudget, maxBudget, priority, ratio },
+    });
+  }
+}
 
 // ============================================
 // METRICS CARDINALITY GOVERNANCE & AUDIT (#749)

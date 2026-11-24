@@ -27,6 +27,13 @@ export const HORIZON_URL: string =
   (import.meta.env.VITE_HORIZON_URL as string | undefined) ??
   "https://horizon-testnet.stellar.org";
 
+/**
+ * Deployed `TreasuryEscrow.sol` address (ZV-107). Empty when unset — the
+ * escrow UI stays hidden rather than pointing at a placeholder address.
+ */
+export const TREASURY_ESCROW_ADDRESS: string =
+  (import.meta.env.VITE_TREASURY_ESCROW_ADDRESS as string | undefined) ?? "";
+
 /** Convenience: all three URLs as a plain object for logging / drift checks. */
 export const SERVICE_URLS = {
   relayer: RELAYER_URL,

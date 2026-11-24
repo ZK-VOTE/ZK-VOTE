@@ -226,6 +226,50 @@ export function isStaleVersion(requested: number, current: number): boolean {
   return requested < current;
 }
 
+/** Circuit ids this registry knows how to report a version for (ZV-113 / #953). */
+export const KNOWN_CIRCUIT_IDS = [
+  "vote_v1",
+  "vote_v2",
+  "weighted_vote",
+  "bridge",
+  "comment",
+  "comment_v2",
+];
+
+export interface CircuitMatrixEntry {
+  circuitId: string;
+  currentVersion: number | null;
+  /** [currentVersion, currentVersion - 1], clamped at 1. */
+  supportedVersions: number[];
+}
+
+/**
+ * SDK circuit-compatibility matrix enforcement (ZV-113 / #953).
+ *
+ * EPIC-004 promises "SDK version N supports circuits version N and N-1",
+ * but until this existed there was nothing an SDK could check that
+ * promise against at runtime - CIRCUIT_COMPATIBILITY in
+ * packages/sdk/src/version.ts was a static, offline table. This returns,
+ * for every circuit this registry knows about, its current version and
+ * the N/N-1 window a client may still use. Exposed over HTTP by
+ * `GET /circuits/compatibility-matrix` (routes/circuits.ts); kept here,
+ * dependency-free of stellar.js module globals like the rest of this
+ * file (#358), so it is unit-testable the same way as
+ * getCurrentVersion/isStaleVersion (see test/di/circuit-registry.test.ts).
+ */
+export async function getCompatibilityMatrix(): Promise<CircuitMatrixEntry[]> {
+  return Promise.all(
+    KNOWN_CIRCUIT_IDS.map(async (circuitId) => {
+      const currentVersion = await getCurrentVersion(circuitId);
+      const supportedVersions =
+        currentVersion === null
+          ? []
+          : [currentVersion, currentVersion - 1].filter((v) => v >= 1);
+      return { circuitId, currentVersion, supportedVersions };
+    }),
+  );
+}
+
 export function detectVKMismatch(
   proposalVersion: number,
   clientVersion: number,

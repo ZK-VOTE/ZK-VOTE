@@ -158,6 +158,9 @@ router.get("/daos", queryLimiter, validateQuery(daosQuerySchema), (async (
       cached: true,
       degraded: syncHealth.state !== "healthy",
       syncStatus: syncHealth.state,
+      dataStatus: syncHealth.state === "healthy" ? "fresh" : "stale",
+      // A stale empty response is never evidence that no DAOs exist.
+      sourceAvailable: syncHealth.state === "healthy",
     });
   } catch (err) {
     log("error", "get_daos_failed", { error: (err as Error).message });

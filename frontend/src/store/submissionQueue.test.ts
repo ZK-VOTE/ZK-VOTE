@@ -500,3 +500,40 @@ describe("classifyError", () => {
     });
   });
 });
+
+describe("ZV-132 race and conflict hardening", () => {
+  it("never overwrites confirmed submission with delayed errors", () => {
+    submissionQueue.enqueue(makePayload("monotonic"));
+    expect(submissionQueue.markSubmitting("monotonic")).toBe(true);
+    submissionQueue.markSubmitted("monotonic", "tx-good");
+    submissionQueue.markRetryable("monotonic", "late network failure");
+    submissionQueue.markFailed("monotonic", "late failure");
+    submissionQueue.markConflict("monotonic", "late conflicting response");
+    expect(submissionQueue.getState().entries.monotonic.status).toBe("submitted");
+    expect(submissionQueue.getState().entries.monotonic.txHash).toBe("tx-good");
+  });
+
+  it("rejects stale storage snapshots", () => {
+    submissionQueue.enqueue(makePayload("stale"));
+    const old = { ...submissionQueue.getState().entries.stale };
+    submissionQueue.markSubmitting("stale");
+    submissionQueue.markSubmitted("stale", "tx");
+    submissionQueue.mergeExternal({ entries: { stale: old } });
+    expect(submissionQueue.getState().entries.stale.status).toBe("submitted");
+  });
+
+  it("surfaces same-sequence conflicting offline edits as typed resolution", () => {
+    submissionQueue.enqueue(makePayload("edit"));
+    const current = submissionQueue.getState().entries.edit;
+    const remote = {
+      ...current,
+      payload: { ...current.payload, choice: false },
+      revision: current.revision,
+      updatedAt: current.updatedAt,
+    };
+    submissionQueue.mergeExternal({ entries: { edit: remote } });
+    const entry = submissionQueue.getState().entries.edit;
+    expect(entry.status).toBe("conflict");
+    expect(entry.resolution?.kind).toBe("concurrent-edit");
+  });
+});

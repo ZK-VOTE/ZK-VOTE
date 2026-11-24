@@ -8,6 +8,7 @@ import { Alert, LoadingSpinner, Badge } from "./ui";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { truncateAddress, extractTxHash } from "../lib/utils";
 import { notifyEvent } from "../lib/api";
+import { BidiSafe } from "../lib/bidiSafe";
 import { MoreVertical, UserMinus, Shield } from "lucide-react";
 
 // Dropdown menu for member actions (admin only)
@@ -49,13 +50,13 @@ function MemberActionsMenu({
       </button>
 
       {isOpen && (
-        <div className="absolute right-0 top-full mt-1 w-48 bg-popover border border-border rounded-md shadow-lg z-50 p-1">
+        <div className="absolute end-0 top-full mt-1 w-48 bg-popover border border-border rounded-md shadow-lg z-50 p-1">
           <button
             onClick={() => {
               setIsOpen(false);
               onMakeAdmin();
             }}
-            className="w-full flex items-center gap-3 px-3 py-3 min-h-[48px] text-sm text-left hover:bg-muted rounded-md transition-colors"
+            className="w-full flex items-center gap-3 px-3 py-3 min-h-[48px] text-sm text-start hover:bg-muted rounded-md transition-colors"
           >
             <Shield className="w-4 h-4 text-primary" />
             <span>Make Admin</span>
@@ -65,7 +66,7 @@ function MemberActionsMenu({
               setIsOpen(false);
               onRemove();
             }}
-            className="w-full flex items-center gap-3 px-3 py-3 min-h-[48px] text-sm text-left text-destructive hover:bg-destructive/10 rounded-md transition-colors"
+            className="w-full flex items-center gap-3 px-3 py-3 min-h-[48px] text-sm text-start text-destructive hover:bg-destructive/10 rounded-md transition-colors"
           >
             <UserMinus className="w-4 h-4" />
             <span>Remove Member</span>
@@ -713,10 +714,12 @@ export default function ManageMembers({
                       )}
                       <p className="font-mono text-xs text-muted-foreground break-all mt-1">
                         <span className="sm:hidden">
-                          {truncateAddress(member.address, 6, 6)}
+                          <BidiSafe>
+                            {truncateAddress(member.address, 6, 6)}
+                          </BidiSafe>
                         </span>
                         <span className="hidden sm:inline">
-                          {member.address}
+                          <BidiSafe>{member.address}</BidiSafe>
                         </span>
                       </p>
                     </div>
@@ -847,9 +850,11 @@ export default function ManageMembers({
                 <p className="font-mono text-sm text-foreground">
                   {/* Truncated on mobile, full on md+ */}
                   <span className="md:hidden">
-                    {truncateAddress(address, 5, 5)}
+                    <BidiSafe>{truncateAddress(address, 5, 5)}</BidiSafe>
                   </span>
-                  <span className="hidden md:inline">{address}</span>
+                  <span className="hidden md:inline">
+                    <BidiSafe>{address}</BidiSafe>
+                  </span>
                 </p>
               </div>
             ))}

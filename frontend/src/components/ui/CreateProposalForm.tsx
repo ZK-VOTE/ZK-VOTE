@@ -9,11 +9,17 @@ import { Label } from "./Label";
 import { Upload } from "lucide-react";
 import { useTheme } from "../../hooks/useTheme";
 import { relayerFetch } from "../../lib/api";
-import { PROPOSAL_TEMPLATES } from "../../lib/proposalTemplates";
+import {
+  getLocalizedProposalTemplates,
+  getProposalTemplate,
+  validateProposalTemplateDraft,
+  type TemplateLocale,
+} from "../../lib/proposalTemplates";
 
 interface ProposalMetadata {
   version: number;
   body: string;
+  template?: { id: string; version: number };
   videoUrl?: string;
   image?: {
     cid: string;
@@ -43,6 +49,10 @@ export default function CreateProposalForm({
   submittingLabel = "Creating...",
 }: CreateProposalFormProps) {
   const { theme } = useTheme();
+  const locale: TemplateLocale =
+    typeof navigator !== "undefined" && navigator.language.toLowerCase().startsWith("ar")
+      ? "ar" : "en";
+  const templates = getLocalizedProposalTemplates(locale);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
@@ -54,6 +64,7 @@ export default function CreateProposalForm({
   );
   const [uploadingImage, setUploadingImage] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [appliedTemplateId, setAppliedTemplateId] = useState<string | null>(
     null,
   );
@@ -64,7 +75,7 @@ export default function CreateProposalForm({
   // text the member has already started typing.
   const applyTemplate = useCallback(
     (templateId: string) => {
-      const template = PROPOSAL_TEMPLATES.find((t) => t.id === templateId);
+      const template = getProposalTemplate(templateId, locale);
       if (!template) return;
 
       setAppliedTemplateId(templateId);
@@ -73,7 +84,7 @@ export default function CreateProposalForm({
       if (!title.trim()) setTitle(template.titlePlaceholder);
       if (!body.trim()) setBody(template.bodyScaffold);
     },
-    [title, body],
+    [title, body, locale],
   );
 
   // Remove toolbar buttons from tab order
@@ -169,7 +180,12 @@ export default function CreateProposalForm({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!title.trim()) return;
+    const errors = validateProposalTemplateDraft({
+      title, body, videoUrl: videoUrl.trim(), voteMode,
+      deadlineSeconds: Number(deadlineSeconds),
+    });
+    setFieldErrors(errors);
+    if (Object.keys(errors).length > 0) return;
 
     setUploadError(null);
 
@@ -193,6 +209,12 @@ export default function CreateProposalForm({
         version: 1,
         body: body.trim(),
       };
+      const appliedTemplate = appliedTemplateId
+        ? getProposalTemplate(appliedTemplateId, locale)
+        : undefined;
+      if (appliedTemplate) {
+        metadata.template = { id: appliedTemplate.id, version: appliedTemplate.version };
+      }
 
       if (videoUrl.trim()) {
         metadata.videoUrl = videoUrl.trim();
@@ -225,20 +247,20 @@ export default function CreateProposalForm({
       {/* Templates */}
       <div className="space-y-2">
         <Label>Start from a template (optional)</Label>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {PROPOSAL_TEMPLATES.map((template) => (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" dir={locale === "ar" ? "rtl" : "ltr"}>
+          {templates.map((template) => (
             <button
               key={template.id}
               type="button"
               disabled={isProcessing}
               onClick={() => applyTemplate(template.id)}
-              className={`text-left rounded-lg border p-3 transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              className={`text-start rounded-lg border p-3 transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                 appliedTemplateId === template.id
                   ? "border-primary bg-primary/5"
                   : "border-input hover:border-primary/50"
               }`}
             >
-              <p className="text-sm font-medium">{template.name}</p>
+              <p dir="auto" className="text-sm font-medium">{template.name}</p>
               <p className="text-xs text-muted-foreground mt-0.5">
                 {template.description}
               </p>
@@ -253,6 +275,7 @@ export default function CreateProposalForm({
           Title <span className="text-destructive">*</span>
         </Label>
         <Input
+          dir={locale === "ar" ? "rtl" : "ltr"}
           value={title}
           onChange={(e) => setTitle(e.target.value.slice(0, 100))}
           placeholder="Brief proposal title (max 100 chars)"
@@ -260,15 +283,18 @@ export default function CreateProposalForm({
           maxLength={100}
         />
         <p className="text-xs text-muted-foreground">{title.length}/100</p>
+        {fieldErrors.title && <p role="alert" className="text-xs text-destructive">{fieldErrors.title}</p>}
       </div>
 
       {/* Markdown Body */}
       <div
         className="space-y-2"
         data-color-mode={theme}
+        dir={locale === "ar" ? "rtl" : "ltr"}
         ref={editorContainerRef}
       >
         <Label>Description</Label>
+        {fieldErrors.body && <p role="alert" className="text-xs text-destructive">{fieldErrors.body}</p>}
         <MDEditor
           value={body}
           onChange={(val) => setBody(val || "")}
@@ -292,6 +318,7 @@ export default function CreateProposalForm({
           disabled={isProcessing}
         />
         <p className="text-xs text-muted-foreground">YouTube or Vimeo links</p>
+        {fieldErrors.videoUrl && <p role="alert" className="text-xs text-destructive">{fieldErrors.videoUrl}</p>}
       </div>
 
       {/* Image Upload */}
@@ -357,6 +384,7 @@ export default function CreateProposalForm({
         onChange={setDeadlineSeconds}
         disabled={isProcessing}
       />
+      {fieldErrors.deadlineSeconds && <p role="alert" className="text-xs text-destructive">{fieldErrors.deadlineSeconds}</p>}
 
       <div className="flex gap-2 pt-2">
         <Button
@@ -365,7 +393,7 @@ export default function CreateProposalForm({
           disabled={isProcessing || !title.trim()}
           className="flex-1"
         >
-          {isProcessing && <LoadingSpinner size="sm" className="mr-2" />}
+          {isProcessing && <LoadingSpinner size="sm" className="me-2" />}
           {uploadingImage
             ? "Uploading..."
             : isSubmitting

@@ -57,7 +57,7 @@ describe("DAOHeader", () => {
     it("renders the DAO name", () => {
       render(<DAOHeader {...defaultProps} />);
 
-      expect(screen.getByText("Test DAO")).toBeInTheDocument();
+      expect(screen.getByText(/Test DAO/)).toBeInTheDocument();
     });
 
     it("renders the DAO ID", () => {
@@ -69,7 +69,8 @@ describe("DAOHeader", () => {
     it("renders the truncated creator address", () => {
       render(<DAOHeader {...defaultProps} />);
 
-      expect(screen.getByText(/Created by GABC\.\.\.4567/)).toBeInTheDocument();
+      expect(screen.getByText(/Created by/)).toBeInTheDocument();
+      expect(screen.getByText(/GABC\.\.\.4567/)).toBeInTheDocument();
     });
   });
 

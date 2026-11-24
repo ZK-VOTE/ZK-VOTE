@@ -18,6 +18,10 @@ members = [
     "tests/integration",
 ]
 default-members = [
+    # Production contracts only — poc-bls12-381 is intentionally excluded from
+    # default-members to prevent it from being included in production builds.
+    # It remains a workspace member for development/research purposes only.
+    # See: SPIKE-044 / issue #725 — BLS12-381 PoC isolation from BN254 production paths.
     "contracts/zkvote-groth16",
     "contracts/dao-registry",
     "contracts/membership-sbt",
@@ -35,6 +39,11 @@ resolver = "2"
 soroban-sdk = "25.3.0"
 num-bigint = "0.4"
 
+# #727 — REPRODUCIBLE BUILDS
+# All flags below must stay identical to the values used inside
+# contracts/Dockerfile.build. Any divergence between a developer's local
+# build and the canonical container build will change WASM output and break
+# the audit trail recorded in .deployed-contracts*. See SPIKE-047 / #727.
 [profile.release]
 opt-level = "z"
 overflow-checks = true

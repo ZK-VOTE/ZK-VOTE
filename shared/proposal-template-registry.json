@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "templates": [
+    {
+      "id": "quick-poll",
+      "version": 1,
+      "voteMode": "fixed",
+      "deadlineSeconds": 259200,
+      "name": {
+        "en": "Quick Poll",
+        "ar": "تصويت سريع"
+      },
+      "description": {
+        "en": "Fixed 3-day window for a simple yes/no decision.",
+        "ar": "تصويت بنعم أو لا لمدة ثلاثة أيام."
+      },
+      "titlePlaceholder": {
+        "en": "Should we ...?",
+        "ar": "هل ينبغي لنا ...؟"
+      },
+      "bodyScaffold": {
+        "en": "## Question\n\n## Context\n\n## Options\n",
+        "ar": "## السؤال\n\n## السياق\n\n## الخيارات\n"
+      }
+    },
+    {
+      "id": "standard-proposal",
+      "version": 1,
+      "voteMode": "fixed",
+      "deadlineSeconds": 604800,
+      "name": {
+        "en": "Standard Proposal",
+        "ar": "مقترح قياسي"
+      },
+      "description": {
+        "en": "Fixed 7-day window for a typical governance decision.",
+        "ar": "فترة تصويت ثابتة لمدة سبعة أيام."
+      },
+      "titlePlaceholder": {
+        "en": "Proposal: ...",
+        "ar": "مقترح: ..."
+      },
+      "bodyScaffold": {
+        "en": "## Summary\n\n## Motivation\n\n## Specification\n\n## Rationale\n",
+        "ar": "## الملخص\n\n## الدافع\n\n## التفاصيل\n\n## المبررات\n"
+      }
+    },
+    {
+      "id": "extended-discussion",
+      "version": 1,
+      "voteMode": "trailing",
+      "deadlineSeconds": 604800,
+      "name": {
+        "en": "Extended Discussion",
+        "ar": "نقاش موسع"
+      },
+      "description": {
+        "en": "Trailing deadline that extends while votes keep coming in.",
+        "ar": "تمتد المهلة عند استمرار التصويت."
+      },
+      "titlePlaceholder": {
+        "en": "Discussion: ...",
+        "ar": "نقاش: ..."
+      },
+      "bodyScaffold": {
+        "en": "## Summary\n\n## Background\n\n## Open Questions\n",
+        "ar": "## الملخص\n\n## الخلفية\n\n## أسئلة مفتوحة\n"
+      }
+    },
+    {
+      "id": "treasury-spend",
+      "version": 1,
+      "voteMode": "trailing",
+      "deadlineSeconds": 1209600,
+      "name": {
+        "en": "Treasury Spend",
+        "ar": "إنفاق الخزينة"
+      },
+      "description": {
+        "en": "Trailing 14-day window for financial decisions.",
+        "ar": "فترة أربعة عشر يوماً لقرارات الإنفاق."
+      },
+      "titlePlaceholder": {
+        "en": "Treasury Spend: ...",
+        "ar": "إنفاق الخزينة: ..."
+      },
+      "bodyScaffold": {
+        "en": "## Requested Amount\n\n## Purpose\n\n## Recipient\n\n## Justification\n",
+        "ar": "## المبلغ المطلوب\n\n## الغرض\n\n## المستفيد\n\n## المبررات\n"
+      }
+    }
+  ]
+}

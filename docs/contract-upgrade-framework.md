@@ -501,3 +501,176 @@ For each contract:
 - [ ] Write upgrade tests
 - [ ] Update deployment scripts
 - [ ] Document migration procedures
+
+---
+
+## Cross-Contract Version Handshakes and Constructor Cascades (SPIKE-051)
+
+### Problem Statement
+
+The 15-member Cargo workspace deploys as separate WASM contracts whose constructor arguments
+(`--registry`, `--sbt_contract`, `--tree_contract`) are baked at deploy time. No runtime
+version negotiation exists between callee and caller. Upgrading a contract that changes its
+return types or error enums breaks callers silently at runtime.
+
+Three specific failure modes are addressed here:
+
+1. **Silent interface breakage** — `membership-tree` returns a new error enum variant;
+   `voting` falls through to an unhandled `Err` arm and panics.
+2. **Constructor-arg redeploy cascade** — changing the `dao-registry` address requires
+   re-deploying `membership-sbt`, `membership-tree`, `voting`, and `comments` in the correct
+   dependency order with updated constructor args.
+3. **`default-members` vs full workspace divergence** — local builds test 9 of 15 members;
+   CI builds all 15. Interface changes to the 6 non-default members are never caught locally.
+
+### Version Handshake Pattern
+
+Every cross-contract call site that may break on callee upgrade must perform a version check
+before dispatching. The callee exposes `version() -> u32` (already required by this framework).
+The caller pins a `MIN_CALLEE_VERSION` constant and checks at call time:
+
+```rust
+// In contracts/voting/src/lib.rs
+const MIN_TREE_VERSION: u32 = 3;
+
+fn assert_tree_version(env: &Env, tree_client: &MembershipTreeClient) {
+    let v = tree_client.version();
+    if v < MIN_TREE_VERSION {
+        panic!("membership-tree version {} is below required minimum {}", v, MIN_TREE_VERSION);
+    }
+}
+```
+
+The check runs once per transaction (not per ledger entry) and is gated behind a storage flag
+that caches the result for the duration of the transaction to avoid redundant cross-contract
+calls.
+
+### Minimum-Version Matrix
+
+| Caller | Callee | Min version | Breaking changes guarded |
+|---|---|---|---|
+| `voting` | `membership-tree` | 3 | `get_leaf` return shape change in v3 |
+| `voting` | `dao-registry` | 2 | `is_member` boolean → `MemberStatus` enum in v2 |
+| `comments` | `membership-tree` | 3 | same as above |
+| `comments` | `voting` | 2 | `proposal_state` enum extension in v2 |
+| `comments` | `dao-registry` | 2 | same as voting |
+| `membership-tree` | `membership-sbt` | 2 | `sbt_active` signature change in v2 |
+
+### Constructor-Cascade Redeploy Tooling
+
+The following shell script encodes the dependency order and re-deploys all downstream
+contracts when an upstream address changes. It is idempotent: if a contract's WASM hash
+and constructor args are unchanged, the deploy is skipped.
+
+```bash
+#!/usr/bin/env bash
+# scripts/redeploy-cascade.sh
+# Usage: ./redeploy-cascade.sh --network testnet [--registry <addr>] [--sbt <addr>] [--tree <addr>]
+set -euo pipefail
+
+NETWORK=${NETWORK:-testnet}
+CONTRACTS_FILE=".deployed-contracts.${NETWORK}.json"
+
+redeploy_if_changed() {
+  local name=$1 wasm=$2 args=$3
+  local current_hash
+  current_hash=$(stellar contract install --wasm "$wasm" --network "$NETWORK" 2>/dev/null)
+  local stored_hash
+  stored_hash=$(jq -r ".\"${name}\".wasm_hash // empty" "$CONTRACTS_FILE" 2>/dev/null)
+  local stored_args
+  stored_args=$(jq -r ".\"${name}\".constructor_args // empty" "$CONTRACTS_FILE" 2>/dev/null)
+
+  if [ "$current_hash" = "$stored_hash" ] && [ "$args" = "$stored_args" ]; then
+    echo "  [skip] $name — WASM hash and args unchanged"
+    return 0
+  fi
+
+  echo "  [deploy] $name"
+  local contract_id
+  contract_id=$(stellar contract deploy --wasm "$wasm" --network "$NETWORK" $args)
+  # Update the contracts file with new address and hash
+  jq --arg name "$name" --arg id "$contract_id" --arg hash "$current_hash" --arg a "$args" \
+    '.[$name] = {contract_id: $id, wasm_hash: $hash, constructor_args: $a}' \
+    "$CONTRACTS_FILE" > /tmp/contracts_tmp.json && mv /tmp/contracts_tmp.json "$CONTRACTS_FILE"
+  echo "    → $contract_id"
+}
+
+# Parse overrides
+REGISTRY_ADDR=$(jq -r '.["dao-registry"].contract_id' "$CONTRACTS_FILE")
+SBT_ADDR=$(jq -r '.["membership-sbt"].contract_id' "$CONTRACTS_FILE")
+TREE_ADDR=$(jq -r '.["membership-tree"].contract_id' "$CONTRACTS_FILE")
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --registry) REGISTRY_ADDR=$2; shift 2 ;;
+    --sbt)      SBT_ADDR=$2;      shift 2 ;;
+    --tree)     TREE_ADDR=$2;     shift 2 ;;
+    --network)  NETWORK=$2;       shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+echo "=== Redeploy cascade for network: $NETWORK ==="
+
+# Layer 0: no dependencies
+redeploy_if_changed "dao-registry" \
+  "target/wasm32v1-none/release/dao_registry.wasm" ""
+
+# Layer 1: depends on registry
+redeploy_if_changed "membership-sbt" \
+  "target/wasm32v1-none/release/membership_sbt.wasm" \
+  "--registry $REGISTRY_ADDR"
+
+redeploy_if_changed "circuit-registry" \
+  "target/wasm32v1-none/release/circuit_registry.wasm" ""
+
+# Layer 2: depends on registry + sbt
+redeploy_if_changed "membership-tree" \
+  "target/wasm32v1-none/release/membership_tree.wasm" \
+  "--registry $REGISTRY_ADDR --sbt_contract $SBT_ADDR"
+
+# Layer 3: depends on registry + sbt + tree
+redeploy_if_changed "voting" \
+  "target/wasm32v1-none/release/voting.wasm" \
+  "--registry $REGISTRY_ADDR --sbt_contract $SBT_ADDR --tree_contract $TREE_ADDR"
+
+redeploy_if_changed "comments" \
+  "target/wasm32v1-none/release/comments.wasm" \
+  "--registry $REGISTRY_ADDR --sbt_contract $SBT_ADDR --tree_contract $TREE_ADDR"
+
+echo "=== Cascade complete ==="
+```
+
+### `default-members` vs Full Workspace Alignment
+
+The `default-members` list in `Cargo.toml` omits 6 workspace members
+(`zkvote-prover`, `rewards`, `poc-bls12-381`, `token`, `vdf`, `threshold-crypto`).
+Local `cargo build` and `cargo test` only cover the 9 default members, which means
+interface changes to the 6 non-default members are never caught locally.
+
+**Fix**: add a `[workspace.metadata.ci]` key that CI reads to assert `--workspace`:
+
+```toml
+# Cargo.toml — workspace metadata
+[workspace.metadata.ci]
+# CI must build and test the full workspace, not just default-members.
+# Run: cargo test --workspace
+full_workspace_required = true
+```
+
+CI (`.github/workflows/`) must pass `--workspace` to all `cargo build`, `cargo test`, and
+`cargo clippy` invocations. The `default-members` shortlist is kept only for developer
+convenience (faster local builds); it must not diverge from the full member set on any
+interface-touching change.
+
+### Open Action Items (SPIKE-051 resolution)
+
+- [x] Document version-handshake pattern and minimum-version matrix (this section)
+- [x] Document constructor-cascade redeploy tooling and dependency order
+- [x] Document `default-members` vs full workspace alignment fix
+- [ ] Implement `assert_callee_version` helper in each caller contract (see matrix above)
+- [ ] Add `scripts/redeploy-cascade.sh` to repository
+- [ ] Update CI workflows to pass `--workspace` to all cargo commands
+- [ ] Add integration test: deploy old `membership-tree` (v2) → confirm `voting` panics with version mismatch
+- [ ] Add integration test: run cascade script → confirm all downstream contracts updated
+- [ ] Update `schema-versioning.md` with cross-contract compatibility policy

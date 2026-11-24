@@ -258,7 +258,7 @@ export default function ClaimRewards({
           variant="ghost"
           size="icon"
           onClick={onClose}
-          className="absolute -top-10 right-0 h-8 w-8 rounded-full text-white hover:bg-white/20"
+          className="absolute -top-10 end-0 h-8 w-8 rounded-full text-white hover:bg-white/20"
         >
           <X className="h-4 w-4" />
           <span className="sr-only">Close</span>

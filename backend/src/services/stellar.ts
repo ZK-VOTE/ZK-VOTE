@@ -523,9 +523,46 @@ export const relayerRotation = new RelayerRotationOrchestrator({
   },
 });
 
-export async function withSequenceLock<T>(fn: () => Promise<T>): Promise<T> {
+type SequenceLane = "vote" | "payment" | "other";
+const sequenceWaits: Record<SequenceLane, number[]> = { vote: [], payment: [], other: [] };
+const SEQUENCE_WAIT_SAMPLE_LIMIT = 512;
+
+function recordSequenceWait(lane: SequenceLane, waitMs: number): void {
+  const values = sequenceWaits[lane];
+  values.push(Math.max(0, waitMs));
+  if (values.length > SEQUENCE_WAIT_SAMPLE_LIMIT) values.shift();
+}
+
+export function getSequenceContentionMetrics() {
+  const summarize = (samples: number[]) => {
+    const sorted = [...samples].sort((a, b) => a - b);
+    return {
+      samples: sorted.length,
+      p99WaitMs: sorted.length ? sorted[Math.ceil(sorted.length * 0.99) - 1] : 0,
+      maxWaitMs: sorted.at(-1) ?? 0,
+    };
+  };
+  return {
+    queued: inFlightLockOps,
+    vote: summarize(sequenceWaits.vote),
+    payment: summarize(sequenceWaits.payment),
+    other: summarize(sequenceWaits.other),
+  };
+}
+
+export async function withPaymentSequenceLock<T>(fn: () => Promise<T>): Promise<T> {
+  return withSequenceLock(fn, "payment");
+}
+
+export async function withVoteSequenceLock<T>(fn: () => Promise<T>): Promise<T> {
+  return withSequenceLock(fn, "vote");
+}
+
+export async function withSequenceLock<T>(fn: () => Promise<T>, lane: SequenceLane = "other"): Promise<T> {
+  const requestedAt = performance.now();
   if (config.clusterEnabled && nodeCluster.isWorker) {
     await acquireClusterSequenceLock();
+    recordSequenceWait(lane, performance.now() - requestedAt);
     try {
       return await fn();
     } finally {
@@ -540,6 +577,7 @@ export async function withSequenceLock<T>(fn: () => Promise<T>): Promise<T> {
   });
   inFlightLockOps++;
   await previous;
+  recordSequenceWait(lane, performance.now() - requestedAt);
   try {
     return await fn();
   } finally {
@@ -825,10 +863,7 @@ export class RpcPoolManager {
     const results = this.endpoints.map((ep) => this.statusOf(ep, tip));
     for (const ep of results) {
       const labels = { dependency: "soroban_rpc", endpoint: endpointLabel(ep.url) };
-      rpcEndpointLatency.set(
-        { endpoint: normalizeEndpoint(ep.url) },
-        ep.latencyMs / 1000,
-      );
+      rpcEndpointLatency.set({ endpoint: normalizeEndpoint(ep.url) }, ep.latencyMs / 1000);
       endpointHealthy.set(labels, ep.healthy ? 1 : 0);
       if (ep.lagLedgers !== null) endpointLedgerLag.set(labels, ep.lagLedgers);
     }

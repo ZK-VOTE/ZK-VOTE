@@ -8,6 +8,7 @@ import {
   getOfflineQueue,
   clearOfflineQueue,
   processOfflineQueue,
+  resolveOfflineTitleEdit,
   MAX_PROPOSAL_TITLE_BYTES,
   MAX_DAO_NAME_CHARS,
 } from "./offlineQueue";
@@ -205,4 +206,31 @@ describe("offlineQueue & CRDT validation", () => {
       expect(queue[0].type).toBe("proposal");
     });
   });
+  it("ZV-132: duplicate flush triggers share one in-flight request", async () => {
+    enqueueOfflineAction({
+      type: "vote",
+      daoId: 1,
+      payload: { nullifier: "0xsame", proof: "data" },
+    });
+    let resolveRequest!: (r: Response) => void;
+    const pending = new Promise<Response>((resolve) => { resolveRequest = resolve; });
+    const fetchMock = vi.spyOn(api, "relayerFetch").mockReturnValueOnce(pending);
+    const first = processOfflineQueue();
+    const second = processOfflineQueue();
+    expect(first).toBe(second);
+    resolveRequest(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toEqual(b);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getOfflineQueue()).toHaveLength(0);
+  });
+
+  it("ZV-132 surfaces simultaneous divergent offline title edits", () => {
+    const result = resolveOfflineTitleEdit(
+      { title: "Approve budget", timestamp: 100, clientId: "a" },
+      { title: "Reject budget", timestamp: 100, clientId: "b" },
+    );
+    expect(result.kind).toBe("conflict");
+  });
+
 });

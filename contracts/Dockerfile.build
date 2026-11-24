@@ -1,0 +1,67 @@
+# Canonical reproducible WASM build environment — issue #727
+#
+# All ZK-VOTE Soroban contracts must be compiled inside this container to
+# produce byte-for-byte identical WASM artifacts that auditors can verify
+# against the hashes recorded in .deployed-contracts* files.
+#
+# Determinism guarantees:
+#   - Rust toolchain pinned via rust-toolchain.toml (read by rustup inside
+#     the container); the exact channel is "1.91.1".
+#   - stellar-cli version pinned below; it must match the version used when
+#     the deployed hashes were recorded.
+#   - All build flags are taken from Cargo.toml [profile.release]: opt-level=z,
+#     lto=true, codegen-units=1, panic=abort, strip=symbols.
+#   - SOURCE_DATE_EPOCH is set to 0 so any timestamp-embedding tooling
+#     produces the same bytes regardless of when the build runs.
+#   - The workspace is mounted read-only; no host-side state leaks in.
+#
+# Usage:
+#   docker build -f contracts/Dockerfile.build -t zkvote-build .
+#   docker run --rm -v "$(pwd)":/src:ro -v "$(pwd)/target":/src/target \
+#       zkvote-build
+#
+# After the build, verify each contract's hash against .deployed-contracts:
+#   sha256sum target/wasm32v1-none/release/*.wasm
+
+FROM rust:1.81-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin stellar-cli to the version used when .deployed-contracts* hashes were
+# recorded. Changing this version changes WASM output — update the recorded
+# hashes if you upgrade.
+ENV STELLAR_CLI_VERSION="22.5.0"
+RUN cargo install stellar-cli --version "${STELLAR_CLI_VERSION}" --locked \
+    && rm -rf /root/.cargo/registry /root/.cargo/git
+
+# Enforce reproducible timestamps
+ENV SOURCE_DATE_EPOCH=0
+
+WORKDIR /src
+
+# Copy workspace manifests first so dependency fetching is cached
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+
+# rustup will read rust-toolchain.toml and install the pinned toolchain
+RUN rustup show
+
+# Copy full source tree (mounted as :ro in production; copied here for CI)
+COPY . .
+
+# Build all Soroban contracts in release mode.
+# The profile settings in Cargo.toml [profile.release] are authoritative;
+# do not pass additional RUSTFLAGS here to avoid divergence.
+RUN cargo build \
+    --target wasm32v1-none \
+    --release \
+    --workspace \
+    --exclude zkvote-prover \
+    --exclude integration
+
+# Print hashes for recording / auditing
+RUN echo "=== WASM artifact SHA-256 hashes ===" && \
+    sha256sum target/wasm32v1-none/release/*.wasm

@@ -198,6 +198,10 @@ impl Voting {
         );
 
         let proposal_id = Self::next_proposal_id(&env, dao_id);
+        // #736: pin the eligibility snapshot root, same as the plain-vote
+        // proposal constructor in lib.rs - votes must prove membership
+        // against this root, not whatever root is current at vote time.
+        let eligibility_snapshot_root = eligible_root.clone();
         let proposal = ProposalInfo {
             id: proposal_id,
             dao_id,
@@ -215,6 +219,8 @@ impl Voting {
             vote_mode: VoteMode::Quadratic,
             earliest_root_index,
             snapshot_ledger: env.ledger().sequence(),
+            eligibility_snapshot_root,
+            trailing_finalized_at: None,
         };
 
         let key = DataKey::Proposal(dao_id, proposal_id);

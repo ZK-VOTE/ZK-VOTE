@@ -131,7 +131,11 @@ export async function processEntry(entry: QueueEntry): Promise<void> {
         : {};
     const response = await relayerFetch("/vote", {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...sessionHeaders },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": `vote_${entry.id}`,
+        ...sessionHeaders,
+      },
       body: JSON.stringify(entry.payload),
       // Do NOT retry inside relayerFetch for queue submissions – the queue
       // owns the retry logic.

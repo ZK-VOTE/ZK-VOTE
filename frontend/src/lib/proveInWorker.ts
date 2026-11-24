@@ -50,6 +50,8 @@ export async function proveInWorker(
   wasm: string | Uint8Array,
   zkey: string | Uint8Array,
   stallTimeoutMs: number = PROOF_STALL_TIMEOUT_MS,
+  /** #728: Merkle depth so the worker can run the OOM preflight. */
+  merkleDepth?: number,
 ): Promise<WorkerProofResult> {
   const worker = new Worker(
     new URL("../workers/proof.worker.ts", import.meta.url),
@@ -76,7 +78,9 @@ export async function proveInWorker(
         if (res.ok) {
           resolve({ proof: res.proof, publicSignals: res.publicSignals });
         } else {
-          const kind = classifyWorkerCrash(res.error);
+          // #728: treat oomAborted:true as an OOM crash so the UI can route to
+          // server-assisted proving without waiting for a doomed retry.
+          const kind = res.oomAborted ? "oom" : classifyWorkerCrash(res.error);
           reject(new ProofWorkerError(kind, res.error ?? "Proof generation failed"));
         }
       };
@@ -92,6 +96,7 @@ export async function proveInWorker(
         input,
         wasm: asPayload(wasm),
         zkey: asPayload(zkey),
+        merkleDepth,
       };
       worker.postMessage(req);
     });
