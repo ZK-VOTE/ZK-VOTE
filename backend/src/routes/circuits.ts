@@ -7,9 +7,13 @@ import {
   getCircuitInfo,
   getDaoMigration,
   getDaoCurrentCircuit,
-  getVK,
   getCurrentVersion,
   isStaleVersion,
+  resolveVk,
+  invalidateVkCache,
+  invalidateVersionCache,
+  CircuitRegistryUnavailableError,
+  StaleVkError,
   proposeVkUpgrade,
   approveVkUpgrade,
   executeVkUpgrade,
@@ -217,7 +221,21 @@ router.get("/circuits/vk/:circuitId/:version", queryLimiter, (async (
     log("error", "vk_fetch_error", {
       circuitId,
       version: ver,
-      error: (error as Error).message,
+      source: resolved.source,
+      hash: resolved.hash,
+    });
+    return res.json({
+      circuitId: resolved.circuitId,
+      circuitType: resolved.circuitType,
+      version: resolved.version,
+      vk: resolved.vk,
+      hash: resolved.hash,
+      numPublicSignals: resolved.numPublicSignals,
+      currentVersion: resolved.currentVersion,
+      ceremonyTranscriptHash: resolved.ceremonyTranscriptHash ?? null,
+      circuitBinding: circuitBinding(resolved),
+      source: resolved.source,
+      isStale: false,
     });
     if (unavailable) {
       return res.status(503).json({ error: "Circuit registry unavailable" });
@@ -279,21 +297,58 @@ router.post("/circuits/verify-version", bodyLimit("5kb"), queryLimiter, (async (
       .status(400)
       .json({ error: "circuitId, proposalVersion, clientVersion required" });
   }
-  const mismatch = proposalVersion !== clientVersion;
-  const currentVersion = await getCurrentVersion(circuitId);
-  const stale =
-    currentVersion !== null
-      ? isStaleVersion(clientVersion, currentVersion)
-      : false;
-  return res.json({
-    circuitId,
-    proposalVersion,
-    clientVersion,
-    mismatch,
-    stale,
-    currentVersion,
-    shouldInvalidate: mismatch || stale,
-  });
+  const circuitType = normalizeCircuitType(req.body?.circuitType);
+  const daoId = optionalDaoId(req.body?.daoId);
+
+  try {
+    // Rotation observation via polling: if the DAO's proposal has executed,
+    // drop cached VKs before answering the client's preflight check.
+    if (daoId !== undefined) {
+      const proposal = await getDaoVkProposal(daoId).catch(() => null);
+      if (proposal?.status === "Executed") {
+        invalidateVkCache({
+          daoId,
+          circuitId: proposal.circuitId,
+          circuitType: proposal.circuitType,
+        });
+        invalidateVersionCache(proposal.circuitId);
+        log("info", "vk_rotation_observed", {
+          daoId,
+          circuitId: proposal.circuitId,
+          proposalId: proposal.id,
+        });
+      }
+    }
+
+    const currentVersion = await getCurrentVersion(circuitId, circuitType);
+    const mismatch = proposalVersion !== clientVersion;
+    const stale = isStaleVersion(clientVersion, currentVersion);
+
+    let resolved = null;
+    if (!stale) {
+      resolved = await resolveVk({
+        daoId,
+        circuitId,
+        circuitType,
+        version: clientVersion,
+      });
+    }
+
+    return res.json({
+      circuitId,
+      circuitType,
+      proposalVersion,
+      clientVersion,
+      mismatch,
+      stale,
+      currentVersion,
+      shouldInvalidate: mismatch || stale,
+      hash: resolved?.hash ?? null,
+      circuitBinding: resolved ? circuitBinding(resolved) : null,
+    });
+  } catch (error) {
+    return registryError(res, error, "verify_version_error");
+  }
 }) as AsyncHandler);
 
 // Propose a VK upgrade (timelock + multi-sig)
@@ -361,7 +416,16 @@ router.post("/circuits/vk/:proposalId/execute", authGuard, queryLimiter, (async 
 ) => {
   const { proposalId } = req.params;
   try {
+    const proposal = await getVkProposal(Number(proposalId)).catch(() => null);
     await executeVkUpgrade(Number(proposalId), req.user?.address ?? "");
+    if (proposal) {
+      invalidateVkCache({
+        daoId: proposal.daoId,
+        circuitId: proposal.circuitId,
+        circuitType: proposal.circuitType,
+      });
+      invalidateVersionCache(proposal.circuitId);
+    }
     return res.json({ success: true });
   } catch (error) {
     log("error", "vk_execute_error", { proposalId, error: (error as Error).message });

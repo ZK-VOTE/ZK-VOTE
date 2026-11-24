@@ -1,6 +1,15 @@
 /**
- * Anchor Service — SEP-6/24/31 for USDC/EURC inflow/outflow (real, no mock)
- * Proxies to Circle/Tempo anchors; stores claimableBalance for pending
+ * Anchor Service — multi-anchor SEP-6/24/31 adapter for USDC/EURC inflow/outflow.
+ *
+ * One `AnchorClient` interface normalizes both Circle anchors: getTransaction,
+ * deposit, withdraw and send. HTTP transport, URLs, logging and the callback
+ * handler are injected (`initAnchor` / `createAnchorAdapter`) so tests never
+ * touch the network. The legacy exports (`sep6Deposit`, `sep6Withdraw`,
+ * `sep31Send`, `anchorFor`) remain as aliases over the default adapter.
+ *
+ * Callbacks are idempotent end-to-end: the adapter deduplicates on event id
+ * before delegating to settlement reconciliation, which in turn deduplicates
+ * on (anchor, externalTxId) and applies the state machine's conflict rule.
  */
 import { log } from "./logger.js";
 import { config } from "../config.js";

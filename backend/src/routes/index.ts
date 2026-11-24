@@ -1,7 +1,12 @@
 /**
- * Routes Module Index
+ * Routes Module Index + declarative route registry.
  *
- * Re-exports all route modules for convenient importing.
+ * Historically this file was a flat list of re-exports and `index.ts` held a
+ * hand-written list of `app.use(...)` calls. The registry below makes the
+ * mount order, required services, DI-service prerequisites and startup profile
+ * explicit, and `mountRoutes()` validates those requirements **before**
+ * mounting anything. The original named re-exports remain as aliases so no
+ * existing import site needs to change.
  */
 
 export { default as healthRoutes, initHealthRoutes } from "./health.js";

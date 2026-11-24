@@ -11,7 +11,14 @@
  * validation; the returned container is passed to the app wiring.
  */
 
-import { config } from "./config.js";
+import {
+  config,
+  isValidContractId,
+  resolveStartupProfile,
+  type ResolvedStartupProfile,
+  type StartupProfile,
+  type StartupProfileInput,
+} from "./config.js";
 import { log, logger } from "./services/logger.js";
 import {
   server,
@@ -35,6 +42,23 @@ import { initAntiSpam } from "./services/anti-spam.js";
 import { initTtlService } from "./services/ttl.js";
 import { initSbtGuard } from "./services/sbt-guard.js";
 import { initExclusionProof } from "./services/exclusion-proof.js";
+// Settlement / double-entry ledger (#516 follow-up): the composition root is
+// the only place these singleton-style services get their stores wired.
+import {
+  initLedger,
+  createInMemoryLedgerStore,
+  createSqliteLedgerStore,
+  type LedgerStore,
+} from "./services/ledger.js";
+import {
+  initSettlementReconciliation,
+  createInMemorySettlementStore,
+  createSqliteSettlementStore,
+  handleAnchorCallback,
+  systemTimers,
+  type SettlementStore,
+} from "./services/settlementReconciliation.js";
+import { initAnchor } from "./services/anchor.js";
 import { initTtlChecker } from "./services/ttl-checker.js";
 import { initSyncService } from "./services/sync.js";
 import { initBridgeRelay } from "./services/bridge.js";
@@ -52,6 +76,76 @@ import {
 } from "./services/ttl-checker.js";
 import { markDegraded, markHealthy } from "./services/service-health.js";
 import { JobScheduler, defaultJobScheduler } from "./services/job-scheduler.js";
+import {
+  createWorker,
+  WorkerRegistry,
+  type BackgroundWorker,
+} from "./services/worker.js";
+
+// Background loops/timers are declared here (the composition root) so the
+// entry point does not own service lifecycles. The service implementations
+// themselves remain untouched.
+import * as ipfsService from "./services/ipfs.js";
+import { initPinManager } from "./services/ipfs-pin-manager.js";
+import {
+  startMonitor as startPinMonitor,
+  stopMonitor as stopPinMonitor,
+} from "./services/ipfs-monitor.js";
+import {
+  startConfirmationWorker,
+  stopConfirmationWorker,
+} from "./services/confirmation-queue.js";
+import {
+  startDaoSync,
+  stopDaoSync,
+  startMembershipSync,
+  stopMembershipSync,
+} from "./services/sync.js";
+import { startTTLRenewal, stopTTLRenewal } from "./services/ttl.js";
+import {
+  startSbtTransferWatch,
+  stopSbtTransferWatch,
+} from "./services/sbt-guard.js";
+import {
+  startAuthScheduler,
+  stopAuthScheduler,
+  ensureLegacyTokenMigrated,
+} from "./services/authScheduler.js";
+import {
+  startMemoryMonitor,
+  stopMemoryMonitor,
+} from "./services/memory-monitor.js";
+import {
+  startWalCheckpointing,
+  stopWalResilience,
+  startWalMonitor,
+  startPeriodicBackups,
+  performInitialCheckpoint,
+  detectAndHandleWalIssue,
+} from "./services/walResilience.js";
+import {
+  startScheduledBackups,
+  stopScheduledBackups,
+} from "./services/backup.js";
+
+/** DI services whose `init*` functions the root has called. */
+export const ROOT_INITIALIZED_SERVICES = [
+  "circuit-registry",
+  "anti-spam",
+  "ttl",
+  "ttl-checker",
+  "sync",
+  "bridge",
+  "sbt-guard",
+  "exclusion-proof",
+  "job-scheduler",
+  "ledger",
+  "settlement-reconciliation",
+  "anchor",
+] as const;
+
+export type InitializedServiceName =
+  (typeof ROOT_INITIALIZED_SERVICES)[number];
 
 /** The explicitly-wired service container. */
 export interface AppServices {
@@ -240,18 +334,61 @@ export function buildAppServices(): AppServices {
   // Wire the exclusion-proof service with explicit dependencies (#358).
   initExclusionProof({ getDb: dbService.getDb, log: logger.log.bind(logger) });
 
+  // Wire the double-entry ledger and settlement reconciliation. Both prefer a
+  // SQLite-backed store so evidence survives restarts; when no database is
+  // available (unit tests, early bootstrap) we fall back to an in-memory store
+  // rather than silently dropping postings.
+  let ledgerStore: LedgerStore;
+  let settlementStore: SettlementStore;
+  try {
+    const writeDb = dbService.getWriteDb();
+    ledgerStore = createSqliteLedgerStore(writeDb);
+    settlementStore = createSqliteSettlementStore(writeDb);
+  } catch (error) {
+    log("warn", "composition_root_ledger_memory_fallback", {
+      error: (error as Error).message,
+    });
+    ledgerStore = createInMemoryLedgerStore();
+    settlementStore = createInMemorySettlementStore();
+  }
+  initLedger({ store: ledgerStore, logger });
+  initSettlementReconciliation({
+    store: settlementStore,
+    ledgerStore,
+    logger,
+    timers: systemTimers,
+  });
+  initAnchor({
+    logger,
+    onCallback: (event) => handleAnchorCallback(event),
+  });
+
+  const services: AppServices = {
+    config,
+    logger,
+    stellar,
+    scheduler: defaultJobScheduler,
+    startup,
+    profile: startup.profile,
+    enableRelayer: startup.enableRelayer,
+    enableIndexer: startup.enableIndexer,
+    enableApi: startup.enableApi,
+    initializedServices: ROOT_INITIALIZED_SERVICES,
+    // Assigned immediately below; the worker definitions close over `services`
+    // lazily so this two-step construction is safe.
+    workers: null as unknown as WorkerRegistry,
+  };
+  services.workers = buildWorkerRegistry(services);
+
   log("info", "composition_root_wired", {
-    services: [
-      "circuit-registry",
-      "anti-spam",
-      "ttl",
-      "ttl-checker",
-      "sbt-guard",
-      "exclusion-proof",
-      "sync",
-      "bridge",
-      "job-scheduler",
-    ],
+    services: ROOT_INITIALIZED_SERVICES,
+    profile: startup.profile,
+    enabled: {
+      relayer: startup.enableRelayer,
+      indexer: startup.enableIndexer,
+      api: startup.enableApi,
+    },
+    workers: services.workers.list().map((worker: BackgroundWorker) => worker.name),
   });
 
   // The ledger is Kysely-native; routing it through the shared handle makes
